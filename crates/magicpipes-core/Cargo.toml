@@ -1,0 +1,20 @@
+[package]
+name = "magicpipes-core"
+description = "Shared protocol, transport and utility code for MagicPipes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+yamux.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+time.workspace = true
+tracing.workspace = true

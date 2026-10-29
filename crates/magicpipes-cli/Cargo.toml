@@ -1,0 +1,38 @@
+[package]
+name = "magicpipes-cli"
+description = "magicpipes: the MagicPipes CLI and local agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "magicpipes"
+path = "src/main.rs"
+
+[dependencies]
+magicpipes-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rcgen.workspace = true

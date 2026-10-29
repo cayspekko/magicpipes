@@ -1,0 +1,351 @@
+//! Agent operations behind the IPC API. `add` implements the readiness state machine:
+//!
+//! ```text
+//! LOCAL_OK -> AGENT_CONNECTED -> ROUTE_REGISTERED -> TLS_READY -> PROBING -> READY
+//!     \______________\________________\_______________\____________\-> FAILED(step, code)
+//! ```
+//!
+//! Every step is bounded by the request's overall deadline. On failure a tunnel created by this
+//! request is unregistered again; pre-existing tunnels are left untouched.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use magicpipes_core::proto::{CertState, RegisterTunnel, Request as Rpc, Response as RpcResponse, TunnelInfo};
+use rustls::ClientConfig;
+use serde_json::{Value, json};
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
+
+use super::probe;
+use super::session::{ConnState, RpcError, Session};
+use super::tunnels::{Registration, Tunnels};
+use crate::ipc::{AddRequest, ErrorInfo, IpcEvent, Step, StepState};
+use crate::state::{LocalTunnel, target_url};
+
+pub struct Agent {
+    pub session: Arc<Session>,
+    pub tunnels: Arc<Tunnels>,
+    pub shutdown: CancellationToken,
+    tls: Arc<ClientConfig>,
+    /// Serializes the find-or-register step so concurrent `add`s of one port don't duplicate.
+    register_lock: Mutex<()>,
+    inflight: AtomicUsize,
+    started_at: i64,
+}
+
+struct Events<'a>(&'a mpsc::Sender<IpcEvent>);
+
+impl Events<'_> {
+    async fn step(&self, step: Step, state: StepState) {
+        let _ = self.0.send(IpcEvent::Step { step, state }).await;
+    }
+}
+
+struct InflightGuard<'a>(&'a AtomicUsize);
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Agent {
+    pub fn new(session: Arc<Session>, tunnels: Arc<Tunnels>, tls: Arc<ClientConfig>, shutdown: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            session,
+            tunnels,
+            shutdown,
+            tls,
+            register_lock: Mutex::new(()),
+            inflight: AtomicUsize::new(0),
+            started_at: magicpipes_core::unix_now(),
+        })
+    }
+
+    pub async fn add(&self, req: AddRequest, tx: &mpsc::Sender<IpcEvent>) -> Result<Value, ErrorInfo> {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        let _guard = InflightGuard(&self.inflight);
+        let ev = Events(tx);
+        let deadline = Instant::now() + Duration::from_secs(req.timeout_secs.clamp(5, 900));
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+
+        // 1. Local service.
+        ev.step(Step::Local, StepState::Running).await;
+        let host = match resolve_local(req.host.as_deref(), req.port).await {
+            Ok(h) => h,
+            Err(e) => {
+                ev.step(Step::Local, StepState::Failed).await;
+                return Err(e.at(Step::Local));
+            }
+        };
+        ev.step(Step::Local, StepState::Done).await;
+
+        // 2. Server session.
+        ev.step(Step::Connect, StepState::Running).await;
+        if let Err(msg) = self.session.wait_connected(remaining().min(Duration::from_secs(20))).await {
+            ev.step(Step::Connect, StepState::Failed).await;
+            let code = if matches!(self.session.state(), ConnState::Unauthorized(_)) { "unauthorized" } else { "server_unreachable" };
+            return Err(ErrorInfo::new(code, msg).at(Step::Connect));
+        }
+        ev.step(Step::Connect, StepState::Done).await;
+
+        // 3. Registration (find-or-create, serialized).
+        ev.step(Step::Register, StepState::Running).await;
+        let (tunnel, created) = match self.register(&req, &host).await {
+            Ok(v) => v,
+            Err(e) => {
+                ev.step(Step::Register, StepState::Failed).await;
+                return Err(e.at(Step::Register));
+            }
+        };
+        ev.step(Step::Register, StepState::Done).await;
+
+        let result = self.verify(&tunnel, &req, &ev, deadline).await;
+        if let Err(e) = result {
+            if created {
+                let _ = self.session.rpc(&Rpc::Unregister { id: tunnel.id.clone() }, Duration::from_secs(10)).await;
+                self.tunnels.remove(&tunnel.id);
+                tracing::info!(tunnel = %tunnel.name, "removed tunnel after failed readiness check");
+            }
+            return Err(e);
+        }
+        tracing::info!(tunnel = %tunnel.name, url = %tunnel.public_url, "tunnel ready");
+        Ok(json!({
+            "id": tunnel.id,
+            "name": tunnel.name,
+            "public_url": tunnel.public_url,
+            "target": tunnel.target(),
+            "status": "ready",
+            "background": true,
+            "created": created,
+        }))
+    }
+
+    async fn register(&self, req: &AddRequest, host: &str) -> Result<(LocalTunnel, bool), ErrorInfo> {
+        let _lock = self.register_lock.lock().await;
+        let name = match &req.name {
+            Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new("invalid_name", m))?),
+            None => None,
+        };
+        let existing = match &name {
+            Some(n) => self.tunnels.find(|t| &t.name == n),
+            None => self.tunnels.find(|t| t.host == host && t.port == req.port),
+        };
+        if let Some(t) = &existing
+            && (t.port != req.port || t.host != host) {
+                return Err(ErrorInfo::new(
+                    "name_conflict",
+                    format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.target()),
+                ));
+            }
+        let target = target_url(host, req.port);
+        let mut rpc_req = RegisterTunnel {
+            id: existing.as_ref().map(|t| t.id.clone()),
+            name: existing.as_ref().map(|t| t.name.clone()).or(name.clone()),
+            target: target.clone(),
+        };
+        let info: TunnelInfo = loop {
+            match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
+                Ok(RpcResponse::Tunnel(info)) => break info,
+                Err(RpcError::Server(e)) if e.code == "not_found" && rpc_req.id.is_some() => {
+                    // Deleted on the server while we still had it: forget it and register anew.
+                    if let Some(id) = rpc_req.id.take() {
+                        self.tunnels.remove(&id);
+                    }
+                    rpc_req.name = name.clone();
+                }
+                Err(RpcError::Server(e)) => return Err(ErrorInfo::new(&e.code, e.message)),
+                Err(e) => return Err(ErrorInfo::new("server_unreachable", e.to_string())),
+                Ok(other) => return Err(ErrorInfo::new("protocol", format!("unexpected response {other:?}"))),
+            }
+        };
+        let tunnel = LocalTunnel {
+            created_at: existing.as_ref().map(|t| t.created_at).unwrap_or_else(magicpipes_core::unix_now),
+            id: info.id,
+            name: info.name,
+            hostname: info.hostname,
+            public_url: info.public_url,
+            host: host.to_string(),
+            port: req.port,
+        };
+        self.tunnels.upsert(tunnel.clone(), Registration::Registered);
+        Ok((tunnel, info.created))
+    }
+
+    async fn verify(&self, t: &LocalTunnel, req: &AddRequest, ev: &Events<'_>, deadline: Instant) -> Result<(), ErrorInfo> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+
+        // 4. Certificate.
+        ev.step(Step::Tls, StepState::Running).await;
+        loop {
+            let wait = remaining().min(Duration::from_secs(25));
+            let rpc = Rpc::CertStatus { hostname: t.hostname.clone(), wait_ms: wait.as_millis() as u64 };
+            match self.session.rpc(&rpc, wait + Duration::from_secs(10)).await {
+                Ok(RpcResponse::Cert(CertState::Ready)) => break,
+                Ok(RpcResponse::Cert(CertState::Failed { message })) => {
+                    ev.step(Step::Tls, StepState::Failed).await;
+                    return Err(ErrorInfo::new("tls_failed", format!("certificate provisioning failed.\n{message}")).at(Step::Tls));
+                }
+                Ok(RpcResponse::Cert(CertState::Pending)) if !remaining().is_zero() => continue,
+                Ok(RpcResponse::Cert(CertState::Pending)) => {
+                    ev.step(Step::Tls, StepState::Failed).await;
+                    return Err(ErrorInfo::new(
+                        "tls_timeout",
+                        format!(
+                            "the certificate for {} is still being issued after {}s. The server keeps trying; run the command again shortly",
+                            t.hostname, req.timeout_secs
+                        ),
+                    )
+                    .at(Step::Tls));
+                }
+                Ok(other) => return Err(ErrorInfo::new("protocol", format!("unexpected response {other:?}")).at(Step::Tls)),
+                Err(e) => {
+                    ev.step(Step::Tls, StepState::Failed).await;
+                    let code = match &e {
+                        RpcError::Server(b) => b.code.clone(),
+                        RpcError::Unavailable(_) => "server_unreachable".into(),
+                    };
+                    return Err(ErrorInfo::new(&code, e.to_string()).at(Step::Tls));
+                }
+            }
+        }
+        ev.step(Step::Tls, StepState::Done).await;
+
+        // 5. End-to-end probe through the public HTTPS endpoint.
+        ev.step(Step::Probe, StepState::Running).await;
+        loop {
+            let last = match probe::probe(t, &req.probe_path, &self.tls, &self.tunnels).await {
+                Ok(status) => {
+                    tracing::debug!(tunnel = %t.name, status, "probe succeeded");
+                    break;
+                }
+                Err(e) => e,
+            };
+            if remaining() < Duration::from_millis(500) {
+                ev.step(Step::Probe, StepState::Failed).await;
+                return Err(ErrorInfo::new("probe_failed", format!("public endpoint verification failed: {last}")).at(Step::Probe));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        ev.step(Step::Probe, StepState::Done).await;
+        Ok(())
+    }
+
+    pub async fn remove(&self, selector: &str, force: bool) -> Result<Value, ErrorInfo> {
+        let t = self
+            .tunnels
+            .find(|t| t.name == selector || t.id == selector || selector.parse::<u16>().is_ok_and(|p| p == t.port))
+            .ok_or_else(|| ErrorInfo::new("not_found", format!("no tunnel named '{selector}'")))?;
+        if !force {
+            let _ = self.session.wait_connected(Duration::from_secs(10)).await;
+        }
+        match self.session.rpc(&Rpc::Unregister { id: t.id.clone() }, Duration::from_secs(15)).await {
+            Ok(_) => {}
+            Err(e) if !force => {
+                return Err(ErrorInfo::new(
+                    "server_unreachable",
+                    format!("could not unregister '{}' on the server: {e}. Use --force to remove it locally only", t.name),
+                ));
+            }
+            Err(e) => tracing::warn!(tunnel = %t.name, error = %e, "removing locally only"),
+        }
+        self.tunnels.remove(&t.id);
+        tracing::info!(tunnel = %t.name, "tunnel removed");
+        Ok(json!({ "id": t.id, "name": t.name, "removed": true }))
+    }
+
+    fn connection(&self) -> (&'static str, Option<String>) {
+        match self.session.state() {
+            ConnState::Connected { handle, .. } if !handle.is_closed() => ("connected", None),
+            ConnState::Connected { .. } => ("connecting", None),
+            ConnState::Connecting { last_error, .. } => ("connecting", last_error),
+            ConnState::Unauthorized(m) => ("unauthorized", Some(m)),
+        }
+    }
+
+    pub fn list(&self) -> Value {
+        let (conn, _) = self.connection();
+        let tunnels: Vec<Value> = self
+            .tunnels
+            .snapshots()
+            .into_iter()
+            .map(|s| {
+                let status = match (conn, s.registration) {
+                    ("connected", Registration::Registered) => "connected",
+                    ("connected", Registration::Failed) => "error",
+                    ("connected", Registration::Pending) | ("connecting", _) => "connecting",
+                    _ => "disconnected",
+                };
+                json!({
+                    "id": s.tunnel.id,
+                    "name": s.tunnel.name,
+                    "public_url": s.tunnel.public_url,
+                    "target": s.tunnel.target(),
+                    "status": status,
+                    "error": s.last_error,
+                    "created_at": magicpipes_core::rfc3339(s.tunnel.created_at),
+                })
+            })
+            .collect();
+        json!({ "agent_running": true, "connection": conn, "tunnels": tunnels })
+    }
+
+    pub fn status(&self) -> Value {
+        let (conn, err) = self.connection();
+        let (connected_since, reconnect_attempt) = match self.session.state() {
+            ConnState::Connected { since, .. } => (Some(magicpipes_core::rfc3339(since)), None),
+            ConnState::Connecting { attempt, .. } => (None, Some(attempt)),
+            ConnState::Unauthorized(_) => (None, None),
+        };
+        json!({
+            "agent": {
+                "running": true,
+                "pid": std::process::id(),
+                "version": magicpipes_core::VERSION,
+                "started_at": magicpipes_core::rfc3339(self.started_at),
+            },
+            "server": self.session.server(),
+            "connection": conn,
+            "connected_since": connected_since,
+            "reconnect_attempt": reconnect_attempt,
+            "last_error": err,
+            "tunnels": self.tunnels.len(),
+        })
+    }
+
+    pub fn shutdown(&self, if_idle: bool) -> Result<Value, ErrorInfo> {
+        // The request asking for shutdown is not itself counted as in-flight work.
+        if if_idle && (self.tunnels.len() > 0 || self.inflight.load(Ordering::SeqCst) > 0) {
+            return Err(ErrorInfo::new("busy", "agent has active tunnels or operations"));
+        }
+        self.shutdown.cancel();
+        Ok(json!({ "stopping": true }))
+    }
+}
+
+/// Finds where the local application listens: the given host, or 127.0.0.1 then ::1.
+async fn resolve_local(host: Option<&str>, port: u16) -> Result<String, ErrorInfo> {
+    if port == 0 {
+        return Err(ErrorInfo::new("invalid_port", "port must be between 1 and 65535"));
+    }
+    let candidates: Vec<&str> = match host {
+        Some(h) => {
+            if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b)) {
+                return Err(ErrorInfo::new("invalid_host", format!("invalid host '{h}'")));
+            }
+            vec![h]
+        }
+        None => vec!["127.0.0.1", "::1"],
+    };
+    for h in &candidates {
+        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((*h, port))).await {
+            return Ok(h.to_string());
+        }
+    }
+    Err(ErrorInfo::new(
+        "local_unreachable",
+        format!("nothing is accepting connections on {}. Start your application first", target_url(candidates[0], port)),
+    ))
+}

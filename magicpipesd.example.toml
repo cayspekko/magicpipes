@@ -1,0 +1,46 @@
+# magicpipesd configuration.
+#
+# Requirements: a wildcard DNS record `*.<base_domain>` and an A/AAAA record for
+# `management.hostname`, both pointing at this machine; ports 80, 443 and 8443 reachable.
+
+# Tunnels are published as https://<name>.<base_domain>
+base_domain = "t.example.com"
+
+# SQLite database, certificates, ACME account and the bootstrap admin token live here.
+data_dir = "/var/lib/magicpipes"
+
+[public]
+https_listen = "0.0.0.0:443"
+# Serves ACME HTTP-01 challenges and redirects everything else to HTTPS.
+http_listen = "0.0.0.0:80"
+# url_port = 443                     # port shown in public URLs (defaults to https_listen's port)
+# max_connections = 10000
+# header_read_timeout_secs = 30
+# upstream_response_timeout_secs = 60
+# websocket_idle_timeout_secs = 600
+
+[management]
+# Management UI, JSON API and the agent endpoint share this listener.
+listen = "0.0.0.0:8443"
+hostname = "example.com"
+# cert_file = "/etc/magicpipes/mgmt.crt" # optional: externally provisioned certificate
+# key_file  = "/etc/magicpipes/mgmt.key"
+
+[tls]
+# "acme"   - per-hostname certificates via ACME HTTP-01 (default)
+# "files"  - an externally provisioned (usually wildcard) certificate
+# "dev-ca" - a local development CA in data_dir/dev-ca (testing only)
+mode = "acme"
+# "letsencrypt", "letsencrypt-staging" or an ACME directory URL. Try staging first.
+acme_directory = "letsencrypt"
+# acme_email = "ops@example.com"
+# acme_ca_root = "/path/to/pebble.minica.pem"   # extra root to trust for the ACME server
+# cert_file = "/etc/magicpipes/wildcard.crt"    # mode = "files"
+# key_file  = "/etc/magicpipes/wildcard.key"
+# issuance_timeout_secs = 120
+# failure_backoff_secs = 300
+
+[agents]
+# session_timeout_secs = 45
+# max_tunnels_per_agent = 50
+# enrollment_ttl_secs = 3600
