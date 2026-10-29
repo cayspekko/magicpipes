@@ -1,0 +1,34 @@
+# MagicPipes server. Edit docker/magicpipesd.toml first, then:
+#
+#   docker compose up -d --build
+#   docker compose exec magicpipesd magicpipesd enroll        # enrollment token for `magicpipes login`
+#   docker compose exec magicpipesd magicpipesd admin-token   # print a new admin token (UI/API login)
+#
+# The image is FROM scratch: there is no shell, `cat` or `id` inside, only the two binaries.
+
+services:
+  magicpipesd:
+    build: .
+    image: magicpipes:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"       # ACME HTTP-01 + redirect to HTTPS
+      - "443:443"     # public tunnel traffic
+      - "8443:8443"   # management UI/API and agent endpoint
+    volumes:
+      - ./docker/magicpipesd.toml:/etc/magicpipes/magicpipesd.toml:ro
+      - magicpipes-data:/data
+    environment:
+      MAGICPIPESD_LOG: info
+    # The image runs as an unprivileged user; let it bind ports 80/443 inside its own network
+    # namespace without granting capabilities.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 20s
+
+volumes:
+  magicpipes-data:

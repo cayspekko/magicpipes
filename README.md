@@ -105,6 +105,27 @@ magicpipesd --config ... admin-token --rotate   # revoke all others
 
 Log in to the UI at `https://example.com:8443` with that token.
 
+### Docker
+
+The [`Dockerfile`](Dockerfile) builds static musl binaries in `rust:1.90-alpine` and copies
+them into a `FROM scratch` image (~30 MB). The image contains only both binaries, a CA bundle
+(ACME has to verify the CA's HTTPS endpoint) and `/data`. It runs as UID 65532.
+
+```bash
+$EDITOR docker/magicpipesd.toml        # base_domain, management.hostname, acme_email
+docker compose up -d --build
+docker compose exec magicpipesd magicpipesd enroll        # enrollment token for `magicpipes login`
+docker compose exec magicpipesd magicpipesd admin-token   # admin token for the UI/API
+docker compose logs -f
+```
+
+[`docker-compose.yml`](docker-compose.yml) publishes 80, 443 and 8443 and keeps state in the
+`magicpipes-data` volume. It hardens the container: read-only root, tmpfs `/tmp`, all
+capabilities dropped, `no-new-privileges`. Binding 80/443 without root uses the
+`net.ipv4.ip_unprivileged_port_start=0` sysctl, which applies only inside the container's
+network namespace. There is no shell in the image, so `docker exec ... sh` and `cat` do not
+work; use the `magicpipesd` subcommands above, or `docker compose cp` to copy files out.
+
 ### systemd
 
 ```ini
