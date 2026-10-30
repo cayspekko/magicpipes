@@ -1,25 +1,19 @@
-# Builds magicpipes + magicpipesd for four platforms, smoke-tests each build on its own OS,
-# and, when a GitHub release is published, attaches the archives and SHA256SUMS to it.
-#
-# Pushes to main, pull requests and manual runs do everything except publishing (the archives
-# are kept as workflow artifacts instead).
+# Runs only when a GitHub release is published: tests, builds magicpipes + magicpipesd for four
+# platforms, smoke-tests each build on its own OS, and attaches the archives and SHA256SUMS to
+# the release. Nothing is published unless every platform passes.
 
 name: Build and release
 
 on:
   release:
     types: [published]
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,7 +62,6 @@ jobs:
           fetch-depth: 0
 
       - name: Check that the release commit is on main
-        if: github.event_name == 'release'
         run: |
           git fetch --quiet origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -116,14 +109,8 @@ jobs:
         id: package
         env:
           TARGET: ${{ matrix.target }}
-          EVENT: ${{ github.event_name }}
         run: |
-          if [[ "$EVENT" == "release" ]]; then
-            version="${GITHUB_REF_NAME}"
-          else
-            version="dev-${GITHUB_SHA::7}"
-          fi
-          name="magicpipes-${version}-${TARGET}"
+          name="magicpipes-${GITHUB_REF_NAME}-${TARGET}"
           ext=""
           [[ "$TARGET" == *windows* ]] && ext=".exe"
           mkdir -p "dist/$name"
@@ -146,7 +133,6 @@ jobs:
 
   publish:
     name: Publish release assets
-    if: github.event_name == 'release'
     needs: build
     runs-on: ubuntu-24.04
     permissions:

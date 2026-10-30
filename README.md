@@ -347,19 +347,21 @@ scripts/smoke-test.sh target/release   # quick end-to-end check of built binarie
 
 ### CI and releases
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) runs on every push to `main`
-and on pull requests:
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs only when a GitHub
+release is published:
 
 1. clippy and the test suite on Linux and macOS;
 2. a release build for each of the four targets above, each on its own OS (native ARM64
    runners for Linux ARM64);
 3. `scripts/smoke-test.sh` against each build on that OS: real server with a dev CA, login,
-   `add`, a public HTTPS request through the tunnel, `agent stop`.
+   `add`, a public HTTPS request through the tunnel, `agent stop`;
+4. if every platform passed, the four archives and `SHA256SUMS` are attached to the release.
 
 To publish, create a GitHub release with a tag such as `v0.2.0` on a commit from `main`. The
-same workflow then attaches the four archives and `SHA256SUMS` to the release. It refuses tags
-that aren't on `main`, and warns if the tag doesn't match the `version` in `Cargo.toml` (bump
-that first so `--version` is right). The toolchain is pinned to Rust 1.90.
+workflow refuses tags that aren't on `main`, and warns if the tag doesn't match the `version`
+in `Cargo.toml` (bump that first so `--version` is right). The toolchain is pinned to Rust 1.90.
+To check builds without releasing, run `cargo test --workspace` and `scripts/smoke-test.sh`
+locally.
 
 The end-to-end tests in `crates/magicpipes-cli/tests/e2e.rs` start real `magicpipesd` and
 `magicpipes` processes and cover HTTP, streaming, WebSockets, the UI, the API, agent and server
