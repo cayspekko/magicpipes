@@ -59,6 +59,14 @@ pub fn detach(cmd: &mut Command) {
     }
 }
 
+/// Resolves on Ctrl+C. If the handler cannot be installed (e.g. a detached process without a
+/// console), never resolves instead of reporting an interrupt that did not happen.
+pub async fn interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await
+    }
+}
+
 /// Resolves on a termination request other than Ctrl+C (SIGTERM on Unix; never on Windows,
 /// where a detached agent is stopped over IPC).
 pub async fn terminate() {

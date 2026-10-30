@@ -221,12 +221,20 @@ async fn wait_for_signal() {
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            _ = interrupt() => {}
             _ = term.recv() => {}
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        interrupt().await;
+    }
+}
+
+/// Ctrl+C. If no handler can be installed (no console), waits forever rather than treating the
+/// error as a shutdown request.
+async fn interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await
     }
 }

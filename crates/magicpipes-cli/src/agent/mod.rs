@@ -72,7 +72,7 @@ async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::signal::ctrl_c() => break,
+            _ = platform::interrupt() => break,
             _ = &mut terminate => break,
             conn = listener.accept() => {
                 let stream = match conn {
