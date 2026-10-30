@@ -46,7 +46,20 @@ both work.
   * `*.t.example.com  A  <server IP>` (wildcard for tunnels)
   * `example.com      A  <server IP>` (management hostname; any name works)
 
-### Build
+### Get the binaries
+
+Prebuilt archives are attached to each
+[GitHub release](https://github.com/cayspekko/magicpipes/releases). Each archive holds both
+`magicpipes` and `magicpipesd`; checksums are in `SHA256SUMS`.
+
+| Platform | Archive |
+|---|---|
+| macOS, Apple silicon | `magicpipes-<version>-aarch64-apple-darwin.tar.gz` |
+| Windows x86-64 | `magicpipes-<version>-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 (static) | `magicpipes-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 (static) | `magicpipes-<version>-aarch64-unknown-linux-musl.tar.gz` |
+
+Or build from source:
 
 ```bash
 cargo build --release
@@ -275,7 +288,7 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 | | |
 |---|---|
 | `MAGICPIPES_HOME` | State directory (default `~/.magicpipes`, mode 0700): `config.json`, `tunnels.json`, `agent.sock`, `agent.lock`, `agent.pid`, `agent.log` |
-| `MAGICPIPES_SOCKET` | IPC socket path override (Unix socket paths are limited to ~104 bytes) |
+| `MAGICPIPES_SOCKET` | IPC endpoint override: Unix socket path (limited to ~104 bytes), or a named pipe name (`\\.\pipe\...`) on Windows |
 | `MAGICPIPES_TOKEN` | Enrollment token for `login` |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |
 | `MAGICPIPES_PROBE_ADDR` | Testing: connect readiness probes to this IP instead of resolving DNS |
@@ -329,7 +342,24 @@ machine, and only the agent may decide what it connects to.
 ```bash
 cargo test --workspace     # unit tests + end-to-end tests (real processes, dev CA, loopback)
 cargo clippy --workspace --all-targets
+scripts/smoke-test.sh target/release   # quick end-to-end check of built binaries
 ```
+
+### CI and releases
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs on every push to `main`
+and on pull requests:
+
+1. clippy and the test suite on Linux and macOS;
+2. a release build for each of the four targets above, each on its own OS (native ARM64
+   runners for Linux ARM64);
+3. `scripts/smoke-test.sh` against each build on that OS: real server with a dev CA, login,
+   `add`, a public HTTPS request through the tunnel, `agent stop`.
+
+To publish, create a GitHub release with a tag such as `v0.2.0` on a commit from `main`. The
+same workflow then attaches the four archives and `SHA256SUMS` to the release. It refuses tags
+that aren't on `main`, and warns if the tag doesn't match the `version` in `Cargo.toml` (bump
+that first so `--version` is right). The toolchain is pinned to Rust 1.90.
 
 The end-to-end tests in `crates/magicpipes-cli/tests/e2e.rs` start real `magicpipesd` and
 `magicpipes` processes and cover HTTP, streaming, WebSockets, the UI, the API, agent and server

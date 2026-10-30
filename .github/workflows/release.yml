@@ -1,0 +1,165 @@
+# Builds magicpipes + magicpipesd for four platforms, smoke-tests each build on its own OS,
+# and, when a GitHub release is published, attaches the archives and SHA256SUMS to it.
+#
+# Pushes to main, pull requests and manual runs do everything except publishing (the archives
+# are kept as workflow artifacts instead).
+
+name: Build and release
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+env:
+  CARGO_TERM_COLOR: always
+# The toolchain is pinned (dtolnay/rust-toolchain@1.90) to the workspace rust-version and the
+# Dockerfile, so new compiler or clippy releases never break a release build.
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check that the release commit is on main
+        if: github.event_name == 'release'
+        run: |
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main."
+            exit 1
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::warning::Tag ${GITHUB_REF_NAME} does not match the Cargo version ${version}; binaries report ${version}."
+          fi
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          # C dependencies (ring, bundled SQLite) must be compiled against musl, not glibc.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin magicpipes --bin magicpipesd
+
+      - name: Check Linux binaries are static
+        if: contains(matrix.target, 'musl')
+        run: |
+          for b in target/${{ matrix.target }}/release/magicpipes target/${{ matrix.target }}/release/magicpipesd; do
+            file "$b"
+            if ldd "$b" 2>&1 | grep -q '=>'; then echo "::error::$b is dynamically linked"; exit 1; fi
+          done
+
+      - name: Smoke test
+        run: scripts/smoke-test.sh target/${{ matrix.target }}/release
+
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == "release" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          name="magicpipes-${version}-${TARGET}"
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/magicpipes$ext" "target/$TARGET/release/magicpipesd$ext" "dist/$name/"
+          cp README.md LICENSE magicpipesd.example.toml "dist/$name/"
+          cd dist
+          if [[ "$TARGET" == *windows* ]]; then
+            7z a -tzip -bso0 "$name.zip" "$name"
+            echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
