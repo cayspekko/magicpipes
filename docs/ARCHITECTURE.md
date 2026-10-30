@@ -107,7 +107,11 @@ the yamux stream, the agent, the local application. It is accepted only if:
   exit 0; every CLI then connects to the single winner. Holding the lock proves any existing
   socket file is stale, so it is removed and re-bound.
 * IPC is newline-delimited JSON over a Unix socket: mode 0600, inside a 0700 directory, and the
-  peer's uid is checked against the agent's. Operations: add, remove, list, status, shutdown
+  peer's uid is checked against the agent's. On Windows it is a named pipe named after a hash
+  of `MAGICPIPES_HOME`, created as the first instance (so no other process can own the name),
+  rejecting remote clients and using the default pipe ACL (the creating user, SYSTEM and
+  Administrators). The agent is started with `DETACHED_PROCESS`. All OS-specific code lives in
+  `magicpipes-cli/src/platform.rs`. Operations: add, remove, list, status, shutdown
   (`if_idle` variant used to clean up an agent a failed `add` started).
 * Registration is serialized inside the agent, so concurrent `add`s of one port yield one
   tunnel.
@@ -172,7 +176,10 @@ the yamux stream, the agent, the local application. It is accepted only if:
 * There is no body idle timeout for regular HTTP requests, only a time-to-first-response timeout.
   Upgraded (WebSocket) connections have an idle timeout.
 * UI sessions live in memory; restarting the server logs administrators out.
-* Unix only (Linux, macOS); the agent uses Unix sockets, `flock` and `setsid`.
+* Windows support is newer and less tested than Unix: it is covered by the CI smoke test on a
+  Windows runner (login, `add`, a public request, `agent stop`), not by the full end-to-end
+  suite, which is Unix-only. Files in `%USERPROFILE%\.magicpipes` rely on the profile's
+  default ACL rather than explicit permissions.
 * One server node, one agent per tunnel; no load balancing.
 * The `Host` header is forwarded unchanged; dev servers with host allow-lists must allow the
   public hostname.

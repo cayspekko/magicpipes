@@ -1,16 +1,16 @@
-//! Local files under `$MAGICPIPES_HOME` (default `~/.magicpipes`, mode 0700):
+//! Local files under `$MAGICPIPES_HOME` (default `~/.magicpipes`, or `%USERPROFILE%\.magicpipes`
+//! on Windows; mode 0700 on Unix):
 //!
 //! | file          | contents                                         |
 //! |---------------|--------------------------------------------------|
 //! | `config.json` | server URL, agent credentials, extra CA (0600)   |
 //! | `tunnels.json`| tunnels this agent serves (0600)                 |
-//! | `agent.sock`  | IPC socket (0600, peer uid checked; `MAGICPIPES_SOCKET` overrides) |
+//! | `agent.sock`  | IPC socket on Unix (0600, peer uid checked; `MAGICPIPES_SOCKET` overrides; a named pipe on Windows) |
 //! | `agent.lock`  | exclusive lock held by the running agent         |
 //! | `agent.pid`   | pid of the running agent                         |
 //! | `agent.log`   | background agent log                             |
 
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -20,20 +20,22 @@ pub fn home() -> PathBuf {
     if let Some(h) = std::env::var_os("MAGICPIPES_HOME") {
         return PathBuf::from(h);
     }
-    let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     base.join(".magicpipes")
 }
 
 pub fn ensure_home() -> anyhow::Result<PathBuf> {
     let h = home();
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&h).with_context(|| format!("creating {}", h.display()))?;
-    // Tighten permissions if the directory already existed.
-    std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700))?;
+    crate::platform::create_private_dir(&h).with_context(|| format!("creating {}", h.display()))?;
     Ok(h)
 }
 
 /// IPC socket path. `MAGICPIPES_SOCKET` overrides it, e.g. when `MAGICPIPES_HOME` is so deep
-/// that the path exceeds the ~104-byte Unix socket limit.
+/// that the path exceeds the ~104-byte Unix socket limit. (Windows uses a named pipe instead.)
+#[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     match std::env::var_os("MAGICPIPES_SOCKET") {
         Some(p) => PathBuf::from(p),
@@ -56,10 +58,10 @@ pub fn tunnels_path() -> PathBuf {
     home().join("tunnels.json")
 }
 
-/// Atomically writes a file with mode 0600.
+/// Atomically writes a file readable only by the current user (mode 0600 on Unix).
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut f = crate::platform::private_options().write(true).create(true).truncate(true).open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(tmp, path)

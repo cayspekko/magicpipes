@@ -1,4 +1,5 @@
-//! End-to-end lifecycle tests with real `magicpipesd` and `magicpipes` processes.
+//! End-to-end lifecycle tests with real `magicpipesd` and `magicpipes` processes (Unix only).
+#![cfg(unix)]
 
 mod common;
 

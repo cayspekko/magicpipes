@@ -129,12 +129,15 @@ fn covers(names: &[String], host: &str) -> bool {
     })
 }
 
-/// Writes a file readable only by the owner.
+/// Writes a file readable only by the owner (mode 0600 on Unix).
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(tmp, path)

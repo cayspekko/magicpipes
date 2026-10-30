@@ -98,12 +98,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn open_store(cfg: &Config) -> anyhow::Result<Store> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&cfg.data_dir)
-        .with_context(|| format!("creating data_dir {}", cfg.data_dir.display()))?;
+    let mut dir = std::fs::DirBuilder::new();
+    dir.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(&cfg.data_dir).with_context(|| format!("creating data_dir {}", cfg.data_dir.display()))?;
     Store::open(&cfg.data_dir.join("magicpipes.db"))
 }
 
@@ -218,9 +217,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 }
 
 async fn wait_for_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

@@ -5,6 +5,9 @@
 //! request. Bodies stream in both directions (hyper `Incoming` is passed through untouched).
 //! `Upgrade` requests (WebSockets) are bridged as raw byte streams after the `101` response.
 
+// Error pages are returned by value through `Result<_, Response>` on purpose.
+#![allow(clippy::result_large_err)]
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -207,7 +210,6 @@ fn is_upgrade(headers: &HeaderMap) -> bool {
 }
 
 /// Removes hop-by-hop and MagicPipes headers and adds forwarding headers.
-#[allow(clippy::result_large_err)] // error pages are returned by value on purpose
 fn prepare_request(req: &mut Request<Incoming>, host: &str, peer: SocketAddr, upgrade: bool) -> Result<(), Response<ProxyBody>> {
     // Absolute-form -> origin-form.
     if req.uri().authority().is_some() {

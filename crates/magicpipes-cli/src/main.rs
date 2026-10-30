@@ -4,6 +4,7 @@ mod agent;
 mod client;
 mod https;
 mod ipc;
+mod platform;
 mod state;
 
 use std::io::{IsTerminal, Write};
@@ -248,7 +249,7 @@ async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, 
         None => None,
     };
     let tls = https::tls_config(ca_pem.as_deref()).map_err(|e| ErrorInfo::new("config_error", format!("{e:#}")))?;
-    let agent_name = name.unwrap_or_else(hostname);
+    let agent_name = name.unwrap_or_else(platform::hostname);
     let body = json!({ "enrollment_token": token.trim(), "agent_name": agent_name });
     let (status, resp) = https::post_json(&server, "/api/v1/enroll", &tls, &body)
         .await
@@ -286,14 +287,6 @@ async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, 
         println!("\nNext: magicpipes add <port>");
     }
     Ok(())
-}
-
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates on success.
-    let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(0);
-    if ok && len > 0 { String::from_utf8_lossy(&buf[..len]).into_owned() } else { "agent".into() }
 }
 
 struct Progress {

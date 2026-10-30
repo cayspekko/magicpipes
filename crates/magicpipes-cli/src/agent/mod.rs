@@ -6,8 +6,9 @@
 //!
 //! Single instance: the agent holds an exclusive `flock` on `agent.lock` for its lifetime.
 //! A second agent (e.g. from two concurrent `magicpipes add` invocations) fails to take the lock
-//! and exits, and both CLIs then talk to the winner over `agent.sock`. Because the lock dies with
-//! the process, a stale socket file can always be removed safely by the lock holder.
+//! and exits, and both CLIs then talk to the winner over the IPC endpoint (`agent.sock`, or a
+//! named pipe on Windows; see `platform`). Because the lock dies with the process, a stale socket
+//! file can always be removed safely by the lock holder.
 
 mod forward;
 mod ops;
@@ -16,16 +17,15 @@ mod session;
 mod tunnels;
 
 use std::fs::File;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::ipc::{self, ErrorInfo, IpcEvent, IpcRequest};
+use crate::platform::{self, IpcListener};
 use crate::state::{self, AgentConfig};
 use ops::Agent;
 
@@ -48,21 +48,15 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let res = rt.block_on(serve(cfg, detached));
-    let _ = std::fs::remove_file(state::socket_path());
+    platform::cleanup_ipc();
     let _ = std::fs::remove_file(state::pid_path());
     drop(lock);
     res.map(|_| Start::Ran)
 }
 
 async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
-    let sock = state::socket_path();
-    if sock.as_os_str().len() > 100 {
-        bail!("socket path {} is too long; set MAGICPIPES_SOCKET (or MAGICPIPES_HOME) to a shorter path", sock.display());
-    }
     // We hold the lock, so any existing socket is stale.
-    let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+    let mut listener = IpcListener::bind()?;
     state::write_private(&state::pid_path(), std::process::id().to_string().as_bytes())?;
 
     let shutdown = CancellationToken::new();
@@ -73,25 +67,22 @@ async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
     tracing::info!(pid = std::process::id(), tunnels = tunnels.len(), detached, "agent started");
 
     let session_task = tokio::spawn(session.clone().run(shutdown.clone()));
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let uid = unsafe { libc::getuid() };
+    let terminate = platform::terminate();
+    tokio::pin!(terminate);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::signal::ctrl_c() => break,
-            _ = term.recv() => break,
+            _ = &mut terminate => break,
             conn = listener.accept() => {
-                let Ok((stream, _)) = conn else { continue };
-                // Defense in depth on top of the 0700 directory and 0600 socket.
-                match stream.peer_cred() {
-                    Ok(c) if c.uid() == uid => {}
-                    Ok(c) => {
-                        tracing::warn!(uid = c.uid(), "rejected IPC connection from another user");
+                let stream = match conn {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "IPC accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
-                    // The peer already hung up (e.g. a CLI liveness check).
-                    Err(_) => continue,
-                }
+                };
                 let agent = agent.clone();
                 tokio::spawn(async move { handle_ipc(agent, stream).await });
             }
@@ -103,8 +94,8 @@ async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_ipc(agent: Arc<Agent>, stream: UnixStream) {
-    let (r, mut w) = stream.into_split();
+async fn handle_ipc<S: AsyncRead + AsyncWrite>(agent: Arc<Agent>, stream: S) {
+    let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r).take(ipc::MAX_LINE as u64);
     let mut line = String::new();
     if reader.read_line(&mut line).await.is_err() {

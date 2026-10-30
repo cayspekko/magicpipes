@@ -110,7 +110,7 @@ impl Tunnels {
             .values()
             .map(|e| TunnelSnapshot { tunnel: e.tunnel.clone(), registration: e.registration, last_error: e.last_error.clone() })
             .collect();
-        v.sort_by(|a, b| a.tunnel.created_at.cmp(&b.tunnel.created_at));
+        v.sort_by_key(|s| s.tunnel.created_at);
         v
     }
 

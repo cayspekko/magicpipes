@@ -1,25 +1,23 @@
 //! CLI side of the agent lifecycle: find the running agent or start a detached one.
 //!
 //! The CLI never forks itself. It spawns a fresh `magicpipes agent run --detached` process
-//! (fork immediately followed by exec, with only `setsid()` in between), so the new agent builds
-//! its own Tokio runtime from scratch and is detached from the terminal's session and signals.
+//! (on Unix, fork immediately followed by exec with only `setsid()` in between; on Windows, a
+//! detached process), so the new agent builds its own Tokio runtime from scratch and is
+//! detached from the terminal's session and signals.
 
 use std::io::{BufRead, Seek};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
-use tokio::net::UnixStream;
-
 use crate::ipc::{self, ErrorInfo, IpcRequest, Step, StepState};
+use crate::platform::{self, IpcClient};
 use crate::state::{self, AgentConfig};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
-pub async fn connect() -> Option<UnixStream> {
-    UnixStream::connect(state::socket_path()).await.ok()
+pub async fn connect() -> Option<IpcClient> {
+    platform::ipc_connect().await
 }
 
 pub fn require_login() -> Result<AgentConfig, ErrorInfo> {
@@ -71,21 +69,13 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
 
 fn spawn_detached() -> std::io::Result<Child> {
     let exe = std::env::current_exe()?;
-    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(state::log_path())?;
+    let log = platform::private_options().create(true).append(true).open(state::log_path())?;
     if log.metadata()?.len() > MAX_LOG_BYTES {
         log.set_len(0)?;
     }
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["agent", "run", "--detached"]).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    // SAFETY: setsid() is async-signal-safe and is the only call between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    platform::detach(&mut cmd);
     cmd.spawn()
 }
 

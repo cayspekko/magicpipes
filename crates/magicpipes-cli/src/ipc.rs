@@ -1,4 +1,4 @@
-//! Local CLI <-> agent protocol over a Unix domain socket.
+//! Local CLI <-> agent protocol over a Unix domain socket (a named pipe on Windows).
 //!
 //! One request per connection: the CLI writes a single JSON line ([`IpcRequest`]); the agent
 //! answers with zero or more [`IpcEvent::Step`] lines followed by exactly one terminal
@@ -6,8 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub const MAX_LINE: usize = 64 * 1024;
 
@@ -103,11 +102,11 @@ pub async fn write_line<T: Serialize>(w: &mut (impl AsyncWriteExt + Unpin), v: &
 
 /// Sends a request and feeds step events to `on_step`; returns the terminal result.
 pub async fn call(
-    stream: UnixStream,
+    stream: impl AsyncRead + AsyncWrite,
     req: &IpcRequest,
     mut on_step: impl FnMut(Step, StepState),
 ) -> Result<Value, ErrorInfo> {
-    let (r, mut w) = stream.into_split();
+    let (r, mut w) = tokio::io::split(stream);
     write_line(&mut w, req).await.map_err(|e| ErrorInfo::new("agent_unavailable", format!("talking to agent: {e}")))?;
     let mut lines = BufReader::new(r).lines();
     loop {
