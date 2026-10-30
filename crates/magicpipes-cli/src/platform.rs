@@ -35,7 +35,8 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Makes `cmd` start detached from the caller's terminal/console, so it survives the CLI.
+/// Makes `cmd` start detached from the caller's terminal/console, so it survives the CLI, and
+/// keeps it from holding on to the CLI's own stdio (see `disinherit_std_handles`).
 pub fn detach(cmd: &mut Command) {
     #[cfg(unix)]
     {
@@ -56,6 +57,35 @@ pub fn detach(cmd: &mut Command) {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        disinherit_std_handles();
+    }
+}
+
+/// Windows creates child processes with handle inheritance enabled, so a long-lived agent would
+/// otherwise inherit this CLI's stdin/stdout/stderr and keep them open after the CLI exits: in
+/// `magicpipes add 8080 --json | jq`, `jq` would never see end-of-file. The child still gets the
+/// stdio handles set on its `Command`; only the CLI's own handles stop being inheritable.
+#[cfg(windows)]
+fn disinherit_std_handles() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on the process's own standard handles; failures (no handle,
+        // invalid handle) are harmless and ignored.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h as isize != -1 {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
     }
 }
 

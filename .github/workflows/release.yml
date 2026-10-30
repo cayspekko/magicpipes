@@ -23,6 +23,7 @@ env:
 jobs:
   test:
     name: Test (${{ matrix.os }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +54,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -103,6 +105,7 @@ jobs:
           done
 
       - name: Smoke test
+        timeout-minutes: 10
         run: scripts/smoke-test.sh target/${{ matrix.target }}/release
 
       - name: Package
@@ -135,6 +138,7 @@ jobs:
     name: Publish release assets
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
