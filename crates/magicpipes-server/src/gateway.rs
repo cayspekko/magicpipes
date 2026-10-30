@@ -58,7 +58,11 @@ async fn run_session(
     io: TokioIo<hyper::upgrade::Upgraded>,
 ) {
     let (handle, mut inbound) = mux::spawn(io, Mode::Server);
-    let conn_id = control.attach_session(&agent_id, handle.clone(), peer);
+    let Some(conn_id) = control.attach_session(&agent_id, handle.clone(), peer) else {
+        tracing::warn!(agent = %agent_id, %peer, "closing session of revoked agent");
+        handle.close();
+        return;
+    };
     loop {
         tokio::select! {
             _ = handle.closed() => break,

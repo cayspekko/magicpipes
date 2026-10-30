@@ -172,6 +172,10 @@ The enrollment token is exchanged for a long-lived **agent credential** stored i
 token out of shell history, pass it as `MAGICPIPES_TOKEN` or type it at the prompt. For a
 `dev-ca` server, add `--ca-cert path/to/ca.crt`.
 
+To revoke a machine (lost laptop, leaked credential), click **Revoke** next to the agent in the
+UI or call `DELETE /api/v1/agents/{id}`. Its credential stops working at once, its live session
+is closed and its tunnels are deleted. Enroll it again with a new token to bring it back.
+
 ---
 
 ## 3. Use tunnels
@@ -289,6 +293,7 @@ All endpoints except `enroll` and the agent endpoint require `Authorization: Bea
 | GET | `/api/v1/tunnels/{id or name}` | One tunnel |
 | DELETE | `/api/v1/tunnels/{id or name}` | 204; the owning agent is notified and stops serving it; 404 if absent |
 | GET | `/api/v1/agents` | Enrolled agents and connection state |
+| DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
 | POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}` |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |

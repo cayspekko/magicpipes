@@ -169,6 +169,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn agent_exists(&self, agent_id: &str) -> anyhow::Result<bool> {
+        self.with(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)", [agent_id], |r| r.get(0)))
+    }
+
+    /// Deletes an agent identity and every tunnel it owns. Returns false if the agent is unknown.
+    pub fn delete_agent(&self, agent_id: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM tunnels WHERE agent_id = ?1", [agent_id])?;
+        let deleted = tx.execute("DELETE FROM agents WHERE id = ?1", [agent_id])?;
+        tx.commit()?;
+        Ok(deleted == 1)
+    }
+
     pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
         self.with(|c| {
             let mut st = c.prepare("SELECT id, name, created_at, last_seen_at FROM agents ORDER BY created_at")?;
@@ -239,6 +253,34 @@ mod tests {
         let adm = store.create_admin_token(false).unwrap();
         assert!(store.verify_admin_token(&adm).unwrap());
         assert!(!store.verify_admin_token("mpadm_nope").unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn deleting_an_agent_revokes_its_token_and_tunnels() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("db.sqlite")).unwrap();
+        let (id, token) = store.enroll(&store.create_enrollment(60).unwrap(), "laptop").unwrap().unwrap();
+        let (other, other_token) = store.enroll(&store.create_enrollment(60).unwrap(), "desktop").unwrap().unwrap();
+        for (tid, agent) in [("tn_a", &id), ("tn_b", &other)] {
+            store
+                .insert_tunnel(&TunnelRow {
+                    id: tid.into(),
+                    name: tid.into(),
+                    hostname: format!("{tid}.example.com"),
+                    agent_id: agent.clone(),
+                    target: "http://127.0.0.1:1".into(),
+                    created_at: 0,
+                })
+                .unwrap();
+        }
+        assert!(store.delete_agent(&id).unwrap());
+        assert!(!store.delete_agent(&id).unwrap());
+        assert!(store.verify_agent_token(&token).unwrap().is_none());
+        assert_eq!(store.verify_agent_token(&other_token).unwrap().as_deref(), Some(other.as_str()));
+        let left: Vec<_> = store.tunnels().unwrap().into_iter().map(|t| t.id).collect();
+        assert_eq!(left, ["tn_b"]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

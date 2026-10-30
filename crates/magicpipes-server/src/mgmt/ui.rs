@@ -129,23 +129,24 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     let mut agent_rows = String::new();
     for a in &agents {
         agent_rows.push_str(&format!(
-            r#"<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td class="muted">{}</td></tr>"#,
+            r#"<tr><td>{}</td><td><code>{id}</code></td><td>{}</td><td>{}</td><td class="muted">{}</td><td><form method="post" action="/agents/{id}/revoke"><input type="hidden" name="csrf" value="{csrf}"><button class="danger">Revoke</button></form></td></tr>"#,
             esc(&a.name),
-            esc(&a.id),
             badge(if a.connected { "connected" } else { "disconnected" }),
             a.tunnels,
             esc(a.last_seen_at.as_deref().unwrap_or("never")),
+            id = esc(&a.id),
+            csrf = esc(&user.csrf),
         ));
     }
     if agents.is_empty() {
-        agent_rows = r#"<tr><td colspan="5" class="muted">No agents enrolled.</td></tr>"#.into();
+        agent_rows = r#"<tr><td colspan="6" class="muted">No agents enrolled.</td></tr>"#.into();
     }
     let body = format!(
         r#"<div class="row" style="justify-content:space-between"><h2 style="margin:0">Tunnels ({n})</h2><a class="btn" href="/">Refresh</a></div>
 <p class="muted">Public URLs are reachable by anyone who knows them; a random name is not access control.</p>
 <div class="card"><table><thead><tr><th>Tunnel</th><th>Public URL</th><th>Target</th><th>Agent</th><th>Status</th><th>TLS</th><th>Created</th></tr></thead><tbody>{rows}</tbody></table></div>
 <h2>Agents</h2>
-<div class="card"><table><thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Tunnels</th><th>Last seen</th></tr></thead><tbody>{agent_rows}</tbody></table></div>
+<div class="card"><table><thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Tunnels</th><th>Last seen</th><th></th></tr></thead><tbody>{agent_rows}</tbody></table></div>
 <h2>Enroll a machine</h2>
 <form method="post" action="/enrollments"><input type="hidden" name="csrf" value="{csrf}"><button>Create enrollment token</button></form>"#,
         n = tunnels.len(),
@@ -198,6 +199,14 @@ pub async fn delete_tunnel(user: UiUser, State(app): State<AppState>, Path(id): 
         return r;
     }
     let _ = app.control.delete_tunnel(&id);
+    Redirect::to("/").into_response()
+}
+
+pub async fn revoke_agent(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<CsrfForm>) -> Response {
+    if let Err(r) = user.check_csrf(&f.csrf) {
+        return r;
+    }
+    let _ = app.control.revoke_agent(&id);
     Redirect::to("/").into_response()
 }
 

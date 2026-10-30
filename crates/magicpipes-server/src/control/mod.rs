@@ -195,12 +195,35 @@ impl ControlPlane {
         }
     }
 
+    /// Revokes an agent: its credential stops working, its tunnels are deleted (new requests get
+    /// 404) and its live session, if any, is closed. Returns false if the agent is unknown.
+    pub fn revoke_agent(&self, agent_id: &str) -> Result<bool, ErrorBody> {
+        let mut st = self.state.lock().unwrap();
+        if !self.store.delete_agent(agent_id).map_err(internal)? {
+            return Ok(false);
+        }
+        st.tunnels.retain(|_, t| t.row.agent_id != agent_id);
+        let session = st.sessions.remove(agent_id);
+        self.publish(&st);
+        drop(st);
+        if let Some(s) = session {
+            s.handle.close();
+        }
+        tracing::info!(agent = %agent_id, "agent revoked by administrator");
+        Ok(true)
+    }
+
     // ---- sessions --------------------------------------------------------------------------
 
     /// Attaches a freshly authenticated agent session. A previous session of the same agent is
-    /// closed (the newest connection wins, e.g. after a network change).
-    pub fn attach_session(&self, agent_id: &str, handle: MuxHandle, remote: SocketAddr) -> u64 {
+    /// closed (the newest connection wins, e.g. after a network change). Returns `None` if the
+    /// agent was revoked after it authenticated.
+    pub fn attach_session(&self, agent_id: &str, handle: MuxHandle, remote: SocketAddr) -> Option<u64> {
         let mut st = self.state.lock().unwrap();
+        // Checked under the state lock, which `revoke_agent` also holds while deleting.
+        if !self.store.agent_exists(agent_id).unwrap_or(false) {
+            return None;
+        }
         st.next_conn_id += 1;
         let conn_id = st.next_conn_id;
         let session = Session { conn_id, handle, connected_at: unix_now(), remote, last_ping: Instant::now() };
@@ -211,7 +234,7 @@ impl ControlPlane {
         drop(st);
         let _ = self.store.touch_agent(agent_id);
         tracing::info!(agent = %agent_id, %remote, conn_id, "agent connected");
-        conn_id
+        Some(conn_id)
     }
 
     pub fn detach_session(&self, agent_id: &str, conn_id: u64) {

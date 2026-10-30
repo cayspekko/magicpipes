@@ -118,6 +118,10 @@ the yamux stream, the agent, the local application. It is accepted only if:
 * **Route removal** (agent `remove`, admin delete): new requests get 404 immediately. In-flight
   requests and WebSockets on that tunnel run to completion; the agent also stops accepting new
   streams for it.
+* **Agent revocation** (admin): the agent row and its tunnels are deleted in one transaction,
+  the routes are unpublished (404) and the live session is closed. The agent's reconnect gets
+  401 and it reports `unauthorized`. `attach_session` re-checks the agent under the registry
+  lock, so a connection that authenticated just before the revoke cannot attach after it.
 * **Agent disconnect**: routes stay registered and answer `502 agent_offline`. The server drops
   sessions without a ping for `session_timeout_secs` (default 45 s; agents ping every 15 s).
 * **Agent reconnect**: the newest session of an agent replaces the old one. The agent

@@ -74,6 +74,15 @@ pub async fn list_agents(_: Admin, State(app): State<AppState>) -> impl IntoResp
     Json(json!({ "agents": app.control.agents() }))
 }
 
+/// Revokes an agent's credential and deletes its tunnels. Missing agents return 404.
+pub async fn revoke_agent(_: Admin, State(app): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.control.revoke_agent(&id) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(api_err(StatusCode::NOT_FOUND, "not_found", "no such agent")),
+        Err(e) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
 pub async fn create_enrollment(_: Admin, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let token = app
         .control

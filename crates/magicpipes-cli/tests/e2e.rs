@@ -249,6 +249,39 @@ async fn concurrent_adds_start_one_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_agent_is_cut_off() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string()]).await;
+    let host = hostname(t["public_url"].as_str().unwrap());
+    assert_eq!(env.get_public(&host, "/").await.0, StatusCode::OK);
+
+    let admin = env.admin_token();
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent_id = v["agents"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(env.api("DELETE", &format!("/api/v1/agents/{agent_id}"), None).await.0, StatusCode::UNAUTHORIZED);
+    let (s, _) = env.api("DELETE", &format!("/api/v1/agents/{agent_id}"), Some(&admin)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // The agent's tunnels are gone at once, and its reconnect is rejected.
+    let (status, err, _) = env.get_public(&host, "/").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(err.as_deref(), Some("tunnel_not_found"));
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    assert!(v["agents"].as_array().unwrap().is_empty(), "{v}");
+    let (_, v) = env.api("GET", "/api/v1/tunnels", Some(&admin)).await;
+    assert!(v["tunnels"].as_array().unwrap().is_empty(), "{v}");
+    env.eventually("agent sees its credential rejected", Duration::from_secs(15), || async {
+        env.cli_json(&["status", "--json"]).await["connection"] == "unauthorized"
+    })
+    .await;
+    assert!(env.server_log().contains("agent revoked by administrator"));
+    assert_eq!(env.api("DELETE", &format!("/api/v1/agents/{agent_id}"), Some(&admin)).await.0, StatusCode::NOT_FOUND);
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn certificate_failure_is_reported() {
     let env = Env::new(Tls::BrokenAcme).await;
     env.login().await;
