@@ -224,6 +224,17 @@ async fn ws_roundtrip(env: &Env, host: &str) {
     let _ = sock.close(None).await;
 }
 
+/// Entry paths of a `.tar.gz` response body, without trailing slashes.
+async fn tar_entries(resp: http::Response<hyper::body::Incoming>) -> Vec<String> {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+    archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().trim_end_matches('/').to_string())
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_files() {
     let env = Env::new(Tls::DevCa).await;
@@ -232,6 +243,9 @@ async fn static_files() {
     std::fs::create_dir_all(site.join("sub dir")).unwrap();
     std::fs::write(site.join("hello.txt"), "hello world").unwrap();
     std::fs::write(site.join("sub dir/a.html"), "<p>a</p>").unwrap();
+    std::fs::write(site.join("notes.md"), "# notes").unwrap();
+    std::fs::write(site.join("song.mp3"), b"ID3fake").unwrap();
+    std::fs::write(site.join("pack.zip"), b"PK").unwrap();
     std::fs::write(site.join(".env"), "SECRET=1").unwrap();
     std::fs::create_dir_all(site.join(".git")).unwrap();
     std::fs::write(site.join(".git/config"), "secret").unwrap();
@@ -264,12 +278,27 @@ async fn static_files() {
     assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "hello world");
     assert_eq!(env.get_public(&host, "/inside.txt").await.2, "hello world");
     let resp = env.send(&host, env.https_port, request("GET", "/sub%20dir/a.html")).await;
-    assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/html");
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
+    let content_type = |path: &'static str| {
+        let req = request("HEAD", path);
+        async { env.send(&host, env.https_port, req).await.headers()[header::CONTENT_TYPE].to_str().unwrap().to_string() }
+    };
+    assert_eq!(content_type("/notes.md").await, "text/plain; charset=utf-8", "markdown opens as text");
+    assert_eq!(content_type("/song.mp3").await, "audio/mpeg");
+    assert_eq!(content_type("/pack.zip").await, "application/zip");
+    let resp = env.send(&host, env.https_port, request("GET", "/hello.txt?download")).await;
+    assert_eq!(resp.headers()[header::CONTENT_DISPOSITION], r#"attachment; filename="hello.txt"; filename*=UTF-8''hello.txt"#);
 
     // Listing: hidden entries and symlinks leaving the root are not shown.
     let (status, _, body) = env.get_public(&host, "/").await;
     assert_eq!(status, 200);
     assert!(body.contains(r#"href="hello.txt""#) && body.contains(r#"href="sub%20dir/""#) && body.contains("inside.txt"), "{body}");
+    // Media opens in a new tab with its icon; archives download.
+    assert!(body.contains(r##"href="song.mp3" target="_blank" rel="noopener" title="Audio"><svg class="ic"><use href="#i-audio"/>"##), "{body}");
+    assert!(body.contains(r#"href="pack.zip?download" download"#), "{body}");
+    assert!(body.contains(r#"<form id="files" class="list" method="post" action="./">"#));
+    let csp = env.send(&host, env.https_port, request("GET", "/")).await.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+    assert!(csp.contains("script-src 'nonce-") && !csp.contains("unsafe-eval"), "{csp}");
     for hidden in [".env", ".git", "escape.txt", "escape-dir"] {
         assert!(!body.contains(hidden), "{hidden} must not be listed: {body}");
     }
@@ -302,6 +331,34 @@ async fn static_files() {
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert!(!site.join("new.txt").exists());
 
+    // Bulk download: a whole folder, or a posted selection, as a streamed .tar.gz. Hidden entries
+    // and symlinks leaving the root are never included; symlinked files inside it are.
+    let resp = env.send(&host, env.https_port, request("GET", "/?archive")).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/gzip");
+    assert!(resp.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().contains(r#"filename="site.tar.gz""#));
+    let all = tar_entries(resp).await;
+    for want in ["hello.txt", "inside.txt", "notes.md", "song.mp3", "pack.zip", "sub dir", "sub dir/a.html", "evil.example"] {
+        assert!(all.iter().any(|e| e == want), "{want} missing from {all:?}");
+    }
+    for never in [".env", ".git", "escape.txt", "escape-dir", "outside.txt"] {
+        assert!(!all.iter().any(|e| e.contains(never)), "{never} must not be archived: {all:?}");
+    }
+    let mut req = request("POST", "/");
+    *req.body_mut() = Full::new(Bytes::from("f=hello.txt&f=sub+dir&f=escape.txt"));
+    req.headers_mut().insert(header::CONTENT_TYPE, "application/x-www-form-urlencoded".parse().unwrap());
+    let picked = tar_entries(env.send(&host, env.https_port, req).await).await;
+    assert_eq!(picked, ["hello.txt", "sub dir", "sub dir/a.html"]);
+    let resp = env.send(&host, env.https_port, request("GET", "/sub%20dir/?archive")).await;
+    assert!(resp.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().contains(r#"filename="sub dir.tar.gz""#));
+    assert_eq!(tar_entries(resp).await, ["a.html"]);
+    for (body, status) in [("f=.env", 400), ("f=..%2Fsecret", 400), ("f=", 400), ("", 400)] {
+        let mut req = request("POST", "/");
+        *req.body_mut() = Full::new(Bytes::from(body));
+        assert_eq!(env.send(&host, env.https_port, req).await.status(), status, "{body:?}");
+    }
+    assert_eq!(env.send(&host, env.https_port, request("POST", "/hello.txt")).await.status(), StatusCode::METHOD_NOT_ALLOWED);
+
     // Same directory again: same tunnel, now without a listing; index.html is still served.
     let t = add_json(&env, &["--serve", dir, "--no-list"]).await;
     assert_eq!((t["name"].as_str(), t["created"].as_bool()), (Some("files"), Some(false)));
@@ -309,6 +366,10 @@ async fn static_files() {
     assert_eq!(env.get_public(&host, "/").await.0, 404);
     std::fs::write(site.join("index.html"), "<h1>home</h1>").unwrap();
     assert_eq!(env.get_public(&host, "/").await.2, "<h1>home</h1>");
+    // Without listings there are no folder archives either.
+    assert_eq!(env.get_public(&host, "/sub%20dir/").await.0, 404);
+    assert_eq!(env.get_public(&host, "/sub%20dir/?archive").await.0, 404);
+    assert_eq!(env.send(&host, env.https_port, request("POST", "/sub%20dir/")).await.status(), StatusCode::METHOD_NOT_ALLOWED);
 
     // Input errors.
     let out = env.cli(&["add", "--serve", "/nonexistent/dir", "--json"]).await;

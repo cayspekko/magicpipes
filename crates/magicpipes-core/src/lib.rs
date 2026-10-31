@@ -4,11 +4,13 @@
 //! * [`mux`] — a small driver that runs a yamux session on a Tokio task.
 //! * [`names`] — tunnel name validation and random name generation.
 //! * [`secret`] — token generation, hashing and constant-time comparison.
+//! * [`theme`] — the shared stylesheet and logo used by every HTML page.
 
 pub mod mux;
 pub mod names;
 pub mod proto;
 pub mod secret;
+pub mod theme;
 
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> i64 {

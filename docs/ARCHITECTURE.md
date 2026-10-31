@@ -83,6 +83,15 @@ NUL, and the canonical path must stay inside the canonical root (so symlinks lea
 are refused and not listed). Trailing-slash redirects are built from the validated segments, so
 a `//host` path cannot become an open redirect. The readiness probe works unchanged.
 
+`serve/kinds.rs` maps names to a kind (icon, open-in-browser or download) and a `Content-Type`;
+text and source files are served as `text/plain; charset=utf-8` so browsers display them. The
+listing (`serve/listing.rs`) uses the shared theme from `magicpipes-core::theme`, the same
+stylesheet and mark as the management UI, and works without JavaScript; its small inline
+script is allowed by a per-response CSP nonce. Bulk downloads (`serve/archive.rs`) are a POST
+of the selected names to the directory URL, or `?archive` for a whole folder: a blocking task
+writes tar + gzip (pure Rust `tar`/`flate2`) into a bounded channel that is the response body,
+so archives of any size stream with flat memory and pause when the client stops reading.
+
 Planned target and ingress kinds (TCP/UDP ports, Unix sockets, SSH gateway, browser terminal and
 desktop) are described in [ROADMAP.md](ROADMAP.md).
 

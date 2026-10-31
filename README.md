@@ -229,13 +229,23 @@ Checking directory...         ✓
   Serving: /home/me/project/dist
 ```
 
-* GET and HEAD only; nothing can be uploaded or changed.
-* Content types from the file extension, `Range` requests (resumable downloads, video
-  seeking), `Last-Modified`/`If-Modified-Since`.
-* A directory's `index.html` is served at its URL. Without one, the directory's contents are
-  listed; `--no-list` turns listings off (files are then reachable only by exact path).
+* Read-only: nothing can be uploaded or changed.
+* A directory's `index.html` is served at its URL. Without one, the directory is shown as a
+  listing in the MagicPipes look (light and dark), with file-type icons, sorting by name, size
+  or date, and breadcrumbs.
+* Clicking a file the browser can show (images, audio, video, PDF, text and source code, CSV)
+  opens it in a new tab; anything else downloads. Source and config files (`.md`, `.rs`,
+  `.toml`, `.ts`, ...) are served as UTF-8 plain text so they display instead of downloading.
+  Every row also has a download button. `Range` requests (resumable downloads, video seeking)
+  and `Last-Modified` work.
+* **Bulk download:** tick files and folders (or select all) and download them as one `.tar.gz`,
+  or use **Download folder**. The archive is streamed as it is built, so size is no problem; the
+  browser just cannot show a percentage.
+* `--no-list` turns listings and folder downloads off; files are then reachable only by exact
+  path (and `index.html`).
 * Hidden files and directories (names starting with `.`, such as `.env` or `.git`) are never
-  listed or served. Symlinks are followed only if they stay inside the served directory.
+  listed, served or archived. Symlinks are followed only if they stay inside the served
+  directory (folder symlinks are not followed into archives).
 * Running `add --serve` again for the same directory returns the same tunnel, applying the new
   `--no-list` setting. `magicpipes remove <name>` stops serving it.
 

@@ -148,6 +148,10 @@ run "${CURL[@]}" -f "${FILES[@]}" "https://files.t.test:$HTTPS/docs/"
 grep -q 'href="note.txt"' cmd.out
 run "${CURL[@]}" -o /dev/null -w '%{http_code}\n' "${FILES[@]}" "https://files.t.test:$HTTPS/.hidden"
 grep -q '^404' cmd.out
+run "${CURL[@]}" -f -o site.tar.gz "${FILES[@]}" "https://files.t.test:$HTTPS/?archive"
+run tar -tzf site.tar.gz
+grep -q 'docs/note.txt' cmd.out
+if grep -q 'hidden' cmd.out; then echo "hidden file in archive"; exit 1; fi
 
 step "list and remove"
 run "$MP" list

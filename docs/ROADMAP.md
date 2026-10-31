@@ -85,7 +85,10 @@ A built-in file server, in the spirit of miniserve.
 - Safe defaults for the public internet: read-only, no uploads, dotfiles hidden and refused,
   symlinks that resolve outside the root refused, `nosniff`.
 - Directory listing is on by default (as in miniserve) with a warning on stderr;
-  `--no-list` turns it off. Later: `--spa` (unknown paths serve `index.html`), `--auth`.
+  `--no-list` turns it off. The listing uses the management UI's theme, with file-type icons,
+  sorting, open-in-browser for media/PDF/text, and select-all + bulk download as a streamed
+  `.tar.gz`.
+- Later: `--spa` (unknown paths serve `index.html`), `--auth`, zip as a second archive format.
 
 ## TCP and UDP ports
 

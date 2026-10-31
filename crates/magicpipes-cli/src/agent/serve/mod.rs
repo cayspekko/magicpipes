@@ -1,16 +1,26 @@
 //! Built-in static file server for `magicpipes add --serve <dir>`.
 //!
 //! It runs inside the agent: each data stream of a static tunnel is served directly by hyper, so
-//! no local port is opened. tower-http's `ServeFile` produces the file responses (content type,
-//! `Range`, `Last-Modified`/`If-Modified-Since`, `HEAD`); this module decides *which* file, and is
-//! strict about it because the directory is exposed to the internet:
+//! no local port is opened. tower-http's `ServeFile` produces the file responses (`Range`,
+//! `Last-Modified`/`If-Modified-Since`, `HEAD`); this module decides *which* file, and is strict
+//! about it because the directory is exposed to the internet:
 //!
-//! - GET and HEAD only; nothing is ever written.
-//! - Hidden entries (names starting with `.`) are neither listed nor served.
+//! - Read-only: GET and HEAD, plus POST on a listed directory to download a selection as a
+//!   `.tar.gz` (the POST only carries the names; nothing is ever written).
+//! - Hidden entries (names starting with `.`) are neither listed, served nor archived.
 //! - The path is decoded segment by segment; `.`/`..`, backslashes, NUL and (on Windows) `:` are
 //!   refused, and the canonical result must lie inside the canonical root, so symlinks that point
 //!   outside the root are refused (and not listed).
-//! - Directory listing can be turned off; a directory's `index.html` is served either way.
+//! - A directory's `index.html` is served either way. Directories without one are listed, and can
+//!   be downloaded as an archive, only when listing is on (`--no-list` turns both off).
+//!
+//! * `kinds` — file kinds: icons, open-in-browser vs download, `Content-Type`.
+//! * `listing` — the directory page.
+//! * `archive` — streamed `.tar.gz` downloads.
+
+mod archive;
+mod kinds;
+mod listing;
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -21,12 +31,14 @@ use std::time::{Duration, UNIX_EPOCH};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_http::services::ServeFile;
+
+use listing::{Entry, Page};
 
 use crate::ipc::ErrorInfo;
 
@@ -34,6 +46,8 @@ type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// Entries beyond this are left out of a listing (and counted in a note).
 const MAX_LISTED: usize = 5000;
+/// Largest accepted selection form (names of the entries to archive).
+const MAX_FORM: usize = 1024 * 1024;
 
 pub struct Site {
     /// Canonical path of the served directory.
@@ -72,17 +86,21 @@ where
 }
 
 async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
-    if req.method() != Method::GET && req.method() != Method::HEAD {
-        let mut resp = text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
-        resp.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-        return resp;
+    let method = req.method().clone();
+    if method != Method::GET && method != Method::HEAD && method != Method::POST {
+        return method_not_allowed();
     }
     let Some(segments) = parse_path(req.uri().path()) else { return not_found() };
     let requested: PathBuf = segments.iter().fold(site.root.clone(), |p, s| p.join(s));
     let Some(path) = contain(&site.root, &requested).await else { return not_found() };
     let Ok(meta) = tokio::fs::metadata(&path).await else { return not_found() };
+    let query = req.uri().query().unwrap_or("").to_string();
     if meta.is_file() {
-        return file(&path, req).await;
+        if method == Method::POST {
+            return method_not_allowed();
+        }
+        let name = segments.last().map(String::as_str).unwrap_or("");
+        return file(&path, name, has_flag(&query, "download"), req).await;
     }
     if !meta.is_dir() {
         return not_found();
@@ -91,21 +109,136 @@ async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
         // Built from the validated segments, never the raw path, so it cannot become `//host`.
         let mut location = encode_path(&segments);
         location.push('/');
-        if let Some(q) = req.uri().query() {
+        if !query.is_empty() {
             location.push('?');
-            location.push_str(q);
+            location.push_str(&query);
         }
         return redirect(&location);
     }
     if let Some(index) = contain(&site.root, &path.join("index.html")).await
         && tokio::fs::metadata(&index).await.is_ok_and(|m| m.is_file())
     {
-        return file(&index, req).await;
+        if method == Method::POST {
+            return method_not_allowed();
+        }
+        return file(&index, "index.html", false, req).await;
     }
-    if site.list {
-        return listing(&site.root, &path, &segments).await;
+    if !site.list {
+        return if method == Method::POST { method_not_allowed() } else { not_found() };
     }
-    not_found()
+    let site_name = site_name(&site.root);
+    let folder = segments.last().cloned().unwrap_or(site_name.clone());
+    if method == Method::POST {
+        let names = match selection(req).await {
+            Ok(n) if !n.is_empty() => n,
+            Ok(_) => return text(StatusCode::BAD_REQUEST, "nothing selected\n"),
+            Err(resp) => return resp,
+        };
+        return archive_response(&site.root, path, &folder, names);
+    }
+    if has_flag(&query, "archive") {
+        let names = read_entries(&site.root, &path).await.0.into_iter().map(|e| e.name).collect();
+        return archive_response(&site.root, path, &folder, names);
+    }
+    let (entries, omitted) = read_entries(&site.root, &path).await;
+    let nonce = magicpipes_core::secret::random_string(22);
+    let html = listing::render(&Page { site: &site_name, segments: &segments, entries: &entries, omitted, nonce: &nonce });
+    let mut resp = Response::new(full(html));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    let csp = format!(
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; img-src 'self' data:; \
+         form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    );
+    if let Ok(v) = HeaderValue::from_str(&csp) {
+        h.insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    resp
+}
+
+/// The name shown for the served directory (its folder name).
+fn site_name(root: &Path) -> String {
+    root.file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()).unwrap_or("files").to_string()
+}
+
+/// Whether a query string contains `key` (with or without a value).
+fn has_flag(query: &str, key: &str) -> bool {
+    query.split('&').any(|p| p.split('=').next() == Some(key))
+}
+
+/// Reads the `f` fields of a posted selection form.
+async fn selection(req: Request<Incoming>) -> Result<Vec<String>, Response<Body>> {
+    let body = Limited::new(req.into_body(), MAX_FORM)
+        .collect()
+        .await
+        .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "selection too large\n"))?
+        .to_bytes();
+    let body = std::str::from_utf8(&body).map_err(|_| text(StatusCode::BAD_REQUEST, "invalid form\n"))?;
+    let mut names = Vec::new();
+    for pair in body.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k != "f" {
+            continue;
+        }
+        match percent_decode(&v.replace('+', " ")) {
+            Some(name) if servable_name(&name) => {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            _ => return Err(text(StatusCode::BAD_REQUEST, "invalid file name in selection\n")),
+        }
+    }
+    Ok(names)
+}
+
+fn archive_response(root: &Path, dir: PathBuf, folder: &str, names: Vec<String>) -> Response<Body> {
+    let body = archive::stream(root.to_path_buf(), dir, names).boxed_unsync();
+    let mut resp = Response::new(body);
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if let Ok(v) = HeaderValue::from_str(&attachment(&format!("{folder}.tar.gz"))) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    resp
+}
+
+/// `Content-Disposition: attachment` with an ASCII fallback and the exact UTF-8 name.
+fn attachment(name: &str) -> String {
+    let ascii: String = name.chars().map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' { c } else { '_' }).collect();
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", percent_encode(name))
+}
+
+/// Servable entries of a directory, folders first, then by name.
+async fn read_entries(root: &Path, dir: &Path) -> (Vec<Entry>, usize) {
+    let mut entries = Vec::new();
+    let mut omitted = 0usize;
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else { return (entries, 0) };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let Ok(name) = e.file_name().into_string() else { continue };
+        if !servable_name(&name) {
+            continue;
+        }
+        // Follow symlinks only when they stay inside the root, exactly like serving does.
+        let Some(real) = contain(root, &e.path()).await else { continue };
+        let Ok(meta) = tokio::fs::metadata(&real).await else { continue };
+        if !meta.is_dir() && !meta.is_file() {
+            continue;
+        }
+        if entries.len() == MAX_LISTED {
+            omitted += 1;
+            continue;
+        }
+        let modified = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
+        entries.push(Entry { name, dir: meta.is_dir(), size: meta.len(), modified });
+    }
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    (entries, omitted)
 }
 
 /// Splits and percent-decodes a request path; `None` if any segment is not servable.
@@ -162,11 +295,15 @@ async fn contain(root: &Path, path: &Path) -> Option<PathBuf> {
     real.starts_with(root).then_some(real)
 }
 
-async fn file(path: &Path, req: Request<Incoming>) -> Response<Body> {
-    match ServeFile::new(path).try_call(req).await {
+async fn file(path: &Path, name: &str, download: bool, req: Request<Incoming>) -> Response<Body> {
+    match ServeFile::new_with_mime(path, &kinds::content_type(name)).try_call(req).await {
         Ok(resp) => {
             let mut resp = resp.map(|b| b.boxed_unsync());
-            resp.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            let h = resp.headers_mut();
+            h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            if download && let Ok(v) = HeaderValue::from_str(&attachment(name)) {
+                h.insert(header::CONTENT_DISPOSITION, v);
+            }
             resp
         }
         Err(e) => {
@@ -174,93 +311,6 @@ async fn file(path: &Path, req: Request<Incoming>) -> Response<Body> {
             text(StatusCode::INTERNAL_SERVER_ERROR, "could not read file\n")
         }
     }
-}
-
-struct Entry {
-    name: String,
-    dir: bool,
-    size: u64,
-    modified: Option<i64>,
-}
-
-async fn listing(root: &Path, dir: &Path, segments: &[String]) -> Response<Body> {
-    let Ok(mut rd) = tokio::fs::read_dir(dir).await else { return not_found() };
-    let mut entries = Vec::new();
-    let mut omitted = 0usize;
-    while let Ok(Some(e)) = rd.next_entry().await {
-        let Ok(name) = e.file_name().into_string() else { continue };
-        if !servable_name(&name) {
-            continue;
-        }
-        // Follow symlinks only when they stay inside the root, exactly like serving does.
-        let Some(real) = contain(root, &e.path()).await else { continue };
-        let Ok(meta) = tokio::fs::metadata(&real).await else { continue };
-        if !meta.is_dir() && !meta.is_file() {
-            continue;
-        }
-        if entries.len() == MAX_LISTED {
-            omitted += 1;
-            continue;
-        }
-        let modified = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
-        entries.push(Entry { name, dir: meta.is_dir(), size: meta.len(), modified });
-    }
-    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-
-    let title = format!("{}/", encode_display(segments));
-    let mut rows = String::new();
-    if !segments.is_empty() {
-        rows.push_str(r#"<tr><td><a href="../">../</a></td><td></td><td></td></tr>"#);
-    }
-    for e in &entries {
-        let slash = if e.dir { "/" } else { "" };
-        let size = if e.dir { String::new() } else { human_size(e.size) };
-        let modified = e.modified.map(|m| magicpipes_core::rfc3339(m).replace('T', " ")).unwrap_or_default();
-        let _ = write!(
-            rows,
-            r#"<tr><td><a href="{href}{slash}">{name}{slash}</a></td><td class="num">{size}</td><td>{modified}</td></tr>"#,
-            href = percent_encode(&e.name),
-            name = esc(&e.name),
-        );
-    }
-    let note = if omitted > 0 { format!("<p>{omitted} more entries not shown.</p>") } else { String::new() };
-    let html = format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Index of {title}</title>
-<style>
-:root {{ color-scheme: light dark; --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --bg: #fff; --link: #0057b8; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --fg: #f2f2f7; --muted: #98989d; --line: #2c2c2e; --bg: #111; --link: #6cb4ff; }} }}
-body {{ margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
-main {{ max-width: 960px; margin: 0 auto; }}
-h1 {{ font-size: 18px; font-weight: 600; margin: 0 0 16px; word-break: break-all; }}
-table {{ width: 100%; border-collapse: collapse; }}
-td {{ padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }}
-td:first-child {{ word-break: break-all; }}
-td:not(:first-child) {{ color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }}
-.num {{ text-align: right; }}
-a {{ color: var(--link); text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-footer {{ margin-top: 16px; color: var(--muted); font-size: 13px; }}
-</style></head>
-<body><main><h1>Index of {title}</h1><table>{rows}</table>{note}<footer>Served by MagicPipes</footer></main></body></html>
-"#
-    );
-    let mut resp = Response::new(full(html));
-    let h = resp.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"));
-    resp
-}
-
-fn encode_display(segments: &[String]) -> String {
-    segments.iter().fold(String::new(), |mut p, s| {
-        p.push('/');
-        p.push_str(&esc(s));
-        p
-    })
 }
 
 fn human_size(n: u64) -> String {
@@ -302,6 +352,12 @@ fn text(status: StatusCode, body: &'static str) -> Response<Body> {
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    resp
+}
+
+fn method_not_allowed() -> Response<Body> {
+    let mut resp = text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
+    resp.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
     resp
 }
 
