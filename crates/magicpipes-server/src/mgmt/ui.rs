@@ -136,6 +136,10 @@ dt{color:var(--muted);font-size:13.5px}dd{overflow-wrap:anywhere}
 dl>:nth-last-child(-n+2){border-bottom:0}
 .term{background:var(--term);color:var(--term-ink);border-radius:14px;padding:20px 22px;margin:24px 0 0;overflow-x:auto;font:13.5px/1.6 var(--mono)}
 .term .p{color:#8e8a82;user-select:none}
+.codebox{position:relative;margin:24px 0 0}.codebox .term{margin:0;padding-right:60px}
+.copy{position:absolute;top:12px;right:12px;display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border-radius:8px;border:1px solid #3a3834;background:var(--term);color:#8e8a82;cursor:pointer;transition:color .15s,border-color .15s}
+.copy:hover,.copy:focus-visible{color:var(--term-ink);border-color:#8e8a82;outline:none}
+.copy.done{color:#7cc48e;border-color:#7cc48e}
 .note{margin:16px 0 0;color:var(--muted);font-size:13.5px}
 .auth{width:100%;max-width:400px;margin:6vh auto 0}
 .auth .card{padding:30px 28px 26px}
@@ -145,6 +149,61 @@ input[type=password]:focus{border-color:var(--accent);box-shadow:0 0 0 4px color
 .alert{margin:0 0 20px;padding:11px 14px;border-radius:10px;font-size:13.5px;color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--bad) 25%,var(--line))}
 @media (max-width:640px){.top-in,main,.foot{padding-left:16px;padding-right:16px}main{padding-top:32px}dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:2px}dd{padding-top:0}}
 "#;
+
+/// Progressive enhancement for every page: a copy-to-clipboard button on each `pre.term` code
+/// block. Add `data-nocopy` to a block to leave it without one. Served from `/ui.js` because the
+/// CSP forbids inline scripts.
+const SCRIPT: &str = r#"(() => {
+  const COPY = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>';
+  const DONE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+  // The text a user would want to paste: the block's content without prompt markers.
+  const text = (pre) => {
+    const c = pre.cloneNode(true);
+    c.querySelectorAll('.p').forEach((p) => p.remove());
+    return c.textContent.trim();
+  };
+  const fallback = (s) => {
+    const t = document.createElement('textarea');
+    t.value = s;
+    t.setAttribute('readonly', '');
+    t.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(t);
+    t.select();
+    const ok = document.execCommand('copy');
+    t.remove();
+    return ok;
+  };
+  document.querySelectorAll('pre.term:not([data-nocopy])').forEach((pre) => {
+    const box = document.createElement('div');
+    box.className = 'codebox';
+    pre.replaceWith(box);
+    box.appendChild(pre);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy';
+    btn.title = 'Copy to clipboard';
+    btn.setAttribute('aria-label', 'Copy to clipboard');
+    btn.innerHTML = COPY;
+    let timer;
+    btn.addEventListener('click', async () => {
+      const s = text(pre);
+      let ok;
+      try { await navigator.clipboard.writeText(s); ok = true; } catch { ok = fallback(s); }
+      if (!ok) return;
+      btn.classList.add('done');
+      btn.innerHTML = DONE;
+      btn.title = 'Copied';
+      clearTimeout(timer);
+      timer = setTimeout(() => { btn.classList.remove('done'); btn.innerHTML = COPY; btn.title = 'Copy to clipboard'; }, 1600);
+    });
+    box.appendChild(btn);
+  });
+})();
+"#;
+
+pub async fn script() -> Response {
+    ([(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"))], SCRIPT).into_response()
+}
 
 /// The MagicPipes mark: two endpoints joined by a flowing line.
 const GLYPH: &str = r#"<svg class="glyph" width="26" height="14" viewBox="0 0 26 14" aria-hidden="true"><line class="flow" x1="6" y1="7" x2="20" y2="7" stroke-width="2.4" stroke-linecap="round"/><circle cx="4.5" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="21.5" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>"#;
@@ -160,7 +219,7 @@ fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
         .unwrap_or_default();
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title><style>{STYLE}</style></head><body>
+<meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title><style>{STYLE}</style><script src="/ui.js" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{logout}</div></header>
 <main>{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),

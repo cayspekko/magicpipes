@@ -66,6 +66,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/tunnels/{id}/delete", post(ui::delete_tunnel))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
         .route("/enrollments", post(ui::create_enrollment))
+        .route("/ui.js", get(ui::script))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/tunnels", get(api::list_tunnels))
@@ -88,7 +89,7 @@ async fn security_headers(mut resp: axum::response::Response) -> axum::response:
     h.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"),
+        HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"),
     );
     resp
 }
