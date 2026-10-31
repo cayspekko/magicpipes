@@ -225,6 +225,106 @@ async fn ws_roundtrip(env: &Env, host: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_files() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let site = env.root.join("site");
+    std::fs::create_dir_all(site.join("sub dir")).unwrap();
+    std::fs::write(site.join("hello.txt"), "hello world").unwrap();
+    std::fs::write(site.join("sub dir/a.html"), "<p>a</p>").unwrap();
+    std::fs::write(site.join(".env"), "SECRET=1").unwrap();
+    std::fs::create_dir_all(site.join(".git")).unwrap();
+    std::fs::write(site.join(".git/config"), "secret").unwrap();
+    std::fs::write(env.root.join("outside.txt"), "outside").unwrap();
+    std::os::unix::fs::symlink(env.root.join("outside.txt"), site.join("escape.txt")).unwrap();
+    std::os::unix::fs::symlink(&env.root, site.join("escape-dir")).unwrap();
+    std::os::unix::fs::symlink(site.join("hello.txt"), site.join("inside.txt")).unwrap();
+    let dir = site.to_str().unwrap();
+
+    let out = env.cli_ok(&["add", "--serve", dir, "--name", "files"]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("Serving:"), "{stdout}");
+    assert!(stderr.contains("Checking directory...") && stderr.contains("Directory listing is on"), "{stderr}");
+    let host = format!("files.{BASE}");
+    let request = |method: &str, path: &str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, &host)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+
+    // Files, with content types; symlinks are followed only inside the root.
+    let resp = env.send(&host, env.https_port, request("GET", "/hello.txt")).await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/plain"));
+    assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "hello world");
+    assert_eq!(env.get_public(&host, "/inside.txt").await.2, "hello world");
+    let resp = env.send(&host, env.https_port, request("GET", "/sub%20dir/a.html")).await;
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/html");
+
+    // Listing: hidden entries and symlinks leaving the root are not shown.
+    let (status, _, body) = env.get_public(&host, "/").await;
+    assert_eq!(status, 200);
+    assert!(body.contains(r#"href="hello.txt""#) && body.contains(r#"href="sub%20dir/""#) && body.contains("inside.txt"), "{body}");
+    for hidden in [".env", ".git", "escape.txt", "escape-dir"] {
+        assert!(!body.contains(hidden), "{hidden} must not be listed: {body}");
+    }
+
+    // Refused: hidden files, traversal, symlinks out of the root.
+    for path in ["/.env", "/.git/config", "/escape.txt", "/escape-dir/outside.txt", "/%2e%2e/outside.txt", "/sub%20dir/../../outside.txt", "/nope"] {
+        let (status, _, body) = env.get_public(&host, path).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(!body.contains("outside") && !body.contains("SECRET"), "{path}: {body}");
+    }
+
+    // Directories redirect to the trailing-slash form, built from the decoded path.
+    let resp = env.send(&host, env.https_port, request("GET", "/sub%20dir?x=1")).await;
+    assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(resp.headers()[header::LOCATION], "/sub%20dir/?x=1");
+    // A `//host` path naming a real directory must not become a protocol-relative redirect.
+    std::fs::create_dir_all(site.join("evil.example")).unwrap();
+    let resp = env.send(&host, env.https_port, request("GET", "//evil.example")).await;
+    assert_eq!(resp.headers()[header::LOCATION], "/evil.example/", "no open redirect");
+
+    // Ranges, HEAD, and read-only methods.
+    let mut req = request("GET", "/hello.txt");
+    req.headers_mut().insert(header::RANGE, "bytes=0-4".parse().unwrap());
+    let resp = env.send(&host, env.https_port, req).await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "hello");
+    let resp = env.send(&host, env.https_port, request("HEAD", "/hello.txt")).await;
+    assert_eq!((resp.status().as_u16(), resp.headers()[header::CONTENT_LENGTH].to_str().unwrap()), (200, "11"));
+    let resp = env.send(&host, env.https_port, request("PUT", "/new.txt")).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(!site.join("new.txt").exists());
+
+    // Same directory again: same tunnel, now without a listing; index.html is still served.
+    let t = add_json(&env, &["--serve", dir, "--no-list"]).await;
+    assert_eq!((t["name"].as_str(), t["created"].as_bool()), (Some("files"), Some(false)));
+    assert!(t["target"].as_str().unwrap().starts_with("static:/"), "{t}");
+    assert_eq!(env.get_public(&host, "/").await.0, 404);
+    std::fs::write(site.join("index.html"), "<h1>home</h1>").unwrap();
+    assert_eq!(env.get_public(&host, "/").await.2, "<h1>home</h1>");
+
+    // Input errors.
+    let out = env.cli(&["add", "--serve", "/nonexistent/dir", "--json"]).await;
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_directory");
+    let out = env.cli(&["add", "--serve", site.join("hello.txt").to_str().unwrap(), "--json"]).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_directory", "{v}");
+    assert_eq!(env.cli(&["add", "8080", "--serve", dir]).await.status.code(), Some(2));
+
+    env.cli_ok(&["remove", "files"]).await;
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_adds_start_one_agent() {
     let env = Env::new(Tls::DevCa).await;
     env.login().await;

@@ -10,7 +10,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use super::serve::{self, Site};
 use super::tunnels::Tunnels;
+use crate::state::Target;
 
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,10 +38,21 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
             }
         }
         ServerOpen::Data { tunnel_id } => {
-            let Some((host, port, counter)) = tunnels.target(&tunnel_id) else {
+            let Some((target, counter)) = tunnels.target(&tunnel_id) else {
                 let _ = stream.write_all(&[STREAM_UNKNOWN_TUNNEL]).await;
                 let _ = stream.shutdown().await;
                 return;
+            };
+            let (host, port) = match target {
+                Target::Tcp { host, port } => (host, port),
+                Target::Static { serve: root, list } => {
+                    if stream.write_all(&[STREAM_OK]).await.is_err() {
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    serve::serve(stream, Arc::new(Site { root, list })).await;
+                    return;
+                }
             };
             let local = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await;
             let mut local = match local {

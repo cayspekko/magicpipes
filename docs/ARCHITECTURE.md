@@ -70,6 +70,22 @@ The agent is split the same way: `agent/session.rs` (control: connect, authentic
 reconnect, RPCs, restoring registrations) and `agent/forward.rs` (data: stream header, connect
 to local target, bidirectional copy). `agent/ops.rs` sits on top of both.
 
+## Static file tunnels (`add --serve`)
+
+A tunnel's local target is either a TCP service or a directory (`state::Target`). For a
+directory, `agent/forward.rs` acknowledges the data stream with `STREAM_OK` and hands it to
+`agent/serve.rs`, which runs hyper's HTTP/1 server directly on the yamux stream: no local port,
+and no server-side change (to the server it is an ordinary HTTP tunnel; the stored target string
+is `static:<path>`). tower-http's `ServeFile` writes file responses (content type, ranges,
+conditional requests); `serve.rs` decides which file and enforces the safety rules: GET/HEAD
+only, hidden names refused, segment-wise percent-decoding that rejects `.`/`..`, separators and
+NUL, and the canonical path must stay inside the canonical root (so symlinks leaving the root
+are refused and not listed). Trailing-slash redirects are built from the validated segments, so
+a `//host` path cannot become an open redirect. The readiness probe works unchanged.
+
+Planned target and ingress kinds (TCP/UDP ports, Unix sockets, SSH gateway, browser terminal and
+desktop) are described in [ROADMAP.md](ROADMAP.md).
+
 ## Wire protocol
 
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.

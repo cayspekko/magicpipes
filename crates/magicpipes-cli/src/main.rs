@@ -54,10 +54,17 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
-    /// Expose a local port; returns once the public HTTPS URL is verified to work.
+    /// Expose a local port, or serve a directory; returns once the public HTTPS URL is verified to work.
     Add {
         /// Local TCP port of the application.
-        port: u16,
+        #[arg(required_unless_present = "serve")]
+        port: Option<u16>,
+        /// Serve the files in DIR with the built-in web server instead of forwarding to a port.
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["port", "host"])]
+        serve: Option<PathBuf>,
+        /// With --serve: don't list directory contents (a directory's index.html is still served).
+        #[arg(long, requires = "serve")]
+        no_list: bool,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
         name: Option<String>,
@@ -138,8 +145,8 @@ enum AgentCommand {
 fn exit_code(code: &str) -> u8 {
     match code {
         "not_logged_in" | "unauthorized" | "invalid_enrollment_token" | "config_error" => 3,
-        "local_unreachable" | "invalid_port" | "invalid_host" => 4,
-        "server_unreachable" | "agent_unavailable" | "agent_start_failed" | "agent_not_running" | "agent_protocol" => 5,
+        "local_unreachable" | "invalid_port" | "invalid_host" | "invalid_directory" => 4,
+        "server_unreachable" | "agent_unavailable" | "agent_start_failed" | "agent_not_running" | "agent_protocol" | "agent_outdated" => 5,
         "name_conflict" | "name_taken" | "invalid_name" | "limit_reached" | "not_found" => 6,
         "tls_failed" | "tls_timeout" => 7,
         "probe_failed" => 8,
@@ -185,8 +192,8 @@ fn read_pid() -> Option<String> {
 async fn dispatch(cmd: Command) -> ExitCode {
     let (out, result) = match cmd {
         Command::Login { server, token, ca_cert, name, out } => (out, login(server, token, ca_cert, name, out).await),
-        Command::Add { port, name, host, probe_path, timeout, out } => {
-            let req = AddRequest { port, host, name, probe_path, timeout_secs: timeout };
+        Command::Add { port, serve, no_list, name, host, probe_path, timeout, out } => {
+            let req = AddRequest { port, serve, list: !no_list, host, name, probe_path, timeout_secs: timeout };
             (out, add(req, out).await)
         }
         Command::List { out } => (out, list(out).await),
@@ -291,6 +298,7 @@ async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, 
 
 struct Progress {
     enabled: bool,
+    serving: bool,
 }
 
 impl Progress {
@@ -301,7 +309,8 @@ impl Progress {
         let mut err = std::io::stderr();
         match state {
             StepState::Running => {
-                let _ = write!(err, "{:<30}", step.label());
+                let label = if self.serving && step == ipc::Step::Local { "Checking directory..." } else { step.label() };
+                let _ = write!(err, "{label:<30}");
             }
             StepState::Done => {
                 let _ = writeln!(err, "✓");
@@ -314,10 +323,18 @@ impl Progress {
     }
 }
 
-async fn add(req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
+async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
     client::require_login()?;
+    // The agent runs elsewhere (another working directory), so it needs an absolute path.
+    if let Some(dir) = &req.serve {
+        let abs = std::fs::canonicalize(dir)
+            .map_err(|e| ErrorInfo::new("invalid_directory", format!("cannot serve {}: {e}", dir.display())))?;
+        req.serve = Some(abs);
+    }
+    let serving = req.serve.clone();
+    let listing = serving.is_some() && req.list;
     let spawned = client::ensure_agent().await?;
-    let progress = Progress { enabled: !out.quiet };
+    let progress = Progress { enabled: !out.quiet, serving: serving.is_some() };
     let result = client::request(&IpcRequest::Add(req), |s, st| progress.step(s, st)).await;
     let data = match result {
         Ok(d) => d,
@@ -336,11 +353,19 @@ async fn add(req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         println!("Tunnel ready");
         println!();
         println!("  Public: {}", data["public_url"].as_str().unwrap_or_default());
-        println!("  Local:  {}", data["target"].as_str().unwrap_or_default());
+        match &serving {
+            Some(dir) => println!("  Serving: {}", state::display_path(dir)),
+            None => println!("  Local:  {}", data["target"].as_str().unwrap_or_default()),
+        }
         println!("  Status: connected");
         println!();
         println!("Tunnel active in background. Anyone with the URL can reach it.");
         println!("Stop it with: magicpipes remove {}", data["name"].as_str().unwrap_or_default());
+    }
+    if listing && !out.quiet {
+        eprintln!();
+        eprintln!("Directory listing is on: anyone with the URL can browse every non-hidden file in this directory.");
+        eprintln!("Use --no-list to serve only files by exact path (and index.html).");
     }
     Ok(())
 }
@@ -353,7 +378,7 @@ async fn list(out: Output) -> Result<(), ErrorInfo> {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|t| {
-                    json!({ "id": t.id, "name": t.name, "public_url": t.public_url, "target": t.target(),
+                    json!({ "id": t.id, "name": t.name, "public_url": t.public_url, "target": t.target.describe(),
                             "status": "stopped", "created_at": magicpipes_core::rfc3339(t.created_at) })
                 })
                 .collect();

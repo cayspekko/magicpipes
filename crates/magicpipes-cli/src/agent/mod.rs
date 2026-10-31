@@ -2,6 +2,7 @@
 //!
 //! * `session` — control path: server connection, reconnects, registration RPCs.
 //! * `forward` — data path: server-opened streams piped to local targets.
+//! * `serve` — built-in static file server for `add --serve`, run on data streams directly.
 //! * `ops` — operations exposed over IPC, including the readiness-gated `add`.
 //!
 //! Single instance: the agent holds an exclusive `flock` on `agent.lock` for its lifetime.
@@ -13,6 +14,7 @@
 mod forward;
 mod ops;
 mod probe;
+mod serve;
 mod session;
 mod tunnels;
 

@@ -137,9 +137,22 @@ step "public request"
 run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "smoke.t.test:$HTTPS:127.0.0.1" "https://smoke.t.test:$HTTPS/"
 grep -q "hello from smoke test" cmd.out
 
+step "serve a directory"
+mkdir -p site/docs && echo "static hello" > site/docs/note.txt && echo "secret" > site/.hidden
+run "$MP" add --serve "$(native "$WORK/site")" --name files --json --timeout 60
+grep -q '"status": "ready"' cmd.out
+FILES=(--cacert server/dev-ca/ca.crt --resolve "files.t.test:$HTTPS:127.0.0.1")
+run "${CURL[@]}" -f "${FILES[@]}" "https://files.t.test:$HTTPS/docs/note.txt"
+grep -q "static hello" cmd.out
+run "${CURL[@]}" -f "${FILES[@]}" "https://files.t.test:$HTTPS/docs/"
+grep -q 'href="note.txt"' cmd.out
+run "${CURL[@]}" -o /dev/null -w '%{http_code}\n' "${FILES[@]}" "https://files.t.test:$HTTPS/.hidden"
+grep -q '^404' cmd.out
+
 step "list and remove"
 run "$MP" list
 run "$MP" remove smoke
+run "$MP" remove files
 run "$MP" agent stop
 
 # A freshly started agent must not keep the CLI's output open: `magicpipes ... | cat` has to

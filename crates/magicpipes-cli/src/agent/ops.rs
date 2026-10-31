@@ -20,10 +20,11 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::probe;
+use super::serve;
 use super::session::{ConnState, RpcError, Session};
 use super::tunnels::{Registration, Tunnels};
 use crate::ipc::{AddRequest, ErrorInfo, IpcEvent, Step, StepState};
-use crate::state::{LocalTunnel, target_url};
+use crate::state::{LocalTunnel, Target, target_url};
 
 pub struct Agent {
     pub session: Arc<Session>,
@@ -73,8 +74,8 @@ impl Agent {
 
         // 1. Local service.
         ev.step(Step::Local, StepState::Running).await;
-        let host = match resolve_local(req.host.as_deref(), req.port).await {
-            Ok(h) => h,
+        let target = match local_target(&req).await {
+            Ok(t) => t,
             Err(e) => {
                 ev.step(Step::Local, StepState::Failed).await;
                 return Err(e.at(Step::Local));
@@ -93,7 +94,7 @@ impl Agent {
 
         // 3. Registration (find-or-create, serialized).
         ev.step(Step::Register, StepState::Running).await;
-        let (tunnel, created) = match self.register(&req, &host).await {
+        let (tunnel, created) = match self.register(&req, target).await {
             Ok(v) => v,
             Err(e) => {
                 ev.step(Step::Register, StepState::Failed).await;
@@ -116,14 +117,14 @@ impl Agent {
             "id": tunnel.id,
             "name": tunnel.name,
             "public_url": tunnel.public_url,
-            "target": tunnel.target(),
+            "target": tunnel.target.describe(),
             "status": "ready",
             "background": true,
             "created": created,
         }))
     }
 
-    async fn register(&self, req: &AddRequest, host: &str) -> Result<(LocalTunnel, bool), ErrorInfo> {
+    async fn register(&self, req: &AddRequest, target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
         let _lock = self.register_lock.lock().await;
         let name = match &req.name {
             Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new("invalid_name", m))?),
@@ -131,20 +132,19 @@ impl Agent {
         };
         let existing = match &name {
             Some(n) => self.tunnels.find(|t| &t.name == n),
-            None => self.tunnels.find(|t| t.host == host && t.port == req.port),
+            None => self.tunnels.find(|t| t.target.same_destination(&target)),
         };
         if let Some(t) = &existing
-            && (t.port != req.port || t.host != host) {
+            && !t.target.same_destination(&target) {
                 return Err(ErrorInfo::new(
                     "name_conflict",
-                    format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.target()),
+                    format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.target.describe()),
                 ));
             }
-        let target = target_url(host, req.port);
         let mut rpc_req = RegisterTunnel {
             id: existing.as_ref().map(|t| t.id.clone()),
             name: existing.as_ref().map(|t| t.name.clone()).or(name.clone()),
-            target: target.clone(),
+            target: target.describe(),
         };
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
@@ -167,8 +167,7 @@ impl Agent {
             name: info.name,
             hostname: info.hostname,
             public_url: info.public_url,
-            host: host.to_string(),
-            port: req.port,
+            target,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);
         Ok((tunnel, info.created))
@@ -236,7 +235,7 @@ impl Agent {
     pub async fn remove(&self, selector: &str, force: bool) -> Result<Value, ErrorInfo> {
         let t = self
             .tunnels
-            .find(|t| t.name == selector || t.id == selector || selector.parse::<u16>().is_ok_and(|p| p == t.port))
+            .find(|t| t.name == selector || t.id == selector || matches!(&t.target, Target::Tcp { port, .. } if selector.parse() == Ok(*port)))
             .ok_or_else(|| ErrorInfo::new("not_found", format!("no tunnel named '{selector}'")))?;
         if !force {
             let _ = self.session.wait_connected(Duration::from_secs(10)).await;
@@ -282,7 +281,7 @@ impl Agent {
                     "id": s.tunnel.id,
                     "name": s.tunnel.name,
                     "public_url": s.tunnel.public_url,
-                    "target": s.tunnel.target(),
+                    "target": s.tunnel.target.describe(),
                     "status": status,
                     "error": s.last_error,
                     "created_at": magicpipes_core::rfc3339(s.tunnel.created_at),
@@ -322,6 +321,15 @@ impl Agent {
         }
         self.shutdown.cancel();
         Ok(json!({ "stopping": true }))
+    }
+}
+
+/// Checks the local side of an `add`: a listening port, or a directory to serve.
+async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
+    match (&req.serve, req.port) {
+        (Some(dir), _) => Ok(Target::Static { serve: serve::check_root(dir).await?, list: req.list }),
+        (None, Some(port)) => Ok(Target::Tcp { host: resolve_local(req.host.as_deref(), port).await?, port }),
+        (None, None) => Err(ErrorInfo::new("invalid_request", "give a local port, or --serve <dir>")),
     }
 }
 

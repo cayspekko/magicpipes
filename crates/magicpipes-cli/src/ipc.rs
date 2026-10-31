@@ -23,7 +23,14 @@ pub enum IpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddRequest {
-    pub port: u16,
+    /// Local port; absent when serving a directory.
+    pub port: Option<u16>,
+    /// Directory for the built-in file server (absolute, resolved by the CLI).
+    #[serde(default)]
+    pub serve: Option<std::path::PathBuf>,
+    /// With `serve`: list directory contents.
+    #[serde(default)]
+    pub list: bool,
     pub host: Option<String>,
     pub name: Option<String>,
     pub probe_path: String,

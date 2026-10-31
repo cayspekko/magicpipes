@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::state::{self, LocalTunnel};
+use crate::state::{self, LocalTunnel, Target};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,9 +119,9 @@ impl Tunnels {
     }
 
     /// Local destination for a data stream.
-    pub fn target(&self, id: &str) -> Option<(String, u16, Arc<AtomicU64>)> {
+    pub fn target(&self, id: &str) -> Option<(Target, Arc<AtomicU64>)> {
         let map = self.map.lock().unwrap();
-        map.get(id).map(|e| (e.tunnel.host.clone(), e.tunnel.port, e.streams_ok.clone()))
+        map.get(id).map(|e| (e.tunnel.target.clone(), e.streams_ok.clone()))
     }
 
     pub fn streams_ok(&self, id: &str) -> u64 {

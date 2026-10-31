@@ -82,7 +82,18 @@ fn spawn_detached() -> std::io::Result<Child> {
 /// One IPC request to a running agent.
 pub async fn request(req: &IpcRequest, on_step: impl FnMut(Step, StepState)) -> Result<serde_json::Value, ErrorInfo> {
     let stream = connect().await.ok_or_else(|| ErrorInfo::new("agent_not_running", "the agent is not running"))?;
-    ipc::call(stream, req, on_step).await
+    ipc::call(stream, req, on_step).await.map_err(|mut e| {
+        // A request this CLI builds is always valid, so the agent must be an older version.
+        if e.code == "bad_request" {
+            e.code = "agent_outdated".into();
+            e.message = format!(
+                "the running agent does not understand this request ({}); it is probably an older version. \
+                 Restart it with `magicpipes agent stop`, then run the command again",
+                e.message
+            );
+        }
+        e
+    })
 }
 
 /// Waits for a stopping agent to release its socket.

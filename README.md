@@ -30,7 +30,9 @@ your application. The tunnel then keeps running in a background agent after the 
 
 Nothing listens for inbound connections on your machine. You don't configure a reverse proxy,
 create per-app DNS records, or restart anything when you add a tunnel. HTTP/1.1 and WebSockets
-both work.
+both work, and `magicpipes add --serve <dir>` publishes a directory of files with a built-in web
+server. See [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next (TCP/UDP ports, an SSH
+gateway, browser terminal and desktop).
 
 > **Public means public.** Anyone who knows a tunnel URL can reach it. The random name is not
 > access control. Put authentication in your application if it needs it.
@@ -197,6 +199,7 @@ is closed and its tunnels are deleted. Enroll it again with a new token to bring
 magicpipes add 8080                 # random name, e.g. https://bright-otter.t.example.com
 magicpipes add 3000 --name myapp    # https://myapp.t.example.com
 magicpipes add 5173 --json          # machine-readable output (see below)
+magicpipes add --serve ./dist       # serve a directory with the built-in file server
 
 magicpipes list                     # tunnels on this machine and their status
 magicpipes status                   # login, agent and connection status
@@ -212,6 +215,32 @@ magicpipes agent logs [-f]
 All tunnels on a machine share **one agent process** (per user). The first `add` starts it;
 later commands reuse it. The agent restores all tunnels when it starts and reconnects with
 backoff when the connection drops.
+
+### Serving a directory
+
+`magicpipes add --serve <dir>` publishes a directory without running a web server yourself,
+much like miniserve. The agent serves the files itself, so no local port is opened.
+
+```console
+$ magicpipes add --serve ./dist --name docs
+Checking directory...         ✓
+...
+  Public: https://docs.t.example.com
+  Serving: /home/me/project/dist
+```
+
+* GET and HEAD only; nothing can be uploaded or changed.
+* Content types from the file extension, `Range` requests (resumable downloads, video
+  seeking), `Last-Modified`/`If-Modified-Since`.
+* A directory's `index.html` is served at its URL. Without one, the directory's contents are
+  listed; `--no-list` turns listings off (files are then reachable only by exact path).
+* Hidden files and directories (names starting with `.`, such as `.env` or `.git`) are never
+  listed or served. Symlinks are followed only if they stay inside the served directory.
+* Running `add --serve` again for the same directory returns the same tunnel, applying the new
+  `--no-list` setting. `magicpipes remove <name>` stops serving it.
+
+> Everything in the directory (except hidden entries) is public. Serve a dedicated build or
+> export directory, not your home directory or a source checkout.
 
 ### `add` semantics
 
@@ -263,8 +292,8 @@ On failure:
 | 1 | `internal`, ... | Unexpected error |
 | 2 | | Invalid command-line usage |
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token` | Enrollment or credentials |
-| 4 | `local_unreachable`, `invalid_port`, `invalid_host` | Nothing listening locally |
-| 5 | `server_unreachable`, `agent_start_failed`, `agent_not_running` | Cannot reach server or agent |
+| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory` | Nothing listening locally, or `--serve` directory missing |
+| 5 | `server_unreachable`, `agent_start_failed`, `agent_not_running`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
 | 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found` | Naming/registry |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
 | 8 | `probe_failed` | Public URL did not reach the application |
