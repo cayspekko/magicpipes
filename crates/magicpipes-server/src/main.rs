@@ -4,8 +4,10 @@ mod certs;
 mod config;
 mod control;
 mod data;
+mod forwarded;
 mod gateway;
 mod listen;
+mod proxy_header;
 mod mgmt;
 mod store;
 
@@ -20,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::certs::{CertManager, CertResolver};
+use crate::certs::{CertManager, CertResolver, SingleHost};
 use crate::config::{Config, TlsMode};
 use crate::control::ControlPlane;
 use crate::data::{DataPlane, ProxySettings};
@@ -123,9 +125,10 @@ async fn bind(addr: std::net::SocketAddr, what: &str) -> anyhow::Result<TcpListe
     TcpListener::bind(addr).await.with_context(|| format!("binding {what} listener on {addr}"))
 }
 
-fn management_resolver(cfg: &Config, certs: &Arc<CertManager>) -> anyhow::Result<Arc<CertResolver>> {
+/// Certificates for the management listener: its hostname only, never a tunnel's.
+fn management_resolver(cfg: &Config, certs: &Arc<CertManager>) -> anyhow::Result<Arc<SingleHost>> {
     let host = &cfg.management.hostname;
-    if let (Some(c), Some(k)) = (&cfg.management.cert_file, &cfg.management.key_file) {
+    let inner = if let (Some(c), Some(k)) = (&cfg.management.cert_file, &cfg.management.key_file) {
         let loaded = certs::load_pem(&read(c)?, &read(k)?)?;
         let resolver = Arc::new(CertResolver::default());
         for n in &loaded.names {
@@ -134,16 +137,18 @@ fn management_resolver(cfg: &Config, certs: &Arc<CertManager>) -> anyhow::Result
         if resolver.lookup(host).is_none() {
             bail!("management.cert_file does not cover {host}");
         }
-        return Ok(resolver);
-    }
-    if cfg.tls.mode == TlsMode::Files {
-        if certs.resolver().lookup(host).is_none() {
-            bail!("tls.cert_file does not cover the management hostname {host}; set management.cert_file");
-        }
+        resolver
     } else {
-        certs.ensure(host);
-    }
-    Ok(certs.resolver())
+        if cfg.tls.mode == TlsMode::Files {
+            if certs.resolver().lookup(host).is_none() {
+                bail!("tls.cert_file does not cover the management hostname {host}; set management.cert_file");
+            }
+        } else {
+            certs.ensure(host);
+        }
+        certs.resolver()
+    };
+    Ok(Arc::new(SingleHost { host: host.clone(), inner }))
 }
 
 fn read(p: &Path) -> anyhow::Result<Vec<u8>> {
@@ -155,7 +160,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let store = open_store(&cfg)?;
     bootstrap_admin(&cfg, &store)?;
 
-    let certs = CertManager::new(&cfg.tls, &cfg.data_dir)?;
+    let certs = CertManager::new(&cfg.tls, &cfg.data_dir, &[&cfg.base_domain, &cfg.management.hostname])?;
     if let Some(p) = certs.dev_ca_path() {
         tracing::warn!(ca = %p.display(), "tls.mode = dev-ca: clients must trust this CA; do not use in production");
     }
@@ -195,8 +200,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         public_https,
         public_acceptor,
         data.clone(),
-        cfg.public.max_connections,
-        Duration::from_secs(cfg.public.header_read_timeout_secs),
+        listen::ListenOpts {
+            name: "public-https",
+            max_connections: cfg.public.max_connections,
+            max_per_client: cfg.public.max_connections_per_client.max(1),
+            header_read_timeout: Duration::from_secs(cfg.public.header_read_timeout_secs),
+            trusted_proxies: cfg.trusted_proxies(),
+            proxy_protocol: cfg.public.proxy_protocol,
+        },
         shutdown.clone(),
         tracker.clone(),
     ));

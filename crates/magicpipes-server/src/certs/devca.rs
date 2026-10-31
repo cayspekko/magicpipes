@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rcgen::{BasicConstraints, CertificateParams, DnType, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints};
 
 pub struct DevCa {
     dir: PathBuf,
@@ -12,7 +12,10 @@ pub struct DevCa {
 }
 
 impl DevCa {
-    pub fn load_or_create(dir: &Path) -> anyhow::Result<Self> {
+    /// A new CA may only vouch for `domains` and their subdomains (an X.509 name constraint), so
+    /// trusting it for development cannot expose other sites. CAs created by older versions
+    /// have no constraint; delete `dev-ca/` to get a new one.
+    pub fn load_or_create(dir: &Path, domains: &[&str]) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let (crt, key) = (dir.join("ca.crt"), dir.join("ca.key"));
         if !crt.exists() {
@@ -21,6 +24,10 @@ impl DevCa {
             params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
             params.distinguished_name.push(DnType::CommonName, "MagicPipes Development CA");
             params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params.name_constraints = Some(NameConstraints {
+                permitted_subtrees: domains.iter().map(|d| GeneralSubtree::DnsName(d.to_string())).collect(),
+                excluded_subtrees: Vec::new(),
+            });
             let cert = params.self_signed(&key_pair)?;
             super::write_private(&key, key_pair.serialize_pem().as_bytes())?;
             std::fs::write(&crt, cert.pem())?;

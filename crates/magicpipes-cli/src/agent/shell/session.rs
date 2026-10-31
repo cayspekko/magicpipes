@@ -31,7 +31,7 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 /// After the program exits, output still in flight is forwarded for this long.
 const DRAIN: Duration = Duration::from_millis(300);
 /// A program that ignores SIGHUP gets SIGKILL after this long.
-const KILL_GRACE: Duration = Duration::from_secs(2);
+pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Output is coalesced into WebSocket messages of at most this size.
 const MAX_CHUNK: usize = 64 * 1024;
 
@@ -292,9 +292,14 @@ impl Pty {
             if tokio::time::timeout(KILL_GRACE, exit).await.is_err() {
                 #[cfg(unix)]
                 if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
-                    // SAFETY: plain syscall on a pid we spawned and have not reaped (the wait
-                    // thread is still blocked on it, so the pid cannot have been reused).
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    // SAFETY: plain syscalls on a pid we spawned and have not reaped (the wait
+                    // thread is still blocked on it, so the pid cannot have been reused). The
+                    // pty made it a session and process-group leader, so `-pid` also reaches
+                    // jobs it started that ignored SIGHUP.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                 }
                 #[cfg(not(unix))]
                 let _ = pid;

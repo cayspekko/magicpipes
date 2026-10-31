@@ -9,7 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -22,6 +22,7 @@ use magicpipes_core::proto::{self, ERROR_HEADER, PROBE_ACK_HEADER, PROBE_HEADER,
 
 use super::io::{StatusPrefixed, UpstreamStatus, bridge, find_status};
 use super::{DataPlane, Outcome, Route};
+use crate::forwarded::{TrustedProxies, client_key};
 use crate::listen::ConnInfo;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -73,12 +74,13 @@ async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> R
         }
     };
 
+    let client = client_key(dp.settings.trusted_proxies.client_ip(conn.peer.ip(), req.headers()));
     let probe = take_probe_nonce(req.headers_mut());
     let upgrade = is_upgrade(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
-    prepare_request(&mut req, &host, conn.peer, upgrade)?;
+    prepare_request(&mut req, &host, conn.peer, upgrade, &dp.settings.trusted_proxies)?;
 
-    let upstream = open_upstream(dp, &route, &session).await?;
+    let upstream = open_upstream(dp, &route, &session, client).await?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Incoming>(TokioIo::new(upstream))
         .await
         .map_err(|_| upstream_error(&route, UpstreamStatus::Closed))?;
@@ -132,12 +134,23 @@ async fn open_upstream(
     dp: &DataPlane,
     route: &Route,
     session: &magicpipes_core::mux::MuxHandle,
+    client: IpAddr,
 ) -> Result<StatusPrefixed<magicpipes_core::mux::MuxStream>, Response<ProxyBody>> {
     let fail = || {
         route.stats.record(Outcome::AgentOffline);
         error_page(StatusCode::BAD_GATEWAY, "agent_unavailable", "Could not open a stream to the MagicPipes agent.")
     };
-    let mut stream = session.open(dp.settings.stream_open_timeout).await.map_err(|_| fail())?;
+    let mut stream = match session.open_data(dp.settings.stream_open_timeout, client).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_busy",
+                "This tunnel is handling too many connections. Try again shortly.",
+            ));
+        }
+        Err(_) => return Err(fail()),
+    };
     proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })
         .await
         .map_err(|_| fail())?;
@@ -210,7 +223,13 @@ fn is_upgrade(headers: &HeaderMap) -> bool {
 }
 
 /// Removes hop-by-hop and MagicPipes headers and adds forwarding headers.
-fn prepare_request(req: &mut Request<Incoming>, host: &str, peer: SocketAddr, upgrade: bool) -> Result<(), Response<ProxyBody>> {
+fn prepare_request(
+    req: &mut Request<Incoming>,
+    host: &str,
+    peer: SocketAddr,
+    upgrade: bool,
+    trusted: &TrustedProxies,
+) -> Result<(), Response<ProxyBody>> {
     // Absolute-form -> origin-form.
     if req.uri().authority().is_some() {
         let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
@@ -229,14 +248,7 @@ fn prepare_request(req: &mut Request<Incoming>, host: &str, peer: SocketAddr, up
             headers.insert(header::UPGRADE, v);
         }
     }
-    let ip = peer.ip().to_canonical().to_string();
-    let xff = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        Some(prev) => format!("{prev}, {ip}"),
-        None => ip,
-    };
-    if let Ok(v) = HeaderValue::from_str(&xff) {
-        headers.insert("x-forwarded-for", v);
-    }
+    trusted.rewrite(peer.ip(), headers);
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     if let Ok(v) = HeaderValue::from_str(host) {
         headers.insert("x-forwarded-host", v);

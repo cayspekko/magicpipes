@@ -5,23 +5,62 @@
 //! and receive inbound streams from the returned channel. Every stream is flow-controlled by
 //! yamux (256 KiB initial window, auto-tuned), which gives per-stream backpressure.
 
+use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
-use std::task::Poll;
+use std::net::IpAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
 pub use yamux::Mode;
 
-/// A yamux stream adapted to Tokio's I/O traits.
-pub type MuxStream = Compat<yamux::Stream>;
+/// A yamux stream adapted to Tokio's I/O traits. A stream opened with
+/// [`MuxHandle::open_data`] keeps its place in the session's data budget until dropped.
+pub struct MuxStream {
+    io: Compat<yamux::Stream>,
+    _slot: Option<DataSlot>,
+}
 
-/// Maximum concurrent streams per session (each public request uses one).
+impl MuxStream {
+    fn new(s: yamux::Stream) -> Self {
+        Self { io: s.compat(), _slot: None }
+    }
+}
+
+impl AsyncRead for MuxStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for MuxStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// Maximum concurrent streams per session, in both directions together.
 pub const MAX_STREAMS: usize = 256;
+/// Streams the server may open for public traffic per session. The remainder stays free for
+/// the agent's RPCs and pings, so public clients can slow a tunnel but never cut its session.
+pub const MAX_DATA_STREAMS: usize = 224;
+/// Data streams one client may hold per session, so one client cannot take all of them.
+pub const MAX_DATA_STREAMS_PER_CLIENT: usize = 64;
 /// Inbound streams buffered before new ones are refused.
 const INBOUND_QUEUE: usize = 64;
 
@@ -31,9 +70,58 @@ type OpenReply = oneshot::Sender<io::Result<MuxStream>>;
 pub struct MuxHandle {
     open_tx: mpsc::Sender<OpenReply>,
     closed: CancellationToken,
+    data: Arc<DataBudget>,
+}
+
+/// Open data streams: in total and per client.
+#[derive(Debug, Default)]
+struct DataBudget(Mutex<(usize, HashMap<IpAddr, usize>)>);
+
+/// One data stream's place in the budget; released on drop.
+struct DataSlot(Arc<DataBudget>, IpAddr);
+
+impl DataBudget {
+    fn acquire(self: &Arc<Self>, client: IpAddr) -> Option<DataSlot> {
+        let mut guard = self.0.lock().unwrap();
+        let (total, per_client) = &mut *guard;
+        let n = per_client.entry(client).or_insert(0);
+        if *total >= MAX_DATA_STREAMS || *n >= MAX_DATA_STREAMS_PER_CLIENT {
+            if *n == 0 {
+                per_client.remove(&client);
+            }
+            return None;
+        }
+        *n += 1;
+        *total += 1;
+        Some(DataSlot(self.clone(), client))
+    }
+}
+
+impl Drop for DataSlot {
+    fn drop(&mut self) {
+        let mut guard = self.0.0.lock().unwrap();
+        let (total, per_client) = &mut *guard;
+        *total -= 1;
+        if let Some(n) = per_client.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                per_client.remove(&self.1);
+            }
+        }
+    }
 }
 
 impl MuxHandle {
+    /// Opens a stream for public traffic from `client` (callers group addresses, e.g. an IPv6
+    /// /64, before passing them), within the session's data budget. Fails at once with
+    /// `WouldBlock` when the budget is used up.
+    pub async fn open_data(&self, timeout: Duration, client: IpAddr) -> io::Result<MuxStream> {
+        let slot = self.data.acquire(client).ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "agent stream budget used up"))?;
+        let mut stream = self.open(timeout).await?;
+        stream._slot = Some(slot);
+        Ok(stream)
+    }
+
     /// Opens a new outbound stream, failing after `timeout`.
     pub async fn open(&self, timeout: Duration) -> io::Result<MuxStream> {
         let (tx, rx) = oneshot::channel();
@@ -82,7 +170,7 @@ where
     let (open_tx, mut open_rx) = mpsc::channel::<OpenReply>(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let token = CancellationToken::new();
-    let handle = MuxHandle { open_tx, closed: token.clone() };
+    let handle = MuxHandle { open_tx, closed: token.clone(), data: Arc::default() };
 
     tokio::spawn(async move {
         let mut pending: Option<OpenReply> = None;
@@ -95,7 +183,7 @@ where
                 if let Some(reply) = pending.take() {
                     match conn.poll_new_outbound(cx) {
                         Poll::Ready(res) => {
-                            let _ = reply.send(res.map(|s| s.compat()).map_err(io::Error::other));
+                            let _ = reply.send(res.map(MuxStream::new).map_err(io::Error::other));
                             continue;
                         }
                         Poll::Pending => pending = Some(reply),
@@ -105,7 +193,7 @@ where
                     Poll::Ready(Some(Ok(stream))) => {
                         // A full queue means the consumer is overloaded: dropping the stream
                         // resets it, which the peer observes as a refused stream.
-                        let _ = inbound_tx.try_send(stream.compat());
+                        let _ = inbound_tx.try_send(MuxStream::new(stream));
                         continue;
                     }
                     Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
@@ -158,5 +246,24 @@ mod tests {
 
         client.close();
         tokio::time::timeout(Duration::from_secs(5), server.closed()).await.unwrap();
+    }
+
+    #[test]
+    fn data_budget_limits_clients_and_total() {
+        let budget = Arc::new(DataBudget::default());
+        let a: IpAddr = "203.0.113.1".parse().unwrap();
+        let mut held: Vec<DataSlot> = (0..MAX_DATA_STREAMS_PER_CLIENT).map(|_| budget.acquire(a).unwrap()).collect();
+        assert!(budget.acquire(a).is_none(), "per-client limit");
+        held.pop();
+        assert!(budget.acquire(a).is_some(), "released on drop");
+        let mut i = 0u32;
+        while let Some(slot) = budget.acquire(IpAddr::from((i + 1).to_be_bytes())) {
+            held.push(slot);
+            i += 1;
+        }
+        assert_eq!(budget.0.lock().unwrap().0, MAX_DATA_STREAMS);
+        drop(held);
+        assert_eq!(budget.0.lock().unwrap().0, 0);
+        assert!(budget.0.lock().unwrap().1.is_empty());
     }
 }

@@ -8,7 +8,7 @@ use http::{HeaderValue, StatusCode, header};
 use magicpipes_core::theme::{GLYPH, STYLE};
 use serde::Deserialize;
 
-use super::{AppState, PeerAddr, SESSION_COOKIE};
+use super::{AppState, ClientIp, SESSION_COOKIE};
 use crate::control::TunnelView;
 
 fn esc(s: &str) -> String {
@@ -365,14 +365,10 @@ pub struct LoginForm {
     token: String,
 }
 
-pub async fn login(State(app): State<AppState>, peer: Option<axum::Extension<PeerAddr>>, Form(f): Form<LoginForm>) -> Response {
-    let ip = peer.map(|p| p.0.0.ip());
-    if ip.is_some_and(|ip| app.limiter.blocked(ip)) {
-        return (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."))).into_response();
-    }
+pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<ClientIp>>, Form(f): Form<LoginForm>) -> Response {
     if !app.control.verify_admin(f.token.trim()) {
-        if let Some(ip) = ip {
-            app.limiter.fail(ip);
+        if app.limiter.reject(client.map(|c| c.0.0)) {
+            return (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."))).into_response();
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         return (StatusCode::UNAUTHORIZED, login_page(Some("Invalid admin token."))).into_response();
@@ -392,7 +388,8 @@ pub async fn logout(user: UiUser, State(app): State<AppState>, Form(f): Form<Csr
     let mut resp = Redirect::to("/login").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("mp_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"),
+        HeaderValue::from_str(&format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"))
+            .expect("cookie is ASCII"),
     );
     resp
 }

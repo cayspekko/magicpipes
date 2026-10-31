@@ -189,7 +189,7 @@ impl Agent {
         let mut rpc_req = RegisterTunnel {
             id: existing.as_ref().map(|t| t.id.clone()),
             name: existing.as_ref().map(|t| t.name.clone()).or(name.clone()),
-            target: target.describe(req.kind),
+            target: target.server_description(req.kind),
             kind: req.kind,
             remote_port: req.remote_port,
             allow: allow.clone(),

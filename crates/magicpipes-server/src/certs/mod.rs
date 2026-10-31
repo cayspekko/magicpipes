@@ -79,6 +79,22 @@ impl ResolvesServerCert for CertResolver {
     }
 }
 
+/// Answers for one hostname only. The management listener uses this: the shared resolver also
+/// holds every tunnel's certificate, and the management UI must not be reachable under a
+/// tunnel's hostname (its session cookie would then belong to the tunnel's origin).
+#[derive(Debug)]
+pub struct SingleHost {
+    pub host: String,
+    pub inner: Arc<CertResolver>,
+}
+
+impl ResolvesServerCert for SingleHost {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let name = hello.server_name()?;
+        if name.eq_ignore_ascii_case(&self.host) { self.inner.lookup(&self.host) } else { None }
+    }
+}
+
 pub fn server_config(resolver: Arc<dyn ResolvesServerCert>) -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
@@ -133,8 +149,11 @@ fn covers(names: &[String], host: &str) -> bool {
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
+    // A fresh file (O_EXCL, which also refuses a symlink), so a leftover temp file can't lend
+    // its permissions.
+    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&tmp)?;
@@ -168,13 +187,14 @@ pub struct CertManager {
 }
 
 impl CertManager {
-    pub fn new(cfg: &TlsConfig, data_dir: &Path) -> anyhow::Result<Arc<Self>> {
+    /// `domains`: the names certificates may be issued for (base domain, management hostname).
+    pub fn new(cfg: &TlsConfig, data_dir: &Path, domains: &[&str]) -> anyhow::Result<Arc<Self>> {
         let dir = data_dir.join("certs");
         std::fs::create_dir_all(&dir)?;
         let resolver = Arc::new(CertResolver::default());
         let mut static_names = Vec::new();
         let devca = match cfg.mode {
-            TlsMode::DevCa => Some(devca::DevCa::load_or_create(&data_dir.join("dev-ca"))?),
+            TlsMode::DevCa => Some(devca::DevCa::load_or_create(&data_dir.join("dev-ca"), domains)?),
             _ => None,
         };
         if cfg.mode == TlsMode::Files {

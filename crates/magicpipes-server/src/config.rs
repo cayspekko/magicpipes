@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use magicpipes_core::cidr;
 use serde::Deserialize;
+
+use crate::forwarded::TrustedProxies;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +27,11 @@ pub struct Config {
     pub agents: AgentsConfig,
     #[serde(default)]
     pub ports: PortsConfig,
+    /// Addresses (CIDR) of reverse proxies or load balancers in front of magicpipesd, such as
+    /// HAProxy. Only these may name the client: X-Forwarded-For on the HTTPS listeners (used for
+    /// login rate limits and passed on to tunnels) and PROXY headers on port tunnels.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,11 +43,16 @@ pub struct PublicConfig {
     /// Port shown in public URLs. Defaults to the `https_listen` port (omitted when 443).
     pub url_port: Option<u16>,
     pub max_connections: usize,
+    /// Open connections per client address (per /64 for IPv6). Trusted proxies are exempt.
+    pub max_connections_per_client: usize,
     pub header_read_timeout_secs: u64,
     /// Time allowed for the local application to start answering a request.
     pub upstream_response_timeout_secs: u64,
     /// Upgraded (WebSocket) connections are closed after this long without traffic.
     pub websocket_idle_timeout_secs: u64,
+    /// Connections from `trusted_proxies` start with a PROXY protocol header (a TCP load
+    /// balancer passing TLS through, such as HAProxy with `send-proxy-v2`).
+    pub proxy_protocol: bool,
 }
 
 impl Default for PublicConfig {
@@ -49,9 +62,11 @@ impl Default for PublicConfig {
             http_listen: Some("0.0.0.0:80".parse().unwrap()),
             url_port: None,
             max_connections: 10_000,
+            max_connections_per_client: 256,
             header_read_timeout_secs: 30,
             upstream_response_timeout_secs: 60,
             websocket_idle_timeout_secs: 600,
+            proxy_protocol: false,
         }
     }
 }
@@ -66,6 +81,9 @@ pub struct ManagementConfig {
     /// Optional externally provisioned certificate for the management hostname.
     pub cert_file: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
+    /// Like `public.proxy_protocol`, for the management listener.
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -127,13 +145,24 @@ pub struct AgentsConfig {
     /// Sessions without a ping for this long are dropped.
     pub session_timeout_secs: u64,
     pub max_tunnels_per_agent: usize,
+    /// TCP/UDP ports one agent may hold, so one agent cannot take the whole `[ports] range`.
+    pub max_ports_per_agent: usize,
+    /// With ACME, new HTTPS hostnames (certificate orders) one agent may add per 24 hours, so
+    /// one agent cannot use up the CA's limits for everyone.
+    pub max_new_certificates_per_day: usize,
     /// Lifetime of enrollment tokens created by `magicpipesd enroll` / the UI.
     pub enrollment_ttl_secs: u64,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
-        Self { session_timeout_secs: 45, max_tunnels_per_agent: 50, enrollment_ttl_secs: 3600 }
+        Self {
+            session_timeout_secs: 45,
+            max_tunnels_per_agent: 50,
+            max_ports_per_agent: 10,
+            max_new_certificates_per_day: 20,
+            enrollment_ttl_secs: 3600,
+        }
     }
 }
 
@@ -147,8 +176,8 @@ pub struct PortsConfig {
     pub bind: IpAddr,
     /// Host shown in `tcp://` and `udp://` URLs. Defaults to `management.hostname`.
     pub public_host: Option<String>,
-    /// TCP connections start with a PROXY protocol header (v1 or v2) from a load balancer such as
-    /// HAProxy, which carries the real client address. Only enable this behind such a proxy.
+    /// TCP connections from `trusted_proxies` start with a PROXY protocol header (v1 or v2),
+    /// which carries the real client address for allow-lists.
     pub proxy_protocol: bool,
     /// Open TCP connections across all port tunnels.
     pub max_connections: usize,
@@ -238,7 +267,16 @@ impl Config {
         if let Some(r) = &self.ports.range {
             PortRange::parse(r)?;
         }
+        let trusted = cidr::parse_list(&self.trusted_proxies).map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
+        let proxied = self.public.proxy_protocol || self.management.proxy_protocol || self.ports.proxy_protocol;
+        if proxied && trusted.is_empty() {
+            bail!("proxy_protocol requires trusted_proxies (the load balancer's addresses)");
+        }
         Ok(())
+    }
+
+    pub fn trusted_proxies(&self) -> TrustedProxies {
+        TrustedProxies::new(cidr::parse_list(&self.trusted_proxies).unwrap_or_default())
     }
 
     /// The configured port range, or `None` when port tunnels are off.

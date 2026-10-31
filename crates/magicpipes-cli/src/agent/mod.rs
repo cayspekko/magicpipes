@@ -96,7 +96,13 @@ async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
     }
     tracing::info!("agent stopping");
     shutdown.cancel();
+    // Web terminal programs get SIGHUP now and SIGKILL after shell::KILL_GRACE; those timers
+    // run on this runtime, so it must outlive them.
+    tunnels.end_all();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), session_task).await;
+    if tunnels.list().iter().any(|t| matches!(t.target, state::Target::Shell { .. })) {
+        tokio::time::sleep(shell::KILL_GRACE + std::time::Duration::from_millis(200)).await;
+    }
     Ok(())
 }
 
@@ -104,8 +110,11 @@ async fn handle_ipc<S: AsyncRead + AsyncWrite>(agent: Arc<Agent>, stream: S) {
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r).take(ipc::MAX_LINE as u64);
     let mut line = String::new();
-    if reader.read_line(&mut line).await.is_err() {
-        return;
+    // The CLI sends its request at once; a connection that sends nothing would otherwise hold
+    // a task (and on Windows a pipe instance) forever.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_line(&mut line)).await {
+        Ok(Ok(_)) => {}
+        _ => return,
     }
     let req: IpcRequest = match serde_json::from_str(&line) {
         Ok(r) => r,

@@ -22,6 +22,8 @@
 mod page;
 mod session;
 
+pub use session::KILL_GRACE;
+
 use std::convert::Infallible;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -95,8 +97,7 @@ pub struct Terminal {
 impl Terminal {
     /// Short name for titles: the program's file name.
     fn program(&self) -> String {
-        let first = self.command.first().map(String::as_str).unwrap_or("shell");
-        first.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(first).to_string()
+        crate::state::program_name(&self.command)
     }
 }
 
@@ -142,7 +143,8 @@ fn page_response(term: &Terminal) -> Response<Body> {
     let nonce = magicpipes_core::secret::random_string(22);
     let html = page::render(&page::Page {
         program: &term.program(),
-        command: &crate::state::command_line(&term.command),
+        // Anyone with the link sees this page, key or not: arguments may hold secrets.
+        command: &term.program(),
         needs_key: term.key.is_some(),
         nonce: &nonce,
     });
@@ -268,22 +270,20 @@ fn upgrade(term: Arc<Terminal>, mut req: Request<Incoming>) -> Response<Body> {
     resp
 }
 
-/// Whether a browser's `Origin` names the host the request is for. Requests without `Origin`
-/// are not from a browser page and cannot ride on a visitor's session, so they pass.
+/// Whether a browser's `Origin` is exactly this page's origin: `https`, the same host and the
+/// same port (tunnels are always served over HTTPS, so another scheme or port, such as a port
+/// tunnel on the same hostname, is another origin). Requests without `Origin` are not from a
+/// browser page and cannot ride on a visitor's session, so they pass.
 fn same_origin(h: &HeaderMap) -> bool {
     let Some(origin) = h.get(header::ORIGIN) else { return true };
-    let host = |v: &str| {
-        let v = v.trim();
-        let v = v.split_once("://").map_or(v, |(_, rest)| rest);
-        let v = v.split('/').next().unwrap_or("");
-        match v.rsplit_once(':') {
-            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name.to_ascii_lowercase(),
-            _ => v.to_ascii_lowercase(),
-        }
+    // `host[:port]`, lowercase, with the default HTTPS port dropped.
+    let authority = |v: &str| {
+        let v = v.trim().to_ascii_lowercase();
+        v.strip_suffix(":443").map(str::to_string).unwrap_or(v)
     };
-    let origin = origin.to_str().ok().filter(|o| o.contains("://")).map(host);
-    let target = h.get(header::HOST).and_then(|v| v.to_str().ok()).map(host);
-    matches!((origin, target), (Some(o), Some(t)) if !o.is_empty() && o == t)
+    let origin = origin.to_str().ok().and_then(|o| o.strip_prefix("https://")).filter(|a| !a.is_empty() && !a.contains('/')).map(authority);
+    let target = h.get(header::HOST).and_then(|v| v.to_str().ok()).map(authority);
+    matches!((origin, target), (Some(o), Some(t)) if o == t)
 }
 
 #[cfg(test)]
@@ -306,6 +306,10 @@ mod tests {
         assert!(!same_origin(&headers(&[("host", "dev.example.com"), ("origin", "https://evil.example")])));
         assert!(!same_origin(&headers(&[("host", "dev.example.com"), ("origin", "null")])));
         assert!(!same_origin(&headers(&[("origin", "https://dev.example.com")])));
+        assert!(same_origin(&headers(&[("host", "dev.example.com:8443"), ("origin", "https://dev.example.com:8443")])));
+        assert!(!same_origin(&headers(&[("host", "dev.example.com"), ("origin", "http://dev.example.com")])), "scheme");
+        assert!(!same_origin(&headers(&[("host", "dev.example.com"), ("origin", "https://dev.example.com:65500")])), "port");
+        assert!(!same_origin(&headers(&[("host", "dev.example.com:8443"), ("origin", "https://dev.example.com")])), "port");
     }
 
     #[test]

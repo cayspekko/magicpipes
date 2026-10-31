@@ -1,11 +1,32 @@
 //! PROXY protocol (v1 text and v2 binary) as sent by HAProxy and other TCP load balancers, so
 //! port tunnels see — and allow-lists check — the real client address rather than the proxy's.
-//! Reads exactly the header and nothing after it.
+//! Reads exactly the header and nothing after it. Used by every listener with `proxy_protocol`
+//! enabled, and only for connections from `trusted_proxies`.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::forwarded::TrustedProxies;
+
+/// Time allowed for a load balancer's PROXY header.
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The client address of a new connection. A trusted proxy must send a PROXY header first;
+/// anyone else connected directly and is the client (a header it sends is not read, so the
+/// connection fails at the next protocol layer). `Err`: close the connection.
+pub async fn client_addr<R: AsyncRead + Unpin>(r: &mut R, peer: SocketAddr, trusted: &TrustedProxies) -> io::Result<SocketAddr> {
+    if !trusted.trusts(peer.ip()) {
+        return Ok(peer);
+    }
+    match tokio::time::timeout(TIMEOUT, read(r)).await {
+        Ok(Ok(client)) => Ok(client.unwrap_or(peer)), // no address: the proxy's own health check
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "no PROXY header from a trusted proxy")),
+    }
+}
 
 const V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
 /// Longest v1 line, including CRLF (from the specification).

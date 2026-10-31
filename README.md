@@ -114,14 +114,34 @@ The management listener uses the same certificate source for `management.hostnam
 [ports]
 range = "65500-65535"        # each port is usable for TCP and for UDP
 # public_host = "example.com"  # host in tcp:// and udp:// URLs (default: management.hostname)
-# proxy_protocol = true        # only behind a TCP proxy that sends PROXY headers
 ```
 
 Every port in the range must reach `magicpipesd` from the internet, for both TCP and UDP (cloud
 firewall, router forwarding). Ports are bound when a tunnel claims them, so the range may
-overlap ports other programs use; those are skipped. If a TCP load balancer such as HAProxy
-sits in front, set `proxy_protocol = true` and `send-proxy-v2` on its servers, so the server
-sees (and `--allow-cidr` checks) the real client address instead of the proxy's.
+overlap ports other programs use; those are skipped. Each agent may hold up to
+`agents.max_ports_per_agent` ports (default 10).
+
+**Behind a reverse proxy or load balancer**, list its addresses in `trusted_proxies` so the server
+sees real client addresses (for login rate limits, per-client connection caps, `--allow-cidr`
+and the `X-Forwarded-For` tunnels receive). A TCP load balancer that passes TLS through, such
+as HAProxy in `mode tcp`, should send a PROXY header (`send-proxy-v2` on its `server` lines),
+and the matching listeners need `proxy_protocol = true`:
+
+```toml
+trusted_proxies = ["172.16.0.0/12"]   # e.g. the Docker network HAProxy runs on
+
+[public]
+proxy_protocol = true
+[management]
+proxy_protocol = true
+[ports]
+proxy_protocol = true
+```
+
+Connections from addresses outside `trusted_proxies` still work, with the peer as the client
+and its own forwarding headers dropped. Without `trusted_proxies`, every client behind the
+proxy shares one address, so ten failed logins from anyone would rate-limit everyone's failed
+attempts (valid tokens are always accepted).
 
 ### Administrator bootstrap
 

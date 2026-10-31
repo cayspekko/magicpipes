@@ -62,7 +62,10 @@ pub fn tunnels_path() -> PathBuf {
 /// Atomically writes a file readable only by the current user (mode 0600 on Unix).
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut f = crate::platform::private_options().write(true).create(true).truncate(true).open(&tmp)?;
+    // A fresh file (O_EXCL, which also refuses a symlink), so a leftover temp file can't lend
+    // its permissions.
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = crate::platform::private_options().write(true).create_new(true).open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(tmp, path)
@@ -123,6 +126,11 @@ impl LocalTunnel {
         self.target.describe(self.kind)
     }
 
+    /// What the server stores and shows its administrators (see [`Target::server_description`]).
+    pub fn server_description(&self) -> String {
+        self.target.server_description(self.kind)
+    }
+
     /// The URL to share (see [`Target::share_url`]).
     pub fn share_url(&self) -> String {
         self.target.share_url(&self.public_url)
@@ -151,7 +159,7 @@ pub enum Target {
 }
 
 impl Target {
-    /// Shown to users and stored on the server for display; `kind` picks the scheme of a port.
+    /// Shown to the local user; `kind` picks the scheme of a port.
     pub fn describe(&self, kind: Kind) -> String {
         match self {
             Target::Port { host, port } if kind.is_http() => target_url(host, *port),
@@ -164,6 +172,21 @@ impl Target {
     }
 
     /// The URL to share: the public URL, plus the write key in the fragment for a writable shell.
+    /// Like [`Target::describe`], minus local details the server operator has no need for: a
+    /// shell's arguments (which may hold secrets) and the folder's full path (which names the
+    /// local user).
+    pub fn server_description(&self, kind: Kind) -> String {
+        match self {
+            Target::Static { serve, .. } => {
+                format!("static:{}", serve.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| display_path(serve)))
+            }
+            Target::Shell { shell, writable, .. } => {
+                format!("shell:{} ({})", program_name(shell), if *writable { "read-write" } else { "read-only" })
+            }
+            Target::Port { .. } => self.describe(kind),
+        }
+    }
+
     pub fn share_url(&self, public_url: &str) -> String {
         match self {
             Target::Shell { key: Some(key), writable: true, .. } => format!("{}/#k={key}", public_url.trim_end_matches('/')),
@@ -189,6 +212,12 @@ pub fn command_line(argv: &[String]) -> String {
         if !w.is_empty() && !w.contains([' ', '\t', '"', '\'']) { w.clone() } else { format!("'{}'", w.replace('\'', "'\\''")) }
     };
     argv.iter().map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// A command's program, without its directory: `zsh` for `/bin/zsh -l`.
+pub fn program_name(argv: &[String]) -> String {
+    let first = argv.first().map(String::as_str).unwrap_or("shell");
+    first.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(first).to_string()
 }
 
 /// A path without the `\\?\` prefix that canonicalization adds on Windows.
@@ -243,6 +272,10 @@ mod tests {
         assert_eq!(json["shell"][0], "htop");
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), t);
         assert_eq!(t.describe(), "shell:htop (read-write)");
+        let secret = Target::Shell { shell: vec!["/usr/bin/psql".into(), "postgres://u:pw@db".into()], cwd: "/".into(), writable: false, key: None, max_clients: 1 };
+        assert_eq!(secret.server_description(Kind::Http), "shell:psql (read-only)");
+        let site = Target::Static { serve: "/home/alice/site".into(), list: true };
+        assert_eq!(site.server_description(Kind::Http), "static:site");
         assert_eq!(t.target.share_url("https://a.t.test"), "https://a.t.test/#k=k1");
 
         let udp = LocalTunnel {

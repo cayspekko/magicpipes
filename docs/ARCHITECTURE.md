@@ -141,7 +141,7 @@ a certificate or an HTTP route.
 * **TCP**: one `ServerOpen::Data` stream per connection, piped after the agent's status byte. No
   idle timeout (database and SSH sessions are long-lived); TCP keepalive drops vanished clients.
   An optional PROXY protocol v1/v2 header (`proxy_protocol`) supplies the client address behind
-  a TCP load balancer.
+  a TCP load balancer; it is read only from `trusted_proxies`.
 * **UDP**: one `ServerOpen::Datagram` stream per client address ("flow"), carrying `u16`-length
   framed datagrams both ways; the agent relays them through a connected UDP socket of its own,
   so replies reach the right client. Flows end after `udp_idle_timeout_secs` and are capped per
@@ -232,28 +232,52 @@ a connection to the public port that must arrive back at the agent (a warning, n
 
 * Three separate credentials:
   * **admin tokens**: API bearer tokens, and the UI login, which becomes an HttpOnly, Secure,
-    SameSite=Strict session cookie plus per-session CSRF tokens on every form;
+    SameSite=Strict `__Host-` session cookie plus per-session CSRF tokens on every form;
   * **single-use enrollment tokens** with an expiry;
   * **per-agent tokens** `ag_<id>.<secret>`.
 
-  All have ≥256 bits of entropy and are stored as SHA-256 digests, compared in constant time.
-  Failed logins and enrollments are rate-limited per IP.
+  Tokens have ~256 bits of entropy (session cookies too; CSRF tokens and web terminal keys
+  ~190) and are stored as SHA-256 digests, compared in constant time. Failed logins and
+  enrollments are rate-limited per client (IPv6 per /64, at most 10,000 tracked); valid
+  credentials are accepted even from a rate-limited client, so nobody can lock an admin out.
+* The management UI, API and agent endpoint answer only for `management.hostname`: its TLS
+  listener has no certificate for other names and returns 421 for another `Host`. Tunnels share
+  the parent domain, so serving the UI under a tunnel's name would hand its cookie to that
+  tunnel's application.
+* Client addresses come from the TCP peer unless it is in `trusted_proxies`; then from its
+  PROXY header (listeners with `proxy_protocol = true`) or the right-most untrusted
+  X-Forwarded-For entry. Tunnels receive `X-Forwarded-For` rewritten accordingly; `Forwarded`
+  and `X-Real-IP` from untrusted peers are dropped.
 * Data streams need no separate credential: the server opens them only on the authenticated
   session of the agent that owns the tunnel, and the agent only dials targets from its own table.
   The server can name a tunnel, never an address.
 * Hostname ownership: names are unique, tied to one agent, validated (DNS label rules, reserved
   names, management hostname). Another agent cannot register or query them.
 * Port tunnels are open to anyone unless `--allow-cidr` is given (the CLI says so). The server
-  enforces allow-lists on every connection; behind a TCP proxy, only `proxy_protocol` makes the
-  checked address the client's. Raw ports are bounded by `[ports] max_connections` (TCP) and
-  `udp_max_flows` per tunnel.
+  enforces allow-lists on every connection, and an allow-list it cannot read keeps the tunnel
+  unpublished (fail closed); behind a TCP proxy, only `proxy_protocol` with `trusted_proxies`
+  makes the checked address the client's. Raw ports are bounded by `[ports] max_connections`
+  (TCP), `udp_max_flows` per tunnel and `max_ports_per_agent`.
 * No open proxy: `CONNECT` is refused, absolute-form URIs must match `Host`, and the TLS SNI must
   equal the `Host` header (421 otherwise). Unknown hostnames get no certificate at all, since
   certificates are never issued on demand from SNI.
-* Bounded resources: connection semaphores per listener, header read and TLS handshake
-  timeouts, 64 KiB control frames and IPC lines, ≤256 concurrent streams per agent session,
-  `max_tunnels_per_agent`, at most two concurrent ACME orders, per-hostname failure backoff.
+* Bounded resources: connection semaphores per listener and per client address, header read
+  and TLS handshake timeouts, a 15 s deadline and 64 KiB body limit for management requests,
+  64 KiB control frames and IPC lines (5 s to send one), ≤256 concurrent streams per agent
+  session of which public traffic may use 224 (64 per client), so pings and RPCs always get
+  through; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
+  concurrent ACME orders, per-hostname failure backoff; at most 8 archive downloads at once
+  per agent, each dropped after 60 s without reading.
 * Secrets are never logged. The bootstrap admin token goes to a 0600 file, not to the log.
+* The server sees only what it needs about local targets: the program name of a web terminal
+  (not its arguments) and the folder name of a static site (not its path). The public terminal
+  page shows the program name only. The write key moves from the link's fragment into the
+  tab's `sessionStorage` and out of the address bar.
+* The server terminates TLS, so its operator can see tunnel traffic, including a web terminal's
+  write key. Run writable terminals only through a server you trust.
+* `tls.mode = "dev-ca"` creates a CA name-constrained to `base_domain` and the management
+  hostname, so trusting it cannot vouch for other sites (CAs created before this was added are
+  unconstrained; delete `data_dir/dev-ca` to replace one).
 * Public tunnels are anonymous by design; this is stated in the CLI output, the UI and the README.
 
 ## Known limitations
@@ -277,6 +301,13 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * There is no body idle timeout for regular HTTP requests, only a time-to-first-response timeout.
   Upgraded (WebSocket) connections have an idle timeout.
 * UI sessions live in memory; restarting the server logs administrators out.
+* Read-only web terminals are anonymous: anyone with the link can hold one of its
+  `--max-clients` sessions for as long as they keep the page open.
+* Each agent session may buffer up to 128 MiB of yamux receive window, and UDP flow queues are
+  bounded by datagram count (64 per flow), not bytes.
+* Windows IPC relies on `first_pipe_instance` and the default pipe ACL. Another local user who
+  creates the pipe name first could receive the CLI's requests; an explicit owner-only ACL and
+  a server-owner check are still to do.
 * Windows support is newer and less tested than Unix: it is covered by the CI smoke test on a
   Windows runner (login, `add`, a public request, `agent stop`), not by the full end-to-end
   suite, which is Unix-only. Files in `%USERPROFILE%\.magicpipes` rely on the profile's

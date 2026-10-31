@@ -102,6 +102,13 @@ impl Tunnels {
         Self::persist(&map);
     }
 
+    /// Ends everything running for every tunnel (web terminal programs), keeping the tunnels.
+    pub fn end_all(&self) {
+        for e in self.map.lock().unwrap().values() {
+            e.ended.cancel();
+        }
+    }
+
     pub fn remove(&self, id: &str) -> Option<LocalTunnel> {
         let mut map = self.map.lock().unwrap();
         let removed = map.remove(id).map(|e| {

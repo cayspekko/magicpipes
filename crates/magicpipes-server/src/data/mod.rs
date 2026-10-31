@@ -14,7 +14,6 @@ pub mod ingress;
 mod io;
 mod ports;
 mod proxy;
-mod proxy_header;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
@@ -28,6 +27,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::forwarded::TrustedProxies;
 pub use ports::PortSettings;
 
 /// One routable hostname or public port.
@@ -91,6 +91,7 @@ pub struct ProxySettings {
     pub websocket_idle_timeout: Duration,
     pub stream_open_timeout: Duration,
     pub ports: PortSettings,
+    pub trusted_proxies: TrustedProxies,
 }
 
 impl ProxySettings {
@@ -100,6 +101,7 @@ impl ProxySettings {
             websocket_idle_timeout: Duration::from_secs(cfg.public.websocket_idle_timeout_secs),
             stream_open_timeout: Duration::from_secs(10),
             ports: PortSettings::from_config(&cfg.ports),
+            trusted_proxies: cfg.trusted_proxies(),
         }
     }
 }

@@ -8,7 +8,7 @@ use http::request::Parts;
 use magicpipes_core::proto::{EnrollRequest, ErrorBody};
 use serde_json::json;
 
-use super::{AppState, PeerAddr, bearer_token};
+use super::{AppState, ClientIp, bearer_token};
 
 pub struct ApiError(StatusCode, ErrorBody);
 
@@ -22,6 +22,10 @@ fn api_err(status: StatusCode, code: &str, msg: &str) -> ApiError {
     ApiError(status, ErrorBody::new(code, msg))
 }
 
+fn rate_limited() -> ApiError {
+    api_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many failed attempts")
+}
+
 /// Extractor: a valid admin bearer token.
 pub struct Admin;
 
@@ -29,18 +33,10 @@ impl FromRequestParts<AppState> for Admin {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Self::Rejection> {
-        let ip = parts.extensions.get::<PeerAddr>().map(|p| p.0.ip());
-        if ip.is_some_and(|ip| app.limiter.blocked(ip)) {
-            return Err(api_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many failed attempts"));
-        }
         match bearer_token(&parts.headers) {
             Some(t) if app.control.verify_admin(t) => Ok(Admin),
-            _ => {
-                if let Some(ip) = ip {
-                    app.limiter.fail(ip);
-                }
-                Err(api_err(StatusCode::UNAUTHORIZED, "unauthorized", "a valid admin bearer token is required"))
-            }
+            _ if app.limiter.reject(parts.extensions.get::<ClientIp>().map(|c| c.0)) => Err(rate_limited()),
+            _ => Err(api_err(StatusCode::UNAUTHORIZED, "unauthorized", "a valid admin bearer token is required")),
         }
     }
 }
@@ -99,19 +95,13 @@ pub async fn create_enrollment(_: Admin, State(app): State<AppState>) -> Result<
 
 pub async fn enroll(
     State(app): State<AppState>,
-    peer: Option<axum::Extension<PeerAddr>>,
+    client: Option<axum::Extension<ClientIp>>,
     Json(req): Json<EnrollRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let ip = peer.map(|p| p.0.0.ip());
-    if ip.is_some_and(|ip| app.limiter.blocked(ip)) {
-        return Err(api_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many failed attempts"));
-    }
     match app.control.enroll(&req) {
         Ok(r) => Ok((StatusCode::CREATED, Json(r))),
+        Err(e) if e.code != "internal" && app.limiter.reject(client.map(|c| c.0.0)) => Err(rate_limited()),
         Err(e) => {
-            if let Some(ip) = ip {
-                app.limiter.fail(ip);
-            }
             let status = if e.code == "internal" { StatusCode::INTERNAL_SERVER_ERROR } else { StatusCode::UNAUTHORIZED };
             Err(ApiError(status, e))
         }

@@ -145,6 +145,7 @@ async fn http_websocket_and_lifecycle() {
     let resp = env.send("localhost", env.mgmt_port, ui_login(admin.clone())).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let cookie = resp.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("__Host-mp_session="), "{cookie}");
     assert!(resp.headers()[header::SET_COOKIE].to_str().unwrap().contains("HttpOnly"));
     let page = |cookie: String| {
         Request::get("/").header(header::HOST, format!("localhost:{}", env.mgmt_port)).header(header::COOKIE, cookie).body(Full::new(Bytes::new())).unwrap()
@@ -154,8 +155,20 @@ async fn http_websocket_and_lifecycle() {
     let html = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     assert!(html.contains(&host1) && html.contains("sockets") && html.contains("connected"), "{html}");
     // Without a session the UI redirects to the login page.
-    let resp = env.send("localhost", env.mgmt_port, page("mp_session=bogus".into())).await;
+    let resp = env.send("localhost", env.mgmt_port, page("__Host-mp_session=bogus".into())).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    // State-changing forms need the session's CSRF token, not just the cookie.
+    let forged = Request::post("/logout")
+        .header(header::HOST, format!("localhost:{}", env.mgmt_port))
+        .header(header::COOKIE, cookie.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Full::new(Bytes::from("csrf=wrong")))
+        .unwrap();
+    assert_eq!(env.send("localhost", env.mgmt_port, forged).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(env.send("localhost", env.mgmt_port, page(cookie.clone())).await.status(), 200, "session survived");
+    // The management interface answers only for its own hostname, never a tunnel's.
+    let misdirected = Request::get("/login").header(header::HOST, &host1).body(Full::new(Bytes::new())).unwrap();
+    assert_eq!(env.send("localhost", env.mgmt_port, misdirected).await.status(), StatusCode::MISDIRECTED_REQUEST);
 
     // --- local app down: infrastructure error, status "error" -----------------------------------
     app.stop();

@@ -72,7 +72,21 @@ import { Unicode11Addon } from "/assets/addon-unicode11.mjs";
 
 const $ = (id) => document.getElementById(id);
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-const key = new URLSearchParams(location.hash.slice(1)).get("k");
+// The write key arrives in the #fragment (never sent to a server). Move it into this tab's
+// sessionStorage and drop it from the address bar, so it doesn't sit in history or get copied
+// along with the link; a reload in the same tab still finds it.
+const key = (() => {
+  const fromLink = new URLSearchParams(location.hash.slice(1)).get("k");
+  try {
+    if (fromLink) {
+      sessionStorage.setItem("mp-k", fromLink);
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+    return fromLink || sessionStorage.getItem("mp-k");
+  } catch {
+    return fromLink;
+  }
+})();
 const needsKey = document.body.dataset.access === "key";
 const small = matchMedia("(max-width:640px)").matches;
 

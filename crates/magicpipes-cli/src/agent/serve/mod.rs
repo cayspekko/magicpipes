@@ -196,7 +196,10 @@ async fn selection(req: Request<Incoming>) -> Result<Vec<String>, Response<Body>
 }
 
 fn archive_response(root: &Path, dir: PathBuf, folder: &str, names: Vec<String>) -> Response<Body> {
-    let body = archive::stream(root.to_path_buf(), dir, names).boxed_unsync();
+    let Some(body) = archive::stream(root.to_path_buf(), dir, names) else {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in progress; try again shortly\n");
+    };
+    let body = body.boxed_unsync();
     let mut resp = Response::new(body);
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
@@ -289,10 +292,19 @@ fn encode_path(segments: &[String]) -> String {
     })
 }
 
-/// Resolves symlinks; `None` unless the result exists and lies inside `root`.
+/// Resolves symlinks; `None` unless the result exists and is servable (see [`servable_path`]).
 async fn contain(root: &Path, path: &Path) -> Option<PathBuf> {
     let real = tokio::fs::canonicalize(path).await.ok()?;
-    real.starts_with(root).then_some(real)
+    servable_path(root, &real).then_some(real)
+}
+
+/// Whether a canonical path lies inside `root` with every component servable. Checking the
+/// resolved path, not just the requested one, keeps hidden entries hidden behind a symlink
+/// (`notes.txt -> .env`) and behind Windows short names (`GIT~1` for `.git`).
+fn servable_path(root: &Path, real: &Path) -> bool {
+    real.strip_prefix(root).is_ok_and(|rel| {
+        rel.components().all(|c| matches!(c, std::path::Component::Normal(n) if n.to_str().is_some_and(servable_name)))
+    })
 }
 
 async fn file(path: &Path, name: &str, download: bool, req: Request<Incoming>) -> Response<Body> {
@@ -385,6 +397,24 @@ mod tests {
         for bad in ["/..", "/a/../b", "/%2e%2e/x", "/.env", "/a/.git/config", "/a%2Fb", "/a%5Cb", "/a%00", "/%zz", "/%C3", "/%"] {
             assert_eq!(parse_path(bad), None, "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_to_hidden_entries_stay_hidden() {
+        let dir = std::env::temp_dir().join(format!("mp-serve-{}", magicpipes_core::secret::random_string(8)));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".env"), "secret").unwrap();
+        std::fs::write(dir.join("ok.txt"), "fine").unwrap();
+        std::os::unix::fs::symlink(".env", dir.join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink(".git", dir.join("repo")).unwrap();
+        std::os::unix::fs::symlink("ok.txt", dir.join("alias.txt")).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        assert!(contain(&root, &root.join("ok.txt")).await.is_some());
+        assert!(contain(&root, &root.join("alias.txt")).await.is_some());
+        assert!(contain(&root, &root.join("notes.txt")).await.is_none());
+        assert!(contain(&root, &root.join("repo")).await.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

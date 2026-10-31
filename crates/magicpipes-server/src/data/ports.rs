@@ -26,7 +26,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{DataPlane, Outcome, Route, proxy_header};
+use super::{DataPlane, Outcome, Route};
+use crate::forwarded::client_key;
+use crate::proxy_header;
 use crate::config::PortsConfig;
 
 #[derive(Debug, Clone)]
@@ -50,8 +52,6 @@ impl PortSettings {
     }
 }
 
-/// Time allowed for a load balancer's PROXY header.
-const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Queued datagrams per UDP flow while its stream is opening or busy; more are dropped.
 const FLOW_QUEUE: usize = 64;
 
@@ -97,11 +97,15 @@ fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr) -> Option<(Arc
     }
 }
 
-/// Opens a data stream to the agent and waits for its status byte.
-async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, header: ServerOpen) -> Option<MuxStream> {
+/// Opens a data stream to the agent for `client` and waits for its status byte.
+async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
     let timeout = dp.settings.stream_open_timeout;
-    let mut stream = match session.open(timeout).await {
+    let mut stream = match session.open_data(timeout, client_key(client)).await {
         Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            tracing::debug!(tunnel = %route.tunnel_id, %client, "agent stream budget used up; refusing");
+            return None;
+        }
         Err(_) => {
             route.stats.record(Outcome::AgentOffline);
             return None;
@@ -157,16 +161,14 @@ async fn tcp_connection(dp: &DataPlane, port: u16, mut tcp: TcpStream, mut peer:
     // Notices clients that vanished without closing, which would otherwise hold a stream forever.
     let _ = SockRef::from(&tcp).set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)));
     if dp.settings.ports.proxy_protocol {
-        match tokio::time::timeout(PROXY_HEADER_TIMEOUT, proxy_header::read(&mut tcp)).await {
-            Ok(Ok(Some(client))) => peer = client,
-            Ok(Ok(None)) => {} // the proxy's own health check
-            Ok(Err(e)) => return tracing::debug!(port, %peer, error = %e, "bad PROXY header"),
-            Err(_) => return tracing::debug!(port, %peer, "no PROXY header"),
+        match proxy_header::client_addr(&mut tcp, peer, &dp.settings.trusted_proxies).await {
+            Ok(client) => peer = client,
+            Err(e) => return tracing::debug!(port, %peer, error = %e, "bad PROXY header"),
         }
     }
     let Some((route, session)) = admit(dp, Kind::Tcp, port, peer) else { return };
     let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
-    let Some(mut stream) = open(dp, &route, &session, header).await else { return };
+    let Some(mut stream) = open(dp, &route, &session, peer.ip(), header).await else { return };
     if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await {
         tracing::debug!(port, %peer, error = %e, "port connection ended");
     }
@@ -218,7 +220,7 @@ async fn udp_flow(
     mut rx: mpsc::Receiver<Bytes>,
 ) {
     let header = ServerOpen::Datagram { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
-    let Some(stream) = open(&dp, &route, &session, header).await else { return };
+    let Some(stream) = open(&dp, &route, &session, peer.ip(), header).await else { return };
     let (mut rd, mut wr) = tokio::io::split(stream);
     let idle = dp.settings.ports.udp_idle_timeout;
     let epoch = Instant::now();

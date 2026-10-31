@@ -3,6 +3,9 @@
 
 base_domain = "t.example.com"
 data_dir = "/data"            # the magicpipes-data volume
+# Behind a reverse proxy (HAProxy, Traefik, ...) on a Docker network: its addresses, plus
+# proxy_protocol = true in [public]/[management] if it passes TLS through with send-proxy-v2.
+# trusted_proxies = ["172.16.0.0/12"]
 
 [public]
 https_listen = "0.0.0.0:443"

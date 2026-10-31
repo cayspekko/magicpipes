@@ -89,10 +89,14 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   third-party origins. Vendored browser assets live in `agent/shell/assets/` with a README
   (source, version) and their license file, which `release.yml` must copy into archives.
 - **Management UI**: state-changing requests need the session cookie *and* the CSRF token.
-  Tunnel subdomains share the base domain with the management host, so never widen cookie
-  scope to the parent domain.
-- **Proxy headers**: the server strips `x-magicpipes-*` headers from upstream responses and sets
-  forwarding headers itself; only `proxy_protocol = true` makes it trust a PROXY header.
+  Tunnel subdomains share the base domain with the management host, so the management listener
+  answers only for `management.hostname` (`SingleHost` certificates, `require_host`), the
+  cookie keeps its `__Host-` prefix, and its scope is never widened.
+- **Client addresses** come from `forwarded::TrustedProxies` and `proxy_header::client_addr`,
+  never straight from a header: a PROXY header or X-Forwarded-For is believed only from
+  `trusted_proxies`. The server strips `x-magicpipes-*` headers from upstream responses.
+- **Public traffic can't starve control traffic**: server-opened data streams go through
+  `MuxHandle::open_data` (per-session and per-client budget); RPCs and pings use `open`.
 - **Filesystem**: secrets and state under `~/.magicpipes` and the server `data_dir` are 0600 in
   0700 directories (written atomically). Static file serving must stay inside the served root,
   including through symlinks and archives.

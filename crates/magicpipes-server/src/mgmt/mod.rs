@@ -17,8 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use http::{HeaderMap, HeaderValue, header};
+use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use magicpipes_core::secret;
@@ -29,11 +32,16 @@ use tokio_util::task::TaskTracker;
 use tower::ServiceExt;
 
 use crate::control::ControlPlane;
+use crate::forwarded::client_key;
 use crate::listen::{ListenOpts, serve};
 
 /// Remote address of the management connection, inserted into request extensions.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerAddr(pub SocketAddr);
+
+/// The client's address: the peer, or what a trusted proxy reported (`trusted_proxies`).
+#[derive(Clone, Copy, Debug)]
+pub struct ClientIp(pub IpAddr);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -76,8 +84,43 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/enrollments", post(api::create_enrollment))
         .route("/api/v1/enroll", post(api::enroll))
         .route(magicpipes_core::proto::AGENT_CONNECT_PATH, get(crate::gateway::connect))
+        .layer(axum::middleware::from_fn(request_deadline))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_host))
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
+}
+
+/// Management requests and forms are small.
+const MAX_BODY: usize = 64 * 1024;
+/// Time allowed for a whole request, body included. hyper only bounds the headers, so without
+/// this a client that announces a body and never sends it would hold a connection forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Applies [`REQUEST_TIMEOUT`] to every request except the agent upgrade, which is long-lived.
+async fn request_deadline(req: Request, next: Next) -> axum::response::Response {
+    if req.uri().path() == magicpipes_core::proto::AGENT_CONNECT_PATH {
+        return next.run(req).await;
+    }
+    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, [(header::CONNECTION, "close")], "Request timed out.\n").into_response(),
+    }
+}
+
+/// Requests must name the management hostname (the TLS layer already refuses other SNI names;
+/// this also covers a mismatched Host header on a valid connection).
+async fn require_host(State(app): State<AppState>, req: Request, next: Next) -> axum::response::Response {
+    let host = req.uri().authority().map(|a| a.host().to_string()).or_else(|| {
+        let h = req.headers().get(header::HOST)?.to_str().ok()?;
+        h.parse::<http::uri::Authority>().ok().map(|a| a.host().to_string())
+    });
+    let expected = &app.control.config().management.hostname;
+    if host.is_some_and(|h| h.trim_end_matches('.').eq_ignore_ascii_case(expected)) {
+        next.run(req).await
+    } else {
+        (StatusCode::MISDIRECTED_REQUEST, "This server's management interface is not served at this address.\n").into_response()
+    }
 }
 
 async fn security_headers(mut resp: axum::response::Response) -> axum::response::Response {
@@ -101,13 +144,25 @@ pub async fn serve_mgmt(
     shutdown: CancellationToken,
     tracker: TaskTracker,
 ) {
+    let cfg = control.config();
+    let trusted = cfg.trusted_proxies();
+    let opts = ListenOpts {
+        name: "management",
+        max_connections: 1024,
+        max_per_client: 64,
+        header_read_timeout: Duration::from_secs(30),
+        trusted_proxies: trusted.clone(),
+        proxy_protocol: cfg.management.proxy_protocol,
+    };
     let app = router(control);
-    let opts = ListenOpts { name: "management", max_connections: 1024, header_read_timeout: Duration::from_secs(30) };
     serve(listener, Some(acceptor), opts, shutdown, tracker, move |conn| {
         let app = app.clone();
         let peer = conn.peer;
+        let trusted = trusted.clone();
         service_fn(move |mut req: http::Request<Incoming>| {
+            let client = trusted.client_ip(peer.ip(), req.headers());
             req.extensions_mut().insert(PeerAddr(peer));
+            req.extensions_mut().insert(ClientIp(client));
             let app = app.clone();
             async move { Ok::<_, Infallible>(app.oneshot(req).await.unwrap_or_else(|e| match e {})) }
         })
@@ -118,7 +173,9 @@ pub async fn serve_mgmt(
 // ---- UI sessions -------------------------------------------------------------------------
 
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
-pub const SESSION_COOKIE: &str = "mp_session";
+/// `__Host-`: browsers only accept it from this exact host, Secure, with `Path=/` and no
+/// `Domain`, so content on a tunnel subdomain cannot set or shadow it.
+pub const SESSION_COOKIE: &str = "__Host-mp_session";
 
 struct UiSession {
     csrf: String,
@@ -157,27 +214,63 @@ impl UiSessions {
 
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(300);
+const MAX_TRACKED: usize = 10_000;
 
+/// Failed credential checks per client. Every credential carries at least 192 bits, so this
+/// sheds load from guessing rather than protecting the secret: callers check credentials first,
+/// and valid ones are accepted even from a blocked address, so nobody can lock an admin out.
 #[derive(Default)]
 struct FailureLimiter {
     map: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl FailureLimiter {
-    fn blocked(&self, ip: IpAddr) -> bool {
-        let map = self.map.lock().unwrap();
-        map.get(&ip).is_some_and(|(n, since)| *n >= MAX_FAILURES && since.elapsed() < FAILURE_WINDOW)
-    }
-
-    fn fail(&self, ip: IpAddr) {
+    /// Records a failed attempt; `true` when the client was already over the limit.
+    fn reject(&self, ip: Option<IpAddr>) -> bool {
+        let Some(ip) = ip.map(client_key) else { return false };
         let mut map = self.map.lock().unwrap();
-        if map.len() > 10_000 {
+        if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
             map.retain(|_, (_, since)| since.elapsed() < FAILURE_WINDOW);
+            if map.len() >= MAX_TRACKED {
+                let oldest = map.iter().min_by_key(|(_, (_, since))| *since).map(|(k, _)| *k);
+                oldest.map(|k| map.remove(&k));
+            }
         }
         let e = map.entry(ip).or_insert((0, Instant::now()));
         if e.1.elapsed() >= FAILURE_WINDOW {
             *e = (0, Instant::now());
         }
-        e.0 += 1;
+        e.0 = e.0.saturating_add(1);
+        e.0 > MAX_FAILURES
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limiter_blocks_per_client_and_per_ipv6_prefix() {
+        let l = FailureLimiter::default();
+        let a: IpAddr = "203.0.113.9".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(!l.reject(Some(a)));
+        }
+        assert!(l.reject(Some(a)));
+        assert!(!l.reject(Some("203.0.113.10".parse().unwrap())));
+        for i in 0..MAX_FAILURES {
+            assert!(!l.reject(Some(format!("2001:db8::{i:x}").parse().unwrap())));
+        }
+        assert!(l.reject(Some("2001:db8::ffff:1".parse().unwrap())), "same /64");
+        assert!(!l.reject(None));
+    }
+
+    #[test]
+    fn limiter_memory_is_bounded() {
+        let l = FailureLimiter::default();
+        for i in 0..(MAX_TRACKED as u32 + 50) {
+            l.reject(Some(IpAddr::from(i.to_be_bytes())));
+        }
+        assert!(l.map.lock().unwrap().len() <= MAX_TRACKED);
     }
 }

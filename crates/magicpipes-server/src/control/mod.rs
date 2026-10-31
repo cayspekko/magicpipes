@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::certs::{CertManager, CertStatus};
-use crate::config::{Config, PortRange};
+use crate::config::{Config, PortRange, TlsMode};
 use crate::data::{DataPlane, Outcome, Route, RouteStats, RouteTable};
 use crate::store::{Store, TunnelRow};
 
@@ -38,7 +38,11 @@ struct State {
     tunnels: HashMap<String, TunnelRecord>,
     sessions: HashMap<String, Session>,
     next_conn_id: u64,
+    /// Per agent: when each of its recent tunnels needed a new certificate order.
+    cert_orders: HashMap<String, Vec<Instant>>,
 }
+
+const CERT_ORDER_WINDOW: Duration = Duration::from_secs(24 * 3600);
 
 struct TunnelRecord {
     row: TunnelRow,
@@ -362,6 +366,10 @@ impl ControlPlane {
         if owned >= self.cfg.agents.max_tunnels_per_agent {
             return Err(err("limit_reached", format!("an agent may own at most {} tunnels", self.cfg.agents.max_tunnels_per_agent)));
         }
+        let max_ports = self.cfg.agents.max_ports_per_agent;
+        if range.is_some() && st.tunnels.values().filter(|t| t.row.agent_id == agent_id && t.row.public_port.is_some()).count() >= max_ports {
+            return Err(err("limit_reached", format!("an agent may hold at most {max_ports} public ports")));
+        }
 
         let name = match &req.name {
             Some(n) => names::validate(n).map_err(|m| err("invalid_name", m))?,
@@ -373,6 +381,17 @@ impl ControlPlane {
         let hostname = self.cfg.hostname_for(&name);
         if hostname == self.cfg.management.hostname {
             return Err(err("invalid_name", format!("'{name}' is reserved")));
+        }
+        // Every new hostname costs a certificate order, and the CA's limits are shared by all
+        // agents (Let's Encrypt: 50 certificates per domain per week).
+        let new_cert = req.kind.is_http() && self.cfg.tls.mode == TlsMode::Acme && self.certs.status(&hostname) != CertStatus::Ready;
+        if new_cert {
+            let max = self.cfg.agents.max_new_certificates_per_day;
+            let orders = st.cert_orders.entry(agent_id.to_string()).or_default();
+            orders.retain(|t| t.elapsed() < CERT_ORDER_WINDOW);
+            if orders.len() >= max {
+                return Err(err("limit_reached", format!("an agent may add at most {max} new hostnames per day; reuse a name or try later")));
+            }
         }
         let public_port = match (range, req.remote_port) {
             (None, _) => None,
@@ -391,6 +410,9 @@ impl ControlPlane {
             allow,
         };
         self.store.insert_tunnel(&row).map_err(internal)?;
+        if new_cert {
+            st.cert_orders.entry(agent_id.to_string()).or_default().push(Instant::now());
+        }
         st.tunnels.insert(row.id.clone(), TunnelRecord { row: row.clone(), stats: Arc::default() });
         self.publish(&st);
         drop(st);

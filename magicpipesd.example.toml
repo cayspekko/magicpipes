@@ -9,15 +9,24 @@ base_domain = "t.example.com"
 # SQLite database, certificates, ACME account and the bootstrap admin token live here.
 data_dir = "/var/lib/magicpipes"
 
+# Reverse proxies or load balancers in front of magicpipesd (CIDR), e.g. HAProxy. Only these may
+# name the client: through a PROXY header where a listener has proxy_protocol = true, or
+# X-Forwarded-For from an HTTP proxy. Client addresses drive login rate limits, per-client
+# connection caps, --allow-cidr and the X-Forwarded-For that tunnels receive. Anyone else is
+# the client, and the forwarding headers it sends are dropped.
+# trusted_proxies = ["172.16.0.0/12"]
+
 [public]
 https_listen = "0.0.0.0:443"
 # Serves ACME HTTP-01 challenges and redirects everything else to HTTPS.
 http_listen = "0.0.0.0:80"
 # url_port = 443                     # port shown in public URLs (defaults to https_listen's port)
 # max_connections = 10000
+# max_connections_per_client = 256   # per client address (per /64 for IPv6); trusted proxies exempt
 # header_read_timeout_secs = 30
 # upstream_response_timeout_secs = 60
 # websocket_idle_timeout_secs = 600
+# proxy_protocol = false             # true behind a TCP load balancer passing TLS through (HAProxy send-proxy-v2)
 
 [management]
 # Management UI, JSON API and the agent endpoint share this listener.
@@ -25,6 +34,7 @@ listen = "0.0.0.0:8443"
 hostname = "example.com"
 # cert_file = "/etc/magicpipes/mgmt.crt" # optional: externally provisioned certificate
 # key_file  = "/etc/magicpipes/mgmt.key"
+# proxy_protocol = false               # as in [public]
 
 [tls]
 # "acme"   - per-hostname certificates via ACME HTTP-01 (default)
@@ -43,6 +53,8 @@ acme_directory = "letsencrypt"
 [agents]
 # session_timeout_secs = 45
 # max_tunnels_per_agent = 50
+# max_ports_per_agent = 10             # TCP/UDP ports one agent may hold
+# max_new_certificates_per_day = 20    # ACME: new hostnames one agent may add per 24 hours
 # enrollment_ttl_secs = 3600
 
 [ports]
@@ -52,7 +64,7 @@ acme_directory = "letsencrypt"
 # range = "65500-65535"
 # bind = "0.0.0.0"
 # public_host = "example.com"          # host in tcp:// and udp:// URLs (default: management.hostname)
-# proxy_protocol = false               # true only behind a TCP proxy sending PROXY headers (HAProxy send-proxy)
+# proxy_protocol = false               # as in [public]; the proxy must be in trusted_proxies
 # max_connections = 10000              # open TCP connections across all port tunnels
 # udp_idle_timeout_secs = 60
 # udp_max_flows = 128                  # UDP clients tracked at once per tunnel

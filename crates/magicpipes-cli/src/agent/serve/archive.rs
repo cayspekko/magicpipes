@@ -11,31 +11,43 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use hyper::body::{Body, Frame};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
-use super::servable_name;
+use super::{servable_name, servable_path};
 
 const CHUNK: usize = 64 * 1024;
+/// Archives being written at once, across all tunnels: each holds a blocking thread.
+const MAX_CONCURRENT: usize = 8;
+/// A client that reads nothing for this long is dropped, freeing its thread.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Starts writing the archive and returns its body. `names` are entries of `dir` (already
-/// validated as servable names); `root` is the canonical served root.
-pub fn stream(root: PathBuf, dir: PathBuf, names: Vec<String>) -> ChannelBody {
+static SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT)));
+
+/// Starts writing the archive and returns its body; `None` when too many are in progress.
+/// `names` are entries of `dir` (already validated as servable names); `root` is the canonical
+/// served root.
+pub fn stream(root: PathBuf, dir: PathBuf, names: Vec<String>) -> Option<ChannelBody> {
+    let slot = SLOTS.clone().try_acquire_owned().ok()?;
     let (tx, rx) = mpsc::channel(8);
+    let rt = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        let mut out = ChannelWriter { tx: tx.clone(), buf: Vec::with_capacity(CHUNK) };
+        let _slot = slot;
+        let mut out = ChannelWriter { tx: tx.clone(), buf: Vec::with_capacity(CHUNK), rt };
         let result = write(&root, &dir, &names, &mut out).and_then(|()| out.send());
         if let Err(e) = result {
             tracing::debug!(error = %e, "archive download ended early");
-            let _ = tx.blocking_send(Err(e));
+            let _ = tx.try_send(Err(e)); // best effort: the client may have stopped reading
         }
     });
-    ChannelBody(rx)
+    Some(ChannelBody(rx))
 }
 
 fn write(root: &Path, dir: &Path, names: &[String], out: &mut ChannelWriter) -> io::Result<()> {
@@ -49,7 +61,7 @@ fn write(root: &Path, dir: &Path, names: &[String], out: &mut ChannelWriter) -> 
 
 fn add<W: Write>(tar: &mut tar::Builder<W>, root: &Path, path: &Path, name: &Path) -> io::Result<()> {
     let (Ok(link), Ok(real)) = (std::fs::symlink_metadata(path), std::fs::canonicalize(path)) else { return Ok(()) };
-    if !real.starts_with(root) {
+    if !servable_path(root, &real) {
         return Ok(());
     }
     let Ok(meta) = std::fs::metadata(&real) else { return Ok(()) };
@@ -76,6 +88,7 @@ fn add<W: Write>(tar: &mut tar::Builder<W>, root: &Path, path: &Path, name: &Pat
 struct ChannelWriter {
     tx: mpsc::Sender<io::Result<Bytes>>,
     buf: Vec<u8>,
+    rt: tokio::runtime::Handle,
 }
 
 impl ChannelWriter {
@@ -84,7 +97,11 @@ impl ChannelWriter {
             return Ok(());
         }
         let chunk = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
-        self.tx.blocking_send(Ok(chunk)).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "client went away"))
+        match self.rt.block_on(tokio::time::timeout(SEND_TIMEOUT, self.tx.send(Ok(chunk)))) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "client went away")),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "client stopped reading")),
+        }
     }
 }
 

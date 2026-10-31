@@ -149,16 +149,26 @@ impl Session {
 
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
+        // A ping that times out means the connection is gone. One that fails outright is
+        // tolerated once: a busy session can briefly refuse a new stream.
+        let mut failed = 0;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = handle.closed() => break,
                 _ = ping.tick() => {
                     match tokio::time::timeout(PING_TIMEOUT, rpc_on(&handle, &Rpc::Ping)).await {
-                        Ok(Ok(RpcResponse::Pong)) => {}
-                        other => {
-                            tracing::warn!(result = ?other.map(|r| r.map(|_| ())), "ping failed");
+                        Ok(Ok(RpcResponse::Pong)) => failed = 0,
+                        Err(_) => {
+                            tracing::warn!("ping timed out");
                             break;
+                        }
+                        Ok(other) => {
+                            failed += 1;
+                            tracing::warn!(result = ?other.map(|_| ()), failed, "ping failed");
+                            if failed >= 2 {
+                                break;
+                            }
                         }
                     }
                 }
@@ -175,7 +185,7 @@ impl Session {
             let req = RegisterTunnel {
                 id: Some(t.id.clone()),
                 name: Some(t.name.clone()),
-                target: t.describe(),
+                target: t.server_description(),
                 kind: t.kind,
                 // Keeps the port if the server had to recreate the tunnel (e.g. a restored backup).
                 remote_port: t.public_port,
