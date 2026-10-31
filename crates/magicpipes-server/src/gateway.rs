@@ -102,6 +102,10 @@ async fn serve_rpc(control: Arc<ControlPlane>, agent_id: String, conn_id: u64, m
             Ok(()) => RpcResponse::Ok,
             Err(e) => RpcResponse::Error(e),
         },
+        Rpc::Check { id } => match control.check(&agent_id, &id).await {
+            Ok(()) => RpcResponse::Ok,
+            Err(e) => RpcResponse::Error(e),
+        },
         Rpc::CertStatus { hostname, wait_ms } => {
             match control.cert_status(&agent_id, &hostname, Duration::from_millis(wait_ms)).await {
                 Ok(s) => RpcResponse::Cert(s),

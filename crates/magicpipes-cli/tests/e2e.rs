@@ -555,6 +555,144 @@ async fn web_terminal() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// Sends `msg` through a TCP port and returns what came back (empty if the server closed it).
+async fn tcp_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return Vec::new() };
+    if s.write_all(msg).await.is_err() {
+        return Vec::new();
+    }
+    let mut got = vec![0u8; msg.len()];
+    match tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut got)).await {
+        Ok(Ok(_)) => got,
+        _ => Vec::new(),
+    }
+}
+
+async fn udp_roundtrip(client: &tokio::net::UdpSocket, port: u16, msg: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; 65536];
+    for _ in 0..5 {
+        client.send_to(msg, ("127.0.0.1", port)).await.unwrap();
+        if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf)).await {
+            return buf[..n].to_vec();
+        }
+    }
+    Vec::new()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn port_tunnels() {
+    let mut env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let echo = common::tcp_echo_app().await;
+    let (first, last) = env.ports;
+
+    // --- TCP: an echo service through a public port -------------------------------------------
+    let out = env.cli_ok(&["add", &echo.port.to_string(), "--tcp", "--name", "echo"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Checking tunnel...") && stderr.contains("Verifying public endpoint...  ✓"), "{stderr}");
+    assert!(stderr.contains("--allow-cidr"), "warns that the port is open to anyone: {stderr}");
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp"]).await;
+    assert_eq!((t["kind"].as_str(), t["created"].as_bool(), t["reachable"].as_bool()), (Some("tcp"), Some(false), Some(true)));
+    let port = t["public_port"].as_u64().unwrap() as u16;
+    assert!((first..=last).contains(&port), "{t}");
+    assert_eq!(t["public_url"], format!("tcp://localhost:{port}"));
+    assert_eq!(t["target"], format!("tcp://127.0.0.1:{}", echo.port));
+    assert_eq!(tcp_roundtrip(port, b"hello over tcp").await, b"hello over tcp");
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(tcp_roundtrip(port, &big).await, big, "large transfers arrive intact");
+
+    // An HTTP tunnel to the same local port is a separate tunnel.
+    let list = env.cli_json(&["list", "--json"]).await;
+    assert_eq!(list["tunnels"].as_array().unwrap().len(), 1);
+    assert_eq!(list["tunnels"][0]["kind"], "tcp");
+
+    // The management API shows the port.
+    let token = env.admin_token();
+    let (_, tunnels) = env.api("GET", "/api/v1/tunnels", Some(&token)).await;
+    let api_t = tunnels["tunnels"].as_array().unwrap().iter().find(|x| x["name"] == "echo").cloned().unwrap();
+    assert_eq!((api_t["kind"].as_str(), api_t["public_port"].as_u64(), api_t["tls"].as_str()), (Some("tcp"), Some(port as u64), Some("none")));
+
+    // --- --remote-port --------------------------------------------------------------------------
+    let echo2 = common::tcp_echo_app().await;
+    let wanted = if port == last { first } else { last };
+    let t2 = add_json(&env, &[&echo2.port.to_string(), "--tcp", "--remote-port", &wanted.to_string()]).await;
+    assert_eq!(t2["public_port"].as_u64(), Some(wanted as u64));
+    assert_eq!(tcp_roundtrip(wanted, b"second").await, b"second");
+    let echo3 = common::tcp_echo_app().await;
+    let out = env.cli(&["add", &echo3.port.to_string(), "--tcp", "--json", "--remote-port", &wanted.to_string()]).await;
+    assert_eq!(out.status.code(), Some(6), "{}", String::from_utf8_lossy(&out.stdout));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "port_unavailable");
+    let out = env.cli(&["add", &echo3.port.to_string(), "--tcp", "--json", "--remote-port", "80"]).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "port_unavailable", "outside the range: {v}");
+
+    // --- --allow-cidr ---------------------------------------------------------------------------
+    // Re-adding replaces the settings; 127.0.0.1 is not in 10.0.0.0/8, so even this machine's
+    // own check of the public port is refused (a warning, not a failure).
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-cidr", "10.0.0.0/8"]).await;
+    assert_eq!((t["public_port"].as_u64(), t["reachable"].as_bool()), (Some(port as u64), Some(false)));
+    assert_eq!(t["allow"], serde_json::json!(["10.0.0.0/8"]));
+    assert!(tcp_roundtrip(port, b"blocked").await.is_empty(), "client outside the allow-list");
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-cidr", "10.0.0.0/8", "--allow-cidr", "127.0.0.1"]).await;
+    assert_eq!(t["reachable"], true);
+    assert_eq!(tcp_roundtrip(port, b"allowed").await, b"allowed");
+    add_json(&env, &[&echo.port.to_string(), "--tcp"]).await;
+
+    // --- the local service stops, the agent goes away, the server restarts ---------------------
+    echo2.stop();
+    assert!(tcp_roundtrip(wanted, b"x").await.is_empty(), "local service down: connection closed");
+    env.cli_ok(&["agent", "stop"]).await;
+    assert!(tcp_roundtrip(port, b"x").await.is_empty(), "agent offline: connection closed");
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(), "the port stays reserved while the agent is offline");
+    env.stop_server().await;
+    env.start_server().await;
+    env.cli_ok(&["agent", "start"]).await;
+    env.eventually("tunnel restored after a server restart", Duration::from_secs(20), || async {
+        tcp_roundtrip(port, b"back").await == b"back"
+    })
+    .await;
+
+    // --- UDP --------------------------------------------------------------------------------------
+    let dns = common::udp_echo_app().await;
+    let out = env.cli_ok(&["add", &dns.port.to_string(), "--udp", "--name", "dns"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("UDP cannot be verified"), "{stderr}");
+    let u = add_json(&env, &[&dns.port.to_string(), "--udp"]).await;
+    assert_eq!((u["kind"].as_str(), u["verified"].as_bool()), (Some("udp"), Some(false)));
+    let uport = u["public_port"].as_u64().unwrap() as u16;
+    assert_eq!(u["public_url"], format!("udp://localhost:{uport}"));
+    let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(udp_roundtrip(&a, uport, b"one").await, b"echo:one");
+    assert_eq!(udp_roundtrip(&b, uport, b"two").await, b"echo:two", "each client gets its own replies");
+    assert_eq!(udp_roundtrip(&a, uport, b"three").await, b"echo:three");
+    // macOS caps UDP datagrams at 9216 bytes by default.
+    let big = vec![7u8; 9_000];
+    assert_eq!(udp_roundtrip(&a, uport, &big).await.len(), 9_005, "large datagrams keep their size");
+    // A flow ends after the idle timeout (5s in tests) and a new one starts on the next datagram.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(udp_roundtrip(&a, uport, b"later").await, b"echo:later");
+
+    // --- removing frees the port -------------------------------------------------------------------
+    env.cli_ok(&["remove", "echo"]).await;
+    env.eventually("port closed after remove", Duration::from_secs(5), || async {
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err()
+    })
+    .await;
+    env.cli_ok(&["remove", "dns"]).await;
+
+    // --- input errors ------------------------------------------------------------------------------
+    assert_eq!(env.cli(&["add", "8080", "--remote-port", "65500"]).await.status.code(), Some(2));
+    assert_eq!(env.cli(&["add", "8080", "--tcp", "--allow-cidr", "10.0.0.0/33"]).await.status.code(), Some(2));
+    assert_eq!(env.cli(&["add", "--serve", ".", "--tcp"]).await.status.code(), Some(2));
+    let out = env.cli(&["add", &common::free_port().to_string(), "--tcp", "--json"]).await;
+    assert_eq!(out.status.code(), Some(4), "nothing listening locally");
+
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_adds_start_one_agent() {
     let env = Env::new(Tls::DevCa).await;

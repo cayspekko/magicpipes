@@ -172,11 +172,25 @@ impl Session {
     /// Re-registers every local tunnel on a new session (idempotent on the server).
     async fn restore(&self) {
         for t in self.tunnels.list() {
-            let req = RegisterTunnel { id: Some(t.id.clone()), name: Some(t.name.clone()), target: t.target.describe() };
+            let req = RegisterTunnel {
+                id: Some(t.id.clone()),
+                name: Some(t.name.clone()),
+                target: t.describe(),
+                kind: t.kind,
+                // Keeps the port if the server had to recreate the tunnel (e.g. a restored backup).
+                remote_port: t.public_port,
+                allow: t.allow.clone(),
+            };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
                 Ok(RpcResponse::Tunnel(info)) => {
                     tracing::info!(tunnel = %t.name, "tunnel restored");
-                    let updated = LocalTunnel { public_url: info.public_url, hostname: info.hostname, name: info.name, ..t };
+                    let updated = LocalTunnel {
+                        public_url: info.public_url,
+                        hostname: info.hostname,
+                        name: info.name,
+                        public_port: info.public_port.or(t.public_port),
+                        ..t
+                    };
                     self.tunnels.upsert(updated, Registration::Registered);
                 }
                 Err(RpcError::Server(e)) if e.code == "not_found" => {

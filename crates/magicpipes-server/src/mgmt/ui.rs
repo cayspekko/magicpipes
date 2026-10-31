@@ -164,6 +164,19 @@ fn display_url(url: &str) -> &str {
     url.strip_prefix("https://").unwrap_or(url)
 }
 
+/// The public address: a link for HTTP tunnels; `tcp://` and `udp://` are not browsable.
+fn public_address(t: &TunnelView, class: &str) -> String {
+    if t.kind.is_http() {
+        format!(
+            r#"<a class="{class}" href="{url}" target="_blank" rel="noopener noreferrer">{shown} ↗</a>"#,
+            url = esc(&t.public_url),
+            shown = esc(display_url(&t.public_url)),
+        )
+    } else {
+        format!(r#"<code class="{class}">{}</code>"#, esc(&t.public_url))
+    }
+}
+
 pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     let agents = app.control.agents();
     let agent_name = |id: &str| agents.iter().find(|a| a.id == id).map(|a| a.name.clone()).unwrap_or_else(|| id.to_string());
@@ -171,15 +184,14 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     let mut rows = String::new();
     for t in &tunnels {
         rows.push_str(&format!(
-            r#"<tr><td><a class="name" href="/tunnels/{id}">{name}</a><a class="sub" href="{url}" target="_blank" rel="noopener noreferrer">{shown} ↗</a></td><td><code>{target}</code></td><td>{agent}</td><td>{status}</td><td>{tls}</td><td class="num">{requests}</td></tr>"#,
+            r#"<tr><td><a class="name" href="/tunnels/{id}">{name}</a>{address}</td><td><code>{target}</code></td><td>{agent}</td><td>{status}</td><td>{tls}</td><td class="num">{requests}</td></tr>"#,
             id = esc(&t.id),
             name = esc(&t.name),
-            url = esc(&t.public_url),
-            shown = esc(display_url(&t.public_url)),
+            address = public_address(t, "sub"),
             target = esc(&t.target),
             agent = esc(&agent_name(&t.agent_id)),
             status = badge(t.status),
-            tls = badge(t.tls),
+            tls = if t.kind.is_http() { badge(t.tls) } else { r#"<span class="sub">—</span>"#.into() },
             requests = t.requests,
         ));
     }
@@ -244,20 +256,28 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str) -> String {
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
     dl.push_str(&field("Agent", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
-    dl.push_str(&field("TLS certificate", &badge(t.tls)));
+    if t.kind.is_http() {
+        dl.push_str(&field("TLS certificate", &badge(t.tls)));
+    } else {
+        let allow = if t.allow.is_empty() { "anyone".to_string() } else { esc(&t.allow.join(", ")) };
+        dl.push_str(&field("Allowed clients", &allow));
+    }
     if let Some(e) = &t.tls_error {
         dl.push_str(&field("TLS error", &esc(e)));
+    }
+    if let Some(e) = &t.port_error {
+        dl.push_str(&field("Port error", &esc(e)));
     }
     dl.push_str(&field("Tunnel ID", &format!("<code>{}</code>", esc(&t.id))));
     dl.push_str(&field("Created", &when(&t.created_at)));
     let last = t.last_request_at.as_deref().map(when).unwrap_or_else(|| "never".into());
     format!(
         r#"<a class="crumb" href="/">← Tunnels</a>
-<div class="head"><div><h1>{name}</h1><p class="lede"><a href="{url}" target="_blank" rel="noopener noreferrer">{shown} ↗</a></p></div>
+<div class="head"><div><h1>{name}</h1><p class="lede">{address}</p></div>
 <a class="btn" href="/tunnels/{id}">Refresh</a></div>
 <div class="stats">
 <div class="stat"><div class="k">Status</div><div class="v sm">{status}</div></div>
-<div class="stat"><div class="k">Requests</div><div class="v">{requests}</div></div>
+<div class="stat"><div class="k">{requests_label}</div><div class="v">{requests}</div></div>
 <div class="stat"><div class="k">Upstream errors</div><div class="v">{errors}</div></div>
 <div class="stat"><div class="k">Last request</div><div class="v sm">{last}</div></div>
 </div>
@@ -266,8 +286,8 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str) -> String {
 <div class="card panel danger" style="margin-top:20px"><div><h3>Delete tunnel</h3><p>The public URL stops working at once and the agent stops serving it. In-flight requests finish.</p></div>
 <form method="post" action="/tunnels/{id}/delete"><input type="hidden" name="csrf" value="{csrf}"><button class="btn danger">Delete tunnel</button></form></div>"#,
         name = esc(&t.name),
-        url = esc(&t.public_url),
-        shown = esc(display_url(&t.public_url)),
+        address = public_address(t, ""),
+        requests_label = if t.kind.is_http() { "Requests" } else { "Connections" },
         id = esc(&t.id),
         status = badge(t.status),
         requests = t.requests,

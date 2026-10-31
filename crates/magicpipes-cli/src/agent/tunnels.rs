@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
+use magicpipes_core::proto::Kind;
+
 use crate::state::{self, LocalTunnel, Target};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -41,6 +43,7 @@ impl Entry {
 
 /// What a data stream needs to serve a tunnel.
 pub struct Route {
+    pub kind: Kind,
     pub target: Target,
     pub streams_ok: Arc<AtomicU64>,
     pub ended: CancellationToken,
@@ -84,7 +87,7 @@ impl Tunnels {
         let mut map = self.map.lock().unwrap();
         match map.get_mut(&t.id) {
             Some(e) => {
-                if e.tunnel.target != t.target {
+                if (&e.tunnel.target, e.tunnel.kind) != (&t.target, t.kind) {
                     e.ended.cancel();
                     e.ended = CancellationToken::new();
                 }
@@ -150,6 +153,7 @@ impl Tunnels {
     pub fn route(&self, id: &str) -> Option<Route> {
         let map = self.map.lock().unwrap();
         map.get(id).map(|e| Route {
+            kind: e.tunnel.kind,
             target: e.tunnel.target.clone(),
             streams_ok: e.streams_ok.clone(),
             ended: e.ended.clone(),

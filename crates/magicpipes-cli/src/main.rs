@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use magicpipes_core::proto::Kind;
 use serde_json::{Value, json};
 
 use crate::ipc::{AddRequest, ErrorInfo, IpcRequest, StepState};
@@ -54,10 +55,24 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
-    /// Expose a local port, serve a directory or share a terminal; returns once the public HTTPS URL is verified to work.
+    /// Expose a local port, serve a directory or share a terminal; returns once the public address is verified to work.
     Add {
-        /// Local TCP port of the application.
+        /// Local port of the application (TCP; UDP with --udp).
         port: Option<u16>,
+        /// Publish a raw TCP port (tcp://host:port) instead of an HTTPS hostname: databases, SSH,
+        /// game servers, anything that speaks TCP.
+        #[arg(long, conflicts_with_all = ["serve", "shell", "udp"])]
+        tcp: bool,
+        /// Publish a UDP port (udp://host:port); datagrams go to the local UDP port.
+        #[arg(long, conflicts_with_all = ["serve", "shell"])]
+        udp: bool,
+        /// With --tcp/--udp: ask for this public port (it must be in the server's range).
+        #[arg(long, value_name = "PORT")]
+        remote_port: Option<u16>,
+        /// With --tcp/--udp: only let clients from this network connect (CIDR or address;
+        /// repeatable). Default: anyone.
+        #[arg(long = "allow-cidr", value_name = "CIDR", value_parser = parse_cidr)]
+        allow_cidr: Vec<String>,
         /// Serve the files in DIR with the built-in web server instead of forwarding to a port.
         #[arg(long, value_name = "DIR", conflicts_with_all = ["port", "host", "shell"])]
         serve: Option<PathBuf>,
@@ -159,7 +174,8 @@ fn exit_code(code: &str) -> u8 {
         "not_logged_in" | "unauthorized" | "invalid_enrollment_token" | "config_error" => 3,
         "local_unreachable" | "invalid_port" | "invalid_host" | "invalid_directory" | "invalid_command" => 4,
         "server_unreachable" | "agent_unavailable" | "agent_start_failed" | "agent_not_running" | "agent_protocol" | "agent_outdated" => 5,
-        "name_conflict" | "name_taken" | "invalid_name" | "limit_reached" | "not_found" => 6,
+        "name_conflict" | "name_taken" | "invalid_name" | "limit_reached" | "not_found" | "port_unavailable" | "kind_mismatch"
+        | "ports_disabled" | "server_outdated" | "invalid_cidr" => 6,
         "tls_failed" | "tls_timeout" => 7,
         "probe_failed" => 8,
         _ => 1,
@@ -181,7 +197,9 @@ fn main() -> ExitCode {
 fn check_add_args(cmd: &Command) {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
-    let Command::Add { port, serve, shell, write, max_clients, command, .. } = cmd else { return };
+    let Command::Add { port, tcp, udp, remote_port, allow_cidr, serve, shell, write, max_clients, command, .. } = cmd else {
+        return;
+    };
     let fail = |kind, msg: &str| Cli::command().find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit();
     if port.is_none() && serve.is_none() && !shell {
         fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --serve <DIR> or --shell");
@@ -189,6 +207,16 @@ fn check_add_args(cmd: &Command) {
     if !shell && (*write || max_clients.is_some() || !command.is_empty()) {
         fail(ErrorKind::ArgumentConflict, "--write, --max-clients and a `-- <PROGRAM>` can only be used with --shell");
     }
+    if !tcp && !udp && (remote_port.is_some() || !allow_cidr.is_empty()) {
+        fail(ErrorKind::ArgumentConflict, "--remote-port and --allow-cidr can only be used with --tcp or --udp");
+    }
+    if remote_port == &Some(0) {
+        fail(ErrorKind::InvalidValue, "--remote-port must be between 1 and 65535");
+    }
+}
+
+fn parse_cidr(s: &str) -> Result<String, String> {
+    magicpipes_core::cidr::Cidr::parse(s).map(|c| c.to_string())
 }
 
 fn run_agent(detached: bool) -> ExitCode {
@@ -220,9 +248,34 @@ fn read_pid() -> Option<String> {
 async fn dispatch(cmd: Command) -> ExitCode {
     let (out, result) = match cmd {
         Command::Login { server, token, ca_cert, name, out } => (out, login(server, token, ca_cert, name, out).await),
-        Command::Add { port, serve, no_list, shell, write, max_clients, command, name, host, probe_path, timeout, out } => {
+        Command::Add {
+            port,
+            tcp,
+            udp,
+            remote_port,
+            allow_cidr,
+            serve,
+            no_list,
+            shell,
+            write,
+            max_clients,
+            command,
+            name,
+            host,
+            probe_path,
+            timeout,
+            out,
+        } => {
+            let kind = match (tcp, udp) {
+                (true, _) => Kind::Tcp,
+                (_, true) => Kind::Udp,
+                _ => Kind::Http,
+            };
             let req = AddRequest {
                 port,
+                kind,
+                remote_port,
+                allow: allow_cidr,
                 serve,
                 list: !no_list,
                 shell: shell.then(|| if command.is_empty() { login_shell() } else { command }),
@@ -371,6 +424,9 @@ impl Progress {
             StepState::Failed => {
                 let _ = writeln!(err, "✗");
             }
+            StepState::Warned => {
+                let _ = writeln!(err, "!");
+            }
         }
         let _ = err.flush();
     }
@@ -388,6 +444,8 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         let cwd = std::env::current_dir().and_then(std::fs::canonicalize);
         req.cwd = Some(cwd.map_err(|e| ErrorInfo::new("invalid_command", format!("cannot use the current directory: {e}")))?);
     }
+    let kind = req.kind;
+    let open_to_anyone = req.allow.is_empty();
     let serving = req.serve.clone();
     let listing = serving.is_some() && req.list;
     let shell = req.shell.as_ref().map(|argv| (state::command_line(argv), req.writable, req.cwd.clone().unwrap_or_default()));
@@ -431,7 +489,9 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         match &shell {
             Some((_, true, _)) => println!("Tunnel active in background. Anyone with this link can type into the terminal."),
             Some((_, false, _)) => println!("Tunnel active in background. Anyone with the URL can watch; each visitor gets their own copy."),
-            None => println!("Tunnel active in background. Anyone with the URL can reach it."),
+            None if kind.is_http() => println!("Tunnel active in background. Anyone with the URL can reach it."),
+            None if open_to_anyone => println!("Tunnel active in background. Anyone who finds the port can connect."),
+            None => println!("Tunnel active in background. Only the allowed networks can connect."),
         }
         println!("Stop it with: magicpipes remove {}", data["name"].as_str().unwrap_or_default());
     }
@@ -444,6 +504,24 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             eprintln!("re-running this command prints the same link, and `magicpipes remove` revokes it.");
         } else {
             eprintln!("Visitors only watch: their keystrokes are ignored. Use --write to let people type.");
+        }
+    }
+    if !kind.is_http() && !out.quiet {
+        let url = data["public_url"].as_str().unwrap_or_default();
+        if data["reachable"] == false {
+            eprintln!();
+            eprintln!("Warning: this machine could not connect to {url}. The tunnel works from the server");
+            eprintln!("inward; check that the server's firewall or router forwards this port. (Some networks");
+            eprintln!("cannot reach their own public address, so clients elsewhere may still get through.)");
+        }
+        if kind == Kind::Udp {
+            eprintln!();
+            eprintln!("UDP cannot be verified end to end: datagrams to {url} now reach the local port.");
+        }
+        if open_to_anyone {
+            eprintln!();
+            eprintln!("The port is open to the whole internet, and nothing but your service authenticates");
+            eprintln!("clients. Use --allow-cidr to limit who can connect.");
         }
     }
     if listing && !out.quiet {
@@ -462,7 +540,7 @@ async fn list(out: Output) -> Result<(), ErrorInfo> {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|t| {
-                    json!({ "id": t.id, "name": t.name, "public_url": t.public_url, "target": t.target.describe(),
+                    json!({ "id": t.id, "name": t.name, "kind": t.kind, "public_url": t.public_url, "target": t.describe(),
                             "status": "stopped", "created_at": magicpipes_core::rfc3339(t.created_at) })
                 })
                 .collect();

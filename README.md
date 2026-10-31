@@ -31,9 +31,9 @@ your application. The tunnel then keeps running in a background agent after the 
 Nothing listens for inbound connections on your machine. You don't configure a reverse proxy,
 create per-app DNS records, or restart anything when you add a tunnel. HTTP/1.1 and WebSockets
 both work. `magicpipes add --serve <dir>` publishes a directory of files with a built-in web
-server, and `magicpipes add --shell` shares a terminal in the browser (like ttyd). See
-[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next (TCP/UDP ports, an SSH gateway, browser
-desktop).
+server, `magicpipes add --shell` shares a terminal in the browser (like ttyd), and
+`magicpipes add 5432 --tcp` (or `--udp`) publishes any service on a raw public port. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next (an SSH gateway, browser desktop).
 
 > **Public means public.** Anyone who knows a tunnel URL can reach it. The random name is not
 > access control. Put authentication in your application if it needs it.
@@ -108,6 +108,21 @@ from `MAGICPIPESD_CONFIG`.
 The management listener uses the same certificate source for `management.hostname`, or
 `management.cert_file` / `management.key_file` if set.
 
+**TCP and UDP ports** are off until you give the server a port range:
+
+```toml
+[ports]
+range = "65500-65535"        # each port is usable for TCP and for UDP
+# public_host = "example.com"  # host in tcp:// and udp:// URLs (default: management.hostname)
+# proxy_protocol = true        # only behind a TCP proxy that sends PROXY headers
+```
+
+Every port in the range must reach `magicpipesd` from the internet, for both TCP and UDP (cloud
+firewall, router forwarding). Ports are bound when a tunnel claims them, so the range may
+overlap ports other programs use; those are skipped. If a TCP load balancer such as HAProxy
+sits in front, set `proxy_protocol = true` and `send-proxy-v2` on its servers, so the server
+sees (and `--allow-cidr` checks) the real client address instead of the proxy's.
+
 ### Administrator bootstrap
 
 On first start the server creates an admin token and writes it to `<data_dir>/admin-token`
@@ -134,6 +149,10 @@ docker compose exec magicpipesd magicpipesd enroll        # enrollment token for
 docker compose exec magicpipesd magicpipesd admin-token   # admin token for the UI/API
 docker compose logs -f
 ```
+
+For TCP/UDP tunnels, publish the `[ports]` range too (commented out in the compose file). Docker
+starts a proxy process per published port, so for a large range use `network_mode: host`
+instead.
 
 [`docker-compose.yml`](docker-compose.yml) publishes 80, 443 and 8443 and keeps state in the
 `magicpipes-data` volume. It hardens the container: read-only root, tmpfs `/tmp`, all
@@ -202,6 +221,8 @@ magicpipes add 3000 --name myapp    # https://myapp.t.example.com
 magicpipes add 5173 --json          # machine-readable output (see below)
 magicpipes add --serve ./dist       # serve a directory with the built-in file server
 magicpipes add --shell -- htop      # a terminal in the browser (read-only unless --write)
+magicpipes add 5432 --tcp           # a raw TCP port, e.g. tcp://example.com:65507
+magicpipes add 53 --udp             # a UDP port
 
 magicpipes list                     # tunnels on this machine and their status
 magicpipes status                   # login, agent and connection status
@@ -290,6 +311,50 @@ Checking program...           ✓
 > The MagicPipes server relays the terminal and can read it (it terminates TLS for every
 > tunnel). Use your own SSH for anything the server operator should not see.
 
+### TCP and UDP ports
+
+For anything that is not HTTP (databases, SSH, game servers, MQTT, DNS), `--tcp` or `--udp`
+gives the tunnel a port on the server instead of a hostname:
+
+```console
+$ magicpipes add 5432 --tcp --name db --allow-cidr 203.0.113.0/24
+Checking local service...     ✓
+Connecting to server...       ✓
+Registering tunnel...         ✓
+Checking tunnel...            ✓
+Verifying public endpoint...  ✓
+
+Tunnel ready
+
+  Public: tcp://example.com:65507
+  Local:  tcp://127.0.0.1:5432
+  Status: connected
+```
+
+```bash
+psql -h example.com -p 65507 -U me mydb
+```
+
+* **The port stays the same** for the tunnel: re-running `add`, restarting the agent or the
+  server keeps it. `--remote-port N` asks for a specific port inside the server's range.
+* **`--allow-cidr`** (repeatable: networks or single addresses) limits who can connect; other
+  clients are disconnected at once. Without it the port is open to the whole internet, and
+  only your service's own authentication protects it. The settings follow the latest `add`:
+  re-adding without `--allow-cidr` removes the limit.
+* **Readiness:** the server opens a connection to your service through the agent (so a service
+  that is down fails the `add`), then this machine connects to the public port. If that last
+  connection does not come through, `add` still succeeds but warns (`"reachable": false`): the
+  server's firewall may not forward the port, or your network may be unable to reach its own
+  public address.
+* **UDP** has no connections, so `add --udp` cannot check the service end to end
+  (`"verified": false`). Each client address gets its own path to your service; it is forgotten
+  after a minute without datagrams. Fine for DNS, syslog, game servers and the like; a poor fit
+  for VPNs such as WireGuard, which suffer when tunneled over TCP.
+* While the agent is offline the port stays reserved: connections are accepted and closed.
+* Traffic is not decrypted: the server sees only what your protocol sends (use TLS or SSH
+  inside for anything private). Each agent connection carries at most 256 TCP connections and
+  UDP clients at once.
+
 ### `add` semantics
 
 * The local service must already be accepting connections. The agent tries `127.0.0.1` and then
@@ -342,7 +407,7 @@ On failure:
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token` | Enrollment or credentials |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_start_failed`, `agent_not_running`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
-| 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found` | Naming/registry |
+| 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `invalid_cidr` | Naming/registry, or the server cannot give out that port |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
 | 8 | `probe_failed` | Public URL did not reach the application |
 

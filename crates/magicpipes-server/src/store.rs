@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use magicpipes_core::proto::Kind;
 use magicpipes_core::{secret, unix_now};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -23,6 +24,11 @@ pub struct TunnelRow {
     pub agent_id: String,
     pub target: String,
     pub created_at: i64,
+    pub kind: Kind,
+    /// Port tunnels only.
+    pub public_port: Option<u16>,
+    /// Port tunnels: allowed client networks (canonical CIDRs); empty = anyone.
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,13 +69,57 @@ CREATE TABLE IF NOT EXISTS tunnels (
 );
 "#;
 
+/// Schema changes after the initial schema, applied in order and tracked in `user_version`.
+/// Append only: a released migration never changes.
+const MIGRATIONS: &[&str] = &[
+    // 1: port tunnels. Their hostname stays `<name>.<base_domain>` (names are unique across
+    // kinds) but is never routed or given a certificate.
+    r#"
+    ALTER TABLE tunnels ADD COLUMN kind TEXT NOT NULL DEFAULT 'http';
+    ALTER TABLE tunnels ADD COLUMN public_port INTEGER;
+    ALTER TABLE tunnels ADD COLUMN allow TEXT NOT NULL DEFAULT '';
+    CREATE UNIQUE INDEX tunnels_public_port ON tunnels(kind, public_port) WHERE public_port IS NOT NULL;
+    "#,
+];
+
+fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(usize::try_from(version).unwrap_or(0)) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql).with_context(|| format!("database migration {}", i + 1))?;
+        tx.pragma_update(None, "user_version", i as i64 + 1)?;
+        tx.commit()?;
+        tracing::info!(version = i + 1, "database migrated");
+    }
+    Ok(())
+}
+
+const TUNNEL_COLUMNS: &str = "id, name, hostname, agent_id, target, created_at, kind, public_port, allow";
+
+fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
+    let kind: String = r.get(6)?;
+    let allow: String = r.get(8)?;
+    Ok(TunnelRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        hostname: r.get(2)?,
+        agent_id: r.get(3)?,
+        target: r.get(4)?,
+        created_at: r.get(5)?,
+        kind: Kind::parse(&kind).unwrap_or_default(),
+        public_port: r.get(7)?,
+        allow: allow.split_whitespace().map(str::to_string).collect(),
+    })
+}
+
 impl Store {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&mut conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -197,36 +247,29 @@ impl Store {
 
     pub fn tunnels(&self) -> anyhow::Result<Vec<TunnelRow>> {
         self.with(|c| {
-            let mut st = c.prepare(
-                "SELECT id, name, hostname, agent_id, target, created_at FROM tunnels ORDER BY created_at",
-            )?;
-            st.query_map([], |r| {
-                Ok(TunnelRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    hostname: r.get(2)?,
-                    agent_id: r.get(3)?,
-                    target: r.get(4)?,
-                    created_at: r.get(5)?,
-                })
-            })?
-            .collect()
+            let mut st = c.prepare(&format!("SELECT {TUNNEL_COLUMNS} FROM tunnels ORDER BY created_at"))?;
+            st.query_map([], tunnel_row)?.collect()
         })
     }
 
     pub fn insert_tunnel(&self, t: &TunnelRow) -> anyhow::Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO tunnels (id, name, hostname, agent_id, target, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![t.id, t.name, t.hostname, t.agent_id, t.target, t.created_at],
+                &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"),
+                params![t.id, t.name, t.hostname, t.agent_id, t.target, t.created_at, t.kind.as_str(), t.public_port, t.allow.join(" ")],
             )
         })?;
         Ok(())
     }
 
-    pub fn update_tunnel_target(&self, id: &str, target: &str) -> anyhow::Result<()> {
-        self.with(|c| c.execute("UPDATE tunnels SET target = ?1 WHERE id = ?2", params![target, id]))?;
+    /// Saves the settings an agent may change on an existing tunnel.
+    pub fn update_tunnel(&self, t: &TunnelRow) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3 WHERE id = ?4",
+                params![t.target, t.public_port, t.allow.join(" "), t.id],
+            )
+        })?;
         Ok(())
     }
 
@@ -272,6 +315,9 @@ mod tests {
                     agent_id: agent.clone(),
                     target: "http://127.0.0.1:1".into(),
                     created_at: 0,
+                    kind: Kind::Http,
+                    public_port: None,
+                    allow: vec![],
                 })
                 .unwrap();
         }
@@ -281,6 +327,47 @@ mod tests {
         assert_eq!(store.verify_agent_token(&other_token).unwrap().as_deref(), Some(other.as_str()));
         let left: Vec<_> = store.tunnels().unwrap().into_iter().map(|t| t.id).collect();
         assert_eq!(left, ["tn_b"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn migrates_an_old_database_and_keeps_ports_unique() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            // A database written before migrations existed, with one HTTP tunnel.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch(
+                "INSERT INTO agents (id, name, token_hash, created_at) VALUES ('ag_1', 'a', 'h', 0);
+                 INSERT INTO tunnels (id, name, hostname, agent_id, target, created_at)
+                 VALUES ('tn_old', 'old', 'old.t.test', 'ag_1', 'http://127.0.0.1:1', 0);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let old = &store.tunnels().unwrap()[0];
+        assert_eq!((old.kind, old.public_port, old.allow.len()), (Kind::Http, None, 0));
+        let row = |id: &str, kind, port| TunnelRow {
+            id: id.into(),
+            name: id.into(),
+            hostname: format!("{id}.t.test"),
+            agent_id: "ag_1".into(),
+            target: "tcp://127.0.0.1:5432".into(),
+            created_at: 1,
+            kind,
+            public_port: Some(port),
+            allow: vec!["10.0.0.0/8".into(), "192.0.2.1/32".into()],
+        };
+        store.insert_tunnel(&row("tn_tcp", Kind::Tcp, 65500)).unwrap();
+        store.insert_tunnel(&row("tn_udp", Kind::Udp, 65500)).unwrap();
+        assert!(store.insert_tunnel(&row("tn_dup", Kind::Tcp, 65500)).is_err(), "a TCP port belongs to one tunnel");
+        let tcp = store.tunnels().unwrap().into_iter().find(|t| t.id == "tn_tcp").unwrap();
+        assert_eq!(tcp.allow, ["10.0.0.0/8", "192.0.2.1/32"]);
+        drop(store);
+        // Opening again does not re-run migrations.
+        assert_eq!(Store::open(&path).unwrap().tunnels().unwrap().len(), 3);
         std::fs::remove_dir_all(dir).ok();
     }
 }

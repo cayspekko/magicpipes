@@ -16,3 +16,8 @@ hostname = "example.com"
 mode = "acme"
 acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # acme_email = "ops@example.com"
+
+# TCP/UDP port tunnels (`magicpipes add 5432 --tcp`). Also publish the range in
+# docker-compose.yml.
+# [ports]
+# range = "65500-65535"

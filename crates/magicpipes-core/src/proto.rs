@@ -17,7 +17,9 @@
 //! * **Server-opened streams are pushes or data.** The server writes one [`ServerOpen`] frame.
 //!   For [`ServerOpen::Data`] the agent connects to the tunnel's local target and writes a single
 //!   status byte ([`STREAM_OK`] or an error code); after `STREAM_OK` the stream is a raw,
-//!   bidirectional byte pipe to the local application.
+//!   bidirectional byte pipe to the local application. [`ServerOpen::Datagram`] is the same for
+//!   one UDP client, except that after `STREAM_OK` both directions carry datagrams framed by
+//!   [`write_datagram`] (a big-endian `u16` length, then the payload).
 //!
 //! Frames are a big-endian `u32` length followed by a JSON document, capped at [`MAX_FRAME`].
 
@@ -44,6 +46,48 @@ pub const STREAM_LOCAL_UNREACHABLE: u8 = 1;
 /// The agent does not know (or no longer serves) the requested tunnel.
 pub const STREAM_UNKNOWN_TUNNEL: u8 = 2;
 
+/// How a tunnel is reached publicly (the server's concern; the agent's local target is separate).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// A hostname under the base domain, with TLS on the public HTTPS port.
+    #[default]
+    Http,
+    /// A raw TCP port from the server's port range.
+    Tcp,
+    /// A UDP port from the server's port range.
+    Udp,
+}
+
+impl Kind {
+    pub fn is_http(&self) -> bool {
+        *self == Kind::Http
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Http => "http",
+            Kind::Tcp => "tcp",
+            Kind::Udp => "udp",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "http" => Some(Kind::Http),
+            "tcp" => Some(Kind::Tcp),
+            "udp" => Some(Kind::Udp),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -56,6 +100,9 @@ pub enum Request {
     Unregister { id: String },
     /// Wait (up to `wait_ms`) until the certificate for `hostname` is no longer pending.
     CertStatus { hostname: String, wait_ms: u64 },
+    /// Readiness check for a port tunnel: the server opens a data stream to this agent for the
+    /// tunnel and answers [`Response::Ok`] once the agent reports [`STREAM_OK`].
+    Check { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +114,16 @@ pub struct RegisterTunnel {
     /// Human-readable description of the local target, e.g. `http://127.0.0.1:8080`.
     /// Informational only: the server never dials it.
     pub target: String,
+    /// Absent (`http`) for agents and servers that predate port tunnels. A server that does not
+    /// know this field ignores it, so the agent checks [`TunnelInfo::kind`] in the answer.
+    #[serde(default, skip_serializing_if = "Kind::is_http")]
+    pub kind: Kind,
+    /// Port tunnels: a specific public port from the server's range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_port: Option<u16>,
+    /// Port tunnels: client networks allowed to connect (CIDRs or addresses); empty = anyone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,9 +141,14 @@ pub struct TunnelInfo {
     pub id: String,
     pub name: String,
     pub hostname: String,
+    /// `https://…`, or `tcp://host:port` / `udp://host:port` for port tunnels.
     pub public_url: String,
     /// `true` if this call created the tunnel, `false` if it already existed.
     pub created: bool,
+    #[serde(default)]
+    pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,7 +175,18 @@ impl ErrorBody {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerOpen {
     /// A public connection for `tunnel_id`; followed by raw bytes after the agent's status byte.
-    Data { tunnel_id: String },
+    /// `peer` is the client's address on port tunnels (for the agent's log).
+    Data {
+        tunnel_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+    },
+    /// One UDP client of `tunnel_id`; followed by framed datagrams after the status byte.
+    Datagram {
+        tunnel_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+    },
     /// The tunnel was deleted on the server (e.g. by an administrator).
     TunnelRemoved { tunnel_id: String },
 }
@@ -148,6 +221,33 @@ where
     w.flush().await
 }
 
+/// Largest datagram a [`ServerOpen::Datagram`] stream carries (the UDP payload limit).
+pub const MAX_DATAGRAM: usize = u16::MAX as usize;
+
+/// Writes one datagram on a [`ServerOpen::Datagram`] stream.
+pub async fn write_datagram<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> std::io::Result<()> {
+    let len = u16::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "datagram too large"))?;
+    let mut buf = Vec::with_capacity(2 + payload.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(payload);
+    w.write_all(&buf).await?;
+    w.flush().await
+}
+
+/// Reads one datagram into `buf` (resized to fit); `Ok(false)` at a clean end of stream.
+pub async fn read_datagram<R: AsyncRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+    let mut len = [0u8; 2];
+    match r.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    buf.resize(u16::from_be_bytes(len) as usize, 0);
+    r.read_exact(buf).await?;
+    Ok(true)
+}
+
 /// Reads exactly one frame; never consumes bytes beyond it.
 pub async fn read_frame<R, T>(r: &mut R) -> std::io::Result<T>
 where
@@ -172,12 +272,38 @@ mod tests {
     #[tokio::test]
     async fn frame_roundtrip_does_not_overread() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &ServerOpen::Data { tunnel_id: "tn_1".into() }).await.unwrap();
+        write_frame(&mut buf, &ServerOpen::Data { tunnel_id: "tn_1".into(), peer: None }).await.unwrap();
         buf.extend_from_slice(b"GET / HTTP/1.1\r\n");
         let mut r = &buf[..];
         let open: ServerOpen = read_frame(&mut r).await.unwrap();
-        assert_eq!(open, ServerOpen::Data { tunnel_id: "tn_1".into() });
+        assert_eq!(open, ServerOpen::Data { tunnel_id: "tn_1".into(), peer: None });
         assert_eq!(r, b"GET / HTTP/1.1\r\n");
+    }
+
+    #[tokio::test]
+    async fn datagrams_keep_their_boundaries() {
+        let mut buf = Vec::new();
+        for d in [&b"one"[..], b"", b"three"] {
+            write_datagram(&mut buf, d).await.unwrap();
+        }
+        let mut r = &buf[..];
+        let mut got = Vec::new();
+        let mut d = Vec::new();
+        while read_datagram(&mut r, &mut d).await.unwrap() {
+            got.push(d.clone());
+        }
+        assert_eq!(got, [b"one".to_vec(), vec![], b"three".to_vec()]);
+        assert!(write_datagram(&mut Vec::new(), &vec![0; MAX_DATAGRAM + 1]).await.is_err());
+    }
+
+    #[test]
+    fn old_peers_still_parse() {
+        // A register request from an agent that predates port tunnels is an HTTP tunnel.
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x"}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Http, remote_port: None, .. })));
+        // An answer from a server that predates port tunnels says http, whatever was asked.
+        let t: TunnelInfo = serde_json::from_str(r#"{"id":"tn","name":"a","hostname":"a.t","public_url":"https://a.t","created":true}"#).unwrap();
+        assert_eq!((t.kind, t.public_port), (Kind::Http, None));
     }
 
     #[tokio::test]

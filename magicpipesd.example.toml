@@ -44,3 +44,15 @@ acme_directory = "letsencrypt"
 # session_timeout_secs = 45
 # max_tunnels_per_agent = 50
 # enrollment_ttl_secs = 3600
+
+[ports]
+# Raw TCP and UDP tunnels (`magicpipes add 5432 --tcp`, `add 53 --udp`). Off unless `range` is
+# set. Every port in the range must be reachable from the internet for TCP and UDP (firewall,
+# router forwarding; in Docker use network_mode: host, see docker-compose.yml).
+# range = "65500-65535"
+# bind = "0.0.0.0"
+# public_host = "example.com"          # host in tcp:// and udp:// URLs (default: management.hostname)
+# proxy_protocol = false               # true only behind a TCP proxy sending PROXY headers (HAProxy send-proxy)
+# max_connections = 10000              # open TCP connections across all port tunnels
+# udp_idle_timeout_secs = 60
+# udp_max_flows = 128                  # UDP clients tracked at once per tunnel

@@ -138,7 +138,7 @@ async fn open_upstream(
         error_page(StatusCode::BAD_GATEWAY, "agent_unavailable", "Could not open a stream to the MagicPipes agent.")
     };
     let mut stream = session.open(dp.settings.stream_open_timeout).await.map_err(|_| fail())?;
-    proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone() })
+    proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })
         .await
         .map_err(|_| fail())?;
     Ok(StatusPrefixed::new(stream))

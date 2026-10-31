@@ -1,7 +1,7 @@
 //! `magicpipesd.toml` configuration. Every field except `base_domain` and
 //! `management.hostname` has a default.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
+    #[serde(default)]
+    pub ports: PortsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +137,67 @@ impl Default for AgentsConfig {
     }
 }
 
+/// Raw TCP and UDP port tunnels (`magicpipes add 5432 --tcp`). Off unless `range` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PortsConfig {
+    /// Ports handed out to tunnels, e.g. `"65500-65535"`. Each is used for TCP and for UDP.
+    pub range: Option<String>,
+    /// Address the port listeners bind to.
+    pub bind: IpAddr,
+    /// Host shown in `tcp://` and `udp://` URLs. Defaults to `management.hostname`.
+    pub public_host: Option<String>,
+    /// TCP connections start with a PROXY protocol header (v1 or v2) from a load balancer such as
+    /// HAProxy, which carries the real client address. Only enable this behind such a proxy.
+    pub proxy_protocol: bool,
+    /// Open TCP connections across all port tunnels.
+    pub max_connections: usize,
+    /// A UDP client is forgotten after this long without datagrams in either direction.
+    pub udp_idle_timeout_secs: u64,
+    /// UDP clients tracked at once per tunnel; datagrams from further clients are dropped.
+    pub udp_max_flows: usize,
+}
+
+impl Default for PortsConfig {
+    fn default() -> Self {
+        Self {
+            range: None,
+            bind: IpAddr::from([0, 0, 0, 0]),
+            public_host: None,
+            proxy_protocol: false,
+            max_connections: 10_000,
+            udp_idle_timeout_secs: 60,
+            udp_max_flows: 128,
+        }
+    }
+}
+
+/// An inclusive range of public ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub first: u16,
+    pub last: u16,
+}
+
+impl PortRange {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        let (a, b) = s.split_once('-').unwrap_or((s, s));
+        let num = |v: &str| v.trim().parse::<u16>().ok().filter(|p| *p > 0);
+        match (num(a), num(b)) {
+            (Some(first), Some(last)) if first <= last => Ok(Self { first, last }),
+            _ => bail!("ports.range must look like \"65500-65535\" (ports 1-65535, first <= last)"),
+        }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        (self.first..=self.last).contains(&port)
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.last - self.first) + 1
+    }
+}
+
 fn default_data_dir() -> PathBuf {
     PathBuf::from("/var/lib/magicpipes")
 }
@@ -172,7 +235,22 @@ impl Config {
         if self.tls.mode == TlsMode::Acme && self.public.http_listen.is_none() {
             bail!("tls.mode = \"acme\" requires public.http_listen for HTTP-01 challenges");
         }
+        if let Some(r) = &self.ports.range {
+            PortRange::parse(r)?;
+        }
         Ok(())
+    }
+
+    /// The configured port range, or `None` when port tunnels are off.
+    pub fn port_range(&self) -> Option<PortRange> {
+        self.ports.range.as_deref().and_then(|r| PortRange::parse(r).ok())
+    }
+
+    /// `tcp://host:port` or `udp://host:port`.
+    pub fn port_url(&self, kind: magicpipes_core::proto::Kind, port: u16) -> String {
+        let host = self.ports.public_host.as_deref().unwrap_or(&self.management.hostname);
+        let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+        format!("{kind}://{host}:{port}")
     }
 
     pub fn url_port(&self) -> u16 {
@@ -197,3 +275,17 @@ impl Config {
 
 /// Configuration template printed by `magicpipesd init-config`.
 pub const EXAMPLE: &str = include_str!("../../../magicpipesd.example.toml");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_ranges() {
+        assert_eq!(PortRange::parse("65500-65535").unwrap(), PortRange { first: 65500, last: 65535 });
+        assert_eq!(PortRange::parse("7000").unwrap().len(), 1);
+        for bad in ["", "0-10", "10-5", "a-b", "1-70000"] {
+            assert!(PortRange::parse(bad).is_err(), "{bad}");
+        }
+    }
+}

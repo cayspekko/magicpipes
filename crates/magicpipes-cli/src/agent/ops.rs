@@ -5,6 +5,10 @@
 //!     \______________\________________\_______________\____________\-> FAILED(step, code)
 //! ```
 //!
+//! Port tunnels (`tcp`, `udp`) replace the last two steps: the server checks the path to the
+//! local service (CHECKED), then, for TCP, this machine connects to the public port. That last
+//! probe only warns when it fails, since some networks cannot reach their own public address.
+//!
 //! Every step is bounded by the request's overall deadline. On failure a tunnel created by this
 //! request is unregistered again; pre-existing tunnels are left untouched.
 
@@ -12,7 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use magicpipes_core::proto::{CertState, RegisterTunnel, Request as Rpc, Response as RpcResponse, TunnelInfo};
+use magicpipes_core::cidr;
+use magicpipes_core::proto::{CertState, Kind, RegisterTunnel, Request as Rpc, Response as RpcResponse, TunnelInfo};
 use rustls::ClientConfig;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -25,7 +30,7 @@ use super::session::{ConnState, RpcError, Session};
 use super::shell;
 use super::tunnels::{Registration, Tunnels};
 use crate::ipc::{AddRequest, ErrorInfo, IpcEvent, Step, StepState};
-use crate::state::{LocalTunnel, Target, target_url};
+use crate::state::{LocalTunnel, Target, address, target_url};
 
 pub struct Agent {
     pub session: Arc<Session>,
@@ -104,26 +109,49 @@ impl Agent {
         };
         ev.step(Step::Register, StepState::Done).await;
 
-        let result = self.verify(&tunnel, &req, &ev, deadline).await;
-        if let Err(e) = result {
-            if created {
-                let _ = self.session.rpc(&Rpc::Unregister { id: tunnel.id.clone() }, Duration::from_secs(10)).await;
-                self.tunnels.remove(&tunnel.id);
-                tracing::info!(tunnel = %tunnel.name, "removed tunnel after failed readiness check");
+        let result = match tunnel.kind {
+            Kind::Http => self.verify(&tunnel, &req, &ev, deadline).await.map(|()| None),
+            _ => self.verify_port(&tunnel, &ev, deadline).await,
+        };
+        let reachable = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if created {
+                    self.forget(&tunnel).await;
+                    tracing::info!(tunnel = %tunnel.name, "removed tunnel after failed readiness check");
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
         tracing::info!(tunnel = %tunnel.name, url = %tunnel.public_url, "tunnel ready");
-        Ok(json!({
+        let mut out = json!({
             "id": tunnel.id,
             "name": tunnel.name,
+            "kind": tunnel.kind,
             "public_url": tunnel.public_url,
-            "target": tunnel.target.describe(),
-            "share_url": tunnel.target.share_url(&tunnel.public_url),
+            "target": tunnel.describe(),
+            "share_url": tunnel.share_url(),
             "status": "ready",
             "background": true,
             "created": created,
-        }))
+        });
+        if let Some(port) = tunnel.public_port {
+            out["public_port"] = json!(port);
+            out["allow"] = json!(tunnel.allow);
+        }
+        match tunnel.kind {
+            Kind::Tcp => out["reachable"] = json!(reachable),
+            // A datagram service cannot be checked end to end (it need not answer anything).
+            Kind::Udp => out["verified"] = json!(false),
+            Kind::Http => {}
+        }
+        Ok(out)
+    }
+
+    /// Unregisters a tunnel this request created and forgets it locally.
+    async fn forget(&self, tunnel: &LocalTunnel) {
+        let _ = self.session.rpc(&Rpc::Unregister { id: tunnel.id.clone() }, Duration::from_secs(10)).await;
+        self.tunnels.remove(&tunnel.id);
     }
 
     async fn register(&self, req: &AddRequest, mut target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
@@ -134,15 +162,16 @@ impl Agent {
         };
         let existing = match &name {
             Some(n) => self.tunnels.find(|t| &t.name == n),
-            None => self.tunnels.find(|t| t.target.same_destination(&target)),
+            None => self.tunnels.find(|t| t.kind == req.kind && t.target.same_destination(&target)),
         };
         if let Some(t) = &existing
-            && !t.target.same_destination(&target) {
-                return Err(ErrorInfo::new(
-                    "name_conflict",
-                    format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.target.describe()),
-                ));
-            }
+            && (t.kind != req.kind || !t.target.same_destination(&target))
+        {
+            return Err(ErrorInfo::new(
+                "name_conflict",
+                format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.describe()),
+            ));
+        }
         // A writable shell keeps its key across re-adds, so links already shared keep working.
         if let Target::Shell { writable: true, key, .. } = &mut target {
             let old = existing.as_ref().and_then(|t| match &t.target {
@@ -151,10 +180,19 @@ impl Agent {
             });
             *key = old.or_else(|| Some(magicpipes_core::secret::random_string(32)));
         }
+        // Settings follow the latest `add`: re-adding without --allow-cidr opens the port to anyone.
+        let allow: Vec<String> = cidr::parse_list(&req.allow)
+            .map_err(|m| ErrorInfo::new("invalid_cidr", m))?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let mut rpc_req = RegisterTunnel {
             id: existing.as_ref().map(|t| t.id.clone()),
             name: existing.as_ref().map(|t| t.name.clone()).or(name.clone()),
-            target: target.describe(),
+            target: target.describe(req.kind),
+            kind: req.kind,
+            remote_port: req.remote_port,
+            allow: allow.clone(),
         };
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
@@ -171,6 +209,16 @@ impl Agent {
                 Ok(other) => return Err(ErrorInfo::new("protocol", format!("unexpected response {other:?}"))),
             }
         };
+        if info.kind != req.kind {
+            // A server that predates port tunnels ignores `kind` and registers an HTTP tunnel.
+            if info.created {
+                let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
+            }
+            return Err(ErrorInfo::new(
+                "server_outdated",
+                format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind),
+            ));
+        }
         let tunnel = LocalTunnel {
             created_at: existing.as_ref().map(|t| t.created_at).unwrap_or_else(magicpipes_core::unix_now),
             id: info.id,
@@ -178,6 +226,9 @@ impl Agent {
             hostname: info.hostname,
             public_url: info.public_url,
             target,
+            kind: info.kind,
+            public_port: info.public_port,
+            allow,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);
         Ok((tunnel, info.created))
@@ -242,11 +293,62 @@ impl Agent {
         Ok(())
     }
 
+    /// Port tunnels: the server's check of the path to the local service, then (TCP) a connection
+    /// from this machine to the public port. Returns whether that connection came through.
+    async fn verify_port(&self, t: &LocalTunnel, ev: &Events<'_>, deadline: Instant) -> Result<Option<bool>, ErrorInfo> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        ev.step(Step::Check, StepState::Running).await;
+        match self.session.rpc(&Rpc::Check { id: t.id.clone() }, remaining().min(Duration::from_secs(30))).await {
+            Ok(_) => ev.step(Step::Check, StepState::Done).await,
+            Err(e) => {
+                ev.step(Step::Check, StepState::Failed).await;
+                let err = match e {
+                    RpcError::Server(b) if b.code == "local_unreachable" => {
+                        ErrorInfo::new("local_unreachable", format!("the server reached this agent, but {} refused the connection", t.describe()))
+                    }
+                    RpcError::Server(b) => ErrorInfo::new(&b.code, b.message),
+                    RpcError::Unavailable(m) => ErrorInfo::new("server_unreachable", m),
+                };
+                return Err(err.at(Step::Check));
+            }
+        }
+        if t.kind != Kind::Tcp {
+            return Ok(None);
+        }
+        ev.step(Step::Probe, StepState::Running).await;
+        let reachable = match probe::tcp(t, &self.tunnels, remaining().min(Duration::from_secs(10))).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(tunnel = %t.name, error = %e, "public port not reachable from this machine");
+                false
+            }
+        };
+        ev.step(Step::Probe, if reachable { StepState::Done } else { StepState::Warned }).await;
+        Ok(Some(reachable))
+    }
+
     pub async fn remove(&self, selector: &str, force: bool) -> Result<Value, ErrorInfo> {
-        let t = self
+        let port = selector.parse::<u16>().ok();
+        let matches: Vec<LocalTunnel> = self
             .tunnels
-            .find(|t| t.name == selector || t.id == selector || matches!(&t.target, Target::Tcp { port, .. } if selector.parse() == Ok(*port)))
-            .ok_or_else(|| ErrorInfo::new("not_found", format!("no tunnel named '{selector}'")))?;
+            .list()
+            .into_iter()
+            .filter(|t| t.name == selector || t.id == selector || matches!(&t.target, Target::Port { port: p, .. } if port == Some(*p)))
+            .collect();
+        let t = match matches.as_slice() {
+            [] => return Err(ErrorInfo::new("not_found", format!("no tunnel named '{selector}'"))),
+            [t] => t.clone(),
+            many => match many.iter().find(|t| t.name == selector || t.id == selector) {
+                Some(t) => t.clone(),
+                None => {
+                    let names: Vec<&str> = many.iter().map(|t| t.name.as_str()).collect();
+                    return Err(ErrorInfo::new(
+                        "name_conflict",
+                        format!("several tunnels use port {selector} ({}); give the tunnel's name", names.join(", ")),
+                    ));
+                }
+            },
+        };
         if !force {
             let _ = self.session.wait_connected(Duration::from_secs(10)).await;
         }
@@ -290,9 +392,10 @@ impl Agent {
                 json!({
                     "id": s.tunnel.id,
                     "name": s.tunnel.name,
+                    "kind": s.tunnel.kind,
                     "public_url": s.tunnel.public_url,
-                    "target": s.tunnel.target.describe(),
-                    "share_url": s.tunnel.target.share_url(&s.tunnel.public_url),
+                    "target": s.tunnel.describe(),
+                    "share_url": s.tunnel.share_url(),
                     "status": status,
                     "error": s.last_error,
                     "created_at": magicpipes_core::rfc3339(s.tunnel.created_at),
@@ -348,23 +451,41 @@ async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
         // The key is assigned at registration (kept from an existing tunnel when re-added).
         return Ok(Target::Shell { shell: command.clone(), cwd, writable: req.writable, key: None, max_clients });
     }
+    if !req.kind.is_http() && (req.serve.is_some() || req.port.is_none()) {
+        return Err(ErrorInfo::new("invalid_request", format!("--{} needs a local port", req.kind)));
+    }
+    cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new("invalid_cidr", m))?;
     match (&req.serve, req.port) {
         (Some(dir), _) => Ok(Target::Static { serve: serve::check_root(dir).await?, list: req.list }),
-        (None, Some(port)) => Ok(Target::Tcp { host: resolve_local(req.host.as_deref(), port).await?, port }),
+        // A UDP service cannot be probed: anything may or may not answer a datagram.
+        (None, Some(port)) if req.kind == Kind::Udp => {
+            let host = req.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+            check_host(&host)?;
+            if port == 0 {
+                return Err(ErrorInfo::new("invalid_port", "port must be between 1 and 65535"));
+            }
+            Ok(Target::Port { host, port })
+        }
+        (None, Some(port)) => Ok(Target::Port { host: resolve_local(req.host.as_deref(), port, req.kind).await?, port }),
         (None, None) => Err(ErrorInfo::new("invalid_request", "give a local port, --serve <dir> or --shell")),
     }
 }
 
+fn check_host(h: &str) -> Result<(), ErrorInfo> {
+    if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b)) {
+        return Err(ErrorInfo::new("invalid_host", format!("invalid host '{h}'")));
+    }
+    Ok(())
+}
+
 /// Finds where the local application listens: the given host, or 127.0.0.1 then ::1.
-async fn resolve_local(host: Option<&str>, port: u16) -> Result<String, ErrorInfo> {
+async fn resolve_local(host: Option<&str>, port: u16, kind: Kind) -> Result<String, ErrorInfo> {
     if port == 0 {
         return Err(ErrorInfo::new("invalid_port", "port must be between 1 and 65535"));
     }
     let candidates: Vec<&str> = match host {
         Some(h) => {
-            if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b)) {
-                return Err(ErrorInfo::new("invalid_host", format!("invalid host '{h}'")));
-            }
+            check_host(h)?;
             vec![h]
         }
         None => vec!["127.0.0.1", "::1"],
@@ -376,6 +497,9 @@ async fn resolve_local(host: Option<&str>, port: u16) -> Result<String, ErrorInf
     }
     Err(ErrorInfo::new(
         "local_unreachable",
-        format!("nothing is accepting connections on {}. Start your application first", target_url(candidates[0], port)),
+        format!(
+            "nothing is accepting connections on {}. Start your application first",
+            if kind.is_http() { target_url(candidates[0], port) } else { address(kind.as_str(), candidates[0], port) }
+        ),
     ))
 }

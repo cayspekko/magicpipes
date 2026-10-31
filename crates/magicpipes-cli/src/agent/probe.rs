@@ -116,3 +116,29 @@ fn websocket_key() -> String {
     out.push_str("==");
     out
 }
+
+/// TCP port tunnels: connects to the public port from this machine and waits for the
+/// connection to arrive back at this agent as a data stream for the tunnel. This catches a
+/// firewall or router that does not forward the port; it cannot see clients' networks.
+pub async fn tcp(t: &LocalTunnel, tunnels: &Tunnels, timeout: std::time::Duration) -> Result<(), String> {
+    let port = t.public_port.ok_or("the server assigned no port")?;
+    let host = t.public_url.split("://").nth(1).and_then(|a| a.rsplit_once(':')).map(|(h, _)| h.trim_matches(['[', ']']));
+    let host = host.ok_or_else(|| format!("unexpected public address {}", t.public_url))?;
+    let addr: Option<IpAddr> = std::env::var(PROBE_ADDR_ENV).ok().and_then(|v| v.parse().ok());
+    let before = tunnels.streams_ok(&t.id);
+    let attempt = async {
+        let _conn = match addr {
+            Some(ip) => tokio::net::TcpStream::connect((ip, port)).await,
+            None => tokio::net::TcpStream::connect((host, port)).await,
+        }
+        .map_err(|e| format!("could not connect to {}: {e}", t.public_url))?;
+        // Held open until the server has opened the stream to this agent.
+        while tunnels.streams_ok(&t.id) <= before {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
+    };
+    tokio::time::timeout(timeout, attempt)
+        .await
+        .map_err(|_| format!("{} accepted no connection through this tunnel within {}s", t.public_url, timeout.as_secs()))?
+}

@@ -2,7 +2,7 @@
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
-# terminal, and stops the agent.
+# terminal, echoes through TCP and UDP port tunnels, and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -35,7 +35,7 @@ CURL=(curl -sS --max-time 20)
 
 WORK=$(mktemp -d)
 cd "$WORK"
-HTTPS=39443 MGMT=39444 HTTP=39080 APP=39090
+HTTPS=39443 MGMT=39444 HTTP=39080 APP=39090 ECHO_TCP=39091 ECHO_UDP=39092
 STEP=setup
 step() { STEP=$1; echo "== $1"; echo "== $1" >> transcript.log; }
 
@@ -74,19 +74,24 @@ listen = "127.0.0.1:$MGMT"
 hostname = "localhost"
 [tls]
 mode = "dev-ca"
+[ports]
+range = "39500-39503"
+bind = "127.0.0.1"
+public_host = "localhost"
 EOF
 
 export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID=""
+SRV="" APPPID="" ECHOPID=""
 cleanup() {
   status=$?
   trap - EXIT
   "$MP" agent stop > /dev/null 2>&1 < /dev/null || true
   stop_pid "$SRV"
   stop_pid "$APPPID"
+  stop_pid "$ECHOPID"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
@@ -213,11 +218,73 @@ run "${CURL[@]}" -f "${TERM_TLS[@]}" "https://term.t.test:$HTTPS/"
 grep -q 'data-access="key"' cmd.out
 run "$PY" term.py term.t.test "$HTTPS" "$(native "$WORK/server/dev-ca/ca.crt")" "$KEY" shell-42 $'smoke\r' got-smoke
 
+step "tcp and udp ports"
+cat > ports.py <<'PYEOF'
+# serve TCP UDP: echo services.  tcp PORT MSG / udp PORT MSG: send MSG, expect it echoed.
+import socket, sys, threading
+
+def serve(tcp, udp):
+    def tcp_echo(conn):
+        with conn:
+            while data := conn.recv(65536):
+                conn.sendall(data)
+    def tcp_loop():
+        s = socket.create_server(("127.0.0.1", tcp))
+        while True:
+            threading.Thread(target=tcp_echo, args=(s.accept()[0],), daemon=True).start()
+    threading.Thread(target=tcp_loop, daemon=True).start()
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind(("127.0.0.1", udp))
+    while True:
+        data, addr = u.recvfrom(65536)
+        u.sendto(b"echo:" + data, addr)
+
+def check(kind, port, msg):
+    msg = msg.encode()
+    if kind == "tcp":
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+            s.sendall(msg)
+            got = b""
+            while len(got) < len(msg) and (chunk := s.recv(65536)):
+                got += chunk
+        want = msg
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        got, want = b"", b"echo:" + msg
+        for _ in range(5):
+            s.sendto(msg, ("127.0.0.1", port))
+            try:
+                got = s.recvfrom(65536)[0]
+                break
+            except socket.timeout:
+                pass
+    print(kind, port, got)
+    sys.exit(0 if got == want else 1)
+
+if sys.argv[1] == "serve":
+    serve(int(sys.argv[2]), int(sys.argv[3]))
+else:
+    check(sys.argv[1], int(sys.argv[2]), sys.argv[3])
+PYEOF
+"$PY" ports.py serve "$ECHO_TCP" "$ECHO_UDP" > echo.log 2>&1 < /dev/null &
+ECHOPID=$!
+sleep 1
+run "$MP" add "$ECHO_TCP" --tcp --name ptcp --json --timeout 60
+grep -q '"reachable": true' cmd.out
+PTCP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
+run "$PY" ports.py tcp "$PTCP" "smoke over tcp"
+run "$MP" add "$ECHO_UDP" --udp --name pudp --json --timeout 60
+PUDP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
+run "$PY" ports.py udp "$PUDP" "smoke over udp"
+
 step "list and remove"
 run "$MP" list
 run "$MP" remove smoke
 run "$MP" remove files
 run "$MP" remove term
+run "$MP" remove ptcp
+run "$MP" remove pudp
 run "$MP" agent stop
 
 # A freshly started agent must not keep the CLI's output open: `magicpipes ... | cat` has to

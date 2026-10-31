@@ -10,13 +10,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use magicpipes_core::mux::MuxHandle;
-use magicpipes_core::proto::{self, CertState, ErrorBody, RegisterTunnel, ServerOpen, TunnelInfo};
-use magicpipes_core::{names, rfc3339, secret, unix_now};
+use magicpipes_core::proto::{
+    self, CertState, ErrorBody, Kind, RegisterTunnel, STREAM_LOCAL_UNREACHABLE, STREAM_OK, STREAM_UNKNOWN_TUNNEL, ServerOpen,
+    TunnelInfo,
+};
+use magicpipes_core::{cidr, names, rfc3339, secret, unix_now};
 use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::certs::{CertManager, CertStatus};
-use crate::config::Config;
+use crate::config::{Config, PortRange};
 use crate::data::{DataPlane, Outcome, Route, RouteStats, RouteTable};
 use crate::store::{Store, TunnelRow};
 
@@ -55,11 +59,21 @@ pub struct TunnelView {
     pub name: String,
     pub hostname: String,
     pub public_url: String,
+    pub kind: Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+    /// Port tunnels: allowed client networks; empty = anyone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
     pub target: String,
     pub agent_id: String,
-    /// `connected`, `disconnected` (agent offline) or `error` (local application unreachable).
+    /// `connected`, `disconnected` (agent offline) or `error` (local application unreachable,
+    /// or the tunnel's port could not be opened).
     pub status: &'static str,
-    /// `ready`, `pending` or `failed`.
+    /// Port tunnels: why the public port is not open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_error: Option<String>,
+    /// `ready`, `pending` or `failed`; `none` for port tunnels.
     pub tls: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_error: Option<String>,
@@ -121,7 +135,15 @@ impl ControlPlane {
 
     /// Starts certificate provisioning for known hostnames and the stale-session reaper.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) {
-        let hosts: Vec<String> = self.state.lock().unwrap().tunnels.values().map(|t| t.row.hostname.clone()).collect();
+        let hosts: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .tunnels
+            .values()
+            .filter(|t| t.row.kind.is_http())
+            .map(|t| t.row.hostname.clone())
+            .collect();
         for h in hosts {
             self.certs.ensure(&h);
         }
@@ -155,10 +177,18 @@ impl ControlPlane {
         let mut table = RouteTable::default();
         for t in st.tunnels.values() {
             let session = st.sessions.get(&t.row.agent_id).map(|s| s.handle.clone());
-            table.by_host.insert(
-                t.row.hostname.clone(),
-                Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone() }),
-            );
+            // Stored lists were validated on registration.
+            let allow = cidr::parse_list(&t.row.allow).unwrap_or_default();
+            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), allow });
+            match (t.row.kind, t.row.public_port) {
+                (Kind::Http, _) => {
+                    table.by_host.insert(t.row.hostname.clone(), route);
+                }
+                (kind, Some(port)) => {
+                    table.by_port.insert((kind, port), route);
+                }
+                (_, None) => {}
+            }
         }
         self.data.publish(table);
     }
@@ -257,6 +287,25 @@ impl ControlPlane {
 
     pub fn register(&self, agent_id: &str, req: &RegisterTunnel) -> Result<TunnelInfo, ErrorBody> {
         let target: String = req.target.chars().filter(|c| !c.is_control()).take(200).collect();
+        let allow: Vec<String> = cidr::parse_list(&req.allow)
+            .map_err(|m| err("invalid_cidr", m))?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let range = match req.kind {
+            Kind::Http if req.remote_port.is_some() || !allow.is_empty() => {
+                return Err(err("invalid_request", "a remote port and an allow-list apply only to TCP and UDP tunnels"));
+            }
+            Kind::Http => None,
+            _ => Some(self.cfg.port_range().ok_or_else(|| {
+                err("ports_disabled", "this server does not offer TCP or UDP ports (its configuration has no [ports] range)")
+            })?),
+        };
+        if let (Some(r), Some(p)) = (range, req.remote_port)
+            && !r.contains(p)
+        {
+            return Err(err("port_unavailable", format!("port {p} is outside this server's port range {}-{}", r.first, r.last)));
+        }
         let mut st = self.state.lock().unwrap();
 
         let existing = match (&req.id, &req.name) {
@@ -276,13 +325,29 @@ impl ControlPlane {
         };
 
         if let Some(id) = existing {
-            let t = st.tunnels.get_mut(&id).expect("checked above");
-            if t.row.target != target {
-                self.store.update_tunnel_target(&id, &target).map_err(internal)?;
-                t.row.target = target;
+            let mut row = st.tunnels[&id].row.clone();
+            if row.kind != req.kind {
+                return Err(err(
+                    "kind_mismatch",
+                    format!("tunnel '{}' is a {} tunnel; remove it first to make it {}", row.name, row.kind, req.kind),
+                ));
             }
-            let row = t.row.clone();
-            self.certs.ensure(&row.hostname);
+            row.target = target;
+            row.allow = allow;
+            if let Some(p) = req.remote_port
+                && row.public_port != Some(p)
+            {
+                row.public_port = Some(self.claim_port(&st, row.kind, p)?);
+            }
+            let t = st.tunnels.get_mut(&id).expect("checked above");
+            if (&t.row.target, &t.row.allow, t.row.public_port) != (&row.target, &row.allow, row.public_port) {
+                self.store.update_tunnel(&row).map_err(internal)?;
+                t.row = row.clone();
+                self.publish(&st);
+            }
+            if row.kind.is_http() {
+                self.certs.ensure(&row.hostname);
+            }
             return Ok(self.info(&row, false));
         }
 
@@ -302,6 +367,11 @@ impl ControlPlane {
         if hostname == self.cfg.management.hostname {
             return Err(err("invalid_name", format!("'{name}' is reserved")));
         }
+        let public_port = match (range, req.remote_port) {
+            (None, _) => None,
+            (Some(_), Some(p)) => Some(self.claim_port(&st, req.kind, p)?),
+            (Some(r), None) => Some(self.allocate_port(&st, req.kind, r)?),
+        };
         let row = TunnelRow {
             id: secret::new_id("tn"),
             name,
@@ -309,14 +379,50 @@ impl ControlPlane {
             agent_id: agent_id.to_string(),
             target,
             created_at: unix_now(),
+            kind: req.kind,
+            public_port,
+            allow,
         };
         self.store.insert_tunnel(&row).map_err(internal)?;
         st.tunnels.insert(row.id.clone(), TunnelRecord { row: row.clone(), stats: Arc::default() });
         self.publish(&st);
         drop(st);
-        tracing::info!(tunnel = %row.id, hostname = %row.hostname, agent = %agent_id, "tunnel registered");
-        self.certs.ensure(&row.hostname);
-        Ok(self.info(&row, true))
+        let info = self.info(&row, true);
+        tracing::info!(tunnel = %row.id, url = %info.public_url, agent = %agent_id, "tunnel registered");
+        if row.kind.is_http() {
+            self.certs.ensure(&row.hostname);
+        }
+        Ok(info)
+    }
+
+    /// Takes a specific public port: free among this kind's tunnels and bindable on this host.
+    fn claim_port(&self, st: &State, kind: Kind, port: u16) -> Result<u16, ErrorBody> {
+        if let Some(t) = st.tunnels.values().find(|t| t.row.kind == kind && t.row.public_port == Some(port)) {
+            return Err(err("port_unavailable", format!("{kind} port {port} is used by tunnel '{}'", t.row.name)));
+        }
+        self.data
+            .bind_port(kind, port)
+            .map_err(|e| err("port_unavailable", format!("cannot open {kind} port {port} on the server: {e}")))?;
+        Ok(port)
+    }
+
+    /// Picks a free port from the range, starting at a random point.
+    fn allocate_port(&self, st: &State, kind: Kind, range: PortRange) -> Result<u16, ErrorBody> {
+        let start = secret::random_u64() as usize % range.len();
+        let taken = |p: u16| st.tunnels.values().any(|t| t.row.kind == kind && t.row.public_port == Some(p));
+        (0..range.len())
+            .map(|i| range.first + ((start + i) % range.len()) as u16)
+            .filter(|p| !taken(*p))
+            // Skips ports another program on the server holds.
+            .find(|p| self.data.bind_port(kind, *p).is_ok())
+            .ok_or_else(|| err("limit_reached", format!("no free {kind} port left in {}-{}", range.first, range.last)))
+    }
+
+    fn public_url(&self, row: &TunnelRow) -> String {
+        match (row.kind, row.public_port) {
+            (Kind::Http, _) | (_, None) => self.cfg.public_url(&row.hostname),
+            (kind, Some(port)) => self.cfg.port_url(kind, port),
+        }
     }
 
     fn info(&self, row: &TunnelRow, created: bool) -> TunnelInfo {
@@ -324,8 +430,40 @@ impl ControlPlane {
             id: row.id.clone(),
             name: row.name.clone(),
             hostname: row.hostname.clone(),
-            public_url: self.cfg.public_url(&row.hostname),
+            public_url: self.public_url(row),
             created,
+            kind: row.kind,
+            public_port: row.public_port,
+        }
+    }
+
+    /// Readiness check for a port tunnel owned by `agent_id`: opens a data stream to the agent,
+    /// as a client connection would, and reports whether the agent reached the local service.
+    pub async fn check(&self, agent_id: &str, id: &str) -> Result<(), ErrorBody> {
+        let (header, session) = {
+            let st = self.state.lock().unwrap();
+            let t = st.tunnels.get(id).filter(|t| t.row.agent_id == agent_id).ok_or_else(|| err("not_found", "unknown tunnel"))?;
+            let tunnel_id = t.row.id.clone();
+            let header = match t.row.kind {
+                Kind::Udp => ServerOpen::Datagram { tunnel_id, peer: None },
+                _ => ServerOpen::Data { tunnel_id, peer: None },
+            };
+            let session = st.sessions.get(agent_id).map(|s| s.handle.clone());
+            (header, session.ok_or_else(|| err("agent_unavailable", "agent is not connected"))?)
+        };
+        let unavailable = |_| err("agent_unavailable", "could not open a stream to the agent");
+        let mut stream = session.open(Duration::from_secs(10)).await.map_err(unavailable)?;
+        let status = async {
+            proto::write_frame(&mut stream, &header).await?;
+            stream.read_u8().await
+        };
+        let status = tokio::time::timeout(Duration::from_secs(15), status).await;
+        let _ = stream.shutdown().await;
+        match status {
+            Ok(Ok(STREAM_OK)) => Ok(()),
+            Ok(Ok(STREAM_LOCAL_UNREACHABLE)) => Err(err("local_unreachable", "the agent could not connect to the local service")),
+            Ok(Ok(STREAM_UNKNOWN_TUNNEL)) => Err(err("not_found", "the agent does not serve this tunnel")),
+            _ => Err(err("agent_unavailable", "the agent did not answer the check")),
         }
     }
 
@@ -383,24 +521,30 @@ impl ControlPlane {
 
     fn view(&self, st: &State, t: &TunnelRecord) -> TunnelView {
         let connected = st.sessions.get(&t.row.agent_id).is_some_and(|s| !s.handle.is_closed());
+        let port_error = t.row.public_port.and_then(|p| self.data.bind_error(t.row.kind, p));
         let status = match (connected, t.stats.last_outcome()) {
+            _ if port_error.is_some() => "error",
             (false, _) => "disconnected",
             (true, Outcome::LocalUnreachable) => "error",
             (true, _) => "connected",
         };
-        let cert = self.certs.status(&t.row.hostname);
+        let cert = if t.row.kind.is_http() { Some(self.certs.status(&t.row.hostname)) } else { None };
         let last = t.stats.last_request_at.load(std::sync::atomic::Ordering::Relaxed);
         TunnelView {
             id: t.row.id.clone(),
             name: t.row.name.clone(),
             hostname: t.row.hostname.clone(),
-            public_url: self.cfg.public_url(&t.row.hostname),
+            public_url: self.public_url(&t.row),
+            kind: t.row.kind,
+            public_port: t.row.public_port,
+            allow: t.row.allow.clone(),
             target: t.row.target.clone(),
             agent_id: t.row.agent_id.clone(),
             status,
-            tls: cert.label(),
+            port_error,
+            tls: cert.as_ref().map_or("none", CertStatus::label),
             tls_error: match cert {
-                CertStatus::Failed(m) => Some(m),
+                Some(CertStatus::Failed(m)) => Some(m),
                 _ => None,
             },
             created_at: rfc3339(t.row.created_at),

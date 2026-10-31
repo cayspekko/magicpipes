@@ -15,6 +15,10 @@ services:
       - "80:80"       # ACME HTTP-01 + redirect to HTTPS
       - "443:443"     # public tunnel traffic
       - "8443:8443"   # management UI/API and agent endpoint
+      # TCP/UDP port tunnels: publish the [ports] range of magicpipesd.toml for both protocols.
+      # Docker starts a proxy process per port; for a large range use network_mode: host.
+      # - "65500-65535:65500-65535"
+      # - "65500-65535:65500-65535/udp"
     volumes:
       - ./docker/magicpipesd.toml:/etc/magicpipes/magicpipesd.toml:ro
       - magicpipes-data:/data

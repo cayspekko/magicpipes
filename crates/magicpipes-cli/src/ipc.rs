@@ -43,6 +43,15 @@ pub struct AddRequest {
     /// With `shell`: concurrent sessions allowed.
     #[serde(default)]
     pub max_clients: Option<u16>,
+    /// `tcp` or `udp` for a raw public port instead of an HTTPS hostname.
+    #[serde(default)]
+    pub kind: magicpipes_core::proto::Kind,
+    /// Port tunnels: a specific public port.
+    #[serde(default)]
+    pub remote_port: Option<u16>,
+    /// Port tunnels: client networks allowed to connect.
+    #[serde(default)]
+    pub allow: Vec<String>,
     pub host: Option<String>,
     pub name: Option<String>,
     pub probe_path: String,
@@ -56,6 +65,8 @@ pub enum Step {
     Connect,
     Register,
     Tls,
+    /// Port tunnels: the server opens a stream to the local service through the agent.
+    Check,
     Probe,
 }
 
@@ -66,6 +77,7 @@ impl Step {
             Step::Connect => "Connecting to server...",
             Step::Register => "Registering tunnel...",
             Step::Tls => "Checking HTTPS certificate...",
+            Step::Check => "Checking tunnel...",
             Step::Probe => "Verifying public endpoint...",
         }
     }
@@ -77,6 +89,8 @@ pub enum StepState {
     Running,
     Done,
     Failed,
+    /// Did not pass, but does not fail the operation (e.g. a public port this machine can't reach).
+    Warned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

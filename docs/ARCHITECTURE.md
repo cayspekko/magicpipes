@@ -123,20 +123,55 @@ token that `Tunnels::upsert`/`remove` cancel when its target changes. Ending sen
 when a terminal closes; the kernel then hangs up the foreground job), then SIGKILL after 2 s;
 on Windows the process is terminated.
 
-Planned target and ingress kinds (TCP/UDP ports, Unix sockets, SSH gateway, browser desktop) are
-described in [ROADMAP.md](ROADMAP.md).
+## Port tunnels (`add --tcp`, `--udp`)
+
+A tunnel has an ingress **kind** (`http`, `tcp`, `udp`; `RegisterTunnel.kind`, the `tunnels.kind`
+column) next to its local target. Port tunnels get a `public_port` from `[ports] range` instead of
+a routed hostname; their hostname row still exists (names are unique across kinds) but never gets
+a certificate or an HTTP route.
+
+* **Allocation** (control plane): a requested `--remote-port` or a free port picked from a random
+  starting point. The data plane binds it *before* the tunnel is stored, so a port another
+  program holds fails the registration (`port_unavailable`) or is skipped. SQLite enforces one
+  tunnel per (kind, port).
+* **Listeners** (data plane, `data/ports.rs`): `DataPlane::publish` diffs `RouteTable.by_port`
+  against the bound listeners, binding new ports and closing removed ones. Each TCP connection
+  or UDP client looks its route up again, so allow-list changes and agent reconnects apply at
+  once. A port stays bound while its agent is offline; connections are then closed at once.
+* **TCP**: one `ServerOpen::Data` stream per connection, piped after the agent's status byte. No
+  idle timeout (database and SSH sessions are long-lived); TCP keepalive drops vanished clients.
+  An optional PROXY protocol v1/v2 header (`proxy_protocol`) supplies the client address behind
+  a TCP load balancer.
+* **UDP**: one `ServerOpen::Datagram` stream per client address ("flow"), carrying `u16`-length
+  framed datagrams both ways; the agent relays them through a connected UDP socket of its own,
+  so replies reach the right client. Flows end after `udp_idle_timeout_secs` and are capped per
+  tunnel (`udp_max_flows`); a full flow queue drops datagrams, as a congested network would.
+* **Allow-lists** (`--allow-cidr`) are validated by the CLI, the agent and the server, stored in
+  canonical form and enforced by the server on every connection and flow.
+* **Readiness**: the `Check` RPC makes the server open a data (or datagram) stream for the tunnel
+  and report the agent's status byte, so a missing local service fails the `add`. For TCP the
+  agent then connects to the public port and waits for that connection to arrive as a stream;
+  failure there is a warning (`reachable: false`), because some networks cannot reach their own
+  public address.
+* **Compatibility**: an old server ignores `kind` and would create an HTTP tunnel, so the agent
+  checks the kind echoed in `TunnelInfo` (absent = `http`) and fails with `server_outdated`.
+  Old agents never send `kind` and keep getting HTTP tunnels.
+
+Planned target and ingress kinds (Unix sockets, SSH gateway, browser desktop) are described in
+[ROADMAP.md](ROADMAP.md).
 
 ## Wire protocol
 
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Agent-opened stream = one RPC**: a length-prefixed JSON `Request` (`Ping`, `Register`,
-  `Unregister`, `CertStatus`), answered with one `Response`. A stream per call means no request
+  `Unregister`, `CertStatus`, `Check`), answered with one `Response`. A stream per call means no request
   ids and no head-of-line blocking between RPCs.
 * **Server-opened stream = data or push**: a `ServerOpen` frame. For `Data { tunnel_id }` the
   agent looks the id up in **its own** table, connects to the local target and writes one status
   byte (`0` ok, `1` local unreachable, `2` unknown tunnel), then raw bytes flow both ways.
-  `TunnelRemoved` tells the agent an administrator deleted a tunnel.
+  `Datagram { tunnel_id }` is the same for one UDP client, followed by `u16`-length framed
+  datagrams. `TunnelRemoved` tells the agent an administrator deleted a tunnel.
 * The status byte is read lazily by the server (`StatusPrefixed`): the HTTP request is written
   immediately, so a successful request costs no extra round trip, but local connection failures
   are still attributed exactly (`local_unreachable` vs `upstream_error` vs `agent_offline`).
@@ -153,6 +188,9 @@ the yamux stream, the agent, the local application. It is accepted only if:
    application sets, so infrastructure errors and impostor servers cannot produce it;
 2. there is no `x-magicpipes-error` header (always present on MagicPipes-generated responses);
 3. the agent's per-tunnel counter of streams that reached the local target increased.
+
+Port tunnels replace the last two steps with `CHECKED` (the server's `Check` RPC) and, for TCP,
+a connection to the public port that must arrive back at the agent (a warning, not a failure).
 
 ## Agent process lifecycle
 
@@ -205,6 +243,10 @@ the yamux stream, the agent, the local application. It is accepted only if:
   The server can name a tunnel, never an address.
 * Hostname ownership: names are unique, tied to one agent, validated (DNS label rules, reserved
   names, management hostname). Another agent cannot register or query them.
+* Port tunnels are open to anyone unless `--allow-cidr` is given (the CLI says so). The server
+  enforces allow-lists on every connection; behind a TCP proxy, only `proxy_protocol` makes the
+  checked address the client's. Raw ports are bounded by `[ports] max_connections` (TCP) and
+  `udp_max_flows` per tunnel.
 * No open proxy: `CONNECT` is refused, absolute-form URIs must match `Host`, and the TLS SNI must
   equal the `Host` header (421 otherwise). Unknown hostnames get no certificate at all, since
   certificates are never issued on demand from SNI.
@@ -228,7 +270,10 @@ the yamux stream, the agent, the local application. It is accepted only if:
   milestone (Cloudflare integration); `tls.mode = "files"` covers wildcard certs today.
 * Public side is HTTP/1.1 only (ALPN `http/1.1`); no HTTP/2 or HTTP/3 yet.
 * One TCP connection per agent: yamux streams share it, so a lossy link causes head-of-line
-  blocking across tunnels of that agent.
+  blocking across tunnels of that agent. UDP tunnels ride the same TCP connection, so they
+  inherit its retransmissions and ordering (poor for VPNs and real-time media).
+* At most 256 streams per agent session: HTTP requests in flight, TCP connections and UDP
+  clients together.
 * There is no body idle timeout for regular HTTP requests, only a time-to-first-response timeout.
   Upgraded (WebSocket) connections have an idle timeout.
 * UI sessions live in memory; restarting the server logs administrators out.

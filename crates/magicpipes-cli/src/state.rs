@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use magicpipes_core::proto::Kind;
 use serde::{Deserialize, Serialize};
 
 pub fn home() -> PathBuf {
@@ -105,14 +106,36 @@ pub struct LocalTunnel {
     #[serde(flatten)]
     pub target: Target,
     pub created_at: i64,
+    /// How the tunnel is reached publicly (absent in files from before port tunnels: `http`).
+    #[serde(default, skip_serializing_if = "Kind::is_http")]
+    pub kind: Kind,
+    /// Port tunnels: the public port the server assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+    /// Port tunnels: client networks allowed to connect (canonical CIDRs); empty = anyone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+impl LocalTunnel {
+    /// The local target as shown to users, e.g. `http://127.0.0.1:8080` or `tcp://127.0.0.1:5432`.
+    pub fn describe(&self) -> String {
+        self.target.describe(self.kind)
+    }
+
+    /// The URL to share (see [`Target::share_url`]).
+    pub fn share_url(&self) -> String {
+        self.target.share_url(&self.public_url)
+    }
 }
 
 /// Where a tunnel's data streams go.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Target {
-    /// A local TCP service; `host` is `127.0.0.1`, `::1` or the `--host` given.
-    Tcp { host: String, port: u16 },
+    /// A local port; `host` is `127.0.0.1`, `::1` or the `--host` given. TCP, except for a UDP
+    /// tunnel, whose datagrams go to this UDP port.
+    Port { host: String, port: u16 },
     /// A directory served by the agent's built-in file server (`--serve`); `serve` is canonical.
     Static { serve: PathBuf, list: bool },
     /// A web terminal (`--shell`): each browser session runs `shell` (argv) in a new pty in `cwd`.
@@ -128,10 +151,11 @@ pub enum Target {
 }
 
 impl Target {
-    /// Shown to users and stored on the server for display.
-    pub fn describe(&self) -> String {
+    /// Shown to users and stored on the server for display; `kind` picks the scheme of a port.
+    pub fn describe(&self, kind: Kind) -> String {
         match self {
-            Target::Tcp { host, port } => target_url(host, *port),
+            Target::Port { host, port } if kind.is_http() => target_url(host, *port),
+            Target::Port { host, port } => address(kind.as_str(), host, *port),
             Target::Static { serve, .. } => format!("static:{}", display_path(serve)),
             Target::Shell { shell, writable, .. } => {
                 format!("shell:{} ({})", command_line(shell), if *writable { "read-write" } else { "read-only" })
@@ -151,7 +175,7 @@ impl Target {
     /// settings, may differ).
     pub fn same_destination(&self, other: &Target) -> bool {
         match (self, other) {
-            (Target::Tcp { host: h1, port: p1 }, Target::Tcp { host: h2, port: p2 }) => h1 == h2 && p1 == p2,
+            (Target::Port { host: h1, port: p1 }, Target::Port { host: h2, port: p2 }) => h1 == h2 && p1 == p2,
             (Target::Static { serve: a, .. }, Target::Static { serve: b, .. }) => a == b,
             (Target::Shell { shell: a, cwd: ca, .. }, Target::Shell { shell: b, cwd: cb, .. }) => a == b && ca == cb,
             _ => false,
@@ -174,7 +198,12 @@ pub fn display_path(p: &Path) -> String {
 }
 
 pub fn target_url(host: &str, port: u16) -> String {
-    if host.contains(':') { format!("http://[{host}]:{port}") } else { format!("http://{host}:{port}") }
+    address("http", host, port)
+}
+
+/// `scheme://host:port`, with IPv6 hosts in brackets.
+pub fn address(scheme: &str, host: &str, port: u16) -> String {
+    if host.contains(':') { format!("{scheme}://[{host}]:{port}") } else { format!("{scheme}://{host}:{port}") }
 }
 
 pub fn load_tunnels() -> anyhow::Result<Vec<LocalTunnel>> {
@@ -199,22 +228,35 @@ mod tests {
     fn tunnels_json_round_trips_and_reads_older_files() {
         let old = r#"[{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","host":"127.0.0.1","port":8080,"created_at":1}]"#;
         let list: Vec<LocalTunnel> = serde_json::from_str(old).unwrap();
-        assert_eq!(list[0].target, Target::Tcp { host: "127.0.0.1".into(), port: 8080 });
-        assert_eq!(list[0].target.describe(), "http://127.0.0.1:8080");
+        assert_eq!(list[0].target, Target::Port { host: "127.0.0.1".into(), port: 8080 });
+        assert_eq!((list[0].kind, list[0].describe()), (Kind::Http, "http://127.0.0.1:8080".to_string()));
 
         let t = LocalTunnel { target: Target::Static { serve: "/srv/site".into(), list: false }, ..list[0].clone() };
         let json = serde_json::to_value(&t).unwrap();
         assert_eq!((json["serve"].as_str(), json["list"].as_bool(), json.get("port")), (Some("/srv/site"), Some(false), None));
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), t);
-        assert_eq!(t.target.describe(), "static:/srv/site");
+        assert_eq!(t.describe(), "static:/srv/site");
 
         let shell = Target::Shell { shell: vec!["htop".into()], cwd: "/home/u".into(), writable: true, key: Some("k1".into()), max_clients: 5 };
         let t = LocalTunnel { target: shell, ..list[0].clone() };
         let json = serde_json::to_value(&t).unwrap();
         assert_eq!(json["shell"][0], "htop");
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), t);
-        assert_eq!(t.target.describe(), "shell:htop (read-write)");
+        assert_eq!(t.describe(), "shell:htop (read-write)");
         assert_eq!(t.target.share_url("https://a.t.test"), "https://a.t.test/#k=k1");
+
+        let udp = LocalTunnel {
+            target: Target::Port { host: "::1".into(), port: 53 },
+            kind: Kind::Udp,
+            public_port: Some(65501),
+            allow: vec!["10.0.0.0/8".into()],
+            ..list[0].clone()
+        };
+        let json = serde_json::to_value(&udp).unwrap();
+        assert_eq!((json["kind"].as_str(), json["public_port"].as_u64()), (Some("udp"), Some(65501)));
+        assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), udp);
+        assert_eq!(udp.describe(), "udp://[::1]:53");
+        assert!(serde_json::to_value(&list[0]).unwrap().get("kind").is_none(), "HTTP tunnels keep the old file format");
     }
 
     #[test]

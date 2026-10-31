@@ -37,8 +37,8 @@ What you expose, and every way people can reach it:
 | HTTP app | `add 8080` | ✅ today | ✅ TCP (optional) | — | via its hostname |
 | HTTP over Unix socket | `add --unix /run/app.sock` | ✅ | ✅ TCP | — | via its hostname |
 | Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
-| Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ TCP | — | — |
-| Any UDP service | `add 53 --udp` | — | ✅ UDP | — | — |
+| Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP) | — | — |
+| Any UDP service | `add 53 --udp` | — | ✅ today (UDP) | — | — |
 | SSH | `add 22 --ssh` | — | ✅ TCP (optional) | ✅ end-to-end | 🖥 terminal (server-side SSH client) |
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP for native clients | — | 🖥 desktop (IronRDP) |
@@ -99,6 +99,14 @@ random and changes on every reconnect unless you pay for a reserved address. The
 connection is multiplexed (muxado) and each TCP connection becomes a new stream with a header
 naming the tunnel, the same shape as our `ServerOpen::Data`. ngrok requires a card on file for
 TCP endpoints because raw ports attract abuse; it offers IP restrictions; it has no UDP.
+
+**Shipped** as `add --tcp` / `add --udp` (see ARCHITECTURE.md, "Port tunnels"). It follows the
+design below with two differences: non-HTTP tunnels keep their `<name>.<base_domain>` hostname
+row (names stay unique across kinds; the hostname is never routed or certified), and readiness
+is two steps: the server's check of the path to the local service must pass, while this
+machine's connection to the public port only warns when it fails (some networks cannot reach
+their own public address). The PROXY protocol (v1/v2) is supported for servers behind a TCP
+load balancer.
 
 Our design:
 
@@ -246,9 +254,9 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1 | Static files (`add --serve`) | none | done |
 | 1b | Agent web terminal (`add --shell`) | none | done |
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
-| 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | planned |
-| 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | planned |
+| 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | `kind` done (with phase 3); Unix sockets planned |
+| 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, web login, grants, audit log | yes | planned |
 | 5 | SSH gateway + SSH web terminal | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
-| 7 | UDP | yes | planned |
+| 7 | UDP | yes | done (with phase 3) |

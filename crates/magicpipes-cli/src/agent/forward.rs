@@ -1,11 +1,12 @@
-//! Agent data path: serves server-opened streams by piping them to local targets.
+//! Agent data path: serves server-opened streams by piping them to local targets (a TCP
+//! connection, the built-in file server or web terminal, or a UDP socket for datagram streams).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use magicpipes_core::mux::MuxStream;
-use magicpipes_core::proto::{self, STREAM_LOCAL_UNREACHABLE, STREAM_OK, STREAM_UNKNOWN_TUNNEL, ServerOpen};
+use magicpipes_core::proto::{self, Kind, STREAM_LOCAL_UNREACHABLE, STREAM_OK, STREAM_UNKNOWN_TUNNEL, ServerOpen};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 use super::serve::{self, Site};
 use super::shell::{self, Terminal};
 use super::tunnels::{Route, Tunnels};
+use super::udp;
 use crate::state::Target;
 
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,14 +40,25 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 tracing::warn!(tunnel = %t.name, "tunnel was deleted on the server; no longer serving it");
             }
         }
-        ServerOpen::Data { tunnel_id } => {
-            let Some(Route { target, streams_ok: counter, ended, sessions }) = tunnels.route(&tunnel_id) else {
+        ServerOpen::Datagram { tunnel_id, peer } => match tunnels.route(&tunnel_id) {
+            Some(Route { kind: Kind::Udp, target: Target::Port { host, port }, streams_ok, .. }) => {
+                tracing::debug!(%host, port, peer = peer.as_deref().unwrap_or("-"), "UDP client");
+                udp::relay(stream, &host, port, &streams_ok).await;
+            }
+            _ => {
+                let _ = stream.write_all(&[STREAM_UNKNOWN_TUNNEL]).await;
+                let _ = stream.shutdown().await;
+            }
+        },
+        ServerOpen::Data { tunnel_id, peer } => {
+            let route = tunnels.route(&tunnel_id).filter(|r| r.kind != Kind::Udp);
+            let Some(Route { target, streams_ok: counter, ended, sessions, .. }) = route else {
                 let _ = stream.write_all(&[STREAM_UNKNOWN_TUNNEL]).await;
                 let _ = stream.shutdown().await;
                 return;
             };
             let (host, port) = match target {
-                Target::Tcp { host, port } => (host, port),
+                Target::Port { host, port } => (host, port),
                 Target::Static { serve: root, list } => {
                     if stream.write_all(&[STREAM_OK]).await.is_err() {
                         return;
@@ -80,6 +93,9 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 }
             };
             let _ = local.set_nodelay(true);
+            if let Some(peer) = peer {
+                tracing::debug!(%host, port, %peer, "TCP client");
+            }
             if stream.write_all(&[STREAM_OK]).await.is_err() {
                 return;
             }

@@ -46,6 +46,19 @@ pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// `n` consecutive ports free for TCP and UDP, below the usual ephemeral range.
+pub fn free_port_range(n: u16) -> (u16, u16) {
+    loop {
+        let first = 20_000 + (magicpipes_core_rand_u16() % 20_000);
+        let free = (first..first + n).all(|p| {
+            std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
+        });
+        if free {
+            return (first, first + n - 1);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tls {
     DevCa,
@@ -60,6 +73,8 @@ pub struct Env {
     pub https_port: u16,
     pub http_port: u16,
     pub mgmt_port: u16,
+    /// The server's `[ports]` range (bound on 127.0.0.1).
+    pub ports: (u16, u16),
     pub ca_path: PathBuf,
     server: Option<std::process::Child>,
     tls: Tls,
@@ -70,6 +85,7 @@ impl Env {
         let root = std::env::temp_dir().join(format!("mpe2e-{}", magicpipes_core_rand()));
         std::fs::create_dir_all(root.join("home")).unwrap();
         let (https_port, mut http_port, mgmt_port) = (free_port(), free_port(), free_port());
+        let ports = free_port_range(8);
         // With real HTTP-01 validation, Pebble connects to a fixed port (its `httpPort`).
         if tls == Tls::Pebble
             && let Some(p) = std::env::var("MAGICPIPES_PEBBLE_HTTP_PORT").ok().and_then(|p| p.parse().ok()) {
@@ -124,11 +140,18 @@ hostname = "localhost"
 {tls_section}
 [agents]
 session_timeout_secs = 20
+[ports]
+range = "{first}-{last}"
+bind = "127.0.0.1"
+public_host = "localhost"
+udp_idle_timeout_secs = 5
 "#,
             data = root.join("server").display(),
+            first = ports.0,
+            last = ports.1,
         );
         std::fs::write(root.join("server.toml"), cfg).unwrap();
-        let mut env = Env { root, https_port, http_port, mgmt_port, ca_path, server: None, tls };
+        let mut env = Env { root, https_port, http_port, mgmt_port, ports, ca_path, server: None, tls };
         env.start_server().await;
         env
     }
@@ -357,6 +380,12 @@ fn magicpipes_core_rand() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+fn magicpipes_core_rand_u16() -> u16 {
+    let mut b = [0u8; 2];
+    getrandom_fill(&mut b);
+    u16::from_le_bytes(b)
+}
+
 fn getrandom_fill(buf: &mut [u8]) {
     use std::io::Read;
     std::fs::File::open("/dev/urandom").unwrap().read_exact(buf).unwrap();
@@ -487,4 +516,36 @@ pub async fn ws_echo_app() -> App {
 
 pub fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// A TCP service that echoes every byte back.
+pub async fn tcp_echo_app() -> App {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    App { port, task }
+}
+
+/// A UDP service that answers each datagram with `echo:` + the datagram.
+pub async fn udp_echo_app() -> App {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let Ok((n, from)) = socket.recv_from(&mut buf).await else { return };
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            let _ = socket.send_to(&reply, from).await;
+        }
+    });
+    App { port, task }
 }

@@ -159,7 +159,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(p) = certs.dev_ca_path() {
         tracing::warn!(ca = %p.display(), "tls.mode = dev-ca: clients must trust this CA; do not use in production");
     }
-    let data = DataPlane::new(ProxySettings::from_config(&cfg));
+    let shutdown = CancellationToken::new();
+    let data = DataPlane::new(ProxySettings::from_config(&cfg), shutdown.clone());
     let control = ControlPlane::new(cfg.clone(), store, certs.clone(), data.clone())?;
     let mgmt_resolver = management_resolver(&cfg, &certs)?;
 
@@ -170,7 +171,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     };
     let mgmt = bind(cfg.management.listen, "management").await?;
 
-    let shutdown = CancellationToken::new();
     let tracker = TaskTracker::new();
 
     control.start(shutdown.clone());
@@ -184,6 +184,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         https = %cfg.public.https_listen,
         http = ?cfg.public.http_listen,
         management = %cfg.management.listen,
+        ports = ?cfg.ports.range,
         tls = ?cfg.tls.mode,
         "magicpipesd {} started",
         magicpipes_core::VERSION

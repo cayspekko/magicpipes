@@ -1,11 +1,13 @@
 //! Code shared by `magicpipesd` (server) and `magicpipes` (CLI + local agent).
 //!
+//! * [`cidr`] — client network allow-lists for port tunnels.
 //! * [`proto`] — the agent <-> server wire protocol (RPC frames and data-stream headers).
 //! * [`mux`] — a small driver that runs a yamux session on a Tokio task.
 //! * [`names`] — tunnel name validation and random name generation.
 //! * [`secret`] — token generation, hashing and constant-time comparison.
 //! * [`theme`] — the shared stylesheet and logo used by every HTML page.
 
+pub mod cidr;
 pub mod mux;
 pub mod names;
 pub mod proto;

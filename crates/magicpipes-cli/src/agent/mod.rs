@@ -4,6 +4,7 @@
 //! * `forward` — data path: server-opened streams piped to local targets.
 //! * `serve` — built-in static file server for `add --serve`, run on data streams directly.
 //! * `shell` — web terminal for `add --shell` (xterm.js page + pty per browser session).
+//! * `udp` — relays a UDP tunnel's datagram streams to the local UDP service.
 //! * `ops` — operations exposed over IPC, including the readiness-gated `add`.
 //!
 //! Single instance: the agent holds an exclusive `flock` on `agent.lock` for its lifetime.
@@ -19,6 +20,7 @@ mod serve;
 mod session;
 mod shell;
 mod tunnels;
+mod udp;
 
 use std::fs::File;
 use std::sync::Arc;
