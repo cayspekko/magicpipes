@@ -184,6 +184,23 @@ before anything is spawned. Once users exist, the management UI can list shell t
 them for logged-in users with grants instead of a link. Later: `--shared` (everyone watches one
 session, like tmux), and a key for read-only terminals.
 
+### Touch-friendly terminal
+
+The terminal page renders on a phone, but using a shell there is hard: the on-screen keyboard
+has no Esc, Tab, Ctrl or arrows, covers the prompt, and swipes do not scroll. Planned, in the
+page only (no agent or server change), and shared by the SSH web terminal later:
+
+- a key bar above the on-screen keyboard (Esc, Tab, Ctrl and Alt as sticky modifiers, arrows,
+  `|`, `~`, `/`, `-`, PgUp/PgDn), as in Termux and Blink;
+- layout that follows `visualViewport`, so the keyboard never covers the cursor line;
+- input that survives mobile keyboards: autocorrect and autocapitalize off, IME composition
+  (Android keyboards send whole words) turned into plain keystrokes;
+- swipe to scroll the scrollback; in full-screen programs (vim, htop) swipes become arrow keys
+  or mouse wheel events;
+- tap to focus and raise the keyboard, long-press to select and copy, a paste button;
+- pinch to change the font size, remembered per device;
+- read-only terminals keep the keyboard hidden: scroll and zoom only.
+
 Logging in to the SSH terminal (a browser has no SSH private key):
 
 1. Password typed into the browser: easy, but it passes through the server.
@@ -228,6 +245,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 |---|---|---|---|
 | 1 | Static files (`add --serve`) | none | done |
 | 1b | Agent web terminal (`add --shell`) | none | done |
+| 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | planned |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | planned |
 | 4 | Users, web login, grants, audit log | yes | planned |
