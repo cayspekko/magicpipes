@@ -72,12 +72,13 @@ to local target, bidirectional copy). `agent/ops.rs` sits on top of both.
 
 ## Static file tunnels (`add --serve`)
 
-A tunnel's local target is either a TCP service or a directory (`state::Target`). For a
+A tunnel's local target is a TCP service, a directory or a program in a terminal
+(`state::Target`). For a
 directory, `agent/forward.rs` acknowledges the data stream with `STREAM_OK` and hands it to
-`agent/serve.rs`, which runs hyper's HTTP/1 server directly on the yamux stream: no local port,
+`agent/serve/`, which runs hyper's HTTP/1 server directly on the yamux stream: no local port,
 and no server-side change (to the server it is an ordinary HTTP tunnel; the stored target string
 is `static:<path>`). tower-http's `ServeFile` writes file responses (content type, ranges,
-conditional requests); `serve.rs` decides which file and enforces the safety rules: GET/HEAD
+conditional requests); `serve/mod.rs` decides which file and enforces the safety rules: GET/HEAD
 only, hidden names refused, segment-wise percent-decoding that rejects `.`/`..`, separators and
 NUL, and the canonical path must stay inside the canonical root (so symlinks leaving the root
 are refused and not listed). Trailing-slash redirects are built from the validated segments, so
@@ -92,8 +93,38 @@ of the selected names to the directory URL, or `?archive` for a whole folder: a 
 writes tar + gzip (pure Rust `tar`/`flate2`) into a bounded channel that is the response body,
 so archives of any size stream with flat memory and pause when the client stops reading.
 
-Planned target and ingress kinds (TCP/UDP ports, Unix sockets, SSH gateway, browser terminal and
-desktop) are described in [ROADMAP.md](ROADMAP.md).
+## Web terminal tunnels (`add --shell`)
+
+The third local target is a program run in a pty (`Target::Shell`: argv, working directory,
+writable flag, write key, session limit). Like static files it is served inside the agent
+(`agent/shell/`): hyper on the data stream, with upgrades enabled. `GET /` is the terminal page
+(shared theme, CSP nonce), `/assets/*` are the vendored xterm.js 6 modules and stylesheet
+(compiled into the binary, gzip-compressed once on first use) and Symbols Nerd Font Mono (WOFF2,
+a fallback after the viewer's monospace font, limited by `unicode-range` to the Nerd Font icon
+code points so it is fetched only when one is drawn), and `/ws` is the WebSocket. The
+server proxies it like any tunnel WebSocket, so it needs no change.
+
+Each WebSocket session starts its own copy of the program (`portable-pty`: openpty on Unix,
+ConPTY on Windows), the ttyd model. The browser opens with a JSON hello carrying the terminal
+size and, for writable tunnels, the key read from the URL fragment; afterwards binary messages
+are input and JSON messages resize. Output flows back as binary messages, coalesced up to
+64 KiB. pty reads, writes and the exit wait are blocking, so each has a thread and a bounded
+channel: a slow viewer pauses the program's output rather than growing a buffer, and input is
+dropped (not queued) if the program stops reading. Access is decided in the agent, never in the
+page: read-only sessions have their input discarded; on writable tunnels a session without the
+key (constant-time comparison) is refused before anything is spawned; `Origin` must match
+`Host`; `max_clients` bounds concurrent sessions. Pings every 30 s keep idle sessions under the
+server's WebSocket idle timeout.
+
+A session ends when the browser goes away, the program exits (output still in flight is
+forwarded for 300 ms, since a background process may hold the pty open, and ConPTY reports no
+EOF), or the tunnel is removed or re-added with other settings: every tunnel has a cancellation
+token that `Tunnels::upsert`/`remove` cancel when its target changes. Ending sends SIGHUP (as
+when a terminal closes; the kernel then hangs up the foreground job), then SIGKILL after 2 s;
+on Windows the process is terminated.
+
+Planned target and ingress kinds (TCP/UDP ports, Unix sockets, SSH gateway, browser desktop) are
+described in [ROADMAP.md](ROADMAP.md).
 
 ## Wire protocol
 

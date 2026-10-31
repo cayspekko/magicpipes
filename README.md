@@ -30,9 +30,10 @@ your application. The tunnel then keeps running in a background agent after the 
 
 Nothing listens for inbound connections on your machine. You don't configure a reverse proxy,
 create per-app DNS records, or restart anything when you add a tunnel. HTTP/1.1 and WebSockets
-both work, and `magicpipes add --serve <dir>` publishes a directory of files with a built-in web
-server. See [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next (TCP/UDP ports, an SSH
-gateway, browser terminal and desktop).
+both work. `magicpipes add --serve <dir>` publishes a directory of files with a built-in web
+server, and `magicpipes add --shell` shares a terminal in the browser (like ttyd). See
+[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next (TCP/UDP ports, an SSH gateway, browser
+desktop).
 
 > **Public means public.** Anyone who knows a tunnel URL can reach it. The random name is not
 > access control. Put authentication in your application if it needs it.
@@ -200,6 +201,7 @@ magicpipes add 8080                 # random name, e.g. https://bright-otter.t.e
 magicpipes add 3000 --name myapp    # https://myapp.t.example.com
 magicpipes add 5173 --json          # machine-readable output (see below)
 magicpipes add --serve ./dist       # serve a directory with the built-in file server
+magicpipes add --shell -- htop      # a terminal in the browser (read-only unless --write)
 
 magicpipes list                     # tunnels on this machine and their status
 magicpipes status                   # login, agent and connection status
@@ -252,6 +254,42 @@ Checking directory...         ✓
 > Everything in the directory (except hidden entries) is public. Serve a dedicated build or
 > export directory, not your home directory or a source checkout.
 
+### Sharing a terminal
+
+`magicpipes add --shell` puts a terminal on a public URL, like ttyd: your login shell, or any
+program given after `--`. Each visitor gets **their own copy** of the program in a new
+terminal, which is stopped when they close the tab. The page uses the MagicPipes look, and the
+terminal resizes with the window.
+
+```console
+$ magicpipes add --shell --name top -- htop
+Checking program...           ✓
+...
+  Public: https://top.t.example.com
+  Shell:  htop (read-only)
+  In:     /home/me/project
+```
+
+* **Read-only by default.** Visitors watch the program's output; the agent ignores their
+  keystrokes. That suits dashboards and logs: `htop`, `btop`, `tail -f app.log`,
+  `watch kubectl get pods`.
+* **`--write` lets visitors type.** The URL then carries a secret: `https://name.t.example.com/#k=…`.
+  Without the full link the page connects to nothing. The part after `#` is never sent in HTTP
+  requests, so it does not appear in proxy or server logs. Anyone with the link can run commands
+  as you, so share it like a password. Running the same `add` again prints the same link;
+  `magicpipes remove <name>` revokes it, and re-adding without `--write` ends open sessions.
+* The program runs in the directory where you ran `add`, with the agent's environment, plus
+  `TERM=xterm-256color`. On Windows the default is PowerShell (ConPTY).
+* Nerd Font icons (Starship, Powerlevel10k, `eza --icons`, …) render for every viewer: the
+  page bundles the symbols-only Nerd Font and downloads it (1.2 MB, once) only when an icon is
+  on screen. Emoji and CJK take two columns, as in current terminals.
+* `--max-clients N` limits concurrent sessions (default 5).
+* Running the same command from the same directory again returns the same tunnel. `list` shows
+  it as `shell:htop (read-only)`; `list --json` includes the `share_url`.
+
+> The MagicPipes server relays the terminal and can read it (it terminates TLS for every
+> tunnel). Use your own SSH for anything the server operator should not see.
+
 ### `add` semantics
 
 * The local service must already be accepting connections. The agent tries `127.0.0.1` and then
@@ -302,7 +340,7 @@ On failure:
 | 1 | `internal`, ... | Unexpected error |
 | 2 | | Invalid command-line usage |
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token` | Enrollment or credentials |
-| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory` | Nothing listening locally, or `--serve` directory missing |
+| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_start_failed`, `agent_not_running`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
 | 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found` | Naming/registry |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
@@ -420,5 +458,12 @@ Workspace layout:
 ```text
 crates/magicpipes-core     wire protocol, yamux driver, names, secrets
 crates/magicpipes-server   magicpipesd: control/ (registry), data/ (proxy), certs/, mgmt/, gateway.rs
-crates/magicpipes-cli      magicpipes: CLI commands, client.rs (agent lifecycle), agent/ (session, forward, ops)
+crates/magicpipes-cli      magicpipes: CLI commands, client.rs (agent lifecycle), agent/ (session, forward, ops, serve, shell)
 ```
+
+## License
+
+MIT ([LICENSE](LICENSE)). For the web terminal, the `magicpipes` binary embeds xterm.js and its
+fit and unicode11 addons (MIT, © the xterm.js authors) and Symbols Nerd Font Mono from Nerd Fonts
+(MIT, © Ryan L McIntyre); their licenses ship as `LICENSE-xterm.js` and `LICENSE-nerd-fonts` in
+release archives.

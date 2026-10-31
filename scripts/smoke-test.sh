@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
-# HTTP server, fetches it through the public HTTPS listener, and stops the agent.
+# HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
+# terminal, and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -153,10 +154,70 @@ run tar -tzf site.tar.gz
 grep -q 'docs/note.txt' cmd.out
 if grep -q 'hidden' cmd.out; then echo "hidden file in archive"; exit 1; fi
 
+step "web terminal"
+# A minimal WebSocket client (standard library only): says hello with the key, waits for the
+# program's output, types a line and waits for the answer.
+cat > term.py <<'PYEOF'
+import base64, json, os, socket, ssl, struct, sys, time
+host, port, ca, key, first, typed, second = sys.argv[1:8]
+ctx = ssl.create_default_context(cafile=ca)
+ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)  # Python 3.13+: the dev CA's leaf has no authority key id
+sock = ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(port)), timeout=20), server_hostname=host)
+sock.sendall((f"GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: https://{host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+              f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}\r\n\r\n").encode())
+buf = b""
+def read(n):
+    global buf
+    while len(buf) < n:
+        chunk = sock.recv(65536)
+        if not chunk: sys.exit("connection closed")
+        buf += chunk
+    out, buf = buf[:n], buf[n:]
+    return out
+while b"\r\n\r\n" not in buf: buf += sock.recv(4096) or sys.exit("closed during handshake")
+head, buf = buf.split(b"\r\n\r\n", 1)
+if not head.startswith(b"HTTP/1.1 101"): sys.exit(head.decode(errors="replace"))
+def send(op, data):
+    mask, n = os.urandom(4), len(data)
+    size = bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n)
+    sock.sendall(bytes([0x80 | op]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+screen = ""
+def until(text):
+    global screen
+    deadline = time.time() + 20
+    while text not in screen:
+        if time.time() > deadline: sys.exit(f"timed out waiting for {text!r}; screen: {screen!r}")
+        b0, b1 = read(2)
+        n = b1 & 127
+        n = struct.unpack(">H", read(2))[0] if n == 126 else struct.unpack(">Q", read(8))[0] if n == 127 else n
+        op, data = b0 & 15, read(n)
+        if op == 2: screen += data.decode(errors="replace")
+        elif op == 1:
+            print("control:", data.decode())
+            if json.loads(data)["type"] != "ready": sys.exit("session refused")
+        elif op == 8: sys.exit(f"closed; screen: {screen!r}")
+        elif op == 9: send(10, data)
+send(1, json.dumps({"type": "hello", "key": key, "cols": 80, "rows": 24}).encode())
+until(first)
+send(2, typed.encode())
+until(second)
+print(screen.encode("ascii", "replace").decode())
+PYEOF
+PROG=$(native "$(command -v "$PY")")
+run "$MP" add --shell --write --name term --json --timeout 60 -- "$PROG" -c "import sys; print('shell-' + str(6*7)); print('got-' + sys.stdin.readline().strip())"
+grep -q '"status": "ready"' cmd.out
+KEY=$(sed -n 's/.*#k=\([A-Za-z0-9]*\)".*/\1/p' cmd.out | head -n 1)
+[[ -n "$KEY" ]] || { echo "no key in the share URL"; exit 1; }
+TERM_TLS=(--cacert server/dev-ca/ca.crt --resolve "term.t.test:$HTTPS:127.0.0.1")
+run "${CURL[@]}" -f "${TERM_TLS[@]}" "https://term.t.test:$HTTPS/"
+grep -q 'data-access="key"' cmd.out
+run "$PY" term.py term.t.test "$HTTPS" "$(native "$WORK/server/dev-ca/ca.crt")" "$KEY" shell-42 $'smoke\r' got-smoke
+
 step "list and remove"
 run "$MP" list
 run "$MP" remove smoke
 run "$MP" remove files
+run "$MP" remove term
 run "$MP" agent stop
 
 # A freshly started agent must not keep the CLI's output open: `magicpipes ... | cat` has to

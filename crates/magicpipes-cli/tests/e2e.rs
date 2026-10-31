@@ -13,6 +13,7 @@ use http::{Request, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 fn hostname(public_url: &str) -> String {
     public_url.trim_start_matches("https://").split(':').next().unwrap().to_string()
@@ -21,7 +22,9 @@ fn hostname(public_url: &str) -> String {
 async fn add_json(env: &Env, args: &[&str]) -> Value {
     let mut a = vec!["add"];
     a.extend_from_slice(args);
-    a.push("--json");
+    // Before a `--` that starts a `--shell` command.
+    let at = a.iter().position(|x| *x == "--").unwrap_or(a.len());
+    a.insert(at, "--json");
     env.cli_json(&a).await
 }
 
@@ -382,6 +385,173 @@ async fn static_files() {
     assert_eq!(env.cli(&["add", "8080", "--serve", dir]).await.status.code(), Some(2));
 
     env.cli_ok(&["remove", "files"]).await;
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+/// Opens a web terminal session and says hello; returns the socket and the first control message.
+async fn terminal(env: &Env, host: &str, key: Option<&str>) -> (Terminal, Value) {
+    let tls = env.connect(host, env.https_port).await;
+    let mut req = format!("wss://{host}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("origin", format!("https://{host}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::client_async(req, tls).await.expect("terminal handshake");
+    let hello = serde_json::json!({ "type": "hello", "key": key, "cols": 100, "rows": 30 });
+    ws.send(Message::text(hello.to_string())).await.unwrap();
+    let (_, first) = read_terminal(&mut ws, "", Duration::from_secs(10)).await;
+    (ws, first.expect("a control message after hello"))
+}
+
+type Terminal = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// Collects terminal output until it contains `want` (if not empty), a control message arrives
+/// (returned), the socket closes or `wait` passes.
+async fn read_terminal(ws: &mut Terminal, want: &str, wait: Duration) -> (String, Option<Value>) {
+    let mut out = String::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Binary(b)))) => {
+                out.push_str(&String::from_utf8_lossy(&b));
+                if !want.is_empty() && out.contains(want) {
+                    return (out, None);
+                }
+            }
+            Ok(Some(Ok(Message::Text(t)))) => return (out, Some(serde_json::from_str(&t).unwrap())),
+            Ok(Some(Ok(_))) => {}
+            _ => return (out, None),
+        }
+    }
+}
+
+fn process_alive(pid: &str) -> bool {
+    std::process::Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().unwrap().success()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_terminal() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let script = "echo READY; read line; echo GOT:$line";
+
+    // --- read-only (the default) ----------------------------------------------------------------
+    let out = env.cli_ok(&["add", "--shell", "--name", "ro", "--", "/bin/sh", "-c", script]).await;
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("Shell:  /bin/sh -c 'echo READY; read line; echo GOT:$line' (read-only)"), "{stdout}");
+    assert!(stderr.contains("Checking program...") && stderr.contains("Visitors only watch"), "{stderr}");
+    let listed = env.cli_json(&["list", "--json"]).await;
+    let ro = &listed["tunnels"][0];
+    assert_eq!(ro["share_url"], ro["public_url"], "no key for a read-only terminal");
+    let host = format!("ro.{BASE}");
+
+    let get = |path: &str, gzip: bool| {
+        let mut b = Request::get(path).header(header::HOST, &host);
+        if gzip {
+            b = b.header(header::ACCEPT_ENCODING, "gzip");
+        }
+        b.body(Full::new(Bytes::new())).unwrap()
+    };
+    let page = env.send(&host, env.https_port, get("/", false)).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let csp = page.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+    let html = String::from_utf8(page.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(html.contains(r#"data-access="open""#) && html.contains("<title>sh · MagicPipes</title>"), "{html}");
+    let nonce = csp.split("'nonce-").nth(1).unwrap().split('\'').next().unwrap();
+    assert!(html.contains(&format!(r#"<script type="module" nonce="{nonce}">"#)));
+    let js = env.send(&host, env.https_port, get("/assets/xterm.mjs", true)).await;
+    assert_eq!((js.status(), js.headers().get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap())), (StatusCode::OK, Some("gzip")));
+    // The icon font is already compressed, and the CSP lets the page load it.
+    let font = env.send(&host, env.https_port, get("/assets/symbols-nerd-font-mono.woff2", true)).await;
+    assert_eq!((font.status(), font.headers().get(header::CONTENT_ENCODING)), (StatusCode::OK, None));
+    assert_eq!(font.headers()[header::CONTENT_TYPE], "font/woff2");
+    assert!(csp.contains("font-src 'self'"), "{csp}");
+    assert_eq!(env.send(&host, env.https_port, get("/nope", false)).await.status(), StatusCode::NOT_FOUND);
+    // A plain request for /ws is not a WebSocket.
+    assert_eq!(env.send(&host, env.https_port, get("/ws", false)).await.status(), StatusCode::BAD_REQUEST);
+
+    // Cross-origin pages cannot open sessions.
+    let tls = env.connect(&host, env.https_port).await;
+    let mut req = format!("wss://{host}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("origin", "https://evil.example".parse().unwrap());
+    assert!(tokio_tungstenite::client_async(req, tls).await.is_err(), "cross-origin handshake must fail");
+
+    // Output arrives; typing is ignored by the agent.
+    let (mut ws, ready) = terminal(&env, &host, None).await;
+    assert_eq!(ready, serde_json::json!({ "type": "ready", "writable": false }));
+    let (screen, _) = read_terminal(&mut ws, "READY", Duration::from_secs(10)).await;
+    assert!(screen.contains("READY"), "{screen:?}");
+    ws.send(Message::binary(b"typed\r".to_vec())).await.unwrap();
+    let (screen, ctl) = read_terminal(&mut ws, "GOT:", Duration::from_millis(1500)).await;
+    assert!(!screen.contains("typed") && ctl.is_none(), "read-only input reached the program: {screen:?} {ctl:?}");
+    drop(ws);
+
+    // --- read-write with the secret link -------------------------------------------------------
+    let rw = add_json(&env, &["--shell", "--write", "--name", "rw", "--", "/bin/sh", "-c", script]).await;
+    assert_eq!(rw["target"], "shell:/bin/sh -c 'echo READY; read line; echo GOT:$line' (read-write)");
+    let share = rw["share_url"].as_str().unwrap().to_string();
+    let key = share.split_once("#k=").expect("share URL carries the key").1.to_string();
+    assert!(key.len() >= 32 && !rw["public_url"].as_str().unwrap().contains(&key));
+    let tunnels = std::fs::read_to_string(env.home().join("tunnels.json")).unwrap();
+    assert!(tunnels.contains(&key), "the key is kept in tunnels.json");
+    // Re-adding keeps the link.
+    let again = add_json(&env, &["--shell", "--write", "--name", "rw", "--", "/bin/sh", "-c", script]).await;
+    assert_eq!((again["share_url"].as_str(), again["created"].as_bool()), (Some(share.as_str()), Some(false)));
+
+    let host = format!("rw.{BASE}");
+    for bad in [None, Some("wrong")] {
+        let (_, refused) = terminal(&env, &host, bad).await;
+        assert_eq!((refused["type"].as_str(), refused["code"].as_str()), (Some("error"), Some("key")), "{bad:?}");
+    }
+    let (mut ws, ready) = terminal(&env, &host, Some(&key)).await;
+    assert_eq!(ready["writable"], true);
+    read_terminal(&mut ws, "READY", Duration::from_secs(10)).await;
+    ws.send(Message::binary(b"typed\r".to_vec())).await.unwrap();
+    let (screen, _) = read_terminal(&mut ws, "GOT:typed", Duration::from_secs(10)).await;
+    assert!(screen.contains("GOT:typed"), "{screen:?}");
+    let (_, exit) = read_terminal(&mut ws, "", Duration::from_secs(10)).await;
+    assert_eq!(exit, Some(serde_json::json!({ "type": "exit", "code": 0, "signal": null })));
+
+    // Re-adding read-only revokes the key and ends open sessions.
+    let (mut ws, _) = terminal(&env, &host, Some(&key)).await;
+    let ro_again = add_json(&env, &["--shell", "--name", "rw", "--", "/bin/sh", "-c", script]).await;
+    assert_eq!(ro_again["share_url"], ro_again["public_url"]);
+    let (_, ended) = read_terminal(&mut ws, "", Duration::from_secs(10)).await;
+    assert_eq!(ended.unwrap()["type"], "ended");
+    let (_, ready) = terminal(&env, &host, Some(&key)).await;
+    assert_eq!(ready["writable"], false, "a stale key no longer grants writing");
+
+    // --- session limit, and programs end with their session ------------------------------------
+    let pidfile = env.root.join("pid");
+    let cmd = format!("echo $$ > {}; echo STARTED; exec sleep 60", pidfile.display());
+    add_json(&env, &["--shell", "--max-clients", "1", "--name", "one", "--", "/bin/sh", "-c", &cmd]).await;
+    let host = format!("one.{BASE}");
+    let (mut first, ready) = terminal(&env, &host, None).await;
+    assert_eq!(ready["type"], "ready");
+    read_terminal(&mut first, "STARTED", Duration::from_secs(10)).await;
+    let (_, busy) = terminal(&env, &host, None).await;
+    assert_eq!(busy["code"], "busy");
+    let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+    assert!(process_alive(&pid));
+    let _ = first.close(None).await;
+    drop(first);
+    env.eventually("program killed when its session closed", Duration::from_secs(10), || async { !process_alive(&pid) }).await;
+    let (mut second, ready) = terminal(&env, &host, None).await;
+    assert_eq!(ready["type"], "ready", "the slot was released");
+    read_terminal(&mut second, "STARTED", Duration::from_secs(10)).await;
+
+    // Removing the tunnel ends its sessions and their programs.
+    let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+    env.cli_ok(&["remove", "one"]).await;
+    let (_, ended) = read_terminal(&mut second, "", Duration::from_secs(10)).await;
+    assert_eq!(ended.unwrap()["type"], "ended");
+    env.eventually("program killed when its tunnel was removed", Duration::from_secs(10), || async { !process_alive(&pid) }).await;
+
+    // --- input errors ---------------------------------------------------------------------------
+    let out = env.cli(&["add", "--shell", "--json", "--", "no-such-program-mp"]).await;
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_command");
+    assert_eq!(env.cli(&["add", "--shell", "8080"]).await.status.code(), Some(2));
+    assert_eq!(env.cli(&["add", "8080", "--write"]).await.status.code(), Some(2));
+
     env.cli_ok(&["agent", "stop"]).await;
 }
 

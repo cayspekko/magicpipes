@@ -42,7 +42,7 @@ use listing::{Entry, Page};
 
 use crate::ipc::ErrorInfo;
 
-type Body = UnsyncBoxBody<Bytes, std::io::Error>;
+pub(super) type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// Entries beyond this are left out of a listing (and counted in a note).
 const MAX_LISTED: usize = 5000;
@@ -327,7 +327,7 @@ fn human_size(n: u64) -> String {
     format!("{v:.1} {}", UNITS[unit])
 }
 
-fn esc(s: &str) -> String {
+pub(super) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -342,11 +342,11 @@ fn esc(s: &str) -> String {
     out
 }
 
-fn full(body: impl Into<Bytes>) -> Body {
+pub(super) fn full(body: impl Into<Bytes>) -> Body {
     Full::new(body.into()).map_err(|never| match never {}).boxed_unsync()
 }
 
-fn text(status: StatusCode, body: &'static str) -> Response<Body> {
+pub(super) fn text(status: StatusCode, body: &'static str) -> Response<Body> {
     let mut resp = Response::new(full(body));
     *resp.status_mut() = status;
     let h = resp.headers_mut();
@@ -355,13 +355,13 @@ fn text(status: StatusCode, body: &'static str) -> Response<Body> {
     resp
 }
 
-fn method_not_allowed() -> Response<Body> {
+pub(super) fn method_not_allowed() -> Response<Body> {
     let mut resp = text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
     resp.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
     resp
 }
 
-fn not_found() -> Response<Body> {
+pub(super) fn not_found() -> Response<Body> {
     text(StatusCode::NOT_FOUND, "not found\n")
 }
 

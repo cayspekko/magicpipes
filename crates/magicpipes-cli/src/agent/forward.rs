@@ -11,7 +11,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use super::serve::{self, Site};
-use super::tunnels::Tunnels;
+use super::shell::{self, Terminal};
+use super::tunnels::{Route, Tunnels};
 use crate::state::Target;
 
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,7 +39,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
             }
         }
         ServerOpen::Data { tunnel_id } => {
-            let Some((target, counter)) = tunnels.target(&tunnel_id) else {
+            let Some(Route { target, streams_ok: counter, ended, sessions }) = tunnels.route(&tunnel_id) else {
                 let _ = stream.write_all(&[STREAM_UNKNOWN_TUNNEL]).await;
                 let _ = stream.shutdown().await;
                 return;
@@ -51,6 +52,15 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
                     serve::serve(stream, Arc::new(Site { root, list })).await;
+                    return;
+                }
+                Target::Shell { shell: command, cwd, writable, key, max_clients } => {
+                    if stream.write_all(&[STREAM_OK]).await.is_err() {
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let key = key.filter(|_| writable);
+                    shell::serve(stream, Arc::new(Terminal { command, cwd, key, max_clients, sessions, ended })).await;
                     return;
                 }
             };

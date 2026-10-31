@@ -1,0 +1,7 @@
+xterm.js 6.0.0 (@xterm/xterm), @xterm/addon-fit 0.11.0 and @xterm/addon-unicode11 0.9.0, MIT licensed
+(LICENSE, LICENSE-addon-fit, LICENSE-addon-unicode11).
+From the npm registry (integrity checked by npm): lib/*.mjs with the sourceMappingURL line removed, css/xterm.css unchanged.
+
+symbols-nerd-font-mono.woff2: Symbols Nerd Font Mono from Nerd Fonts v3.5.1 (NerdFontsSymbolsOnly.tar.xz,
+GitHub release), MIT licensed (LICENSE-nerd-fonts). SymbolsNerdFontMono-Regular.ttf converted to WOFF2 with
+fontTools (TTFont(...).flavor = "woff2"), glyphs unchanged.

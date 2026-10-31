@@ -35,11 +35,12 @@ mime.workspace = true
 mime_guess.workspace = true
 tar.workspace = true
 flate2.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+portable-pty.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
-tokio-tungstenite.workspace = true
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rcgen.workspace = true

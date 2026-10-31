@@ -54,17 +54,29 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
-    /// Expose a local port, or serve a directory; returns once the public HTTPS URL is verified to work.
+    /// Expose a local port, serve a directory or share a terminal; returns once the public HTTPS URL is verified to work.
     Add {
         /// Local TCP port of the application.
-        #[arg(required_unless_present = "serve")]
         port: Option<u16>,
         /// Serve the files in DIR with the built-in web server instead of forwarding to a port.
-        #[arg(long, value_name = "DIR", conflicts_with_all = ["port", "host"])]
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["port", "host", "shell"])]
         serve: Option<PathBuf>,
         /// With --serve: don't list directory contents (a directory's index.html is still served).
         #[arg(long, requires = "serve")]
         no_list: bool,
+        /// Share a terminal in the browser: your login shell, or the program given after `--`.
+        /// Each visitor gets their own copy; read-only unless --write.
+        #[arg(long, conflicts_with_all = ["port", "host"])]
+        shell: bool,
+        /// With --shell: let visitors type. Prints a secret link, which is required to connect.
+        #[arg(long)]
+        write: bool,
+        /// With --shell: most sessions open at once.
+        #[arg(long, value_name = "N")]
+        max_clients: Option<u16>,
+        /// With --shell: the program (and its arguments) to run instead of your login shell.
+        #[arg(last = true, value_name = "PROGRAM")]
+        command: Vec<String>,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
         name: Option<String>,
@@ -145,7 +157,7 @@ enum AgentCommand {
 fn exit_code(code: &str) -> u8 {
     match code {
         "not_logged_in" | "unauthorized" | "invalid_enrollment_token" | "config_error" => 3,
-        "local_unreachable" | "invalid_port" | "invalid_host" | "invalid_directory" => 4,
+        "local_unreachable" | "invalid_port" | "invalid_host" | "invalid_directory" | "invalid_command" => 4,
         "server_unreachable" | "agent_unavailable" | "agent_start_failed" | "agent_not_running" | "agent_protocol" | "agent_outdated" => 5,
         "name_conflict" | "name_taken" | "invalid_name" | "limit_reached" | "not_found" => 6,
         "tls_failed" | "tls_timeout" => 7,
@@ -156,11 +168,27 @@ fn exit_code(code: &str) -> u8 {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    check_add_args(&cli.command);
     if let Command::Agent { command: AgentCommand::Run { detached } } = cli.command {
         return run_agent(detached);
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     rt.block_on(dispatch(cli.command))
+}
+
+/// Argument rules clap cannot express: a bool flag such as `--shell` always counts as present
+/// (it has a default), so `requires = "shell"` would never fire.
+fn check_add_args(cmd: &Command) {
+    use clap::CommandFactory;
+    use clap::error::ErrorKind;
+    let Command::Add { port, serve, shell, write, max_clients, command, .. } = cmd else { return };
+    let fail = |kind, msg: &str| Cli::command().find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit();
+    if port.is_none() && serve.is_none() && !shell {
+        fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --serve <DIR> or --shell");
+    }
+    if !shell && (*write || max_clients.is_some() || !command.is_empty()) {
+        fail(ErrorKind::ArgumentConflict, "--write, --max-clients and a `-- <PROGRAM>` can only be used with --shell");
+    }
 }
 
 fn run_agent(detached: bool) -> ExitCode {
@@ -192,8 +220,20 @@ fn read_pid() -> Option<String> {
 async fn dispatch(cmd: Command) -> ExitCode {
     let (out, result) = match cmd {
         Command::Login { server, token, ca_cert, name, out } => (out, login(server, token, ca_cert, name, out).await),
-        Command::Add { port, serve, no_list, name, host, probe_path, timeout, out } => {
-            let req = AddRequest { port, serve, list: !no_list, host, name, probe_path, timeout_secs: timeout };
+        Command::Add { port, serve, no_list, shell, write, max_clients, command, name, host, probe_path, timeout, out } => {
+            let req = AddRequest {
+                port,
+                serve,
+                list: !no_list,
+                shell: shell.then(|| if command.is_empty() { login_shell() } else { command }),
+                cwd: None,
+                writable: write,
+                max_clients,
+                host,
+                name,
+                probe_path,
+                timeout_secs: timeout,
+            };
             (out, add(req, out).await)
         }
         Command::List { out } => (out, list(out).await),
@@ -231,6 +271,15 @@ async fn dispatch(cmd: Command) -> ExitCode {
 
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+}
+
+/// The command `--shell` runs without one: the user's login shell (PowerShell on Windows).
+fn login_shell() -> Vec<String> {
+    if cfg!(windows) {
+        return vec!["powershell.exe".into(), "-NoLogo".into()];
+    }
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+    vec![shell, "-l".into()]
 }
 
 // ---- commands -----------------------------------------------------------------------------
@@ -298,7 +347,8 @@ async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, 
 
 struct Progress {
     enabled: bool,
-    serving: bool,
+    /// Label for the local step when it is not a port check.
+    local: Option<&'static str>,
 }
 
 impl Progress {
@@ -309,7 +359,10 @@ impl Progress {
         let mut err = std::io::stderr();
         match state {
             StepState::Running => {
-                let label = if self.serving && step == ipc::Step::Local { "Checking directory..." } else { step.label() };
+                let label = match self.local {
+                    Some(l) if step == ipc::Step::Local => l,
+                    _ => step.label(),
+                };
                 let _ = write!(err, "{label:<30}");
             }
             StepState::Done => {
@@ -331,10 +384,22 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             .map_err(|e| ErrorInfo::new("invalid_directory", format!("cannot serve {}: {e}", dir.display())))?;
         req.serve = Some(abs);
     }
+    if req.shell.is_some() {
+        let cwd = std::env::current_dir().and_then(std::fs::canonicalize);
+        req.cwd = Some(cwd.map_err(|e| ErrorInfo::new("invalid_command", format!("cannot use the current directory: {e}")))?);
+    }
     let serving = req.serve.clone();
     let listing = serving.is_some() && req.list;
+    let shell = req.shell.as_ref().map(|argv| (state::command_line(argv), req.writable, req.cwd.clone().unwrap_or_default()));
     let spawned = client::ensure_agent().await?;
-    let progress = Progress { enabled: !out.quiet, serving: serving.is_some() };
+    let local = if serving.is_some() {
+        Some("Checking directory...")
+    } else if shell.is_some() {
+        Some("Checking program...")
+    } else {
+        None
+    };
+    let progress = Progress { enabled: !out.quiet, local };
     let result = client::request(&IpcRequest::Add(req), |s, st| progress.step(s, st)).await;
     let data = match result {
         Ok(d) => d,
@@ -352,15 +417,34 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         println!();
         println!("Tunnel ready");
         println!();
-        println!("  Public: {}", data["public_url"].as_str().unwrap_or_default());
-        match &serving {
-            Some(dir) => println!("  Serving: {}", state::display_path(dir)),
-            None => println!("  Local:  {}", data["target"].as_str().unwrap_or_default()),
+        println!("  Public: {}", data["share_url"].as_str().or(data["public_url"].as_str()).unwrap_or_default());
+        match (&serving, &shell) {
+            (Some(dir), _) => println!("  Serving: {}", state::display_path(dir)),
+            (_, Some((cmd, writable, cwd))) => {
+                println!("  Shell:  {cmd} ({})", if *writable { "read-write" } else { "read-only" });
+                println!("  In:     {}", state::display_path(cwd));
+            }
+            _ => println!("  Local:  {}", data["target"].as_str().unwrap_or_default()),
         }
         println!("  Status: connected");
         println!();
-        println!("Tunnel active in background. Anyone with the URL can reach it.");
+        match &shell {
+            Some((_, true, _)) => println!("Tunnel active in background. Anyone with this link can type into the terminal."),
+            Some((_, false, _)) => println!("Tunnel active in background. Anyone with the URL can watch; each visitor gets their own copy."),
+            None => println!("Tunnel active in background. Anyone with the URL can reach it."),
+        }
         println!("Stop it with: magicpipes remove {}", data["name"].as_str().unwrap_or_default());
+    }
+    if let Some((cmd, writable, _)) = &shell
+        && !out.quiet
+    {
+        eprintln!();
+        if *writable {
+            eprintln!("The link above runs `{cmd}` on this machine as you, with full control. Share it like a password;");
+            eprintln!("re-running this command prints the same link, and `magicpipes remove` revokes it.");
+        } else {
+            eprintln!("Visitors only watch: their keystrokes are ignored. Use --write to let people type.");
+        }
     }
     if listing && !out.quiet {
         eprintln!();

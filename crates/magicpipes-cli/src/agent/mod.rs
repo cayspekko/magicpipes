@@ -3,6 +3,7 @@
 //! * `session` — control path: server connection, reconnects, registration RPCs.
 //! * `forward` — data path: server-opened streams piped to local targets.
 //! * `serve` — built-in static file server for `add --serve`, run on data streams directly.
+//! * `shell` — web terminal for `add --shell` (xterm.js page + pty per browser session).
 //! * `ops` — operations exposed over IPC, including the readiness-gated `add`.
 //!
 //! Single instance: the agent holds an exclusive `flock` on `agent.lock` for its lifetime.
@@ -16,6 +17,7 @@ mod ops;
 mod probe;
 mod serve;
 mod session;
+mod shell;
 mod tunnels;
 
 use std::fs::File;

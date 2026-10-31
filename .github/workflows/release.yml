@@ -119,6 +119,8 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/magicpipes$ext" "target/$TARGET/release/magicpipesd$ext" "dist/$name/"
           cp README.md LICENSE magicpipesd.example.toml "dist/$name/"
+          cp crates/magicpipes-cli/src/agent/shell/assets/LICENSE "dist/$name/LICENSE-xterm.js"
+          cp crates/magicpipes-cli/src/agent/shell/assets/LICENSE-nerd-fonts "dist/$name/LICENSE-nerd-fonts"
           cd dist
           if [[ "$TARGET" == *windows* ]]; then
             7z a -tzip -bso0 "$name.zip" "$name"

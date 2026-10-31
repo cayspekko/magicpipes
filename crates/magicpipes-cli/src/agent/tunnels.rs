@@ -3,8 +3,10 @@
 //! an address, so a compromised or misbehaving server cannot make the agent dial elsewhere.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::state::{self, LocalTunnel, Target};
 
@@ -24,6 +26,25 @@ struct Entry {
     last_error: Option<String>,
     /// Data streams that reached the local target (used by the readiness probe).
     streams_ok: Arc<AtomicU64>,
+    /// Cancelled when the tunnel is removed or its target changes, ending long-lived sessions
+    /// (web terminals) that were opened under the old settings.
+    ended: CancellationToken,
+    /// Open web terminal sessions.
+    sessions: Arc<AtomicUsize>,
+}
+
+impl Entry {
+    fn new(tunnel: LocalTunnel, registration: Registration) -> Self {
+        Self { tunnel, registration, last_error: None, streams_ok: Arc::default(), ended: CancellationToken::new(), sessions: Arc::default() }
+    }
+}
+
+/// What a data stream needs to serve a tunnel.
+pub struct Route {
+    pub target: Target,
+    pub streams_ok: Arc<AtomicU64>,
+    pub ended: CancellationToken,
+    pub sessions: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -45,7 +66,7 @@ impl Tunnels {
         {
             let mut map = me.map.lock().unwrap();
             for t in state::load_tunnels()? {
-                map.insert(t.id.clone(), Entry { tunnel: t, registration: Registration::Pending, last_error: None, streams_ok: Arc::default() });
+                map.insert(t.id.clone(), Entry::new(t, Registration::Pending));
             }
         }
         Ok(me)
@@ -63,12 +84,16 @@ impl Tunnels {
         let mut map = self.map.lock().unwrap();
         match map.get_mut(&t.id) {
             Some(e) => {
+                if e.tunnel.target != t.target {
+                    e.ended.cancel();
+                    e.ended = CancellationToken::new();
+                }
                 e.tunnel = t;
                 e.registration = registration;
                 e.last_error = None;
             }
             None => {
-                map.insert(t.id.clone(), Entry { tunnel: t, registration, last_error: None, streams_ok: Arc::default() });
+                map.insert(t.id.clone(), Entry::new(t, registration));
             }
         }
         Self::persist(&map);
@@ -76,7 +101,10 @@ impl Tunnels {
 
     pub fn remove(&self, id: &str) -> Option<LocalTunnel> {
         let mut map = self.map.lock().unwrap();
-        let removed = map.remove(id).map(|e| e.tunnel);
+        let removed = map.remove(id).map(|e| {
+            e.ended.cancel();
+            e.tunnel
+        });
         if removed.is_some() {
             Self::persist(&map);
         }
@@ -119,9 +147,14 @@ impl Tunnels {
     }
 
     /// Local destination for a data stream.
-    pub fn target(&self, id: &str) -> Option<(Target, Arc<AtomicU64>)> {
+    pub fn route(&self, id: &str) -> Option<Route> {
         let map = self.map.lock().unwrap();
-        map.get(id).map(|e| (e.tunnel.target.clone(), e.streams_ok.clone()))
+        map.get(id).map(|e| Route {
+            target: e.tunnel.target.clone(),
+            streams_ok: e.streams_ok.clone(),
+            ended: e.ended.clone(),
+            sessions: e.sessions.clone(),
+        })
     }
 
     pub fn streams_ok(&self, id: &str) -> u64 {

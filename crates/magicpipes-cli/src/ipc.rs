@@ -23,7 +23,7 @@ pub enum IpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddRequest {
-    /// Local port; absent when serving a directory.
+    /// Local port; absent when serving a directory or a shell.
     pub port: Option<u16>,
     /// Directory for the built-in file server (absolute, resolved by the CLI).
     #[serde(default)]
@@ -31,6 +31,18 @@ pub struct AddRequest {
     /// With `serve`: list directory contents.
     #[serde(default)]
     pub list: bool,
+    /// Web terminal: the command to run (argv, never empty; the CLI fills in the login shell).
+    #[serde(default)]
+    pub shell: Option<Vec<String>>,
+    /// With `shell`: working directory (absolute, from the CLI).
+    #[serde(default)]
+    pub cwd: Option<std::path::PathBuf>,
+    /// With `shell`: allow typing (needs the secret key from the share URL).
+    #[serde(default)]
+    pub writable: bool,
+    /// With `shell`: concurrent sessions allowed.
+    #[serde(default)]
+    pub max_clients: Option<u16>,
     pub host: Option<String>,
     pub name: Option<String>,
     pub probe_path: String,

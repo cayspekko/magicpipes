@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::probe;
 use super::serve;
 use super::session::{ConnState, RpcError, Session};
+use super::shell;
 use super::tunnels::{Registration, Tunnels};
 use crate::ipc::{AddRequest, ErrorInfo, IpcEvent, Step, StepState};
 use crate::state::{LocalTunnel, Target, target_url};
@@ -118,13 +119,14 @@ impl Agent {
             "name": tunnel.name,
             "public_url": tunnel.public_url,
             "target": tunnel.target.describe(),
+            "share_url": tunnel.target.share_url(&tunnel.public_url),
             "status": "ready",
             "background": true,
             "created": created,
         }))
     }
 
-    async fn register(&self, req: &AddRequest, target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
+    async fn register(&self, req: &AddRequest, mut target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
         let _lock = self.register_lock.lock().await;
         let name = match &req.name {
             Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new("invalid_name", m))?),
@@ -141,6 +143,14 @@ impl Agent {
                     format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.target.describe()),
                 ));
             }
+        // A writable shell keeps its key across re-adds, so links already shared keep working.
+        if let Target::Shell { writable: true, key, .. } = &mut target {
+            let old = existing.as_ref().and_then(|t| match &t.target {
+                Target::Shell { writable: true, key, .. } => key.clone(),
+                _ => None,
+            });
+            *key = old.or_else(|| Some(magicpipes_core::secret::random_string(32)));
+        }
         let mut rpc_req = RegisterTunnel {
             id: existing.as_ref().map(|t| t.id.clone()),
             name: existing.as_ref().map(|t| t.name.clone()).or(name.clone()),
@@ -282,6 +292,7 @@ impl Agent {
                     "name": s.tunnel.name,
                     "public_url": s.tunnel.public_url,
                     "target": s.tunnel.target.describe(),
+                    "share_url": s.tunnel.target.share_url(&s.tunnel.public_url),
                     "status": status,
                     "error": s.last_error,
                     "created_at": magicpipes_core::rfc3339(s.tunnel.created_at),
@@ -324,12 +335,23 @@ impl Agent {
     }
 }
 
-/// Checks the local side of an `add`: a listening port, or a directory to serve.
+/// Checks the local side of an `add`: a listening port, a directory to serve, or a program to
+/// run in a web terminal.
 async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
+    if let Some(command) = &req.shell {
+        let cwd = req.cwd.clone().ok_or_else(|| ErrorInfo::new("invalid_request", "--shell needs a working directory"))?;
+        shell::check(command, &cwd)?;
+        let max_clients = req.max_clients.unwrap_or(shell::DEFAULT_MAX_CLIENTS);
+        if max_clients == 0 {
+            return Err(ErrorInfo::new("invalid_request", "--max-clients must be at least 1"));
+        }
+        // The key is assigned at registration (kept from an existing tunnel when re-added).
+        return Ok(Target::Shell { shell: command.clone(), cwd, writable: req.writable, key: None, max_clients });
+    }
     match (&req.serve, req.port) {
         (Some(dir), _) => Ok(Target::Static { serve: serve::check_root(dir).await?, list: req.list }),
         (None, Some(port)) => Ok(Target::Tcp { host: resolve_local(req.host.as_deref(), port).await?, port }),
-        (None, None) => Err(ErrorInfo::new("invalid_request", "give a local port, or --serve <dir>")),
+        (None, None) => Err(ErrorInfo::new("invalid_request", "give a local port, --serve <dir> or --shell")),
     }
 }
 

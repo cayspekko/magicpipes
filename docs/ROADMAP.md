@@ -36,11 +36,11 @@ What you expose, and every way people can reach it:
 |---|---|---|---|---|---|
 | HTTP app | `add 8080` | ✅ today | ✅ TCP (optional) | — | via its hostname |
 | HTTP over Unix socket | `add --unix /run/app.sock` | ✅ | ✅ TCP | — | via its hostname |
-| Static files | `add --serve ./dist` | ✅ | — | — | via its hostname (listing) |
+| Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
 | Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ TCP | — | — |
 | Any UDP service | `add 53 --udp` | — | ✅ UDP | — | — |
 | SSH | `add 22 --ssh` | — | ✅ TCP (optional) | ✅ end-to-end | 🖥 terminal (server-side SSH client) |
-| Shell (no sshd) | `add --shell` | — | — | — | 🖥 terminal (agent-side pty) |
+| Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP for native clients | — | 🖥 desktop (IronRDP) |
 | VNC | `add 5900 --vnc` | — | ✅ TCP | — | 🖥 desktop (noVNC) |
 
@@ -63,6 +63,7 @@ Everything stays under `add`, following the existing convention (positional port
 ```text
 magicpipes add 8080                          # http (unchanged)
 magicpipes add --serve ./dist                # static files
+magicpipes add --shell -- htop               # web terminal (read-only; --write needs the #k= link)
 magicpipes add --unix /var/run/docker.sock   # http over a unix socket
 magicpipes add 5432 --tcp                    # → tcp://example.com:65307
 magicpipes add 53 --udp --host 10.0.0.2      # → udp://example.com:65311
@@ -157,7 +158,7 @@ user, then pipe a WebSocket into a tunnel stream.
 |---|---|---|---|
 | VNC desktop | noVNC (MPL-2.0) | plain relay | TCP to the VNC server |
 | RDP desktop | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway) | TCP to the RDP server |
-| Shell terminal | xterm.js (MIT) | plain relay | pty (`portable-pty`, ConPTY on Windows) |
+| Shell terminal (**done**: `add --shell`) | xterm.js (MIT), served by the agent | none: an ordinary tunnel WebSocket | pty (`portable-pty`, ConPTY on Windows) |
 | SSH terminal | xterm.js | SSH client (`russh`) through the tunnel | TCP to sshd |
 
 ### Web terminal: build, don't embed ttyd
@@ -170,9 +171,18 @@ command on the machine it runs on. Embedding it gains nothing:
 - It cannot use the SSH tunnel; it would have to run on the server and start `ssh` there, so
   the server would hold credentials anyway.
 
-Our own is small: xterm.js in the UI over a WebSocket, with two back ends (SSH terminal and
-agent shell, table above). The agent shell is effectively a remote shell, so it must be opted
-into per tunnel and never on by default.
+Our own is small: xterm.js over a WebSocket, with two back ends (SSH terminal and agent shell,
+table above). The agent shell is effectively a remote shell, so it must be opted into per tunnel
+and never on by default.
+
+The agent shell shipped first, as `magicpipes add --shell [-- program]`, without waiting for
+users: the agent serves the xterm.js page and the WebSocket on the tunnel's own hostname (like
+`--serve`, no server change), and every session runs its own copy of the program (the ttyd
+model). It is read-only unless added with `--write`; a writable tunnel has a secret key that
+travels in the URL fragment (`#k=…`, never sent in HTTP requests) and is checked by the agent
+before anything is spawned. Once users exist, the management UI can list shell tunnels and open
+them for logged-in users with grants instead of a link. Later: `--shared` (everyone watches one
+session, like tmux), and a key for read-only terminals.
 
 Logging in to the SSH terminal (a browser has no SSH private key):
 
@@ -193,8 +203,9 @@ VNC is nearly free once the relay exists.
 
 ## Prerequisite for browser access and the SSH gateway: users
 
-Today the management UI has a single admin token. Shells and desktops in the browser need real
-accounts, which also own the SSH gateway keys:
+Today the management UI has a single admin token. Desktops and SSH terminals in the browser
+need real accounts, which also own the SSH gateway keys (the agent shell manages with its
+secret link until then):
 
 - `users` table with web login (password + TOTP; OIDC later);
 - per-user SSH keys and grants (which agents/tunnels, and whether terminal/desktop is allowed);
@@ -215,10 +226,11 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 
 | # | Phase | Server changes | Status |
 |---|---|---|---|
-| 1 | Static files (`add --serve`) | none | in progress |
+| 1 | Static files (`add --serve`) | none | done |
+| 1b | Agent web terminal (`add --shell`) | none | done |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | planned |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | planned |
 | 4 | Users, web login, grants, audit log | yes | planned |
-| 5 | SSH gateway + web terminal + agent shell | yes | planned |
+| 5 | SSH gateway + SSH web terminal | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | planned |

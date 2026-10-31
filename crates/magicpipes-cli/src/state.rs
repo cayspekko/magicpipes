@@ -115,6 +115,16 @@ pub enum Target {
     Tcp { host: String, port: u16 },
     /// A directory served by the agent's built-in file server (`--serve`); `serve` is canonical.
     Static { serve: PathBuf, list: bool },
+    /// A web terminal (`--shell`): each browser session runs `shell` (argv) in a new pty in `cwd`.
+    /// Read-only unless `writable`, which requires `key` (it travels in the URL fragment).
+    Shell {
+        shell: Vec<String>,
+        cwd: PathBuf,
+        writable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        max_clients: u16,
+    },
 }
 
 impl Target {
@@ -123,17 +133,38 @@ impl Target {
         match self {
             Target::Tcp { host, port } => target_url(host, *port),
             Target::Static { serve, .. } => format!("static:{}", display_path(serve)),
+            Target::Shell { shell, writable, .. } => {
+                format!("shell:{} ({})", command_line(shell), if *writable { "read-write" } else { "read-only" })
+            }
         }
     }
 
-    /// Whether both point at the same place (a static tunnel's listing flag may differ).
+    /// The URL to share: the public URL, plus the write key in the fragment for a writable shell.
+    pub fn share_url(&self, public_url: &str) -> String {
+        match self {
+            Target::Shell { key: Some(key), writable: true, .. } => format!("{}/#k={key}", public_url.trim_end_matches('/')),
+            _ => public_url.to_string(),
+        }
+    }
+
+    /// Whether both point at the same place (a static tunnel's listing flag, or a shell's access
+    /// settings, may differ).
     pub fn same_destination(&self, other: &Target) -> bool {
         match (self, other) {
             (Target::Tcp { host: h1, port: p1 }, Target::Tcp { host: h2, port: p2 }) => h1 == h2 && p1 == p2,
             (Target::Static { serve: a, .. }, Target::Static { serve: b, .. }) => a == b,
+            (Target::Shell { shell: a, cwd: ca, .. }, Target::Shell { shell: b, cwd: cb, .. }) => a == b && ca == cb,
             _ => false,
         }
     }
+}
+
+/// A command as one line, quoting words that contain spaces or quotes.
+pub fn command_line(argv: &[String]) -> String {
+    let word = |w: &String| {
+        if !w.is_empty() && !w.contains([' ', '\t', '"', '\'']) { w.clone() } else { format!("'{}'", w.replace('\'', "'\\''")) }
+    };
+    argv.iter().map(word).collect::<Vec<_>>().join(" ")
 }
 
 /// A path without the `\\?\` prefix that canonicalization adds on Windows.
@@ -176,5 +207,19 @@ mod tests {
         assert_eq!((json["serve"].as_str(), json["list"].as_bool(), json.get("port")), (Some("/srv/site"), Some(false), None));
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), t);
         assert_eq!(t.target.describe(), "static:/srv/site");
+
+        let shell = Target::Shell { shell: vec!["htop".into()], cwd: "/home/u".into(), writable: true, key: Some("k1".into()), max_clients: 5 };
+        let t = LocalTunnel { target: shell, ..list[0].clone() };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["shell"][0], "htop");
+        assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), t);
+        assert_eq!(t.target.describe(), "shell:htop (read-write)");
+        assert_eq!(t.target.share_url("https://a.t.test"), "https://a.t.test/#k=k1");
+    }
+
+    #[test]
+    fn command_lines_quote_where_needed() {
+        let argv: Vec<String> = ["tail", "-f", "my log.txt", "it's"].map(String::from).to_vec();
+        assert_eq!(command_line(&argv), r"tail -f 'my log.txt' 'it'\''s'");
     }
 }
