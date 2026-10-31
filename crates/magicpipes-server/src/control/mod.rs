@@ -177,8 +177,15 @@ impl ControlPlane {
         let mut table = RouteTable::default();
         for t in st.tunnels.values() {
             let session = st.sessions.get(&t.row.agent_id).map(|s| s.handle.clone());
-            // Stored lists were validated on registration.
-            let allow = cidr::parse_list(&t.row.allow).unwrap_or_default();
+            // Stored lists were validated on registration. If one no longer parses, fail closed:
+            // an empty list would mean "anyone".
+            let allow = match cidr::parse_list(&t.row.allow) {
+                Ok(allow) => allow,
+                Err(e) => {
+                    tracing::error!(tunnel = %t.row.name, error = %e, "unreadable allow-list; tunnel not published");
+                    continue;
+                }
+            };
             let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), allow });
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {

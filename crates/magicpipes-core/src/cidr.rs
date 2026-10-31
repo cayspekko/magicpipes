@@ -23,6 +23,13 @@ impl Cidr {
             Some(p) => p.parse::<u8>().ok().filter(|p| *p <= max).ok_or_else(|| format!("'{s}': prefix must be 0-{max}"))?,
             None => max,
         };
+        // `::ffff:a.b.c.d/n` is the IPv4 range `a.b.c.d/(n - 96)`.
+        let prefix = match (addr, canonical(addr)) {
+            (IpAddr::V6(_), IpAddr::V4(_)) => {
+                prefix.checked_sub(96).ok_or_else(|| format!("'{s}': an IPv4-mapped prefix must be 96-128"))?
+            }
+            _ => prefix,
+        };
         Ok(Self { addr: canonical(addr), prefix })
     }
 
@@ -85,6 +92,20 @@ mod tests {
         assert!(v6.contains(ip("2001:db8:ffff::1")) && !v6.contains(ip("2001:db9::1")));
         assert!(Cidr::parse("0.0.0.0/0").unwrap().contains(ip("8.8.8.8")));
         assert!(allowed(&[], ip("1.2.3.4")));
+    }
+
+    /// A mapped address must round-trip through its stored form, or the server would fail to
+    /// re-parse it.
+    #[test]
+    fn ipv4_mapped_entries() {
+        let host = Cidr::parse("::ffff:203.0.113.7").unwrap();
+        assert_eq!(host.to_string(), "203.0.113.7/32");
+        assert_eq!(Cidr::parse(&host.to_string()), Ok(host));
+        assert!(host.contains(ip("203.0.113.7")) && !host.contains(ip("203.0.113.8")));
+        let net = Cidr::parse("::ffff:10.0.0.0/104").unwrap();
+        assert_eq!(net.to_string(), "10.0.0.0/8");
+        assert!(net.contains(ip("10.9.9.9")) && !net.contains(ip("11.0.0.1")));
+        assert!(Cidr::parse("::ffff:10.0.0.0/64").is_err());
     }
 
     #[test]

@@ -1,0 +1,57 @@
+# cargo-deny policy: run `cargo deny check` (CI runs it on every push and pull request).
+# Only the platforms we ship are considered, so Windows-only or wasm-only crates on other
+# targets don't add noise.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = false
+
+[advisories]
+# Every RustSec advisory (vulnerable, unmaintained, unsound, yanked) fails the check unless it
+# is listed in `ignore` with a reason and a date to revisit it.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses only. A new license here is a policy decision: say why in the commit.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    # webpki-roots: Mozilla's CA list.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are reported but allowed: they come from upstream crates moving at
+# different speeds (syn, thiserror, windows-sys, ...), not from our own manifests.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # TLS goes through rustls with ring; never link a system TLS library.
+    { crate = "openssl", reason = "use rustls" },
+    { crate = "openssl-sys", reason = "use rustls" },
+    { crate = "native-tls", reason = "use rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

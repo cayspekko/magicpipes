@@ -530,5 +530,8 @@ crates/magicpipes-cli      magicpipes: CLI commands, client.rs (agent lifecycle)
 
 MIT ([LICENSE](LICENSE)). For the web terminal, the `magicpipes` binary embeds xterm.js and its
 fit and unicode11 addons (MIT, © the xterm.js authors) and Symbols Nerd Font Mono from Nerd Fonts
-(MIT, © Ryan L McIntyre); their licenses ship as `LICENSE-xterm.js` and `LICENSE-nerd-fonts` in
-release archives.
+(MIT, © Ryan L McIntyre); their licenses ship as `LICENSE-xterm.js`, `LICENSE-xterm-addon-fit`,
+`LICENSE-xterm-addon-unicode11` and `LICENSE-nerd-fonts` in release archives.
+
+Third-party Rust dependencies are checked by `cargo deny check` against [deny.toml](deny.toml)
+(permissive licenses only, no known advisories, crates.io only); CI runs it on every push.

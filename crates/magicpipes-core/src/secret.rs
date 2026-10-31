@@ -72,4 +72,10 @@ mod tests {
         assert!(!verify("other", &sha256_hex(&t)));
         assert_ne!(new_token("x"), new_token("x"));
     }
+
+    /// Stored token hashes must never change across dependency upgrades.
+    #[test]
+    fn sha256_known_answer() {
+        assert_eq!(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
 }
