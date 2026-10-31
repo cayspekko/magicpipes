@@ -36,19 +36,19 @@ const LISTING_STYLE: &str = r#"
 h1{overflow-wrap:anywhere}
 .head .btn{margin-bottom:6px}
 .list{margin-top:32px}
-table.files td{padding:10px 18px}
+table.files td{padding:13px 18px}
 table.files tbody tr{transition:background .12s}
 .ck{width:46px;padding-right:0!important}
-input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer}
+input[type=checkbox]{accent-color:var(--ink);width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer}
 th button{all:unset;cursor:pointer;border-radius:4px}th button:hover{color:var(--ink)}
 th button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 th[aria-sort=ascending] button::after{content:" ↑"}th[aria-sort=descending] button::after{content:" ↓"}
 .nm{white-space:normal;width:100%}
 .nm a{display:flex;align-items:center;gap:13px;text-decoration:none;font-weight:500;min-width:0}
-.nm a:hover .fn{color:var(--accent)}
+.nm a:hover .fn,.nm a:hover .ic{color:var(--accent)}
 .fn{overflow-wrap:anywhere}
 .ic{width:22px;height:22px;flex:none;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;color:var(--muted)}
-.k-folder .ic{color:var(--accent)}
+.ic{transition:color .12s}
 .meta{display:none;font:400 12.5px var(--sans);color:var(--muted);margin-top:2px}
 .c-size,.c-mod{color:var(--muted);font-size:13.5px;font-variant-numeric:tabular-nums}
 .act{width:1%;text-align:right;padding-left:4px!important}
@@ -56,7 +56,7 @@ th[aria-sort=ascending] button::after{content:" ↑"}th[aria-sort=descending] bu
 tr:hover .dl,.dl:focus-visible{opacity:1}.dl:hover{color:var(--accent);background:var(--bg)}
 .dl .ic{width:18px;height:18px;color:inherit}
 tr.up .ic{color:var(--muted)}tr.up .fn{color:var(--muted);font-weight:400}
-tbody tr.sel td{background:color-mix(in srgb,var(--accent) 7%,var(--surface))}
+tbody tr.sel td{background:color-mix(in srgb,var(--ink) 5%,var(--surface))}
 .bar{position:sticky;bottom:18px;z-index:2;margin-top:18px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 10px 10px 20px;
 background:var(--ink);color:var(--bg);border-radius:12px;box-shadow:0 10px 30px rgb(0 0 0/.16)}
 .bar[hidden]{display:none}
@@ -65,7 +65,7 @@ background:var(--ink);color:var(--bg);border-radius:12px;box-shadow:0 10px 30px 
 .bar .btn{background:var(--bg);border-color:var(--bg);color:var(--ink)}.bar .btn:hover{background:var(--surface);border-color:var(--surface);color:var(--ink)}
 .bar .btn.ghost{background:transparent;border-color:transparent;color:var(--bg);opacity:.8}.bar .btn.ghost:hover{opacity:1;background:transparent;color:var(--bg)}
 .more{margin:14px 0 0;color:var(--muted);font-size:13.5px}
-@media (max-width:640px){.c-size,.c-mod{display:none}.meta{display:block}.tag{display:none}table.files td{padding:10px 12px}.bar{padding-left:16px}}
+@media (max-width:640px){.c-size,.c-mod{display:none}.meta{display:block}.tag{display:none}table.files td{padding:12px 12px}.bar{padding-left:16px}}
 "#;
 
 const SCRIPT: &str = r#"(()=>{
@@ -88,7 +88,9 @@ boxes.forEach(b=>b.addEventListener('click',e=>{
     order.slice(Math.min(a,c),Math.max(a,c)+1).forEach(x=>x.checked=b.checked)}
   last=b;update()}));
 document.getElementById('clear').addEventListener('click',()=>{boxes.forEach(b=>b.checked=false);update()});
-document.querySelectorAll('time[data-ts]').forEach(t=>{const d=new Date(t.dataset.ts*1000);t.textContent=t.closest('.meta')?d.toLocaleDateString(undefined,{dateStyle:'medium'}):d.toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'})});
+const p2=n=>String(n).padStart(2,'0');
+document.querySelectorAll('time[data-ts]').forEach(t=>{const d=new Date(t.dataset.ts*1000),day=d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate());
+  t.textContent=t.closest('.meta')?day:day+' · '+p2(d.getHours())+':'+p2(d.getMinutes());t.title=d.toString()});
 const tbody=form.querySelector('tbody'),coll=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 let key='name',dir=1;
 const cmp=(a,b)=>key==='name'?coll.compare(a.dataset.name,b.dataset.name):(+a.dataset[key]-+b.dataset[key])||coll.compare(a.dataset.name,b.dataset.name);
@@ -173,7 +175,11 @@ pub fn render(p: &Page<'_>) -> String {
 </body></html>
 "##,
         title = if p.segments.is_empty() { esc(p.site) } else { esc(&format!("{here} · {}", p.site)) },
-        crumbs = if p.segments.is_empty() { String::new() } else { format!(r#"<nav class="crumbs" aria-label="Path">{crumbs}</nav>"#) },
+        crumbs = if p.segments.is_empty() {
+            r#"<div class="eyebrow">Shared folder</div>"#.to_string()
+        } else {
+            format!(r#"<nav class="crumbs" aria-label="Path">{crumbs}</nav>"#)
+        },
         site = esc(p.site),
         here = esc(here),
         summary = summary.join(" · "),
