@@ -131,7 +131,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
 
 /// Copies bytes in both directions until both sides finish or no data flows for `idle`.
 /// Backpressure is inherent: each direction only reads when the previous write completed.
-pub async fn bridge<A, B>(a: A, b: B, idle: Duration)
+/// Copies both ways until either side closes, the connection idles for `idle`, or `stop` is
+/// cancelled (access was revoked).
+pub async fn bridge<A, B>(a: A, b: B, idle: Duration, stop: tokio_util::sync::CancellationToken)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -149,6 +151,10 @@ where
                 if let Err(e) = res {
                     tracing::debug!(error = %e, "upgraded connection ended");
                 }
+                return;
+            }
+            _ = stop.cancelled() => {
+                tracing::debug!("closing upgraded connection: access revoked");
                 return;
             }
             _ = tick.tick() => {

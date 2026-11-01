@@ -118,6 +118,15 @@ pub struct LocalTunnel {
     /// Port tunnels: client networks allowed to connect (canonical CIDRs); empty = anyone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// What the server confirmed; absent in files from before private tunnels, or when the
+    /// server predates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<magicpipes_core::proto::Visibility>,
+    /// Private tunnels: the access tags asked for (empty = all of the machine's tags).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 impl LocalTunnel {

@@ -105,6 +105,8 @@ pub struct UserView {
     pub role: Role,
     pub disabled: bool,
     pub must_change_password: bool,
+    /// Access tags assigned by administrators.
+    pub tags: Vec<String>,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_login_at: Option<String>,
@@ -119,6 +121,7 @@ impl From<UserRow> for UserView {
             role: u.role,
             disabled: u.disabled,
             must_change_password: u.must_change_password,
+            tags: Vec::new(),
             created_at: rfc3339(u.created_at),
             last_login_at: u.last_login_at.map(rfc3339),
         }
@@ -250,7 +253,7 @@ impl ControlPlane {
         self.accounts.succeeded(&email);
         let _ = self.store.touch_login(&user.id, LOCAL_ISSUER);
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(|_| LoginError::Internal)?;
-        let who = Principal::User { id: user.id.clone(), role: user.role };
+        let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };
         self.audit(&who, "session.login", &user.id, "password");
         Ok(Login { cookie, must_change_password: user.must_change_password })
     }
@@ -265,10 +268,17 @@ impl ControlPlane {
         Ok(Some(Login { cookie, must_change_password: false }))
     }
 
-    /// The principal of an active user, or `None` if the account is disabled or gone.
+    /// The principal of an active user, with their current role and tags, or `None` if the
+    /// account is disabled or gone.
     fn user_principal(&self, user_id: &str) -> Option<(Principal, UserRow)> {
         let u = self.store.user(user_id).ok().flatten().filter(|u| !u.disabled)?;
-        Some((Principal::User { id: u.id.clone(), role: u.role }, u))
+        let tags = self.state.lock().unwrap().dir.user_tags(&u.id);
+        Some((Principal::User { id: u.id.clone(), role: u.role, tags }, u))
+    }
+
+    fn user_view(&self, u: UserRow) -> UserView {
+        let tags = self.state.lock().unwrap().dir.user_tags(&u.id);
+        UserView { tags, ..u.into() }
     }
 
     pub fn session(&self, cookie: &str) -> Option<UiSession> {
@@ -280,7 +290,7 @@ impl ControlPlane {
         if row.created_at < user.sessions_valid_after {
             return None;
         }
-        Some(UiSession { who, csrf: row.csrf, user: Some(user.into()) })
+        Some(UiSession { who, csrf: row.csrf, user: Some(self.user_view(user)) })
     }
 
     pub fn logout(&self, who: &Principal, cookie: &str) {
@@ -324,6 +334,8 @@ impl ControlPlane {
         let hash = self.hash_password(new.to_string()).await?;
         self.store.set_password(id, &hash, false).map_err(internal)?;
         self.store.end_sessions(id).map_err(internal)?;
+        // Tunnel cookies issued before now stop working too.
+        self.refresh();
         self.audit(who, "user.password_change", id, "");
         let (cookie, _) = self.store.create_session(Some(id), self.cfg.users.session_max_age_secs).map_err(internal)?;
         Ok(Login { cookie, must_change_password: false })
@@ -335,6 +347,8 @@ impl ControlPlane {
             return Err(err(ErrorCode::InvalidRequest, "admin-token sessions end when you log out"));
         };
         self.store.end_sessions(id).map_err(internal)?;
+        // Tunnel cookies issued before now stop working too.
+        self.refresh();
         self.audit(who, "session.logout_everywhere", id, "");
         Ok(())
     }
@@ -380,14 +394,14 @@ impl ControlPlane {
             tracing::error!(error = %e, "listing users failed");
             Vec::new()
         });
-        rows.into_iter().filter(|u| authz::authorize(who, Action::Manage, Resource::User(&u.id))).map(Into::into).collect()
+        rows.into_iter().filter(|u| authz::authorize(who, Action::Manage, Resource::User(&u.id))).map(|u| self.user_view(u)).collect()
     }
 
     pub fn user(&self, who: &Principal, id: &str) -> Option<UserView> {
         if !authz::authorize(who, Action::Manage, Resource::User(id)) {
             return None;
         }
-        self.store.user(id).ok().flatten().map(Into::into)
+        self.store.user(id).ok().flatten().map(|u| self.user_view(u))
     }
 
     /// Creates a password account. Without `password`, one is generated and returned (shown
@@ -420,8 +434,9 @@ impl ControlPlane {
             .map_err(internal)?
             .ok_or_else(|| err(ErrorCode::EmailTaken, format!("an account for {email} already exists")))?;
         self.audit(who, "user.create", &id, &format!("{email} {}", role.as_str()));
+        self.refresh();
         let user = self.store.user(&id).map_err(internal)?.ok_or_else(|| err(ErrorCode::Internal, "the new user disappeared"))?;
-        Ok((user.into(), generated))
+        Ok((self.user_view(user), generated))
     }
 
     /// Changes another account's role or disables or enables it.
@@ -442,8 +457,11 @@ impl ControlPlane {
         if let Some(disabled) = disabled {
             self.store.set_disabled(id, disabled).map_err(internal)?;
             self.audit(who, if disabled { "user.disable" } else { "user.enable" }, id, "");
+            // Their machines stop (or start) serving.
+            self.refresh();
         }
-        self.store.user(id).map_err(internal)?.map(Into::into).ok_or_else(|| err(ErrorCode::NotFound, "no such user"))
+        let user = self.store.user(id).map_err(internal)?.ok_or_else(|| err(ErrorCode::NotFound, "no such user"))?;
+        Ok(self.user_view(user))
     }
 
     /// Sets a new generated password (shown once) that the user must change, and ends the
@@ -459,6 +477,8 @@ impl ControlPlane {
         let hash = self.hash_password(password.clone()).await?;
         self.store.set_password(id, &hash, true).map_err(internal)?;
         self.store.end_sessions(id).map_err(internal)?;
+        // Tunnel cookies issued before now stop working too.
+        self.refresh();
         self.audit(who, "user.password_reset", id, "");
         Ok(password)
     }

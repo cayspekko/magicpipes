@@ -5,13 +5,19 @@
 //! management API, the UI and the agent gateway all call these typed methods directly, and every
 //! access decision goes through [`authz::authorize`].
 //!
+//! * `device` — `magicpipes login` approved in the browser;
+//! * `directory` — owners and tags, kept in memory for access decisions;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
+//! * `tags` — the tag registry, tag assignments and enrollment tokens;
 //! * `users` — accounts, logins, UI sessions, API tokens and the audit log;
 //! * `views` — what the API and the UI show.
 
+mod device;
+mod directory;
 mod registry;
 mod sessions;
+mod tags;
 mod users;
 mod views;
 
@@ -28,11 +34,14 @@ use magicpipes_core::unix_now;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::authz::{self, Action, Principal, Resource, TunnelAuthz};
+use crate::authz::{self, Action, AgentAuthz, Principal, Resource, TunnelAuthz};
 use crate::certs::CertManager;
 use crate::config::Config;
-use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable};
+use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
+pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
+pub use registry::TunnelSignIn;
+pub use tags::EnrollmentOptions;
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
 
@@ -46,6 +55,7 @@ pub struct ControlPlane {
     /// Bounds concurrent password hashing (CPU and memory).
     hashing: Semaphore,
     accounts: users::AccountLimiter,
+    devices: device::DeviceLogins,
 }
 
 #[derive(Default)]
@@ -55,6 +65,7 @@ struct State {
     next_conn_id: u64,
     /// Per agent: when each of its recent tunnels needed a new certificate order.
     cert_orders: HashMap<String, Vec<Instant>>,
+    dir: directory::Directory,
 }
 
 const CERT_ORDER_WINDOW: Duration = Duration::from_secs(24 * 3600);
@@ -64,9 +75,27 @@ struct TunnelRecord {
     stats: Arc<RouteStats>,
 }
 
-impl TunnelRecord {
-    fn authz(&self) -> TunnelAuthz {
-        TunnelAuthz { agent_id: self.row.agent_id.clone(), public: true }
+impl State {
+    /// The tunnel's effective access: its requested tags (all of the agent's when none were
+    /// asked for), limited to the tags the agent holds now.
+    fn tunnel_authz(&self, t: &TunnelRecord) -> TunnelAuthz {
+        let held = self.dir.agent_tags(&t.row.agent_id);
+        let access = if t.row.access.is_empty() { held } else { t.row.access.iter().filter(|a| held.contains(a)).cloned().collect() };
+        TunnelAuthz {
+            agent_id: t.row.agent_id.clone(),
+            owner_user_id: self.dir.owner(&t.row.agent_id).map(str::to_string),
+            public: t.row.visibility == proto::Visibility::Public,
+            access,
+        }
+    }
+
+    /// Whether `who` may do `action` to the tunnel.
+    fn may(&self, who: &Principal, action: Action, t: &TunnelRecord) -> bool {
+        authz::authorize(who, action, Resource::Tunnel(&self.tunnel_authz(t)))
+    }
+
+    fn agent_resource<'a>(&'a self, agent_id: &'a str) -> Resource<'a> {
+        Resource::Agent(AgentAuthz { id: agent_id, owner_user_id: self.dir.owner(agent_id) })
     }
 }
 
@@ -89,14 +118,9 @@ fn internal(e: anyhow::Error) -> ErrorBody {
     err(ErrorCode::Internal, "internal server error")
 }
 
-/// Whether `who` may do `action` to the tunnel.
-fn may(who: &Principal, action: Action, t: &TunnelRecord) -> bool {
-    authz::authorize(who, action, Resource::Tunnel(&t.authz()))
-}
-
 impl ControlPlane {
     pub fn new(cfg: Arc<Config>, store: Store, certs: Arc<CertManager>, data: Arc<DataPlane>) -> anyhow::Result<Arc<Self>> {
-        let mut state = State::default();
+        let mut state = State { dir: directory::Directory::load(&store)?, ..State::default() };
         for row in store.tunnels()? {
             state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default() });
         }
@@ -109,6 +133,7 @@ impl ControlPlane {
             started_at: unix_now(),
             hashing: Semaphore::new(users::HASH_CONCURRENCY),
             accounts: users::AccountLimiter::default(),
+            devices: device::DeviceLogins::default(),
         });
         cp.publish(&cp.state.lock().unwrap());
         Ok(cp)
@@ -151,7 +176,15 @@ impl ControlPlane {
     /// concurrent mutations publish in order.
     fn publish(&self, st: &State) {
         let mut table = RouteTable::default();
+        for u in st.dir.active_users() {
+            let principal = Principal::User { id: u.id.clone(), role: u.role, tags: st.dir.user_tags(&u.id) };
+            table.users.insert(u.id.clone(), TunnelUser { email: u.email.clone(), principal, valid_after: u.sessions_valid_after });
+        }
         for t in st.tunnels.values() {
+            // A disabled owner's agents serve nothing.
+            if !st.dir.agent_active(&t.row.agent_id) {
+                continue;
+            }
             let session = st.sessions.get(&t.row.agent_id).map(|s| s.handle.clone());
             // Stored lists were validated on registration. If one no longer parses, fail closed:
             // an empty list would mean "anyone".
@@ -162,7 +195,7 @@ impl ControlPlane {
                     continue;
                 }
             };
-            let access = AccessPolicy { allow, authz: t.authz() };
+            let access = AccessPolicy { allow, authz: st.tunnel_authz(t) };
             let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access });
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {
@@ -193,21 +226,13 @@ impl ControlPlane {
         })
     }
 
-    pub fn create_enrollment(&self, who: &Principal) -> Result<String, ErrorBody> {
-        if !authz::authorize(who, Action::Manage, Resource::Org) {
-            return Err(err(ErrorCode::Forbidden, "only administrators create enrollment tokens"));
-        }
-        let token = self.store.create_enrollment(self.cfg.agents.enrollment_ttl_secs).map_err(internal)?;
-        self.audit(who, "enrollment.create", "enrollment", "");
-        Ok(token)
-    }
-
     pub fn enroll(&self, req: &proto::EnrollRequest) -> Result<proto::EnrollResponse, ErrorBody> {
         let name: String = req.agent_name.chars().filter(|c| !c.is_control()).take(64).collect();
         let name = if name.trim().is_empty() { "agent".to_string() } else { name.trim().to_string() };
         match self.store.enroll(&req.enrollment_token, &name).map_err(internal)? {
             Some((agent_id, agent_token)) => {
                 tracing::info!(agent = %agent_id, %name, "agent enrolled");
+                self.refresh();
                 Ok(proto::EnrollResponse { agent_id, agent_token, base_domain: self.cfg.base_domain.clone() })
             }
             None => Err(err(ErrorCode::InvalidEnrollmentToken, "enrollment token is invalid, expired or already used")),
@@ -218,10 +243,10 @@ impl ControlPlane {
     /// 404) and its live session, if any, is closed. Returns false if the agent is unknown, or if
     /// `who` may not manage it (never revealing which).
     pub fn revoke_agent(&self, who: &Principal, agent_id: &str) -> Result<bool, ErrorBody> {
-        if !authz::authorize(who, Action::Manage, Resource::Agent(agent_id)) {
+        let mut st = self.state.lock().unwrap();
+        if !authz::authorize(who, Action::Manage, st.agent_resource(agent_id)) {
             return Ok(false);
         }
-        let mut st = self.state.lock().unwrap();
         if !self.store.delete_agent(agent_id).map_err(internal)? {
             return Ok(false);
         }
@@ -232,8 +257,9 @@ impl ControlPlane {
         if let Some(s) = session {
             s.handle.close();
         }
-        tracing::info!(agent = %agent_id, "agent revoked by administrator");
+        tracing::info!(agent = %agent_id, by = who.actor(), "agent revoked");
         self.audit(who, "agent.revoke", agent_id, "");
+        self.refresh();
         Ok(true)
     }
 }

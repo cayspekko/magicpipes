@@ -127,7 +127,7 @@ async fn handle_ipc<S: AsyncRead + AsyncWrite>(agent: Arc<Agent>, stream: S) {
     let (tx, mut rx) = mpsc::channel::<IpcEvent>(16);
     let work = async {
         let res = match req {
-            IpcRequest::Add(a) => agent.add(a, &tx).await,
+            IpcRequest::Add(a) => agent.add(*a, &tx).await,
             IpcRequest::Remove { selector, force } => agent.remove(&selector, force).await,
             IpcRequest::List => Ok(agent.list()),
             IpcRequest::Status => Ok(agent.status()),

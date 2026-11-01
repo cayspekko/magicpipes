@@ -10,6 +10,7 @@
 //! for it get 404. Requests and WebSockets already in flight keep their own stream and run to
 //! completion; they end early only if the agent session itself closes.
 
+mod gate;
 pub mod ingress;
 mod io;
 mod ports;
@@ -24,12 +25,13 @@ use std::time::Duration;
 use magicpipes_core::cidr::{self, Cidr};
 use magicpipes_core::mux::MuxHandle;
 use magicpipes_core::proto::Kind;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::authz::{self, Action, Principal, Resource, TunnelAuthz};
 use crate::config::Config;
 use crate::forwarded::TrustedProxies;
+use crate::tunnel_auth::Signer;
 pub use ports::PortSettings;
 
 /// One routable hostname or public port.
@@ -52,9 +54,14 @@ pub struct AccessPolicy {
 }
 
 impl AccessPolicy {
+    /// The network check alone, which comes first for everyone.
+    pub fn allows_network(&self, ip: IpAddr) -> bool {
+        cidr::allowed(&self.allow, ip)
+    }
+
     /// Whether `who`, connecting from `ip`, may reach the tunnel.
     pub fn admits(&self, who: &Principal, ip: IpAddr) -> bool {
-        cidr::allowed(&self.allow, ip) && authz::authorize(who, Action::Connect, Resource::Tunnel(&self.authz))
+        self.allows_network(ip) && authz::authorize(who, Action::Connect, Resource::Tunnel(&self.authz))
     }
 }
 
@@ -100,20 +107,43 @@ pub struct RouteTable {
     pub by_host: HashMap<String, Arc<Route>>,
     /// Port tunnels, by protocol and public port.
     pub by_port: HashMap<(Kind, u16), Arc<Route>>,
+    /// Active users, by id, for private tunnels: who a tunnel cookie stands for now.
+    pub users: HashMap<String, TunnelUser>,
 }
 
+/// A user as private tunnels see them: current role and tags, and the time before which their
+/// cookies no longer count ("sign out everywhere", password changes).
 #[derive(Debug, Clone)]
+pub struct TunnelUser {
+    pub email: String,
+    pub principal: Principal,
+    pub valid_after: i64,
+}
+
+#[derive(Clone)]
 pub struct ProxySettings {
     pub upstream_response_timeout: Duration,
     pub websocket_idle_timeout: Duration,
     pub stream_open_timeout: Duration,
     pub ports: PortSettings,
     pub trusted_proxies: TrustedProxies,
+    /// Where private tunnels send browsers to sign in, e.g. `https://example.com:8443`.
+    pub management_url: String,
+    /// How long a private tunnel's cookie lasts.
+    pub tunnel_cookie_ttl_secs: i64,
+    pub signer: Signer,
 }
 
 impl ProxySettings {
-    pub fn from_config(cfg: &Config) -> Self {
+    pub fn from_config(cfg: &Config, signer: Signer) -> Self {
+        let management_url = match cfg.management.listen.port() {
+            443 => format!("https://{}", cfg.management.hostname),
+            port => format!("https://{}:{port}", cfg.management.hostname),
+        };
         Self {
+            management_url,
+            tunnel_cookie_ttl_secs: cfg.users.session_max_age_secs as i64,
+            signer,
             upstream_response_timeout: Duration::from_secs(cfg.public.upstream_response_timeout_secs),
             websocket_idle_timeout: Duration::from_secs(cfg.public.websocket_idle_timeout_secs),
             stream_open_timeout: Duration::from_secs(10),
@@ -134,6 +164,10 @@ pub struct DataPlane {
     /// Cancelled at shutdown: closes every port listener.
     shutdown: CancellationToken,
     me: Weak<DataPlane>,
+    /// Bumped on every publish, so long-lived connections to private tunnels recheck access.
+    generation: watch::Sender<u64>,
+    /// Nonces of sign-in codes already used, with when they were seen (bounded, 60 s each).
+    used_codes: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl DataPlane {
@@ -146,7 +180,32 @@ impl DataPlane {
             bind_errors: Mutex::default(),
             shutdown,
             me: me.clone(),
+            generation: watch::Sender::new(0),
+            used_codes: Mutex::default(),
         })
+    }
+
+    pub fn signer(&self) -> &Signer {
+        &self.settings.signer
+    }
+
+    fn table(&self) -> Arc<RouteTable> {
+        self.routes.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Marks a sign-in code's nonce as used; false if it was already.
+    fn use_code(&self, nonce: &str) -> bool {
+        const MAX_TRACKED: usize = 10_000;
+        let mut used = self.used_codes.lock().unwrap_or_else(|e| e.into_inner());
+        let ttl = Duration::from_secs(crate::tunnel_auth::CODE_TTL_SECS as u64 + 5);
+        if used.len() >= MAX_TRACKED {
+            used.retain(|_, at| at.elapsed() < ttl);
+            if used.len() >= MAX_TRACKED {
+                // Codes expire in a minute; refusing new sign-ins briefly beats unbounded memory.
+                return false;
+            }
+        }
+        used.insert(nonce.to_string(), std::time::Instant::now()).is_none()
     }
 
     /// Atomically replaces the routing table (called by the control plane only), then binds the
@@ -154,6 +213,7 @@ impl DataPlane {
     pub fn publish(&self, table: RouteTable) {
         let keys: Vec<(Kind, u16)> = table.by_port.keys().copied().collect();
         *self.routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(table);
+        self.generation.send_modify(|g| *g += 1);
         self.listeners.lock().unwrap_or_else(|e| e.into_inner()).retain(|key, stop| {
             let keep = keys.contains(key);
             if !keep {

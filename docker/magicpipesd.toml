@@ -23,6 +23,7 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # [users]
 # session_max_age_secs = 43200
 # audit_retention_days = 90
+# members_can_publish = true
 
 # TCP/UDP port tunnels (`magicpipes add 5432 --tcp`). Also publish the range in
 # docker-compose.yml.

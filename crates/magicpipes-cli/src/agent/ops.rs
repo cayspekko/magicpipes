@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use magicpipes_core::cidr;
 use magicpipes_core::error::ErrorCode;
-use magicpipes_core::proto::{CertState, Kind, RegisterTunnel, Request as Rpc, Response as RpcResponse, TunnelInfo};
+use magicpipes_core::proto::{CertState, Kind, RegisterTunnel, Request as Rpc, Response as RpcResponse, TunnelInfo, Visibility};
 use rustls::ClientConfig;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -135,7 +135,12 @@ impl Agent {
             "status": "ready",
             "background": true,
             "created": created,
+            // Absent when the server predates private tunnels (then it is public).
+            "visibility": tunnel.visibility,
         });
+        if tunnel.visibility == Some(Visibility::Private) {
+            out["access"] = json!(tunnel.access);
+        }
         if let Some(port) = tunnel.public_port {
             out["public_port"] = json!(port);
             out["allow"] = json!(tunnel.allow);
@@ -187,6 +192,16 @@ impl Agent {
             .iter()
             .map(ToString::to_string)
             .collect();
+        // Without --private/--public a re-add keeps the tunnel's access; a new one gets the
+        // machine's default from the server.
+        let (visibility, access, labels) = match (req.visibility, &existing) {
+            (Some(v), _) => (Some(v), req.access.clone(), req.labels.clone()),
+            (None, Some(t)) => (t.visibility, t.access.clone(), if req.labels.is_empty() { t.labels.clone() } else { req.labels.clone() }),
+            (None, None) => (None, Vec::new(), req.labels.clone()),
+        };
+        if (req.visibility.is_some() || !req.labels.is_empty()) && self.session.server_protocol().is_some_and(|v| v < 3) {
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels or labels; it needs a newer magicpipesd"));
+        }
         let mut rpc_req = RegisterTunnel {
             id: existing.as_ref().map(|t| t.id.clone()),
             name: existing.as_ref().map(|t| t.name.clone()).or(name.clone()),
@@ -194,6 +209,9 @@ impl Agent {
             kind: req.kind,
             remote_port: req.remote_port,
             allow: allow.clone(),
+            visibility,
+            access,
+            labels,
         };
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
@@ -220,6 +238,13 @@ impl Agent {
                 format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind),
             ));
         }
+        if rpc_req.visibility == Some(Visibility::Private) && info.visibility != Some(Visibility::Private) {
+            // A server that predates private tunnels would have made it public: never leave that.
+            if info.created {
+                let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
+            }
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels; it needs a newer magicpipesd"));
+        }
         let tunnel = LocalTunnel {
             created_at: existing.as_ref().map(|t| t.created_at).unwrap_or_else(magicpipes_core::unix_now),
             id: info.id,
@@ -230,6 +255,9 @@ impl Agent {
             kind: info.kind,
             public_port: info.public_port,
             allow,
+            visibility: info.visibility,
+            access: info.access,
+            labels: info.labels,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);
         Ok((tunnel, info.created))
@@ -273,6 +301,12 @@ impl Agent {
             }
         }
         ev.step(Step::Tls, StepState::Done).await;
+
+        // 5. A private tunnel answers anonymous requests with a sign-in page, so the server checks
+        // the path to the local application instead of a public request.
+        if t.visibility == Some(Visibility::Private) {
+            return self.verify_port(t, ev, deadline).await.map(drop);
+        }
 
         // 5. End-to-end probe through the public HTTPS endpoint.
         ev.step(Step::Probe, StepState::Running).await;
@@ -400,6 +434,10 @@ impl Agent {
                     "status": status,
                     "error": s.last_error,
                     "created_at": magicpipes_core::rfc3339(s.tunnel.created_at),
+                    // Absent when the server predates private tunnels (then it is public).
+                    "visibility": s.tunnel.visibility,
+                    "access": s.tunnel.access,
+                    "labels": s.tunnel.labels,
                 })
             })
             .collect();

@@ -27,7 +27,7 @@ impl ControlPlane {
     pub fn attach_session(&self, agent_id: &str, handle: MuxHandle, remote: SocketAddr, protocol: u32) -> Option<u64> {
         let mut st = self.state.lock().unwrap();
         // Checked under the state lock, which `revoke_agent` also holds while deleting.
-        if !self.store.agent_exists(agent_id).unwrap_or(false) {
+        if !self.store.agent_exists(agent_id).unwrap_or(false) || !st.dir.agent_active(agent_id) {
             return None;
         }
         st.next_conn_id += 1;

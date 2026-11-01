@@ -26,7 +26,13 @@ open.
    {"id":"tn_…","name":"bright-otter","public_url":"https://bright-otter.t.example.com","target":"http://127.0.0.1:5173","status":"ready","background":true,"created":true}
    ```
 
-4. Give the user `public_url`, and tell them it is reachable by anyone who has the link.
+4. Give the user `public_url`. If `visibility` is `"private"`, tell them they (and people who
+   share the tunnel's access tags) must sign in to open it; otherwise, that anyone with the link
+   can reach it.
+
+Add `--private` to keep it to the user (and their team's access tags, `--access team:dev`), or
+`--public` for a link anyone can open; without either, the server applies the machine's
+default.
 
 Use `--name <label>` for a stable, readable hostname (`https://<label>.<base domain>`). Running
 the same `add` again is safe: it returns the existing tunnel (`"created": false`).
@@ -38,11 +44,14 @@ present a URL. Act on the code:
 
 | Exit | `error.code` | What to do |
 |---|---|---|
-| 3 | `not_logged_in`, `unauthorized` | The machine is not enrolled. Ask the user for an enrollment token and run `magicpipes login --server <url> --token <token>`. |
+| 3 | `not_logged_in`, `unauthorized` | The machine is not enrolled. Ask the user to run `magicpipes login --server <url>` in their terminal (they approve it in the browser), or for an enrollment token: `magicpipes login --server <url> --token <token>`. |
 | 4 | `local_unreachable` | The app is not listening yet, or binds another address. Wait or fix the app, then retry; use `--host ::1` if it listens only on IPv6. |
 | 5 | `server_unreachable`, `agent_start_failed` | Check `magicpipes status`; see `magicpipes agent logs`. |
 | 6 | `name_conflict`, `name_taken`, `invalid_name` | Choose another `--name`, or `magicpipes remove <name>` first. |
 | 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. |
+| 6 | `public_not_allowed` | This machine may only publish private tunnels. Retry without `--public`. |
+| 6 | `tag_unknown` | The access tag doesn't exist. Ask the user which tag to use. |
+| 3 | `forbidden` | The machine doesn't hold that access tag. Retry without `--access`, or ask the user. |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
 

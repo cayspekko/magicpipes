@@ -164,9 +164,13 @@ Under **Users**, administrators add people with an email address, a role and a p
 let the server generate one, shown once). Everyone must replace a password set by an
 administrator when they first sign in.
 
-* **Roles**: *administrators* manage tunnels, agents, users, enrollment tokens and the audit
-  log; *members* manage their own account (password, API tokens, sessions). Members get more to
-  do once private tunnels arrive (see [docs/USERS.md](docs/USERS.md)).
+* **Roles**: *administrators* manage tunnels, agents, users, tags, enrollment tokens and the
+  audit log; *members* manage their own account (password, API tokens, sessions) and their own
+  machines and tunnels. Design: [docs/USERS.md](docs/USERS.md).
+* **Access tags** (Tags page, e.g. `team:dev`): administrators create them and assign them to
+  users. Someone reaches a private tunnel when they share one of its access tags, or own it.
+  Matching is exact; nobody can give themselves a tag. Deleting a tag takes it away from
+  everyone and everything at once.
 * **Sign-in protection**: passwords are stored as Argon2id hashes and need at least 12
   characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every
   10 seconds, right password or not; failed attempts also count against the client's address.
@@ -230,7 +234,29 @@ sessions (agents reconnect when it is back) and gives in-flight requests up to 1
 
 ## 2. Enroll a machine
 
-Create a single-use enrollment token (valid 1 hour by default) on the server, or in the UI
+**With an account** (users, see "Users" above), run this on the machine and approve it in the
+browser:
+
+```bash
+magicpipes login --server https://example.com:8443
+```
+
+The CLI prints a link and a code, and opens the server's page where you sign in, check that the
+code matches, and pick which of your access tags the machine gets. The machine then belongs to
+you: you manage it and its tunnels, and it never has more access tags than you hold. Without a
+terminal, add `--browser` to wait for the approval anyway.
+
+**With an enrollment token**: create a single-use token (valid 1 hour by default) on the server,
+or in the UI ("Enroll a machine"), or via `POST /api/v1/enrollments`. Administrators choose who
+the machine belongs to (nobody, for a *service agent*), its access tags and labels, and whether
+its tunnels may be public:
+
+```bash
+magicpipesd --config /etc/magicpipes/magicpipesd.toml enroll
+# magicpipes login --server https://example.com:8443 --token mpenr_...
+```
+
+Run the printed command on the application machine: (valid 1 hour by default) on the server, or in the UI
 ("Create enrollment token"), or via `POST /api/v1/enrollments`:
 
 ```bash
@@ -244,18 +270,47 @@ Run the printed command on the application machine:
 magicpipes login --server https://example.com:8443 --token mpenr_...
 ```
 
-The enrollment token is exchanged for a long-lived **agent credential** stored in
+Either way, the enrollment token is exchanged for a long-lived **agent credential** stored in
 `~/.magicpipes/config.json` (mode 0600). The server stores only a SHA-256 hash of it. To keep the
 token out of shell history, pass it as `MAGICPIPES_TOKEN` or type it at the prompt. For a
 `dev-ca` server, add `--ca-cert path/to/ca.crt`.
 
 To revoke a machine (lost laptop, leaked credential), click **Revoke** next to the agent in the
-UI or call `DELETE /api/v1/agents/{id}`. Its credential stops working at once, its live session
+UI or call `DELETE /api/v1/agents/{id}` (administrators, or the machine's owner). Its credential stops working at once, its live session
 is closed and its tunnels are deleted. Enroll it again with a new token to bring it back.
 
 ---
 
 ## 3. Use tunnels
+
+### Public and private
+
+A **public** tunnel is reachable by anyone who has its address. A **private** one asks people to
+sign in to the management UI first, then lets in its owner and anyone who shares one of its
+access tags. Machines enrolled before the server had user accounts make public tunnels, as
+before; machines enrolled since make private ones unless asked otherwise.
+
+```bash
+magicpipes add 3000 --private                 # the owner, plus everyone who shares the machine's tags
+magicpipes add 3000 --access team:dev         # narrower: only team:dev (the machine must have it)
+magicpipes add 3000 --public                  # anyone; refused if the enrollment doesn't allow it
+magicpipes add 3000 --label environment:staging   # metadata only, never used for access
+```
+
+* Opening a private tunnel in a browser without being signed in shows the sign-in page, then
+  comes back to the same address. Signed in without a shared tag: an "access denied" page. API
+  clients and scripts get `401 unauthenticated` or `403 forbidden` instead.
+* The application receives `X-MagicPipes-User` (email) and `X-MagicPipes-User-Id` on every
+  request; clients can't forge them. It never sees MagicPipes' own cookie.
+* Taking a tag away, disabling a user or "Sign out everywhere" takes effect on the next request,
+  and closes open WebSockets.
+* `https://<tunnel>/.magicpipes/` is reserved on private tunnels (`/.magicpipes/logout` signs out
+  of that tunnel).
+* The readiness check of a private tunnel goes through the server to the local application
+  (the public address would ask for a sign-in).
+* TCP and UDP tunnels can't be private yet: a raw port can't show a sign-in page. Use
+  `--allow-cidr` for them.
+* The UI lists tunnels shared with you under **Shared with you**; `GET /api/v1/shared` too.
 
 ```bash
 magicpipes add 8080                 # random name, e.g. https://bright-otter.t.example.com
@@ -446,10 +501,10 @@ On failure:
 | 0 | | Success (for `add`: verified ready) |
 | 1 | `internal`, ... | Unexpected error |
 | 2 | | Invalid command-line usage |
-| 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden` | Enrollment, credentials or local configuration |
+| 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden`, `unauthenticated` | Enrollment, credentials or local configuration |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
-| 6 | `name_conflict`, `name_taken`, `email_taken`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
+| 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 
 `name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:
 another machine's agent owns it. Codes are listed in `crates/magicpipes-core/src/error.rs`; new
@@ -497,13 +552,20 @@ administrators answer `403 forbidden` to members.
 | DELETE | `/api/v1/tunnels/{id or name}` | 204; the owning agent is notified and stops serving it; 404 if absent |
 | GET | `/api/v1/agents` | Enrolled agents and connection state |
 | DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
-| POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}` |
+| POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "labels"?, "allow_public"?, "default_private"?}`. Members may enroll only their own machines, with tags they hold |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
 | GET | `/api/v1/me` | `{"kind": "admin_token"}` or `{"kind": "user", "user": {...}}` |
+| GET | `/api/v1/shared` | Tunnels you can reach but don't manage (`name`, `public_url`, `kind`, `visibility`, `owner_email`, `labels`) |
+| PATCH | `/api/v1/agents/{id}` | `{"tags"?, "labels"?}`; owners may only remove tags |
+| GET | `/api/v1/tags` | `{"tags": [{"name", "description", "created_at"}]}` (administrators) |
+| POST | `/api/v1/tags` | 201; body `{"name", "description"?}` |
+| DELETE | `/api/v1/tags/{name}` | 204; removes it from every user, agent and tunnel |
+| POST | `/api/v1/device` | Starts a browser-approved `magicpipes login` (used by the CLI) |
+| POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`), `denied` or `expired` |
 | GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |
 | POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
 | GET | `/api/v1/users/{id}` | One user |
-| PATCH | `/api/v1/users/{id}` | `{"role"?: "admin" \| "member", "disabled"?: bool}`; not for your own account |
+| PATCH | `/api/v1/users/{id}` | `{"role"?: "admin" \| "member", "disabled"?: bool, "tags"?: [...]}`; role and status not for your own account |
 | POST | `/api/v1/users/{id}/password` | `{"password"}`: a new generated password the user must change; ends their sessions |
 | GET | `/api/v1/tokens` | Your API tokens (never their secrets) |
 | POST | `/api/v1/tokens` | 201 `{"api_token", "token"}`; body `{"name", "expires_in_days"?}`; the secret is returned once; at most 20 per user |
@@ -511,13 +573,15 @@ administrators answer `403 forbidden` to members.
 | GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 
-User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`,
+User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`, `tags`,
 `created_at`, `last_login_at`.
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
-agent's protocol version), `last_seen_at`, `tunnels`, `created_at`.
+agent's protocol version), `owner_user_id`, `owner_email`, `tags` (in effect), `labels`,
+`allow_public`, `default_private`, `last_seen_at`, `tunnels`, `created_at`.
 
-Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `status`
+Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `visibility`,
+`access` (private: the tags in effect), `labels`, `status`
 (`connected` / `disconnected` / `error` = local app unreachable on the last request), `tls`
 (`ready` / `pending` / `failed`), `tls_error`, `created_at`, `requests`, `upstream_errors`,
 `last_request_at`. Errors: `{"error": {"code", "message"}}`.

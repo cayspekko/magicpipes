@@ -794,7 +794,15 @@ useful.
    - Admin-created users with forced password changes, and memberships with roles.
    - API tokens and the audit log.
    - The admin token stays.
-3. **Tags and private HTTP tunnels.**
+3. **Tags and private HTTP tunnels.** *Done*, with these differences from the plan above:
+   - Signing out of one UI session doesn't end tunnel cookies; "Sign out everywhere", a
+     password change, disabling the user or losing the tag does.
+   - The signed-in user without access sees the access-denied answer on the tunnel host
+     (`403 forbidden`) when they already hold that host's cookie, and on the management host
+     otherwise.
+   - `magicpipes ls --all` is not built yet: the CLI holds only its agent credential. The UI's
+     "Shared with you" and `GET /api/v1/shared` cover discovery.
+   - Tag rules (IdP groups, claims, email domains) arrive with the SSO steps.
    - The tag registry and admin assignment.
    - Agent tags from enrollment tokens, and the device-style `magicpipes login`.
    - Tunnel visibility, access and labels.

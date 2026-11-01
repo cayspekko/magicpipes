@@ -11,6 +11,7 @@ mod listen;
 mod proxy_header;
 mod mgmt;
 mod store;
+mod tunnel_auth;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,7 +75,9 @@ fn main() -> anyhow::Result<()> {
         Command::Enroll => {
             let cfg = Config::load(&cli.config)?;
             let store = open_store(&cfg)?;
-            let token = store.create_enrollment(cfg.agents.enrollment_ttl_secs)?;
+            // A service agent; its tunnels are private by default once the server has user accounts.
+            let spec = store::EnrollmentSpec { default_private: store.has_users()?, ..Default::default() };
+            let token = store.create_enrollment(cfg.agents.enrollment_ttl_secs, &spec)?;
             let port = cfg.management.listen.port();
             let server = match port {
                 443 => format!("https://{}", cfg.management.hostname),
@@ -166,7 +169,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         tracing::warn!(ca = %p.display(), "tls.mode = dev-ca: clients must trust this CA; do not use in production");
     }
     let shutdown = CancellationToken::new();
-    let data = DataPlane::new(ProxySettings::from_config(&cfg), shutdown.clone());
+    let signer = tunnel_auth::Signer::load_or_create(&cfg.data_dir)?;
+    let data = DataPlane::new(ProxySettings::from_config(&cfg, signer), shutdown.clone());
     let control = ControlPlane::new(cfg.clone(), store, certs.clone(), data.clone())?;
     let mgmt_resolver = management_resolver(&cfg, &certs)?;
 

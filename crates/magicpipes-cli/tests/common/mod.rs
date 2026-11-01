@@ -221,6 +221,17 @@ udp_idle_timeout_secs = 5
         cmd
     }
 
+    /// Starts the CLI with stdout and stderr piped (and no browser), for commands that wait.
+    pub fn cli_spawn(&self, args: &[&str]) -> tokio::process::Child {
+        self.cli_command(args)
+            .env("MAGICPIPES_NO_BROWSER", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("run magicpipes")
+    }
+
     pub async fn cli(&self, args: &[&str]) -> Output {
         self.cli_command(args).output().await.expect("run magicpipes")
     }
@@ -298,6 +309,29 @@ udp_idle_timeout_secs = 5
             let _ = conn.with_upgrades().await;
         });
         sender.send_request(req).await.unwrap()
+    }
+
+    /// GET on a tunnel hostname with cookies, as a browser (`html`) or not.
+    pub async fn tunnel_get(&self, hostname: &str, path: &str, cookies: &str, html: bool) -> TunnelResponse {
+        let mut b = Request::get(path).header(header::HOST, format!("{hostname}:{}", self.https_port));
+        if !cookies.is_empty() {
+            b = b.header(header::COOKIE, cookies);
+        }
+        if html {
+            b = b.header(header::ACCEPT, "text/html,application/xhtml+xml");
+        }
+        let resp = self.send(hostname, self.https_port, b.body(Full::new(Bytes::new())).unwrap()).await;
+        let get = |n| resp.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let (location, error) = (get(header::LOCATION), get(http::HeaderName::from_static("x-magicpipes-error")));
+        let set_cookies = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok()?.split(';').next().map(str::to_string))
+            .collect();
+        let status = resp.status();
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+        TunnelResponse { status, location, error, set_cookies, body }
     }
 
     /// GET on a public tunnel hostname; returns status, `x-magicpipes-error` and body.
@@ -493,6 +527,11 @@ pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
                                     .unwrap()
                             }
                             ("POST", "/echo") => Response::new(req.into_body().boxed()),
+                            ("GET", "/whoami") => {
+                                let h = |n: &str| req.headers().get(n).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                                let body = format!("user={} id={} cookie={}", h("x-magicpipes-user"), h("x-magicpipes-user-id"), h("cookie"));
+                                Response::new(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                            }
                             ("GET", "/stream") => {
                                 let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
                                 tokio::spawn(async move {
@@ -590,6 +629,7 @@ pub async fn udp_echo_app() -> App {
     App { port, task }
 }
 
+#[derive(Debug)]
 pub struct UiResponse {
     pub status: StatusCode,
     pub location: Option<String>,
@@ -603,5 +643,20 @@ impl UiResponse {
     pub fn csrf(&self) -> String {
         let at = self.html.find(r#"name="csrf" value=""#).expect("page has a CSRF field") + r#"name="csrf" value=""#.len();
         self.html[at..].split('"').next().unwrap().to_string()
+    }
+}
+
+pub struct TunnelResponse {
+    pub status: StatusCode,
+    pub location: Option<String>,
+    pub error: Option<String>,
+    /// `name=value` of each `Set-Cookie`.
+    pub set_cookies: Vec<String>,
+    pub body: String,
+}
+
+impl TunnelResponse {
+    pub fn cookie(&self, name: &str) -> Option<String> {
+        self.set_cookies.iter().find(|c| c.starts_with(&format!("{name}="))).cloned()
     }
 }

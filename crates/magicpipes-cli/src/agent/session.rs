@@ -13,7 +13,7 @@ use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::{self, Mode, MuxHandle, MuxStream};
 use magicpipes_core::proto::{
     self, AGENT_CONNECT_PATH, PROTOCOL_HEADER, PROTOCOL_VERSION, RegisterTunnel, Request as Rpc, Response as RpcResponse,
-    UPGRADE_PROTOCOL,
+    UPGRADE_PROTOCOL, Visibility,
 };
 use rustls::ClientConfig;
 use tokio::io::AsyncWriteExt;
@@ -75,6 +75,14 @@ impl Session {
 
     pub fn state(&self) -> ConnState {
         self.state.borrow().clone()
+    }
+
+    /// The connected server's protocol version.
+    pub fn server_protocol(&self) -> Option<u32> {
+        match &*self.state.borrow() {
+            ConnState::Connected { server_protocol, .. } => Some(*server_protocol),
+            _ => None,
+        }
     }
 
     /// Runs the connect/serve/reconnect loop until `shutdown`.
@@ -205,8 +213,17 @@ impl Session {
                 // Keeps the port if the server had to recreate the tunnel (e.g. a restored backup).
                 remote_port: t.public_port,
                 allow: t.allow.clone(),
+                visibility: t.visibility,
+                access: t.access.clone(),
+                labels: t.labels.clone(),
             };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
+                // Never let a private tunnel come back public (e.g. after a server downgrade).
+                Ok(RpcResponse::Tunnel(info)) if t.visibility == Some(Visibility::Private) && info.visibility != Some(Visibility::Private) => {
+                    tracing::error!(tunnel = %t.name, "the server did not keep the tunnel private; removing it there");
+                    let _ = self.rpc(&Rpc::Unregister { id: info.id }, Duration::from_secs(10)).await;
+                    self.tunnels.set_registration(&t.id, Registration::Failed, Some("the server no longer supports private tunnels".into()));
+                }
                 Ok(RpcResponse::Tunnel(info)) => {
                     tracing::info!(tunnel = %t.name, "tunnel restored");
                     let updated = LocalTunnel {
@@ -214,6 +231,9 @@ impl Session {
                         hostname: info.hostname,
                         name: info.name,
                         public_port: info.public_port.or(t.public_port),
+                        visibility: info.visibility,
+                        access: info.access,
+                        labels: info.labels,
                         ..t
                     };
                     self.tunnels.upsert(updated, Registration::Registered);

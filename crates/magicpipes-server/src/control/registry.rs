@@ -4,17 +4,53 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use magicpipes_core::error::ErrorCode;
-use magicpipes_core::proto::{self, CertState, ErrorBody, Kind, RegisterTunnel, ServerOpen, StreamStatus, TunnelInfo};
-use magicpipes_core::{cidr, names, secret, unix_now};
+use magicpipes_core::proto::{self, CertState, ErrorBody, Kind, RegisterTunnel, ServerOpen, StreamStatus, TunnelInfo, Visibility};
+use magicpipes_core::{cidr, names, secret, tags, unix_now};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{CERT_ORDER_WINDOW, ControlPlane, State, TunnelRecord, err, internal, may};
+use super::{CERT_ORDER_WINDOW, ControlPlane, State, TunnelRecord, err, internal};
 use crate::authz::{Action, Principal};
 use crate::certs::CertStatus;
 use crate::config::{PortRange, TlsMode};
 use crate::store::TunnelRow;
 
+/// Visibility, access tags and labels of a tunnel.
+type Access = (Visibility, Vec<String>, Vec<String>);
+
 impl ControlPlane {
+    /// What a registration asks for, within the agent's enrollment. Agents before protocol 3
+    /// send no visibility: a new tunnel then gets the agent's default and an existing one keeps
+    /// its settings.
+    fn requested_access(&self, st: &State, agent_id: &str, req: &RegisterTunnel, existing: Option<&TunnelRow>) -> Result<Access, ErrorBody> {
+        let (allow_public, default_private) = st.dir.agent(agent_id).map_or((true, false), |a| (a.allow_public, a.default_private));
+        let invalid = |m: String| err(ErrorCode::InvalidRequest, m);
+        let (visibility, access, labels) = match (req.visibility, existing) {
+            (None, Some(row)) => return Ok((row.visibility, row.access.clone(), row.labels.clone())),
+            // Raw ports can't ask anyone to sign in yet, so they stay public by default.
+            (None, None) if default_private && req.kind.is_http() => (Visibility::Private, Vec::new(), tags::normalize_list(&req.labels).map_err(invalid)?),
+            (None, None) => (Visibility::Public, Vec::new(), tags::normalize_list(&req.labels).map_err(invalid)?),
+            (Some(v), _) => (v, tags::normalize_list(&req.access).map_err(invalid)?, tags::normalize_list(&req.labels).map_err(invalid)?),
+        };
+        match visibility {
+            Visibility::Public if !allow_public => {
+                return Err(err(ErrorCode::PublicNotAllowed, "this machine may only publish private tunnels (its enrollment doesn't allow public ones)"));
+            }
+            Visibility::Public if !access.is_empty() => {
+                return Err(err(ErrorCode::InvalidRequest, "access tags apply only to private tunnels"));
+            }
+            Visibility::Private if !req.kind.is_http() => {
+                return Err(err(ErrorCode::Unsupported, "TCP and UDP tunnels can't be private yet: people can't sign in to a raw port"));
+            }
+            _ => {}
+        }
+        let access = self.registered(&access)?;
+        let held = st.dir.agent_tags(agent_id);
+        if let Some(t) = access.iter().find(|t| !held.contains(t)) {
+            return Err(err(ErrorCode::Forbidden, format!("this machine doesn't have the access tag '{t}', so it can't share with it")));
+        }
+        Ok((visibility, access, labels))
+    }
+
     pub fn register(&self, agent_id: &str, req: &RegisterTunnel) -> Result<TunnelInfo, ErrorBody> {
         let who = Principal::Agent(agent_id.to_string());
         let target: String = req.target.chars().filter(|c| !c.is_control()).take(200).collect();
@@ -41,13 +77,13 @@ impl ControlPlane {
 
         let existing = match (&req.id, &req.name) {
             (Some(id), _) => match st.tunnels.get(id) {
-                Some(t) if may(&who, Action::Manage, t) => Some(id.clone()),
+                Some(t) if st.may(&who, Action::Manage, t) => Some(id.clone()),
                 _ => return Err(err(ErrorCode::NotFound, "tunnel no longer exists on the server")),
             },
             (None, Some(name)) => {
                 let name = names::validate(name).map_err(|m| err(ErrorCode::InvalidName, m))?;
                 match st.tunnels.values().find(|t| t.row.name == name) {
-                    Some(t) if may(&who, Action::Manage, t) => Some(t.row.id.clone()),
+                    Some(t) if st.may(&who, Action::Manage, t) => Some(t.row.id.clone()),
                     Some(_) => return Err(err(ErrorCode::NameTaken, format!("the name '{name}' is used by another agent"))),
                     None => None,
                 }
@@ -57,6 +93,7 @@ impl ControlPlane {
 
         if let Some(id) = existing {
             let mut row = st.tunnels[&id].row.clone();
+            (row.visibility, row.access, row.labels) = self.requested_access(&st, agent_id, req, Some(&row))?;
             if row.kind != req.kind {
                 return Err(err(
                     ErrorCode::KindMismatch,
@@ -71,7 +108,8 @@ impl ControlPlane {
                 row.public_port = Some(self.claim_port(&st, row.kind, p)?);
             }
             let t = st.tunnels.get_mut(&id).expect("checked above");
-            if (&t.row.target, &t.row.allow, t.row.public_port) != (&row.target, &row.allow, row.public_port) {
+            let settings = |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.access.clone(), r.labels.clone());
+            if settings(&t.row) != settings(&row) {
                 self.store.update_tunnel(&row).map_err(internal)?;
                 t.row = row.clone();
                 self.publish(&st);
@@ -113,6 +151,7 @@ impl ControlPlane {
                 return Err(err(ErrorCode::LimitReached, format!("an agent may add at most {max} new hostnames per day; reuse a name or try later")));
             }
         }
+        let (visibility, access, labels) = self.requested_access(&st, agent_id, req, None)?;
         let public_port = match (range, req.remote_port) {
             (None, _) => None,
             (Some(_), Some(p)) => Some(self.claim_port(&st, req.kind, p)?),
@@ -128,6 +167,9 @@ impl ControlPlane {
             kind: req.kind,
             public_port,
             allow,
+            visibility,
+            access,
+            labels,
         };
         self.store.insert_tunnel(&row).map_err(internal)?;
         if new_cert {
@@ -183,6 +225,9 @@ impl ControlPlane {
             created,
             kind: row.kind,
             public_port: row.public_port,
+            visibility: Some(row.visibility),
+            access: row.access.clone(),
+            labels: row.labels.clone(),
         }
     }
 
@@ -192,7 +237,7 @@ impl ControlPlane {
         let who = Principal::Agent(agent_id.to_string());
         let (header, session) = {
             let st = self.state.lock().unwrap();
-            let t = st.tunnels.get(id).filter(|t| may(&who, Action::Manage, t)).ok_or_else(|| err(ErrorCode::NotFound, "unknown tunnel"))?;
+            let t = st.tunnels.get(id).filter(|t| st.may(&who, Action::Manage, t)).ok_or_else(|| err(ErrorCode::NotFound, "unknown tunnel"))?;
             let tunnel_id = t.row.id.clone();
             let header = match t.row.kind {
                 Kind::Udp => ServerOpen::Datagram { tunnel_id, peer: None },
@@ -223,7 +268,7 @@ impl ControlPlane {
         let who = Principal::Agent(agent_id.to_string());
         let mut st = self.state.lock().unwrap();
         match st.tunnels.get(id) {
-            Some(t) if may(&who, Action::Manage, t) => {}
+            Some(t) if st.may(&who, Action::Manage, t) => {}
             _ => return Ok(()), // idempotent; never reveal other agents' tunnels
         }
         self.store.delete_tunnel(id).map_err(internal)?;
@@ -237,7 +282,7 @@ impl ControlPlane {
     /// Returns false if the tunnel is unknown or `who` may not manage it.
     pub fn delete_tunnel(&self, who: &Principal, id: &str) -> Result<bool, ErrorBody> {
         let mut st = self.state.lock().unwrap();
-        let Some(t) = st.tunnels.get(id).filter(|t| may(who, Action::Manage, t)) else { return Ok(false) };
+        let Some(t) = st.tunnels.get(id).filter(|t| st.may(who, Action::Manage, t)) else { return Ok(false) };
         let agent_id = t.row.agent_id.clone();
         self.store.delete_tunnel(id).map_err(internal)?;
         st.tunnels.remove(id);
@@ -261,7 +306,10 @@ impl ControlPlane {
     /// Certificate readiness for a hostname owned by `agent_id`.
     pub async fn cert_status(&self, agent_id: &str, hostname: &str, wait: Duration) -> Result<CertState, ErrorBody> {
         let who = Principal::Agent(agent_id.to_string());
-        let owned = self.state.lock().unwrap().tunnels.values().any(|t| t.row.hostname == hostname && may(&who, Action::Manage, t));
+        let owned = {
+            let st = self.state.lock().unwrap();
+            st.tunnels.values().any(|t| t.row.hostname == hostname && st.may(&who, Action::Manage, t))
+        };
         if !owned {
             return Err(err(ErrorCode::NotFound, "unknown tunnel hostname"));
         }
@@ -270,5 +318,41 @@ impl ControlPlane {
             CertStatus::Pending => CertState::Pending,
             CertStatus::Failed(message) => CertState::Failed { message },
         })
+    }
+}
+
+/// The answer to "may this user into the private tunnel at this host?".
+pub enum TunnelSignIn {
+    /// A one-time code for the tunnel host, and where to send it.
+    Allowed { callback: String },
+    Denied,
+    NotFound,
+}
+
+impl ControlPlane {
+    /// For `/auth/tunnel`: whether `who` may connect to the private tunnel at `host`, and if so a
+    /// sign-in code bound to the browser's `state` nonce. Only hostnames of published private
+    /// tunnels are accepted, so this never redirects anywhere else.
+    pub fn tunnel_sign_in(&self, who: &Principal, host: &str, state: &str) -> TunnelSignIn {
+        let host = host.trim().to_ascii_lowercase();
+        let Principal::User { id, .. } = who else { return TunnelSignIn::Denied };
+        let allowed = {
+            let st = self.state.lock().unwrap();
+            let found = st.tunnels.values().find(|t| {
+                t.row.hostname == host && t.row.kind.is_http() && t.row.visibility == Visibility::Private && st.dir.agent_active(&t.row.agent_id)
+            });
+            match found {
+                None => return TunnelSignIn::NotFound,
+                Some(t) => st.may(who, Action::Connect, t),
+            }
+        };
+        if !allowed {
+            self.audit(who, "tunnel.denied", &host, "");
+            return TunnelSignIn::Denied;
+        }
+        self.audit(who, "tunnel.sign_in", &host, "");
+        let code = self.data.signer().code(id, &host, state);
+        let enc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+        TunnelSignIn::Allowed { callback: format!("{}{}?code={}", self.cfg.public_url(&host), crate::tunnel_auth::CALLBACK_PATH, enc(&code)) }
     }
 }

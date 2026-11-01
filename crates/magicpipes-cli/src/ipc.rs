@@ -14,7 +14,7 @@ pub const MAX_LINE: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
-    Add(AddRequest),
+    Add(Box<AddRequest>),
     Remove { selector: String, force: bool },
     List,
     Status,
@@ -57,6 +57,13 @@ pub struct AddRequest {
     pub name: Option<String>,
     pub probe_path: String,
     pub timeout_secs: u64,
+    /// `None`: the server's default for this machine (or no change for an existing tunnel).
+    #[serde(default)]
+    pub visibility: Option<magicpipes_core::proto::Visibility>,
+    #[serde(default)]
+    pub access: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

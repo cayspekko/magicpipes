@@ -4,15 +4,17 @@
 //! All queries are short; callers hold the connection mutex only for the duration of one
 //! statement or transaction. Users, sessions, API tokens and the audit log are in [`users`].
 
+mod tags;
 mod users;
 
+pub use tags::{EnrollmentSpec, MAX_TAGS};
 pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use magicpipes_core::proto::Kind;
+use magicpipes_core::proto::{Kind, Visibility};
 use magicpipes_core::{secret, unix_now};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -34,6 +36,11 @@ pub struct TunnelRow {
     pub public_port: Option<u16>,
     /// Port tunnels: allowed client networks (canonical CIDRs); empty = anyone.
     pub allow: Vec<String>,
+    pub visibility: Visibility,
+    /// Private tunnels: the requested access tags (the effective set is limited to the agent's
+    /// tags when routes are published); empty = all of the agent's tags.
+    pub access: Vec<String>,
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +49,13 @@ pub struct AgentRow {
     pub name: String,
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
+    /// `None`: a service agent, managed by administrators.
+    pub owner_user_id: Option<String>,
+    /// May its tunnels be public?
+    pub allow_public: bool,
+    /// Are its tunnels private unless asked otherwise?
+    pub default_private: bool,
+    pub labels: Vec<String>,
 }
 
 const SCHEMA: &str = r#"
@@ -155,6 +169,62 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX audit_log_at ON audit_log(at);
     "#,
+    // 3: access tags, agent ownership and private tunnels (docs/USERS.md). Labels are a
+    // separate column everywhere and never grant access. Every tag reference points at the
+    // registry, so deleting a tag revokes it everywhere through the cascade.
+    r#"
+    CREATE TABLE tags (
+        org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        created_by  TEXT,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (org_id, name)
+    );
+    CREATE TABLE user_tags (
+        org_id      TEXT NOT NULL,
+        user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tag         TEXT NOT NULL,
+        assigned_by TEXT,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (org_id, user_id, tag),
+        FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    ALTER TABLE agents ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
+    ALTER TABLE agents ADD COLUMN owner_user_id TEXT REFERENCES users(id);
+    ALTER TABLE agents ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE agents ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agents ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+    CREATE TABLE agent_tags (
+        agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        org_id      TEXT NOT NULL,
+        tag         TEXT NOT NULL,
+        PRIMARY KEY (agent_id, tag),
+        FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    ALTER TABLE enrollments ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
+    ALTER TABLE enrollments ADD COLUMN created_by TEXT;
+    ALTER TABLE enrollments ADD COLUMN owner_user_id TEXT;
+    ALTER TABLE enrollments ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE enrollments ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE enrollments ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+    CREATE TABLE enrollment_tags (
+        token_hash  TEXT NOT NULL REFERENCES enrollments(token_hash) ON DELETE CASCADE,
+        org_id      TEXT NOT NULL,
+        tag         TEXT NOT NULL,
+        PRIMARY KEY (token_hash, tag),
+        FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    ALTER TABLE tunnels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private'));
+    ALTER TABLE tunnels ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+    CREATE TABLE tunnel_access (
+        tunnel_id   TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+        org_id      TEXT NOT NULL,
+        tag         TEXT NOT NULL,
+        PRIMARY KEY (tunnel_id, tag),
+        FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -169,11 +239,13 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-const TUNNEL_COLUMNS: &str = "id, name, hostname, agent_id, target, created_at, kind, public_port, allow";
+const TUNNEL_COLUMNS: &str = "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, labels";
 
 fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
     let kind: String = r.get(6)?;
     let allow: String = r.get(8)?;
+    let visibility: String = r.get(9)?;
+    let labels: String = r.get(10)?;
     Ok(TunnelRow {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -184,6 +256,10 @@ fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
         kind: Kind::parse(&kind).unwrap_or_default(),
         public_port: r.get(7)?,
         allow: allow.split_whitespace().map(str::to_string).collect(),
+        // A visibility that can't be read keeps the tunnel private.
+        visibility: Visibility::parse(&visibility).unwrap_or(Visibility::Private),
+        access: Vec::new(),
+        labels: labels.split_whitespace().map(str::to_string).collect(),
     })
 }
 
@@ -238,16 +314,33 @@ impl Store {
 
     // ---- enrollment & agents --------------------------------------------------------------
 
-    pub fn create_enrollment(&self, ttl_secs: u64) -> anyhow::Result<String> {
+    /// Creates a single-use enrollment token; the agent enrolled with it gets `spec`'s owner,
+    /// tags, labels and visibility settings.
+    pub fn create_enrollment(&self, ttl_secs: u64, spec: &EnrollmentSpec) -> anyhow::Result<String> {
         let token = secret::new_token("mpenr");
+        let hash = secret::sha256_hex(&token);
         let now = unix_now();
-        self.with(|c| {
-            c.execute("DELETE FROM enrollments WHERE expires_at < ?1 AND used_at IS NULL", [now])?;
-            c.execute(
-                "INSERT INTO enrollments (token_hash, created_at, expires_at) VALUES (?1, ?2, ?3)",
-                params![secret::sha256_hex(&token), now, now + ttl_secs as i64],
-            )
-        })?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM enrollments WHERE expires_at < ?1 AND used_at IS NULL", [now])?;
+        tx.execute(
+            "INSERT INTO enrollments (token_hash, created_at, expires_at, created_by, owner_user_id, allow_public, default_private, labels)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                hash,
+                now,
+                now + ttl_secs as i64,
+                spec.created_by,
+                spec.owner_user_id,
+                spec.allow_public as i64,
+                spec.default_private as i64,
+                spec.labels.join(" ")
+            ],
+        )?;
+        for t in &spec.tags {
+            tx.execute("INSERT INTO enrollment_tags (token_hash, org_id, tag) VALUES (?1, ?2, ?3)", params![hash, users::DEFAULT_ORG, t])?;
+        }
+        tx.commit()?;
         Ok(token)
     }
 
@@ -269,9 +362,15 @@ impl Store {
         if updated != 1 {
             return Ok(None);
         }
+        // The agent takes the token's owner, tags, labels and visibility settings.
         tx.execute(
-            "INSERT INTO agents (id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![agent_id, agent_name, secret::sha256_hex(&agent_token), now],
+            "INSERT INTO agents (id, name, token_hash, created_at, owner_user_id, allow_public, default_private, labels)
+             SELECT ?1, ?2, ?3, ?4, owner_user_id, allow_public, default_private, labels FROM enrollments WHERE token_hash = ?5",
+            params![agent_id, agent_name, secret::sha256_hex(&agent_token), now, hash],
+        )?;
+        tx.execute(
+            "INSERT INTO agent_tags (agent_id, org_id, tag) SELECT ?1, org_id, tag FROM enrollment_tags WHERE token_hash = ?2",
+            params![agent_id, hash],
         )?;
         tx.commit()?;
         Ok(Some((agent_id, agent_token)))
@@ -310,9 +409,21 @@ impl Store {
 
     pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, name, created_at, last_seen_at FROM agents ORDER BY created_at")?;
+            let mut st = c.prepare(
+                "SELECT id, name, created_at, last_seen_at, owner_user_id, allow_public, default_private, labels FROM agents ORDER BY created_at",
+            )?;
             st.query_map([], |r| {
-                Ok(AgentRow { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, last_seen_at: r.get(3)? })
+                let labels: String = r.get(7)?;
+                Ok(AgentRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    created_at: r.get(2)?,
+                    last_seen_at: r.get(3)?,
+                    owner_user_id: r.get(4)?,
+                    allow_public: r.get::<_, i64>(5)? != 0,
+                    default_private: r.get::<_, i64>(6)? != 0,
+                    labels: labels.split_whitespace().map(str::to_string).collect(),
+                })
             })?
             .collect()
         })
@@ -321,30 +432,65 @@ impl Store {
     // ---- tunnels --------------------------------------------------------------------------
 
     pub fn tunnels(&self) -> anyhow::Result<Vec<TunnelRow>> {
-        self.with(|c| {
+        let mut rows: Vec<TunnelRow> = self.with(|c| {
             let mut st = c.prepare(&format!("SELECT {TUNNEL_COLUMNS} FROM tunnels ORDER BY created_at"))?;
             st.query_map([], tunnel_row)?.collect()
-        })
+        })?;
+        let access: Vec<(String, String)> = self.with(|c| {
+            let mut st = c.prepare("SELECT tunnel_id, tag FROM tunnel_access ORDER BY tag")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        })?;
+        for (id, tag) in access {
+            if let Some(t) = rows.iter_mut().find(|t| t.id == id) {
+                t.access.push(tag);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Replaces a tunnel's access rows (inside the caller's transaction).
+    fn write_access(tx: &rusqlite::Transaction<'_>, t: &TunnelRow) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM tunnel_access WHERE tunnel_id = ?1", [&t.id])?;
+        for tag in &t.access {
+            tx.execute("INSERT INTO tunnel_access (tunnel_id, org_id, tag) VALUES (?1, ?2, ?3)", params![t.id, users::DEFAULT_ORG, tag])?;
+        }
+        Ok(())
     }
 
     pub fn insert_tunnel(&self, t: &TunnelRow) -> anyhow::Result<()> {
-        self.with(|c| {
-            c.execute(
-                &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"),
-                params![t.id, t.name, t.hostname, t.agent_id, t.target, t.created_at, t.kind.as_str(), t.public_port, t.allow.join(" ")],
-            )
-        })?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        tx.execute(
+            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            params![
+                t.id,
+                t.name,
+                t.hostname,
+                t.agent_id,
+                t.target,
+                t.created_at,
+                t.kind.as_str(),
+                t.public_port,
+                t.allow.join(" "),
+                t.visibility.as_str(),
+                t.labels.join(" ")
+            ],
+        )?;
+        Self::write_access(&tx, t)?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Saves the settings an agent may change on an existing tunnel.
     pub fn update_tunnel(&self, t: &TunnelRow) -> anyhow::Result<()> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3 WHERE id = ?4",
-                params![t.target, t.public_port, t.allow.join(" "), t.id],
-            )
-        })?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, labels = ?5 WHERE id = ?6",
+            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.labels.join(" "), t.id],
+        )?;
+        Self::write_access(&tx, t)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -363,7 +509,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("db.sqlite")).unwrap();
-        let enr = store.create_enrollment(60).unwrap();
+        let enr = store.create_enrollment(60, &EnrollmentSpec::default()).unwrap();
         let (id, token) = store.enroll(&enr, "laptop").unwrap().unwrap();
         assert!(store.enroll(&enr, "again").unwrap().is_none());
         assert_eq!(store.verify_agent_token(&token).unwrap().as_deref(), Some(id.as_str()));
@@ -379,8 +525,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("db.sqlite")).unwrap();
-        let (id, token) = store.enroll(&store.create_enrollment(60).unwrap(), "laptop").unwrap().unwrap();
-        let (other, other_token) = store.enroll(&store.create_enrollment(60).unwrap(), "desktop").unwrap().unwrap();
+        let (id, token) = store.enroll(&store.create_enrollment(60, &EnrollmentSpec::default()).unwrap(), "laptop").unwrap().unwrap();
+        let (other, other_token) = store.enroll(&store.create_enrollment(60, &EnrollmentSpec::default()).unwrap(), "desktop").unwrap().unwrap();
         for (tid, agent) in [("tn_a", &id), ("tn_b", &other)] {
             store
                 .insert_tunnel(&TunnelRow {
@@ -393,6 +539,9 @@ mod tests {
                     kind: Kind::Http,
                     public_port: None,
                     allow: vec![],
+                    visibility: Visibility::Public,
+                    access: vec![],
+                    labels: vec![],
                 })
                 .unwrap();
         }
@@ -424,6 +573,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let old = &store.tunnels().unwrap()[0];
         assert_eq!((old.kind, old.public_port, old.allow.len()), (Kind::Http, None, 0));
+        assert_eq!(old.visibility, Visibility::Public, "tunnels from before private tunnels stay public");
         let row = |id: &str, kind, port| TunnelRow {
             id: id.into(),
             name: id.into(),
@@ -434,6 +584,9 @@ mod tests {
             kind,
             public_port: Some(port),
             allow: vec!["10.0.0.0/8".into(), "192.0.2.1/32".into()],
+            visibility: Visibility::Public,
+            access: vec![],
+            labels: vec![],
         };
         store.insert_tunnel(&row("tn_tcp", Kind::Tcp, 65500)).unwrap();
         store.insert_tunnel(&row("tn_udp", Kind::Udp, 65500)).unwrap();

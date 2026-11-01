@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::{AppState, ClientIp, Rejected, bearer_token};
 use crate::authz::{Principal, Role};
+use crate::control::{DEVICE_LOGIN_TTL, DevicePoll, EnrollmentOptions};
 
 /// An API error; its HTTP status follows from the code.
 pub struct ApiError(ErrorBody);
@@ -68,6 +69,11 @@ pub async fn list_tunnels(Caller(who): Caller, State(app): State<AppState>) -> i
     Json(json!({ "tunnels": app.control.tunnels(&who) }))
 }
 
+/// Tunnels you can reach but don't manage.
+pub async fn shared_tunnels(Caller(who): Caller, State(app): State<AppState>) -> impl IntoResponse {
+    Json(json!({ "tunnels": app.control.shared(&who) }))
+}
+
 pub async fn get_tunnel(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
     app.control
         .tunnel(&who, &id)
@@ -98,8 +104,34 @@ pub async fn revoke_agent(Caller(who): Caller, State(app): State<AppState>, Path
     }
 }
 
-pub async fn create_enrollment(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let token = app.control.create_enrollment(&who).map_err(ApiError)?;
+#[derive(Deserialize, Default)]
+pub struct NewEnrollment {
+    /// The user the agent will belong to; omitted: a service agent (administrators), or
+    /// yourself (members).
+    owner_user_id: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    allow_public: Option<bool>,
+    default_private: Option<bool>,
+}
+
+/// The body is optional: without one, a service agent with today's defaults.
+pub async fn create_enrollment(
+    Caller(who): Caller,
+    State(app): State<AppState>,
+    body: Option<Json<NewEnrollment>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let opts = EnrollmentOptions {
+        owner_user_id: b.owner_user_id,
+        tags: b.tags,
+        labels: b.labels,
+        allow_public: b.allow_public,
+        default_private: b.default_private,
+    };
+    let token = app.control.create_enrollment(&who, opts).map_err(ApiError)?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -175,6 +207,8 @@ pub async fn create_user(Caller(who): Caller, State(app): State<AppState>, Json(
 pub struct UserChange {
     role: Option<String>,
     disabled: Option<bool>,
+    /// Replaces the user's access tags.
+    tags: Option<Vec<String>>,
 }
 
 pub async fn update_user(
@@ -184,6 +218,12 @@ pub async fn update_user(
     Json(req): Json<UserChange>,
 ) -> Result<impl IntoResponse, ApiError> {
     let role = parse_role(req.role.as_deref())?;
+    if let Some(tags) = &req.tags {
+        app.control.set_user_tags(&who, &id, tags).map_err(ApiError)?;
+    }
+    if role.is_none() && req.disabled.is_none() {
+        return app.control.user(&who, &id).map(Json).ok_or_else(no_user);
+    }
     app.control.update_user(&who, &id, role, req.disabled).map(Json).map_err(ApiError)
 }
 
@@ -226,4 +266,94 @@ pub struct AuditQuery {
 pub async fn audit(Caller(who): Caller, State(app): State<AppState>, Query(q): Query<AuditQuery>) -> Result<impl IntoResponse, ApiError> {
     let entries = app.control.audit_entries(&who, q.limit.unwrap_or(100)).map_err(ApiError)?;
     Ok(Json(json!({ "entries": entries })))
+}
+
+// ---- tags ------------------------------------------------------------------------------------
+
+pub async fn list_tags(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    if !who.is_admin() {
+        return Err(forbidden());
+    }
+    Ok(Json(json!({ "tags": app.control.tags(&who) })))
+}
+
+#[derive(Deserialize)]
+pub struct NewTag {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+pub async fn create_tag(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewTag>) -> Result<impl IntoResponse, ApiError> {
+    let tag = app.control.create_tag(&who, &req.name, &req.description).map_err(ApiError)?;
+    Ok((StatusCode::CREATED, Json(tag)))
+}
+
+pub async fn delete_tag(Caller(who): Caller, State(app): State<AppState>, Path(name): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.control.delete_tag(&who, &name) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(api_err(ErrorCode::NotFound, "no such tag")),
+        Err(e) => Err(ApiError(e)),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AgentChange {
+    /// Replaces the agent's access tags (owners may only remove).
+    tags: Option<Vec<String>>,
+    labels: Option<Vec<String>>,
+}
+
+pub async fn update_agent(
+    Caller(who): Caller,
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AgentChange>,
+) -> Result<impl IntoResponse, ApiError> {
+    app.control.update_agent(&who, &id, req.tags.as_deref(), req.labels.as_deref()).map_err(ApiError)?;
+    let agent = app.control.agents(&who).into_iter().find(|a| a.id == id).ok_or_else(|| api_err(ErrorCode::NotFound, "no such agent"))?;
+    Ok(Json(agent))
+}
+
+// ---- `magicpipes login` approved in the browser ------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DeviceStart {
+    agent_name: String,
+}
+
+/// Starts a browser-approved login. The CLI shows `user_code`, opens `/cli?code=<user_code>`
+/// and polls with the secret `device_code`.
+pub async fn start_device(
+    State(app): State<AppState>,
+    client: Option<axum::Extension<ClientIp>>,
+    Json(req): Json<DeviceStart>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ip = client.map(|c| c.0.0).unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+    let (device_code, user_code) = app.control.start_device_login(&req.agent_name, ip).map_err(ApiError)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "device_code": device_code,
+            "user_code": user_code,
+            "expires_in_secs": DEVICE_LOGIN_TTL.as_secs(),
+            "interval_secs": 2,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct DevicePollRequest {
+    device_code: String,
+}
+
+/// `{"status": "pending" | "approved" | "denied" | "expired"}`; `approved` carries the
+/// `enrollment_token`, handed out once.
+pub async fn poll_device(State(app): State<AppState>, Json(req): Json<DevicePollRequest>) -> impl IntoResponse {
+    Json(match app.control.poll_device_login(&req.device_code) {
+        DevicePoll::Pending => json!({ "status": "pending" }),
+        DevicePoll::Approved(token) => json!({ "status": "approved", "enrollment_token": token }),
+        DevicePoll::Denied => json!({ "status": "denied" }),
+        DevicePoll::Gone => json!({ "status": "expired" }),
+    })
 }

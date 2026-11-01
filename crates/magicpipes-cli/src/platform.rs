@@ -113,6 +113,29 @@ pub async fn terminate() {
     std::future::pending::<()>().await
 }
 
+/// Opens `url` in the user's browser, best effort: errors are ignored, because the URL is also
+/// printed. `url` is built by the CLI itself (never taken from the server as is).
+pub fn open_url(url: &str) {
+    if std::env::var_os("MAGICPIPES_NO_BROWSER").is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("open");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = Command::new("xdg-open");
+    cmd.arg(url).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        // Reap it in the background so it doesn't linger as a zombie.
+        std::thread::spawn(move || child.wait());
+    }
+}
+
 pub fn hostname() -> String {
     #[cfg(unix)]
     {

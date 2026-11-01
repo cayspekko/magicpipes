@@ -1,10 +1,10 @@
 //! What the management API and UI show. Every list is filtered by [`authz::authorize`].
 
-use magicpipes_core::proto::Kind;
+use magicpipes_core::proto::{Kind, Visibility};
 use magicpipes_core::rfc3339;
 use serde::Serialize;
 
-use super::{ControlPlane, State, TunnelRecord, may};
+use super::{ControlPlane, State, TunnelRecord};
 use crate::authz::{self, Action, Principal, Resource};
 use crate::certs::CertStatus;
 use crate::data::Outcome;
@@ -23,6 +23,12 @@ pub struct TunnelView {
     pub allow: Vec<String>,
     pub target: String,
     pub agent_id: String,
+    pub visibility: Visibility,
+    /// Private tunnels: the access tags in effect (limited to the agent's); empty = owner only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     /// `connected`, `disconnected` (agent offline) or `error` (local application unreachable,
     /// or the tunnel's port could not be opened).
     pub status: &'static str,
@@ -52,10 +58,35 @@ pub struct AgentView {
     /// The connected agent's protocol version (1 for agents that predate the handshake).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<u32>,
+    /// The user the agent belongs to; absent for a service agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    /// Access tags in effect (a personal agent's are limited to its owner's).
+    pub tags: Vec<String>,
+    pub labels: Vec<String>,
+    /// May its tunnels be public?
+    pub allow_public: bool,
+    /// Are its tunnels private unless asked otherwise?
+    pub default_private: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<String>,
     pub tunnels: usize,
     pub created_at: String,
+}
+
+/// A tunnel shared with someone who doesn't manage it: no target, agent or statistics.
+#[derive(Debug, Clone, Serialize)]
+pub struct SharedTunnelView {
+    pub name: String,
+    pub public_url: String,
+    pub kind: Kind,
+    pub visibility: Visibility,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +121,9 @@ impl ControlPlane {
             allow: t.row.allow.clone(),
             target: t.row.target.clone(),
             agent_id: t.row.agent_id.clone(),
+            visibility: t.row.visibility,
+            access: if t.row.visibility == Visibility::Private { st.tunnel_authz(t).access } else { Vec::new() },
+            labels: t.row.labels.clone(),
             status,
             port_error,
             tls: cert.as_ref().map_or("none", CertStatus::label),
@@ -107,8 +141,28 @@ impl ControlPlane {
     /// The tunnels `who` manages.
     pub fn tunnels(&self, who: &Principal) -> Vec<TunnelView> {
         let st = self.state.lock().unwrap();
-        let mut v: Vec<_> = st.tunnels.values().filter(|t| may(who, Action::Manage, t)).map(|t| self.view(&st, t)).collect();
+        let mut v: Vec<_> = st.tunnels.values().filter(|t| st.may(who, Action::Manage, t)).map(|t| self.view(&st, t)).collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.name.cmp(&b.name)));
+        v
+    }
+
+    /// Tunnels `who` can reach but doesn't manage: shared with one of their tags, or public.
+    pub fn shared(&self, who: &Principal) -> Vec<SharedTunnelView> {
+        let st = self.state.lock().unwrap();
+        let mut v: Vec<SharedTunnelView> = st
+            .tunnels
+            .values()
+            .filter(|t| st.dir.agent_active(&t.row.agent_id) && !st.may(who, Action::Manage, t) && st.may(who, Action::Discover, t))
+            .map(|t| SharedTunnelView {
+                name: t.row.name.clone(),
+                public_url: self.public_url(&t.row),
+                kind: t.row.kind,
+                visibility: t.row.visibility,
+                owner_email: st.dir.owner(&t.row.agent_id).and_then(|o| st.dir.email(o)).map(str::to_string),
+                labels: t.row.labels.clone(),
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
 
@@ -117,7 +171,7 @@ impl ControlPlane {
         st.tunnels
             .values()
             .find(|t| t.row.id == id_or_name || t.row.name == id_or_name)
-            .filter(|t| may(who, Action::Manage, t))
+            .filter(|t| st.may(who, Action::Manage, t))
             .map(|t| self.view(&st, t))
     }
 
@@ -126,7 +180,7 @@ impl ControlPlane {
         let rows = self.store.agents().unwrap_or_default();
         let st = self.state.lock().unwrap();
         rows.into_iter()
-            .filter(|a| authz::authorize(who, Action::Manage, Resource::Agent(&a.id)))
+            .filter(|a| authz::authorize(who, Action::Manage, st.agent_resource(&a.id)))
             .map(|a| {
                 let s = st.sessions.get(&a.id);
                 AgentView {
@@ -134,6 +188,12 @@ impl ControlPlane {
                     remote_addr: s.map(|s| s.remote.to_string()),
                     connected_at: s.map(|s| rfc3339(s.connected_at)),
                     protocol: s.map(|s| s.protocol),
+                    owner_email: a.owner_user_id.as_deref().and_then(|u| st.dir.email(u)).map(str::to_string),
+                    tags: st.dir.agent_tags(&a.id),
+                    labels: a.labels,
+                    allow_public: a.allow_public,
+                    default_private: a.default_private,
+                    owner_user_id: a.owner_user_id,
                     last_seen_at: a.last_seen_at.map(rfc3339),
                     tunnels: st.tunnels.values().filter(|t| t.row.agent_id == a.id).count(),
                     created_at: rfc3339(a.created_at),
@@ -145,10 +205,11 @@ impl ControlPlane {
     }
 
     pub fn agent_name(&self, who: &Principal, agent_id: &str) -> Option<String> {
-        if !authz::authorize(who, Action::Discover, Resource::Agent(agent_id)) {
+        let st = self.state.lock().unwrap();
+        if !authz::authorize(who, Action::Discover, st.agent_resource(agent_id)) {
             return None;
         }
-        self.store.agents().ok()?.into_iter().find(|a| a.id == agent_id).map(|a| a.name)
+        st.dir.agent(agent_id).map(|a| a.name.clone())
     }
 
     pub fn status(&self, who: &Principal) -> Option<StatusView> {

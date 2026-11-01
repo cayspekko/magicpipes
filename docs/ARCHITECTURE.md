@@ -62,6 +62,17 @@ proxy logic (≈300 lines) only routes and rewrites hop-by-hop and forwarding he
   filters every view with it. Each route carries an `AccessPolicy` (network allow-list, then
   `authorize`), which the data plane checks per HTTP request, TCP connection and UDP flow.
   Users and tags extend the same table ([USERS.md](USERS.md)); a check never bypasses it.
+* `control/directory.rs` keeps who owns which agent and which tags everyone holds in memory,
+  reloaded (`ControlPlane::refresh`) after every change to users, tags or agents, which also
+  republishes. Each `RouteTable` carries the active users with their current tags, so the data
+  plane decides private-tunnel access without the database, and a revocation applies on the
+  next request.
+* Private tunnels (`data/gate.rs`, `tunnel_auth.rs`): the management cookie never leaves the
+  management host, so a private tunnel's host gets its own signed cookie (`__Host-mp_tunnel`,
+  HMAC-SHA256 with `data_dir/session-key`) through a redirect to `/auth/tunnel` and a one-time,
+  60-second code bound to a state cookie. Every request rechecks the cookie against the current
+  table; the proxy strips MagicPipes' cookies and adds `X-MagicPipes-User`. Upgraded connections
+  watch the table's generation and close when their user loses access.
 * `certs/` belongs to the control plane. The `CertResolver` it fills is read by the TLS
   acceptors in the handshake; issuance never happens on the request path, and only for
   hostnames the control plane authorized.
@@ -291,6 +302,13 @@ a connection to the public port that must arrive back at the agent (a warning, n
   The server can name a tunnel, never an address.
 * Hostname ownership: names are unique, tied to one agent, validated (DNS label rules, reserved
   names, management hostname). Another agent cannot register or query them.
+* Private HTTP tunnels admit their owner and users sharing one of their access tags (exact
+  match), after signing in; administrators manage them but don't get in through their role.
+  A tunnel's effective access is its requested tags limited to its agent's tags, and a personal
+  agent's tags are limited to its owner's, so nobody can widen access by tagging their own
+  machine. Visibility and access stored in a form that can't be read keep the tunnel private.
+  Members enroll only their own machines, with tags they hold; an owner may remove tags from
+  their machine but not add any.
 * Port tunnels are open to anyone unless `--allow-cidr` is given (the CLI says so). The server
   enforces allow-lists on every connection, and an allow-list it cannot read keeps the tunnel
   unpublished (fail closed); behind a TCP proxy, only `proxy_protocol` with `trusted_proxies`

@@ -61,6 +61,7 @@ acme_directory = "letsencrypt"
 # Accounts are created by administrators in the UI (Users) or the API; see the README.
 # session_max_age_secs = 43200         # how long a sign-in lasts
 # audit_retention_days = 90
+# members_can_publish = true           # may members' machines create public tunnels?
 
 [ports]
 # Raw TCP and UDP tunnels (`magicpipes add 5432 --tcp`, `add 53 --udp`). Off unless `range` is

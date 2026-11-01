@@ -176,11 +176,13 @@ pub struct UsersConfig {
     pub session_max_age_secs: u64,
     /// How long audit log entries are kept.
     pub audit_retention_days: u64,
+    /// May members' machines create public tunnels?
+    pub members_can_publish: bool,
 }
 
 impl Default for UsersConfig {
     fn default() -> Self {
-        Self { session_max_age_secs: 12 * 3600, audit_retention_days: 90 }
+        Self { session_max_age_secs: 12 * 3600, audit_retention_days: 90, members_can_publish: true }
     }
 }
 

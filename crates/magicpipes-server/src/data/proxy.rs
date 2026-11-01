@@ -20,7 +20,9 @@ use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::{self, ERROR_HEADER, PROBE_ACK_HEADER, PROBE_HEADER, ServerOpen};
+use tokio_util::sync::CancellationToken;
 
+use super::gate;
 use super::io::{StatusPrefixed, UpstreamStatus, bridge, find_status};
 use super::{DataPlane, Outcome, Route};
 use crate::authz::Principal;
@@ -50,7 +52,7 @@ pub async fn handle(
     })
 }
 
-async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> Result<Response<ProxyBody>, Response<ProxyBody>> {
+async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>) -> Result<Response<ProxyBody>, Response<ProxyBody>> {
     if req.method() == Method::CONNECT {
         return Err(error_page(ErrorCode::MethodNotAllowed, "CONNECT is not supported."));
     }
@@ -64,10 +66,15 @@ async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> R
         .lookup(&host)
         .ok_or_else(|| error_page(ErrorCode::TunnelNotFound, "There is no tunnel at this address."))?;
     let client_ip = dp.settings.trusted_proxies.client_ip(conn.peer.ip(), req.headers());
-    // Fails like an unknown hostname: a client that may not use a tunnel learns nothing about it.
-    if !route.access.admits(&Principal::Anonymous, client_ip) {
+    // Fails like an unknown hostname: a client outside the allowed networks learns nothing.
+    if !route.access.allows_network(client_ip) {
         return Err(error_page(ErrorCode::TunnelNotFound, "There is no tunnel at this address."));
     }
+    // Public tunnels admit anyone; private ones a signed-in user who may connect.
+    let admitted = match route.access.admits(&Principal::Anonymous, client_ip) {
+        true => None,
+        false => Some(gate::check(dp, &req, &host, &route)?),
+    };
 
     let session = match &route.session {
         Some(s) if !s.is_closed() => s.clone(),
@@ -85,6 +92,16 @@ async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> R
     let upgrade = is_upgrade(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
     prepare_request(&mut req, &host, conn.peer, upgrade, &dp.settings.trusted_proxies)?;
+    if let Some(a) = &admitted {
+        // The application learns who is asking, never the tunnel cookie. Clients can't forge
+        // these: `prepare_request` dropped every client-sent x-magicpipes-* header.
+        gate::strip_cookies(req.headers_mut());
+        let h = req.headers_mut();
+        if let (Ok(email), Ok(id)) = (HeaderValue::from_str(&a.user.email), HeaderValue::from_str(&a.user_id)) {
+            h.insert("x-magicpipes-user", email);
+            h.insert("x-magicpipes-user-id", id);
+        }
+    }
 
     let upstream = open_upstream(dp, &route, &session, client).await?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Incoming>(TokioIo::new(upstream))
@@ -118,11 +135,32 @@ async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> R
         };
         let upstream_upgrade = hyper::upgrade::on(&mut resp);
         let idle = dp.settings.websocket_idle_timeout;
+        let stop = CancellationToken::new();
+        if let Some(a) = admitted {
+            // Recheck on every change to routes, users or tags; close once access is gone.
+            let (dp, stop, host) = (dp.clone(), stop.clone(), host.clone());
+            let mut changes = dp.generation.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        changed = changes.changed() => {
+                            if changed.is_err() || !gate::still_admitted(&dp.table(), &host, &a.user_id, a.issued_at) {
+                                stop.cancel();
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                Ok((client, upstream)) => bridge(TokioIo::new(client), TokioIo::new(upstream), idle).await,
+                Ok((client, upstream)) => bridge(TokioIo::new(client), TokioIo::new(upstream), idle, stop.clone()).await,
                 Err(e) => tracing::debug!(error = %e, "upgrade failed"),
             }
+            // Ends the watcher, if any.
+            stop.cancel();
         });
         clean_response_headers(resp.headers_mut(), true);
     } else {

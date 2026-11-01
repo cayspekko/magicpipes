@@ -762,7 +762,7 @@ async fn revoked_agent_is_cut_off() {
         env.cli_json(&["status", "--json"]).await["connection"] == "unauthorized"
     })
     .await;
-    assert!(env.server_log().contains("agent revoked by administrator"));
+    assert!(env.server_log().contains("agent revoked"));
     assert_eq!(env.api("DELETE", &format!("/api/v1/agents/{agent_id}"), Some(&admin)).await.0, StatusCode::NOT_FOUND);
     env.cli_ok(&["agent", "stop"]).await;
 }
@@ -872,7 +872,7 @@ async fn user_accounts() {
     assert_eq!((first.status, first.location.as_deref()), (StatusCode::SEE_OTHER, Some("/password")));
     let cookie = first.cookie.clone().unwrap();
     assert!(cookie.starts_with("__Host-mp_session="));
-    assert_eq!(env.ui("/account", Some(&cookie), None).await.location.as_deref(), Some("/password"));
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.location.as_deref(), Some("/password?next=%2Faccount"));
     let form = env.ui("/password", Some(&cookie), None).await;
     assert_eq!(form.status, 200);
     let new_password = "correct horse battery staple";
@@ -881,12 +881,13 @@ async fn user_accounts() {
         .await;
     assert_eq!(changed.status, StatusCode::SEE_OTHER, "{}", changed.html);
     let cookie2 = changed.cookie.clone().unwrap();
-    assert_eq!(env.ui("/account", Some(&cookie), None).await.location.as_deref(), Some("/login"), "old session ended");
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.location.as_deref(), Some("/login?next=%2Faccount"), "old session ended");
 
-    // Members get their account page, not the administration pages.
+    // Members get their account and machines, not the administration pages.
     let account = env.ui("/account", Some(&cookie2), None).await;
     assert!(account.status == 200 && account.html.contains("ann@example.com"), "{}", account.html);
-    assert_eq!(env.ui("/", Some(&cookie2), None).await.location.as_deref(), Some("/account"));
+    let home = env.ui("/", Some(&cookie2), None).await;
+    assert!(home.status == 200 && !home.html.contains("Create enrollment token"), "members see their machines, not the administration");
     assert_eq!(env.ui("/users", Some(&cookie2), None).await.location.as_deref(), Some("/account"));
 
     // An API token acts as its user, with the user's role.
@@ -904,7 +905,7 @@ async fn user_accounts() {
     // Disabling ends the sessions and the API tokens; the admin token keeps working.
     let (s, v) = env.api_json("PATCH", &format!("/api/v1/users/{ann_id}"), Some(&admin), serde_json::json!({ "disabled": true })).await;
     assert_eq!((s, v["disabled"].as_bool()), (StatusCode::OK, Some(true)));
-    assert_eq!(env.ui("/account", Some(&cookie2), None).await.location.as_deref(), Some("/login"));
+    assert_eq!(env.ui("/account", Some(&cookie2), None).await.location.as_deref(), Some("/login?next=%2Faccount"));
     assert_eq!(env.api("GET", "/api/v1/me", Some(&token)).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(login("ann@example.com", new_password.into()).await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(env.api("GET", "/api/v1/status", Some(&admin)).await.0, StatusCode::OK);
@@ -929,6 +930,225 @@ async fn user_accounts() {
     }
     // A disabled user's token is refused (429 by now: this client failed too often).
     assert!(matches!(env.api("GET", "/api/v1/audit", Some(&token)).await.0, StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browser_login_enrolls_your_machine() {
+    use tokio::io::AsyncBufReadExt;
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    let (s, _) = env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:dev" })).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let password = "correct horse battery staple";
+    let (_, v) = env
+        .api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": "ann@example.com", "password": password }))
+        .await;
+    let ann = v["user"]["id"].as_str().unwrap().to_string();
+    let (s, v) = env.api_json("PATCH", &format!("/api/v1/users/{ann}"), Some(&admin), serde_json::json!({ "tags": ["Team:Dev"] })).await;
+    assert_eq!((s, v["tags"].clone()), (StatusCode::OK, serde_json::json!(["team:dev"])));
+    let (s, v) = env.api_json("PATCH", &format!("/api/v1/users/{ann}"), Some(&admin), serde_json::json!({ "tags": ["team:qa"] })).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tag_unknown")));
+
+    // `magicpipes login` without a token prints an approval link and waits.
+    let url = env.server_url();
+    let ca = env.ca_path.to_string_lossy().to_string();
+    let mut child = env.cli_spawn(&["login", "--server", &url, "--ca-cert", &ca, "--browser", "--name", "laptop"]);
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let link = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if let Some(at) = line.find("/cli?code=") {
+                return line[at..].trim().to_string();
+            }
+        }
+        panic!("no approval link");
+    })
+    .await
+    .unwrap();
+
+    // Signing in on the way keeps the destination (and the forced password change).
+    let page = env.ui(&link, None, None).await;
+    assert_eq!(page.location.as_deref(), Some(format!("/login?next={}", link.replace('/', "%2F").replace('?', "%3F").replace('=', "%3D")).as_str()));
+    let signed_in = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", password), ("next", &link)])).await;
+    assert!(signed_in.location.as_deref().is_some_and(|l| l.starts_with("/password?next=")), "{:?}", signed_in.location);
+    let cookie = signed_in.cookie.unwrap();
+    let form = env.ui("/password", Some(&cookie), None).await;
+    let new_password = "another horse battery staple";
+    let changed = env
+        .ui("/password", Some(&cookie), Some(&[("csrf", &form.csrf()), ("current", password), ("new", new_password), ("repeat", new_password), ("next", &link)]))
+        .await;
+    assert_eq!(changed.location.as_deref(), Some(link.as_str()));
+    let cookie = changed.cookie.unwrap();
+    // An outside `next` is ignored.
+    let elsewhere = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", new_password), ("next", "//evil.example/")])).await;
+    assert_eq!(elsewhere.location.as_deref(), Some("/"));
+
+    let approval = env.ui(&link, Some(&cookie), None).await;
+    assert!(approval.status == 200 && approval.html.contains("laptop") && approval.html.contains("team:dev"), "{}", approval.html);
+    let code = link.split("code=").nth(1).unwrap().to_string();
+    let done = env.ui("/cli", Some(&cookie), Some(&[("csrf", &approval.csrf()), ("code", &code), ("answer", "approve"), ("tag", "team:dev")])).await;
+    assert!(done.html.contains("Approved"), "{}", done.html);
+    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(env.ui(&link, Some(&cookie), None).await.status == StatusCode::NOT_FOUND, "a code works once");
+
+    // The machine belongs to Ann, with her tag, and its tunnels default to private.
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let laptop = v["agents"].as_array().unwrap().iter().find(|a| a["name"] == "laptop").unwrap().clone();
+    assert_eq!(laptop["owner_email"], "ann@example.com");
+    assert_eq!(laptop["tags"], serde_json::json!(["team:dev"]));
+    assert_eq!(laptop["default_private"], true);
+    let mine = env.ui("/", Some(&cookie), None).await;
+    assert!(mine.status == 200 && mine.html.contains("laptop"), "members see their own machines");
+
+    // Denying works too, and the waiting CLI says so.
+    let mut child = env.cli_spawn(&["login", "--server", &url, "--ca-cert", &ca, "--browser", "--name", "other"]);
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let code = loop {
+        let line = lines.next_line().await.unwrap().unwrap();
+        if let Some(at) = line.find("code=") {
+            break line[at + 5..].trim().to_string();
+        }
+    };
+    let approval = env.ui(&format!("/cli?code={code}"), Some(&cookie), None).await;
+    env.ui("/cli", Some(&cookie), Some(&[("csrf", &approval.csrf()), ("code", &code), ("answer", "deny")])).await;
+    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await.unwrap().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+}
+
+/// Signs a new user in and replaces the password an administrator set; returns the session cookie.
+async fn sign_in(env: &Env, email: &str, password: &str) -> String {
+    let first = env.ui("/login", None, Some(&[("email", email), ("password", password)])).await;
+    let cookie = first.cookie.expect("signed in");
+    let form = env.ui("/password", Some(&cookie), None).await;
+    let new = format!("{password} again");
+    let changed = env.ui("/password", Some(&cookie), Some(&[("csrf", &form.csrf()), ("current", password), ("new", &new), ("repeat", &new)])).await;
+    changed.cookie.expect("new session")
+}
+
+/// A browser opening `path` on a private tunnel while signed in to the management UI with
+/// `ui_cookie`. Returns the tunnel cookie, or the management page that refused.
+async fn open_private(env: &Env, host: &str, path: &str, ui_cookie: &str) -> Result<String, common::UiResponse> {
+    let first = env.tunnel_get(host, path, "", true).await;
+    assert_eq!(first.status, StatusCode::SEE_OTHER, "{}", first.body);
+    let state = first.cookie("__Host-mp_state").expect("state cookie");
+    let mgmt = format!("https://localhost:{}", env.mgmt_port);
+    let at = first.location.unwrap().strip_prefix(&mgmt).expect("sent to the management host").to_string();
+    let auth = env.ui(&at, Some(ui_cookie), None).await;
+    let Some(callback) = auth.location.clone().filter(|_| auth.status == StatusCode::SEE_OTHER) else { return Err(auth) };
+    let callback = callback.strip_prefix(&format!("https://{host}:{}", env.https_port)).expect("back to the tunnel").to_string();
+    let done = env.tunnel_get(host, &callback, &state, true).await;
+    assert_eq!((done.status, done.location.as_deref()), (StatusCode::SEE_OTHER, Some(path)), "{}", done.body);
+    // The code works once.
+    assert_eq!(env.tunnel_get(host, &callback, &state, true).await.status, StatusCode::UNAUTHORIZED);
+    Ok(done.cookie("__Host-mp_tunnel").expect("tunnel cookie"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_tunnels() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    for t in ["team:dev", "team:ops"] {
+        env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": t })).await;
+    }
+    let mut ids = std::collections::HashMap::new();
+    for (email, tags) in [("ann@example.com", vec!["team:dev"]), ("bob@example.com", vec![]), ("cy@example.com", vec!["team:ops"])] {
+        let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
+        let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+        let id = v["user"]["id"].as_str().unwrap().to_string();
+        env.api_json("PATCH", &format!("/api/v1/users/{id}"), Some(&admin), serde_json::json!({ "tags": tags })).await;
+        ids.insert(email, id);
+    }
+    let (ann, bob, cy) = (
+        sign_in(&env, "ann@example.com", "correct horse battery").await,
+        sign_in(&env, "bob@example.com", "correct horse battery").await,
+        sign_in(&env, "cy@example.com", "correct horse battery").await,
+    );
+
+    // Ann's machine, enrolled by an administrator with her tag; private only.
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"], "tags": ["team:dev"], "allow_public": false });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "anns-laptop"]).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let port = app.port.to_string();
+    let out = env.cli(&["add", &port, "--public", "--json", "--timeout", "30"]).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((out.status.code(), v["error"]["code"].as_str()), (Some(6), Some("public_not_allowed")), "{v}");
+    let out = env.cli(&["add", &port, "--access", "team:ops", "--json", "--timeout", "30"]).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "forbidden", "the machine doesn't hold team:ops: {v}");
+    let t = add_json(&env, &[&port, "--name", "wiki", "--label", "env:test"]).await;
+    assert_eq!(t["status"], "ready", "private tunnels are verified through the server: {t}");
+    assert_eq!((t["visibility"].as_str(), t["access"].clone()), (Some("private"), serde_json::json!([])), "{t}");
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let list = env.cli_json(&["list", "--json"]).await;
+    assert_eq!(list["tunnels"][0]["visibility"], "private", "{list}");
+
+    // Not signed in: browsers are sent to sign in; everything else gets a 401.
+    let api = env.tunnel_get(&host, "/whoami", "", false).await;
+    assert_eq!((api.status, api.error.as_deref()), (StatusCode::UNAUTHORIZED, Some("unauthenticated")));
+    assert!(!api.body.contains("user="), "the app never saw it");
+
+    // Ann (owner) gets in; the app learns who she is but never sees the tunnel cookie.
+    let ann_cookie = open_private(&env, &host, "/whoami", &ann).await.unwrap();
+    let r = env.tunnel_get(&host, "/whoami", &format!("{ann_cookie}; theirs=1"), false).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.starts_with(&format!("user=ann@example.com id={}", ids["ann@example.com"])), "{}", r.body);
+    assert!(r.body.ends_with("cookie=theirs=1"), "{}", r.body);
+    let forged = env.tunnel_get(&host, "/whoami", "", false).await;
+    assert_eq!(forged.status, StatusCode::UNAUTHORIZED);
+    // A cookie for one tunnel host is useless on another.
+    let other = add_json(&env, &[&port, "--name", "other"]).await;
+    let other_host = hostname(other["public_url"].as_str().unwrap());
+    assert_eq!(env.tunnel_get(&other_host, "/whoami", &ann_cookie, false).await.status, StatusCode::UNAUTHORIZED);
+
+    // Bob has no shared tag: the management host says so. Cy has team:ops, not team:dev.
+    let refused = open_private(&env, &host, "/", &bob).await.unwrap_err();
+    assert!(refused.status == StatusCode::FORBIDDEN && refused.html.contains("bob@example.com"), "{}", refused.html);
+    assert!(open_private(&env, &host, "/", &cy).await.is_err());
+    let (_, v) = env.api("GET", "/api/v1/shared", Some(&admin)).await;
+    assert!(v["tunnels"].as_array().unwrap().is_empty(), "administrators don't discover private tunnels through their role");
+
+    // An administrator gives Cy team:dev: she gets in, without restarts, and sees it shared.
+    env.api_json("PATCH", &format!("/api/v1/users/{}", ids["cy@example.com"]), Some(&admin), serde_json::json!({ "tags": ["team:dev"] })).await;
+    let cy_cookie = open_private(&env, &host, "/", &cy).await.unwrap();
+    assert_eq!(env.tunnel_get(&host, "/", &cy_cookie, false).await.status, 200);
+    let shared = env.ui("/", Some(&cy), None).await;
+    assert!(shared.html.contains("Shared with you") && shared.html.contains(&host), "{}", shared.html);
+
+    // A WebSocket to a private tunnel, opened with the tunnel cookie.
+    let ws = common::ws_echo_app().await;
+    let live = add_json(&env, &[&ws.port.to_string(), "--name", "live"]).await;
+    let live_host = hostname(live["public_url"].as_str().unwrap());
+    let cy_live = open_private(&env, &live_host, "/", &cy).await.unwrap();
+    let mut req = format!("wss://{live_host}/").into_client_request().unwrap();
+    req.headers_mut().insert(header::COOKIE, cy_live.parse().unwrap());
+    let (mut sock, _) = tokio_tungstenite::client_async(req, env.connect(&live_host, env.https_port).await).await.expect("websocket handshake");
+    sock.send(Message::text("ping")).await.unwrap();
+    assert_eq!(sock.next().await.unwrap().unwrap(), Message::text("ping"));
+
+    // Taking the tag away ends her access on the very next request, and closes the WebSocket.
+    env.api_json("PATCH", &format!("/api/v1/users/{}", ids["cy@example.com"]), Some(&admin), serde_json::json!({ "tags": [] })).await;
+    let r = env.tunnel_get(&host, "/", &cy_cookie, false).await;
+    assert_eq!((r.status, r.error.as_deref()), (StatusCode::FORBIDDEN, Some("forbidden")));
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sock.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the WebSocket stayed open after access was revoked");
+
+    // "Sign out everywhere" ends Ann's tunnel cookies too (issued before it, at second precision).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let account = env.ui("/account", Some(&ann), None).await;
+    env.ui("/account/logout-everywhere", Some(&ann), Some(&[("csrf", &account.csrf())])).await;
+    assert_eq!(env.tunnel_get(&host, "/whoami", &ann_cookie, false).await.status, StatusCode::UNAUTHORIZED);
+
+    env.cli_ok(&["agent", "stop"]).await;
 }
 
 /// Real ACME issuance against Pebble (https://github.com/letsencrypt/pebble), including real

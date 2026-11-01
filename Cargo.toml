@@ -39,6 +39,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sha2 = "0.11"
 argon2 = "0.6"
+hmac = "0.13"
 getrandom = "0.4"
 libc = "0.2"
 tower-http = { version = "0.7", default-features = false, features = ["fs"] }

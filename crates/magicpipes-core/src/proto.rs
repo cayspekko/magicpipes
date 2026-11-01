@@ -43,7 +43,9 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 /// * 1: everything before the handshake (no header).
 /// * 2: the handshake. An unknown request is answered with the error code `unsupported`, and an
 ///   unknown server-opened stream with [`StreamStatus::Unsupported`], instead of being dropped.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// * 3: private tunnels. [`RegisterTunnel`] carries `visibility`, `access` and `labels`, and
+///   [`TunnelInfo`] echoes them.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -142,6 +144,34 @@ impl std::fmt::Display for Kind {
     }
 }
 
+/// Who may reach a tunnel.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// Anyone with the address (network allow-lists still apply).
+    #[default]
+    Public,
+    /// Only its owner and people who share one of its access tags, after signing in.
+    Private,
+}
+
+impl Visibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Visibility::Public),
+            "private" => Some(Visibility::Private),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -178,6 +208,17 @@ pub struct RegisterTunnel {
     /// Port tunnels: client networks allowed to connect (CIDRs or addresses); empty = anyone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// Protocol 3. `None`: the agent's default for a new tunnel, and no change for an existing
+    /// one (older agents never send it). `Some`: `access` and `labels` are the full new values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+    /// Private tunnels: access tags that may reach it, a subset of the agent's tags; empty = all
+    /// of the agent's tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<String>,
+    /// Free-form metadata, never used for access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +244,13 @@ pub struct TunnelInfo {
     pub kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
+    /// Protocol 3; servers before it omit it (and every tunnel of theirs is public).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,6 +418,23 @@ mod tests {
         // An answer from a server that predates port tunnels says http, whatever was asked.
         let t: TunnelInfo = serde_json::from_str(r#"{"id":"tn","name":"a","hostname":"a.t","public_url":"https://a.t","created":true}"#).unwrap();
         assert_eq!((t.kind, t.public_port), (Kind::Http, None));
+        // Before protocol 3: no visibility either way, so a new agent can tell it wasn't honored.
+        assert!(t.visibility.is_none() && t.access.is_empty());
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x"}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { visibility: None, .. })));
+        let r = Request::Register(RegisterTunnel {
+            id: None,
+            name: None,
+            target: "x".into(),
+            kind: Kind::Http,
+            remote_port: None,
+            allow: vec![],
+            visibility: Some(Visibility::Private),
+            access: vec!["team:dev".into()],
+            labels: vec![],
+        });
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""visibility":"private""#) && json.contains(r#""access":["team:dev"]"#), "{json}");
     }
 
     #[test]

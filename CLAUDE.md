@@ -77,7 +77,12 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   (the web terminal key lives in the `#fragment`).
 - **One authorization function**: every access decision (API, UI, agent RPCs, public traffic)
   goes through `authz::authorize(principal, action, resource)`; never compare owners inline.
-  Refusals look like "not found" so callers learn nothing about other agents' tunnels.
+  Refusals look like "not found" so callers learn nothing about other agents' tunnels. After
+  any change to users, tags, roles or agents, call `ControlPlane::refresh` so the directory and
+  the published routes (which private tunnels check per request) follow at once.
+- **Labels never grant access**: only registered access tags reach `authorize`. Members can't
+  give themselves or their machines tags they don't hold; a private tunnel never falls back to
+  public (the agent removes a tunnel the server didn't keep private).
 - **Isolation between agents**: an agent manages only its own tunnels (`authorize`'s Manage
   rule). Hostnames and public ports are unique and owned by one agent.
 - **Fail closed**: if a stored policy (allow-list, ownership, permission) cannot be read or

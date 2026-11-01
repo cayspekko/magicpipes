@@ -10,11 +10,12 @@ mod state;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use magicpipes_core::error::ErrorCode;
-use magicpipes_core::proto::Kind;
+use magicpipes_core::proto::{Kind, Visibility};
 use serde_json::{Value, json};
 
 use crate::ipc::{AddRequest, ErrorInfo, IpcRequest, StepState};
@@ -44,9 +45,13 @@ enum Command {
         /// Management URL of the server, e.g. https://example.com:8443
         #[arg(long)]
         server: String,
-        /// Single-use enrollment token (from `magicpipesd enroll` or the UI).
+        /// Single-use enrollment token (from `magicpipesd enroll` or the UI). Without one, the
+        /// CLI opens the server's sign-in page so you can approve this machine as yours.
         #[arg(long, env = "MAGICPIPES_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Approve this machine in the browser even when not run in a terminal.
+        #[arg(long, conflicts_with = "token")]
+        browser: bool,
         /// Extra CA certificate (PEM) to trust, e.g. the server's development CA.
         #[arg(long)]
         ca_cert: Option<PathBuf>,
@@ -93,6 +98,20 @@ enum Command {
         /// With --shell: the program (and its arguments) to run instead of your login shell.
         #[arg(last = true, value_name = "PROGRAM")]
         command: Vec<String>,
+        /// Only you and people who share one of its access tags can open it, after signing in.
+        /// Default for machines enrolled once the server has user accounts.
+        #[arg(long, conflicts_with_all = ["public", "tcp", "udp"])]
+        private: bool,
+        /// Anyone with the address can open it (if this machine's enrollment allows it).
+        #[arg(long, conflicts_with = "access")]
+        public: bool,
+        /// With --private (implied): only these access tags may open it (repeatable or
+        /// comma-separated; default: all of this machine's tags).
+        #[arg(long, value_name = "TAG", value_parser = parse_tag, conflicts_with_all = ["tcp", "udp"])]
+        access: Vec<String>,
+        /// Free-form label, e.g. environment:staging (repeatable). Never used for access.
+        #[arg(long = "label", value_name = "LABEL", value_parser = parse_tag)]
+        labels: Vec<String>,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
         name: Option<String>,
@@ -203,6 +222,10 @@ fn check_add_args(cmd: &Command) {
     }
 }
 
+fn parse_tag(s: &str) -> Result<String, String> {
+    magicpipes_core::tags::normalize(s)
+}
+
 fn parse_cidr(s: &str) -> Result<String, String> {
     magicpipes_core::cidr::Cidr::parse(s).map(|c| c.to_string())
 }
@@ -235,7 +258,7 @@ fn read_pid() -> Option<String> {
 
 async fn dispatch(cmd: Command) -> ExitCode {
     let (out, result) = match cmd {
-        Command::Login { server, token, ca_cert, name, out } => (out, login(server, token, ca_cert, name, out).await),
+        Command::Login { server, token, browser, ca_cert, name, out } => (out, login(server, token, browser, ca_cert, name, out).await),
         Command::Add {
             port,
             tcp,
@@ -248,12 +271,21 @@ async fn dispatch(cmd: Command) -> ExitCode {
             write,
             max_clients,
             command,
+            private,
+            public,
+            access,
+            labels,
             name,
             host,
             probe_path,
             timeout,
             out,
         } => {
+            let visibility = match (private || !access.is_empty(), public) {
+                (true, _) => Some(Visibility::Private),
+                (_, true) => Some(Visibility::Public),
+                _ => None,
+            };
             let kind = match (tcp, udp) {
                 (true, _) => Kind::Tcp,
                 (_, true) => Kind::Udp,
@@ -274,6 +306,9 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 name,
                 probe_path,
                 timeout_secs: timeout,
+                visibility,
+                access,
+                labels,
             };
             (out, add(req, out).await)
         }
@@ -325,28 +360,89 @@ fn login_shell() -> Vec<String> {
 
 // ---- commands -----------------------------------------------------------------------------
 
-async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, name: Option<String>, out: Output) -> Result<(), ErrorInfo> {
+fn prompt_token() -> Result<String, ErrorInfo> {
+    eprint!("Enrollment token: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, e.to_string()))?;
+    Ok(line)
+}
+
+/// Browser-approved login: asks the server for a code, opens its approval page and waits until
+/// the user approves this machine there. Returns the enrollment token, or `None` if the server
+/// predates this kind of login.
+async fn browser_login(server: &str, tls: &Arc<rustls::ClientConfig>, agent_name: &str, quiet: bool) -> Result<Option<String>, ErrorInfo> {
+    let unreachable = |e: anyhow::Error| ErrorInfo::new(ErrorCode::ServerUnreachable, format!("{e:#}"));
+    let (status, resp) = https::post_json(server, "/api/v1/device", tls, &json!({ "agent_name": agent_name })).await.map_err(unreachable)?;
+    if matches!(status.as_u16(), 404 | 405) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let msg = resp["error"]["message"].as_str().unwrap_or("the server refused to start a login").to_string();
+        return Err(ErrorInfo::wire(resp["error"]["code"].as_str().unwrap_or(ErrorCode::Protocol.as_str()), msg));
+    }
+    let bad = || ErrorInfo::new(ErrorCode::Protocol, "unexpected answer to the login request");
+    let device_code = resp["device_code"].as_str().ok_or_else(bad)?.to_string();
+    // The URL is built here, from the server address the user typed; only a well-formed code
+    // from the server goes into it.
+    let user_code = resp["user_code"].as_str().filter(|c| c.len() <= 16 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')).ok_or_else(bad)?;
+    let expires = Duration::from_secs(resp["expires_in_secs"].as_u64().unwrap_or(600).min(900));
+    let interval = Duration::from_secs(resp["interval_secs"].as_u64().unwrap_or(2).clamp(1, 10));
+    let url = format!("{server}/cli?code={user_code}");
+    if !quiet {
+        eprintln!("To sign in, open this page and approve the machine:\n\n  {url}\n\nIt should show the code {user_code}. Waiting for approval...");
+    }
+    platform::open_url(&url);
+    let deadline = std::time::Instant::now() + expires;
+    let expired = || ErrorInfo::new(ErrorCode::InvalidEnrollmentToken, "the login code expired before it was approved; run magicpipes login again");
+    loop {
+        tokio::time::sleep(interval).await;
+        if std::time::Instant::now() > deadline {
+            return Err(expired());
+        }
+        // A failed poll (network hiccup) is retried until the deadline.
+        let Ok((_, resp)) = https::post_json(server, "/api/v1/device/poll", tls, &json!({ "device_code": device_code })).await else { continue };
+        match resp["status"].as_str() {
+            Some("approved") => return resp["enrollment_token"].as_str().map(|t| Some(t.to_string())).ok_or_else(bad),
+            Some("denied") => return Err(ErrorInfo::new(ErrorCode::InvalidEnrollmentToken, "the login was denied in the browser")),
+            Some("expired") => return Err(expired()),
+            _ => {}
+        }
+    }
+}
+
+async fn login(
+    server: String,
+    token: Option<String>,
+    browser: bool,
+    ca_cert: Option<PathBuf>,
+    name: Option<String>,
+    out: Output,
+) -> Result<(), ErrorInfo> {
     let server = server.trim().trim_end_matches('/').to_string();
     https::parse_server(&server).map_err(|e| ErrorInfo::new(ErrorCode::InvalidServer, e.to_string()))?;
-    let token = match token {
-        Some(t) => t,
-        None => {
-            if !std::io::stdin().is_terminal() {
-                return Err(ErrorInfo::new(ErrorCode::InvalidEnrollmentToken, "pass --token or set MAGICPIPES_TOKEN"));
-            }
-            eprint!("Enrollment token: ");
-            let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, e.to_string()))?;
-            line
-        }
-    };
     let ca_pem = match &ca_cert {
         Some(p) => Some(std::fs::read_to_string(p).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("reading {}: {e}", p.display())))?),
         None => None,
     };
     let tls = https::tls_config(ca_pem.as_deref()).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     let agent_name = name.unwrap_or_else(platform::hostname);
+    let interactive = std::io::stdin().is_terminal();
+    let token = match token {
+        Some(t) => t,
+        None if browser || interactive => match browser_login(&server, &tls, &agent_name, out.quiet).await? {
+            Some(t) => t,
+            // The server predates browser login.
+            None if interactive => prompt_token()?,
+            None => return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "this server can't approve logins in the browser; pass --token")),
+        },
+        None => {
+            return Err(ErrorInfo::new(
+                ErrorCode::InvalidEnrollmentToken,
+                "pass --token or set MAGICPIPES_TOKEN, or use --browser to approve this machine in your browser",
+            ));
+        }
+    };
     let body = json!({ "enrollment_token": token.trim(), "agent_name": agent_name });
     let (status, resp) = https::post_json(&server, "/api/v1/enroll", &tls, &body)
         .await
@@ -446,7 +542,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         None
     };
     let progress = Progress { enabled: !out.quiet, local };
-    let result = client::request(&IpcRequest::Add(req), |s, st| progress.step(s, st)).await;
+    let result = client::request(&IpcRequest::Add(Box::new(req)), |s, st| progress.step(s, st)).await;
     let data = match result {
         Ok(d) => d,
         Err(e) => {
@@ -474,7 +570,15 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         }
         println!("  Status: connected");
         println!();
+        let private = data["visibility"] == "private";
         match &shell {
+            _ if private => {
+                let who = match data["access"].as_array().filter(|a| !a.is_empty()) {
+                    Some(tags) => format!("you and people with {}", tags.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join(" or ")),
+                    None => "you and people who share this machine's access tags".to_string(),
+                };
+                println!("Tunnel active in background. Private: only {who} can open it, after signing in.");
+            }
             Some((_, true, _)) => println!("Tunnel active in background. Anyone with this link can type into the terminal."),
             Some((_, false, _)) => println!("Tunnel active in background. Anyone with the URL can watch; each visitor gets their own copy."),
             None if kind.is_http() => println!("Tunnel active in background. Anyone with the URL can reach it."),
