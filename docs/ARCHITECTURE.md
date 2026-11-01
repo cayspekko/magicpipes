@@ -251,16 +251,33 @@ a connection to the public port that must arrive back at the agent (a warning, n
 
 ## Security model (Milestone 1)
 
-* Three separate credentials:
-  * **admin tokens**: API bearer tokens, and the UI login, which becomes an HttpOnly, Secure,
-    SameSite=Strict `__Host-` session cookie plus per-session CSRF tokens on every form;
+* Credentials:
+  * **admin tokens**: API bearer tokens and a UI login; always valid, whatever else is
+    configured (break-glass);
+  * **user passwords**: Argon2id (19 MiB, 2 iterations, 1 lane), at most 4 hashed at once on
+    the blocking pool; an unknown email is checked against a throwaway hash so it takes as long
+    as a wrong password. Administrator-set passwords must be changed at first sign-in;
+  * **user API tokens** `tok_<id>.mpu_<secret>`, acting as their user with the user's current
+    role, at most 20 per user, optional expiry;
   * **single-use enrollment tokens** with an expiry;
   * **per-agent tokens** `ag_<id>.<secret>`.
+
+  A UI login becomes an HttpOnly, Secure, SameSite=Strict `__Host-` session cookie plus a
+  per-session CSRF token on every form. Sessions are rows in SQLite (hash of the cookie): they
+  survive restarts, at most 20 per user, and end on logout, "sign out everywhere"
+  (`users.sessions_valid_after`), a password change, or when the user is disabled.
 
   Tokens have ~256 bits of entropy (session cookies too; CSRF tokens and web terminal keys
   ~190) and are stored as SHA-256 digests, compared in constant time. Failed logins and
   enrollments are rate-limited per client (IPv6 per /64, at most 10,000 tracked); valid
   credentials are accepted even from a rate-limited client, so nobody can lock an admin out.
+  Passwords can be guessed, so each account also has its own limit, checked *before* the
+  password: after 10 failures in 15 minutes, one attempt per 10 seconds (at most 10,000
+  accounts tracked). That slows guessing without letting anyone lock an account out.
+* Roles: `admin` and `member`, checked only through `authz::authorize`. Users can't change their
+  own role or status. The audit log (bounded: 90 days by default, at most 100,000 rows) records
+  sign-ins, failed sign-ins, account changes, tunnel deletions, agent revocations and
+  enrollment tokens.
 * The management UI, API and agent endpoint answer only for `management.hostname`: its TLS
   listener has no certificate for other names and returns 421 for another `Host`. Tunnels share
   the parent domain, so serving the UI under a tunnel's name would hand its cookie to that

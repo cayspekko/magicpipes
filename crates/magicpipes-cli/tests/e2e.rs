@@ -835,6 +835,102 @@ async fn authentication_and_input_failures() {
     assert!(env.server_log().contains("invalid credentials"));
 }
 
+/// The secret a "shown once" page displays.
+fn shown_secret(html: &str) -> String {
+    let at = html.find(r#"<pre class="term">"#).expect("secret on the page") + r#"<pre class="term">"#.len();
+    html[at..].split("</pre>").next().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_accounts() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    let new_user = |email: &str, role: &str| serde_json::json!({ "email": email, "display_name": "Ann", "role": role });
+
+    // Only administrators create users; the server generates a password that must be changed.
+    assert_eq!(env.api_json("POST", "/api/v1/users", None, new_user("ann@example.com", "member")).await.0, StatusCode::UNAUTHORIZED);
+    let (s, v) = env.api_json("POST", "/api/v1/users", Some(&admin), new_user("Ann@Example.com", "member")).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    assert_eq!((v["user"]["email"].as_str(), v["user"]["must_change_password"].as_bool()), (Some("ann@example.com"), Some(true)));
+    let ann_id = v["user"]["id"].as_str().unwrap().to_string();
+    let generated = v["password"].as_str().unwrap().to_string();
+    let (s, v) = env.api_json("POST", "/api/v1/users", Some(&admin), new_user("ann@example.com", "admin")).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("email_taken")));
+
+    // A wrong password and an unknown email look the same.
+    let env = &env;
+    let login = |email: &'static str, password: String| async move {
+        env.ui("/login", None, Some(&[("email", email), ("password", password.as_str())])).await
+    };
+    let wrong = login("ann@example.com", "not the password".into()).await;
+    let unknown = login("nobody@example.com", "not the password".into()).await;
+    assert_eq!((wrong.status, unknown.status), (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED));
+    assert!(wrong.html.contains("Email or password is incorrect.") && unknown.html.contains("Email or password is incorrect."));
+
+    // First sign-in: the user must replace the generated password before anything else.
+    let first = login("ann@example.com", generated.clone()).await;
+    assert_eq!((first.status, first.location.as_deref()), (StatusCode::SEE_OTHER, Some("/password")));
+    let cookie = first.cookie.clone().unwrap();
+    assert!(cookie.starts_with("__Host-mp_session="));
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.location.as_deref(), Some("/password"));
+    let form = env.ui("/password", Some(&cookie), None).await;
+    assert_eq!(form.status, 200);
+    let new_password = "correct horse battery staple";
+    let changed = env
+        .ui("/password", Some(&cookie), Some(&[("csrf", &form.csrf()), ("current", &generated), ("new", new_password), ("repeat", new_password)]))
+        .await;
+    assert_eq!(changed.status, StatusCode::SEE_OTHER, "{}", changed.html);
+    let cookie2 = changed.cookie.clone().unwrap();
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.location.as_deref(), Some("/login"), "old session ended");
+
+    // Members get their account page, not the administration pages.
+    let account = env.ui("/account", Some(&cookie2), None).await;
+    assert!(account.status == 200 && account.html.contains("ann@example.com"), "{}", account.html);
+    assert_eq!(env.ui("/", Some(&cookie2), None).await.location.as_deref(), Some("/account"));
+    assert_eq!(env.ui("/users", Some(&cookie2), None).await.location.as_deref(), Some("/account"));
+
+    // An API token acts as its user, with the user's role.
+    let created = env.ui("/account/tokens", Some(&cookie2), Some(&[("csrf", &account.csrf()), ("name", "ci")])).await;
+    let token = shown_secret(&created.html);
+    assert!(token.starts_with("tok_"), "{}", created.html);
+    let (s, v) = env.api("GET", "/api/v1/me", Some(&token)).await;
+    assert_eq!((s, v["user"]["id"].as_str()), (StatusCode::OK, Some(ann_id.as_str())));
+    let (s, v) = env.api("GET", "/api/v1/status", Some(&token)).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")));
+    assert_eq!(env.api("GET", "/api/v1/users", Some(&token)).await.1["users"].as_array().unwrap().len(), 1);
+    let (s, _) = env.api_json("PATCH", &format!("/api/v1/users/{ann_id}"), Some(&token), serde_json::json!({ "role": "admin" })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "users can't promote themselves");
+
+    // Disabling ends the sessions and the API tokens; the admin token keeps working.
+    let (s, v) = env.api_json("PATCH", &format!("/api/v1/users/{ann_id}"), Some(&admin), serde_json::json!({ "disabled": true })).await;
+    assert_eq!((s, v["disabled"].as_bool()), (StatusCode::OK, Some(true)));
+    assert_eq!(env.ui("/account", Some(&cookie2), None).await.location.as_deref(), Some("/login"));
+    assert_eq!(env.api("GET", "/api/v1/me", Some(&token)).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(login("ann@example.com", new_password.into()).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(env.api("GET", "/api/v1/status", Some(&admin)).await.0, StatusCode::OK);
+
+    // After repeated failures an account accepts one attempt every few seconds, right or not.
+    let (_, v) = env
+        .api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": "bo@example.com", "password": new_password, "role": "admin" }))
+        .await;
+    assert!(v.get("password").is_none(), "no generated password when one was given");
+    for _ in 0..10 {
+        login("bo@example.com", "guess guess guess".into()).await;
+    }
+    let throttled = login("bo@example.com", new_password.into()).await;
+    assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(throttled.html.contains("this account"), "{}", throttled.html);
+
+    let (s, v) = env.api("GET", "/api/v1/audit", Some(&admin)).await;
+    assert_eq!(s, StatusCode::OK);
+    let actions: Vec<&str> = v["entries"].as_array().unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
+    for want in ["user.create", "login.failed", "session.login", "user.password_change", "token.create", "user.disable"] {
+        assert!(actions.contains(&want), "{want} missing from {actions:?}");
+    }
+    // A disabled user's token is refused (429 by now: this client failed too often).
+    assert!(matches!(env.api("GET", "/api/v1/audit", Some(&token)).await.0, StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS));
+}
+
 /// Real ACME issuance against Pebble (https://github.com/letsencrypt/pebble), including real
 /// HTTP-01 validation of magicpipesd's challenge responder. Not run by default.
 ///

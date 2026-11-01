@@ -314,6 +314,46 @@ udp_idle_timeout_secs = 5
     }
 
     /// Management API call; returns status and JSON body (Null if empty).
+    /// A management API call with a JSON body.
+    pub async fn api_json(&self, method: &str, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, format!("localhost:{}", self.mgmt_port))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = self.send("localhost", self.mgmt_port, b.body(Full::new(Bytes::from(body.to_string()))).unwrap()).await;
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// A management UI request: GET without `form`, otherwise a POSTed form. Returns the status,
+    /// the `Location` and `Set-Cookie` session values (if any) and the body.
+    pub async fn ui(&self, path: &str, cookie: Option<&str>, form: Option<&[(&str, &str)]>) -> UiResponse {
+        let mut b = Request::builder().uri(path).header(header::HOST, format!("localhost:{}", self.mgmt_port));
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        let body = match form {
+            Some(fields) => {
+                b = b.method("POST").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+                let enc = |s: &str| s.bytes().map(|c| if c.is_ascii_alphanumeric() { (c as char).to_string() } else { format!("%{c:02X}") }).collect::<String>();
+                fields.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+            }
+            None => String::new(),
+        };
+        let resp = self.send("localhost", self.mgmt_port, b.body(Full::new(Bytes::from(body))).unwrap()).await;
+        let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let location = header(header::LOCATION);
+        let cookie = header(header::SET_COOKIE).and_then(|c| c.split(';').next().map(str::to_string)).filter(|c| !c.ends_with('='));
+        let status = resp.status();
+        let html = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+        UiResponse { status, location, cookie, html }
+    }
+
     pub async fn api(&self, method: &str, path: &str, token: Option<&str>) -> (StatusCode, Value) {
         let mut b = Request::builder()
             .method(method)
@@ -548,4 +588,20 @@ pub async fn udp_echo_app() -> App {
         }
     });
     App { port, task }
+}
+
+pub struct UiResponse {
+    pub status: StatusCode,
+    pub location: Option<String>,
+    /// `name=value` of a session cookie the response set.
+    pub cookie: Option<String>,
+    pub html: String,
+}
+
+impl UiResponse {
+    /// The CSRF token embedded in the page's forms.
+    pub fn csrf(&self) -> String {
+        let at = self.html.find(r#"name="csrf" value=""#).expect("page has a CSRF field") + r#"name="csrf" value=""#.len();
+        self.html[at..].split('"').next().unwrap().to_string()
+    }
 }

@@ -1,7 +1,12 @@
 //! SQLite persistence (control plane only — the data plane never touches the database).
 //!
-//! Secrets are stored as SHA-256 digests. All queries are short; callers hold the connection
-//! mutex only for the duration of one statement or transaction.
+//! Secrets are stored as SHA-256 digests (passwords as Argon2id hashes, computed by the caller).
+//! All queries are short; callers hold the connection mutex only for the duration of one
+//! statement or transaction. Users, sessions, API tokens and the audit log are in [`users`].
+
+mod users;
+
+pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -79,6 +84,76 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tunnels ADD COLUMN public_port INTEGER;
     ALTER TABLE tunnels ADD COLUMN allow TEXT NOT NULL DEFAULT '';
     CREATE UNIQUE INDEX tunnels_public_port ON tunnels(kind, public_port) WHERE public_port IS NOT NULL;
+    "#,
+    // 2: users with passwords, UI sessions, API tokens and the audit log (docs/USERS.md). One
+    // organization for now; every row names it so more can come without another rewrite.
+    r#"
+    CREATE TABLE orgs (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
+    );
+    INSERT INTO orgs (id, name, created_at) VALUES ('org_default', 'default', CAST(strftime('%s', 'now') AS INTEGER));
+    CREATE TABLE users (
+        id                   TEXT PRIMARY KEY,
+        email                TEXT NOT NULL,
+        email_verified_at    INTEGER,
+        display_name         TEXT NOT NULL DEFAULT '',
+        disabled_at          INTEGER,
+        sessions_valid_after INTEGER NOT NULL DEFAULT 0,
+        created_at           INTEGER NOT NULL
+    );
+    CREATE TABLE identities (
+        issuer        TEXT NOT NULL,
+        subject       TEXT NOT NULL,
+        user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        last_login_at INTEGER,
+        PRIMARY KEY (issuer, subject)
+    );
+    CREATE INDEX identities_user ON identities(user_id);
+    CREATE TABLE memberships (
+        org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role        TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (org_id, user_id)
+    );
+    CREATE TABLE passwords (
+        user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        hash        TEXT NOT NULL,
+        must_change INTEGER NOT NULL DEFAULT 1,
+        updated_at  INTEGER NOT NULL
+    );
+    CREATE TABLE sessions (
+        id_hash     TEXT PRIMARY KEY,
+        user_id     TEXT REFERENCES users(id) ON DELETE CASCADE,
+        org_id      TEXT NOT NULL,
+        csrf        TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        expires_at  INTEGER NOT NULL
+    );
+    CREATE INDEX sessions_user ON sessions(user_id);
+    CREATE TABLE api_tokens (
+        id           TEXT PRIMARY KEY,
+        token_hash   TEXT NOT NULL UNIQUE,
+        user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        org_id       TEXT NOT NULL,
+        name         TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        expires_at   INTEGER,
+        last_used_at INTEGER
+    );
+    CREATE INDEX api_tokens_user ON api_tokens(user_id);
+    CREATE TABLE audit_log (
+        id          INTEGER PRIMARY KEY,
+        at          INTEGER NOT NULL,
+        org_id      TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        action      TEXT NOT NULL,
+        resource    TEXT NOT NULL,
+        detail      TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX audit_log_at ON audit_log(at);
     "#,
 ];
 
@@ -365,6 +440,8 @@ mod tests {
         assert!(store.insert_tunnel(&row("tn_dup", Kind::Tcp, 65500)).is_err(), "a TCP port belongs to one tunnel");
         let tcp = store.tunnels().unwrap().into_iter().find(|t| t.id == "tn_tcp").unwrap();
         assert_eq!(tcp.allow, ["10.0.0.0/8", "192.0.2.1/32"]);
+        // Migration 2 added accounts, starting empty.
+        assert!(store.users().unwrap().is_empty());
         drop(store);
         // Opening again does not re-run migrations.
         assert_eq!(Store::open(&path).unwrap().tunnels().unwrap().len(), 3);

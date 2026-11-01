@@ -154,7 +154,29 @@ magicpipesd --config ... admin-token       # create another admin token
 magicpipesd --config ... admin-token --rotate   # revoke all others
 ```
 
-Log in to the UI at `https://example.com:8443` with that token.
+Log in to the UI at `https://example.com:8443` with that token ("Use an admin token" on the
+sign-in page). The admin token always works, whatever else is configured; keep it for
+emergencies.
+
+### Users
+
+Under **Users**, administrators add people with an email address, a role and a password (or
+let the server generate one, shown once). Everyone must replace a password set by an
+administrator when they first sign in.
+
+* **Roles**: *administrators* manage tunnels, agents, users, enrollment tokens and the audit
+  log; *members* manage their own account (password, API tokens, sessions). Members get more to
+  do once private tunnels arrive (see [docs/USERS.md](docs/USERS.md)).
+* **Sign-in protection**: passwords are stored as Argon2id hashes and need at least 12
+  characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every
+  10 seconds, right password or not; failed attempts also count against the client's address.
+  A wrong password and an unknown email get the same answer.
+* **Sessions** last `[users] session_max_age_secs` (12 hours) and survive server restarts.
+  Changing your password, being disabled, or "Sign out everywhere" ends them.
+* **API tokens** (Account page) act as their user with the user's current role:
+  `Authorization: Bearer tok_…`. Disabling the user stops them.
+* **Audit log**: sign-ins (including failed ones), account changes, deletions, revocations and
+  enrollment tokens, kept for `[users] audit_retention_days` (90).
 
 ### Docker
 
@@ -424,10 +446,10 @@ On failure:
 | 0 | | Success (for `add`: verified ready) |
 | 1 | `internal`, ... | Unexpected error |
 | 2 | | Invalid command-line usage |
-| 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error` | Enrollment, credentials or local configuration |
+| 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden` | Enrollment, credentials or local configuration |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
-| 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
+| 6 | `name_conflict`, `name_taken`, `email_taken`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 
 `name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:
 another machine's agent owns it. Codes are listed in `crates/magicpipes-core/src/error.rs`; new
@@ -463,7 +485,9 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
 ## 4. Management API
 
-All endpoints except `enroll` and the agent endpoint require `Authorization: Bearer <admin token>`.
+All endpoints except `enroll` and the agent endpoint require `Authorization: Bearer <token>`:
+an admin token, or a user's API token, which can do what its user can do. Endpoints for
+administrators answer `403 forbidden` to members.
 
 | Method | Path | |
 |---|---|---|
@@ -475,7 +499,20 @@ All endpoints except `enroll` and the agent endpoint require `Authorization: Bea
 | DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
 | POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}` |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
+| GET | `/api/v1/me` | `{"kind": "admin_token"}` or `{"kind": "user", "user": {...}}` |
+| GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |
+| POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
+| GET | `/api/v1/users/{id}` | One user |
+| PATCH | `/api/v1/users/{id}` | `{"role"?: "admin" \| "member", "disabled"?: bool}`; not for your own account |
+| POST | `/api/v1/users/{id}/password` | `{"password"}`: a new generated password the user must change; ends their sessions |
+| GET | `/api/v1/tokens` | Your API tokens (never their secrets) |
+| POST | `/api/v1/tokens` | 201 `{"api_token", "token"}`; body `{"name", "expires_in_days"?}`; the secret is returned once; at most 20 per user |
+| DELETE | `/api/v1/tokens/{id}` | 204 |
+| GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
+
+User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`,
+`created_at`, `last_login_at`.
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
 agent's protocol version), `last_seen_at`, `tunnels`, `created_at`.

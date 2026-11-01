@@ -27,6 +27,8 @@ pub struct Config {
     pub agents: AgentsConfig,
     #[serde(default)]
     pub ports: PortsConfig,
+    #[serde(default)]
+    pub users: UsersConfig,
     /// Addresses (CIDR) of reverse proxies or load balancers in front of magicpipesd, such as
     /// HAProxy. Only these may name the client: X-Forwarded-For on the HTTPS listeners (used for
     /// login rate limits and passed on to tunnels) and PROXY headers on port tunnels.
@@ -163,6 +165,22 @@ impl Default for AgentsConfig {
             max_new_certificates_per_day: 20,
             enrollment_ttl_secs: 3600,
         }
+    }
+}
+
+/// User accounts (docs/USERS.md). Administrators create them in the UI or API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UsersConfig {
+    /// How long a UI login lasts.
+    pub session_max_age_secs: u64,
+    /// How long audit log entries are kept.
+    pub audit_retention_days: u64,
+}
+
+impl Default for UsersConfig {
+    fn default() -> Self {
+        Self { session_max_age_secs: 12 * 3600, audit_retention_days: 90 }
     }
 }
 

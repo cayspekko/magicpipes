@@ -245,6 +245,7 @@ impl ControlPlane {
         let session = st.sessions.get(&agent_id).map(|s| s.handle.clone());
         drop(st);
         tracing::info!(tunnel = %id, "tunnel deleted by administrator");
+        self.audit(who, "tunnel.delete", id, "");
         if let Some(handle) = session {
             let tunnel_id = id.to_string();
             tokio::spawn(async move {

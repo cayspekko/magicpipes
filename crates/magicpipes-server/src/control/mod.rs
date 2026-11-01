@@ -7,10 +7,12 @@
 //!
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
+//! * `users` — accounts, logins, UI sessions, API tokens and the audit log;
 //! * `views` — what the API and the UI show.
 
 mod registry;
 mod sessions;
+mod users;
 mod views;
 
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::MuxHandle;
 use magicpipes_core::proto::{self, ErrorBody, Kind};
 use magicpipes_core::unix_now;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::authz::{self, Action, Principal, Resource, TunnelAuthz};
@@ -30,6 +33,7 @@ use crate::certs::CertManager;
 use crate::config::Config;
 use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable};
 use crate::store::{Store, TunnelRow};
+pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
 
 pub struct ControlPlane {
@@ -39,6 +43,9 @@ pub struct ControlPlane {
     data: Arc<DataPlane>,
     state: Mutex<State>,
     started_at: i64,
+    /// Bounds concurrent password hashing (CPU and memory).
+    hashing: Semaphore,
+    accounts: users::AccountLimiter,
 }
 
 #[derive(Default)]
@@ -93,7 +100,16 @@ impl ControlPlane {
         for row in store.tunnels()? {
             state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default() });
         }
-        let cp = Arc::new(Self { cfg, store, certs, data, state: Mutex::new(state), started_at: unix_now() });
+        let cp = Arc::new(Self {
+            cfg,
+            store,
+            certs,
+            data,
+            state: Mutex::new(state),
+            started_at: unix_now(),
+            hashing: Semaphore::new(users::HASH_CONCURRENCY),
+            accounts: users::AccountLimiter::default(),
+        });
         cp.publish(&cp.state.lock().unwrap());
         Ok(cp)
     }
@@ -102,7 +118,8 @@ impl ControlPlane {
         &self.cfg
     }
 
-    /// Starts certificate provisioning for known hostnames and the stale-session reaper.
+    /// Starts certificate provisioning for known hostnames, the stale-session reaper and hourly
+    /// pruning of the audit log and expired UI sessions.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) {
         let hosts: Vec<String> = self
             .state
@@ -119,10 +136,12 @@ impl ControlPlane {
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
+            let mut hourly = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = tick.tick() => me.reap_sessions(),
+                    _ = hourly.tick() => me.prune(),
                 }
             }
         });
@@ -176,9 +195,11 @@ impl ControlPlane {
 
     pub fn create_enrollment(&self, who: &Principal) -> Result<String, ErrorBody> {
         if !authz::authorize(who, Action::Manage, Resource::Org) {
-            return Err(err(ErrorCode::Unauthorized, "only administrators create enrollment tokens"));
+            return Err(err(ErrorCode::Forbidden, "only administrators create enrollment tokens"));
         }
-        self.store.create_enrollment(self.cfg.agents.enrollment_ttl_secs).map_err(internal)
+        let token = self.store.create_enrollment(self.cfg.agents.enrollment_ttl_secs).map_err(internal)?;
+        self.audit(who, "enrollment.create", "enrollment", "");
+        Ok(token)
     }
 
     pub fn enroll(&self, req: &proto::EnrollRequest) -> Result<proto::EnrollResponse, ErrorBody> {
@@ -212,6 +233,7 @@ impl ControlPlane {
             s.handle.close();
         }
         tracing::info!(agent = %agent_id, "agent revoked by administrator");
+        self.audit(who, "agent.revoke", agent_id, "");
         Ok(true)
     }
 }

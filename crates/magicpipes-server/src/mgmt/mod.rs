@@ -1,12 +1,16 @@
 //! Management listener: JSON API, server-rendered UI and the agent endpoint.
 //!
 //! Authentication boundaries:
-//! * `/api/v1/*` (except enroll/agent connect): `Authorization: Bearer <admin token>`.
-//! * UI pages: session cookie created by logging in with an admin token; state-changing forms
-//!   carry a per-session CSRF token.
+//! * `/api/v1/*` (except enroll/agent connect): `Authorization: Bearer <admin token or a user's
+//!   API token>`.
+//! * UI pages: session cookie created by logging in with an email and password or an admin
+//!   token; state-changing forms carry a per-session CSRF token.
+//!
+//! What each caller may do is decided by `authz::authorize`, in the control plane.
 //! * `/api/v1/enroll`: a single-use enrollment token in the body.
 //! * `/api/v1/agent/connect`: `Authorization: Bearer <agent token>`.
 
+mod accounts;
 mod api;
 mod ui;
 
@@ -24,14 +28,12 @@ use axum::routing::{get, post};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use magicpipes_core::secret;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tower::ServiceExt;
 
-use crate::authz::Principal;
 use crate::control::ControlPlane;
 use crate::forwarded::client_key;
 use crate::listen::{ListenOpts, serve};
@@ -47,7 +49,6 @@ pub struct ClientIp(pub IpAddr);
 #[derive(Clone)]
 pub struct AppState {
     pub control: Arc<ControlPlane>,
-    sessions: Arc<UiSessions>,
     limiter: Arc<FailureLimiter>,
 }
 
@@ -69,11 +70,6 @@ impl AppState {
             Err(e) => Err(Rejected::Invalid(e)),
         }
     }
-
-    /// The principal an admin token stands for.
-    fn admin(&self, token: &str) -> Option<Principal> {
-        self.control.verify_admin(token).then_some(Principal::AdminToken)
-    }
 }
 
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -87,11 +83,7 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 pub fn router(control: Arc<ControlPlane>) -> Router {
-    let state = AppState {
-        control,
-        sessions: Arc::new(UiSessions::default()),
-        limiter: Arc::new(FailureLimiter::default()),
-    };
+    let state = AppState { control, limiter: Arc::new(FailureLimiter::default()) };
     Router::new()
         .route("/", get(ui::index))
         .route("/login", get(ui::login_form).post(ui::login))
@@ -100,6 +92,14 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/tunnels/{id}/delete", post(ui::delete_tunnel))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
         .route("/enrollments", post(ui::create_enrollment))
+        .route("/password", get(accounts::password_form).post(accounts::change_password))
+        .route("/account", get(accounts::account))
+        .route("/account/tokens", post(accounts::create_token))
+        .route("/account/tokens/{id}/delete", post(accounts::delete_token))
+        .route("/account/logout-everywhere", post(accounts::logout_everywhere))
+        .route("/users", get(accounts::users).post(accounts::create_user))
+        .route("/users/{id}", post(accounts::update_user))
+        .route("/audit", get(accounts::audit))
         .route("/ui.js", get(ui::script))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/status", get(api::status))
@@ -108,6 +108,13 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/agents", get(api::list_agents))
         .route("/api/v1/agents/{id}", axum::routing::delete(api::revoke_agent))
         .route("/api/v1/enrollments", post(api::create_enrollment))
+        .route("/api/v1/me", get(api::me))
+        .route("/api/v1/users", get(api::list_users).post(api::create_user))
+        .route("/api/v1/users/{id}", get(api::get_user).patch(api::update_user))
+        .route("/api/v1/users/{id}/password", post(api::reset_password))
+        .route("/api/v1/tokens", get(api::list_tokens).post(api::create_token))
+        .route("/api/v1/tokens/{id}", axum::routing::delete(api::delete_token))
+        .route("/api/v1/audit", get(api::audit))
         .route("/api/v1/enroll", post(api::enroll))
         .route(magicpipes_core::proto::AGENT_CONNECT_PATH, get(crate::gateway::connect))
         .layer(axum::middleware::from_fn(request_deadline))
@@ -198,44 +205,10 @@ pub async fn serve_mgmt(
 
 // ---- UI sessions -------------------------------------------------------------------------
 
-const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// `__Host-`: browsers only accept it from this exact host, Secure, with `Path=/` and no
-/// `Domain`, so content on a tunnel subdomain cannot set or shadow it.
+/// `Domain`, so content on a tunnel subdomain cannot set or shadow it. Sessions live in the
+/// database (`control::users`).
 pub const SESSION_COOKIE: &str = "__Host-mp_session";
-
-struct UiSession {
-    who: Principal,
-    csrf: String,
-    expires: Instant,
-}
-
-#[derive(Default)]
-struct UiSessions {
-    // Keyed by SHA-256 of the cookie value.
-    map: Mutex<HashMap<String, UiSession>>,
-}
-
-impl UiSessions {
-    /// Returns `(cookie value, csrf token)`.
-    fn create(&self, who: Principal) -> (String, String) {
-        let cookie = secret::random_string(43);
-        let csrf = secret::random_string(32);
-        let mut map = self.map.lock().unwrap();
-        map.retain(|_, s| s.expires > Instant::now());
-        map.insert(secret::sha256_hex(&cookie), UiSession { who, csrf: csrf.clone(), expires: Instant::now() + SESSION_TTL });
-        (cookie, csrf)
-    }
-
-    /// Returns who is logged in and the CSRF token, for a valid session cookie.
-    fn get(&self, cookie: &str) -> Option<(Principal, String)> {
-        let map = self.map.lock().unwrap();
-        map.get(&secret::sha256_hex(cookie)).filter(|s| s.expires > Instant::now()).map(|s| (s.who.clone(), s.csrf.clone()))
-    }
-
-    fn remove(&self, cookie: &str) {
-        self.map.lock().unwrap().remove(&secret::sha256_hex(cookie));
-    }
-}
 
 // ---- brute-force limiter -----------------------------------------------------------------
 

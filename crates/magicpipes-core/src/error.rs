@@ -69,6 +69,8 @@ codes! {
     InvalidEnrollmentToken = "invalid_enrollment_token", http 401, exit 3;
     /// Too many failed attempts from this client.
     RateLimited = "rate_limited", http 429, exit 1;
+    /// Authenticated, but not allowed to do this.
+    Forbidden = "forbidden", http 403, exit 3;
     ConfigError = "config_error", http 500, exit 3;
 
     // ---- local targets -----------------------------------------------------------------------
@@ -98,6 +100,8 @@ codes! {
     NameConflict = "name_conflict", http 409, exit 6;
     /// Another agent owns this name.
     NameTaken = "name_taken", http 409, exit 6;
+    /// Another account already logs in with this email.
+    EmailTaken = "email_taken", http 409, exit 6;
     InvalidName = "invalid_name", http 400, exit 6;
     InvalidCidr = "invalid_cidr", http 400, exit 6;
     /// A per-agent quota (tunnels, ports, new certificates).
@@ -161,10 +165,10 @@ mod tests {
     fn exit_codes_match_the_documented_table() {
         // The CLI's exit statuses are an API (README "JSON output and exit codes").
         let table: &[(u8, &[&str])] = &[
-            (3, &["not_logged_in", "unauthorized", "invalid_enrollment_token", "config_error"]),
+            (3, &["not_logged_in", "unauthorized", "invalid_enrollment_token", "config_error", "forbidden"]),
             (4, &["local_unreachable", "invalid_port", "invalid_host", "invalid_directory", "invalid_command", "spawn_failed"]),
             (5, &["server_unreachable", "agent_unavailable", "agent_start_failed", "agent_not_running", "agent_protocol", "agent_outdated"]),
-            (6, &["name_conflict", "name_taken", "invalid_name", "limit_reached", "not_found", "port_unavailable", "kind_mismatch",
+            (6, &["name_conflict", "name_taken", "email_taken", "invalid_name", "limit_reached", "not_found", "port_unavailable", "kind_mismatch",
                   "ports_disabled", "server_outdated", "invalid_cidr", "unsupported"]),
             (7, &["tls_failed", "tls_timeout"]),
             (8, &["probe_failed"]),

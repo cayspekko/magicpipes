@@ -1,4 +1,5 @@
 //! Minimal server-rendered management UI. Uses the same control-plane methods as the API.
+//! Tunnels, agents and the login screen live here; accounts and users in `accounts`.
 
 use axum::Form;
 use axum::extract::{FromRequestParts, Path, State};
@@ -10,9 +11,9 @@ use serde::Deserialize;
 
 use super::{AppState, ClientIp, Rejected, SESSION_COOKIE};
 use crate::authz::Principal;
-use crate::control::TunnelView;
+use crate::control::{Login, LoginError, TunnelView, UserView};
 
-fn esc(s: &str) -> String {
+pub(super) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -39,11 +40,14 @@ fn cookie_value(parts: &Parts) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// Extractor: a logged-in UI session. Redirects to the login page otherwise.
+/// Extractor: a logged-in UI session. Redirects to the login page otherwise, and to the password
+/// page while the user still has to replace a password an administrator set.
 pub struct UiUser {
-    cookie: String,
-    who: Principal,
-    csrf: String,
+    pub(super) cookie: String,
+    pub(super) who: Principal,
+    pub(super) csrf: String,
+    /// `None` for an admin-token session.
+    pub(super) user: Option<UserView>,
 }
 
 impl FromRequestParts<AppState> for UiUser {
@@ -51,14 +55,18 @@ impl FromRequestParts<AppState> for UiUser {
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Self::Rejection> {
         let cookie = cookie_value(parts).ok_or_else(|| Redirect::to("/login").into_response())?;
-        let (who, csrf) = app.sessions.get(&cookie).ok_or_else(|| Redirect::to("/login").into_response())?;
-        Ok(UiUser { cookie, who, csrf })
+        let s = app.control.session(&cookie).ok_or_else(|| Redirect::to("/login").into_response())?;
+        let must_change = s.user.as_ref().is_some_and(|u| u.must_change_password);
+        if must_change && !matches!(parts.uri.path(), "/password" | "/logout") {
+            return Err(Redirect::to("/password").into_response());
+        }
+        Ok(UiUser { cookie, who: s.who, csrf: s.csrf, user: s.user })
     }
 }
 
 impl UiUser {
     #[allow(clippy::result_large_err)] // error pages are returned by value on purpose
-    fn check_csrf(&self, submitted: &str) -> Result<(), Response> {
+    pub(super) fn check_csrf(&self, submitted: &str) -> Result<(), Response> {
         if magicpipes_core::secret::constant_time_eq(self.csrf.as_bytes(), submitted.as_bytes()) {
             Ok(())
         } else {
@@ -122,12 +130,20 @@ pub async fn script() -> Response {
     ([(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"))], SCRIPT).into_response()
 }
 
-fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
+pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     let logout = user
         .map(|u| {
+            let links: &[(&str, &str)] = if u.who.is_admin() {
+                &[("/", "Tunnels"), ("/users", "Users"), ("/audit", "Audit log"), ("/account", "Account")]
+            } else {
+                &[("/account", "Account")]
+            };
+            let nav: String = links.iter().map(|(href, label)| format!(r#"<a class="btn ghost" href="{href}">{label}</a>"#)).collect();
+            let me = u.user.as_ref().map_or("admin token".to_string(), |v| v.email.clone());
             format!(
-                r#"<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="btn ghost">Log out</button></form>"#,
-                esc(&u.csrf)
+                r#"<nav style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">{nav}<span class="sub">{me}</span><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="btn ghost">Log out</button></form></nav>"#,
+                me = esc(&me),
+                csrf = esc(&u.csrf)
             )
         })
         .unwrap_or_default();
@@ -154,7 +170,7 @@ fn badge(state: &str) -> String {
 }
 
 /// `2026-10-30T04:08:00Z` -> `2026-10-30 · 04:08 UTC`, with the exact value as a tooltip.
-fn when(ts: &str) -> String {
+pub(super) fn when(ts: &str) -> String {
     let short = match (ts.get(..10), ts.get(11..16)) {
         (Some(d), Some(t)) if ts.as_bytes().get(10) == Some(&b'T') => format!("{d} · {t} UTC"),
         _ => ts.to_string(),
@@ -180,6 +196,9 @@ fn public_address(t: &TunnelView, class: &str) -> String {
 }
 
 pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
+    if !user.who.is_admin() {
+        return Redirect::to("/account").into_response();
+    }
     let agents = app.control.agents(&user.who);
     let agent_name = |id: &str| agents.iter().find(|a| a.id == id).map(|a| a.name.clone()).unwrap_or_else(|| id.to_string());
     let tunnels = app.control.tunnels(&user.who);
@@ -305,6 +324,12 @@ pub struct CsrfForm {
     csrf: String,
 }
 
+impl CsrfForm {
+    pub(super) fn csrf(&self) -> &str {
+        &self.csrf
+    }
+}
+
 pub async fn delete_tunnel(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<CsrfForm>) -> Response {
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
@@ -344,54 +369,96 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, Form(f
     page("Enrollment token", Some(&user), &body)
 }
 
-fn login_page(error: Option<&str>) -> Response {
+fn login_page(error: Option<&str>, admin_token: bool) -> Response {
     let err = error.map(|e| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(e))).unwrap_or_default();
-    page(
-        "Log in",
-        None,
-        &format!(
-            r#"<div class="auth"><div class="eyebrow">Administration</div><h1>Sign <em>in</em></h1>
-<p class="lede">Use an admin token to manage tunnels and agents.</p>
-<div class="card" style="margin-top:28px">{err}
-<form method="post" action="/login"><label for="t" style="margin-top:0">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
+    let form = if admin_token {
+        r#"<form method="post" action="/login"><label for="t" style="margin-top:0">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
 <button class="btn primary block" style="margin-top:18px">Log in</button></form></div>
-<p class="note">The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>. Create another with <code>magicpipesd admin-token</code>.</p></div>"#
-        ),
+<p class="note"><a href="/login">Sign in with email and password</a> instead. The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>; create another with <code>magicpipesd admin-token</code>.</p>"#
+    } else {
+        r#"<form method="post" action="/login"><label for="e" style="margin-top:0">Email</label><input id="e" type="email" name="email" autocomplete="username" autofocus required>
+<label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required>
+<button class="btn primary block" style="margin-top:18px">Sign in</button></form></div>
+<p class="note">Administrators create accounts. <a href="/login?method=token">Use an admin token</a></p>"#
+    };
+    page(
+        "Sign in",
+        None,
+        &format!(r#"<div class="auth"><div class="eyebrow">MagicPipes</div><h1>Sign <em>in</em></h1><div class="card" style="margin-top:28px">{err}{form}</div>"#),
     )
 }
 
-pub async fn login_form() -> Response {
-    login_page(None)
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    method: Option<String>,
+}
+
+pub async fn login_form(axum::extract::Query(q): axum::extract::Query<LoginQuery>) -> Response {
+    login_page(None, q.method.as_deref() == Some("token"))
 }
 
 #[derive(Deserialize)]
 pub struct LoginForm {
-    token: String,
+    token: Option<String>,
+    email: Option<String>,
+    password: Option<String>,
+}
+
+/// Sets the session cookie and sends the browser on: to the password page if the user must
+/// replace an administrator-set password first.
+pub(super) fn logged_in(app: &AppState, login: Login) -> Response {
+    let to = if login.must_change_password { "/password" } else { "/" };
+    let mut resp = Redirect::to(to).into_response();
+    let max_age = app.control.config().users.session_max_age_secs;
+    let value = format!("{SESSION_COOKIE}={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}", login.cookie);
+    resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&value).expect("cookie is ASCII"));
+    resp
 }
 
 pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<ClientIp>>, Form(f): Form<LoginForm>) -> Response {
-    let who = match app.check_credential(app.admin(f.token.trim()).ok_or(()), client.map(|c| c.0.0)) {
-        Ok(who) => who,
-        Err(Rejected::RateLimited) => {
-            return (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."))).into_response();
+    let client = client.map(|c| c.0.0);
+    if let Some(token) = f.token {
+        let checked = match app.control.login_admin_token(token.trim()) {
+            Ok(found) => found.ok_or(()),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, login_page(Some("Something went wrong. Try again."), true)).into_response(),
+        };
+        return match app.check_credential(checked, client) {
+            Ok(login) => logged_in(&app, login),
+            Err(Rejected::RateLimited) => {
+                (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."), true)).into_response()
+            }
+            Err(Rejected::Invalid(())) => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                (StatusCode::UNAUTHORIZED, login_page(Some("Invalid admin token."), true)).into_response()
+            }
+        };
+    }
+    let (email, password) = (f.email.unwrap_or_default(), f.password.unwrap_or_default());
+    let checked = match app.control.login_password(&email, &password).await {
+        Ok(login) => Ok(login),
+        Err(LoginError::Invalid) => Err(()),
+        Err(LoginError::Throttled) => {
+            let msg = "Too many failed attempts for this account. Wait a few seconds and try again.";
+            return (StatusCode::TOO_MANY_REQUESTS, login_page(Some(msg), false)).into_response();
         }
-        Err(Rejected::Invalid(())) => {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            return (StatusCode::UNAUTHORIZED, login_page(Some("Invalid admin token."))).into_response();
+        Err(LoginError::Internal) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, login_page(Some("Something went wrong. Try again."), false)).into_response();
         }
     };
-    let (cookie, _) = app.sessions.create(who);
-    let mut resp = Redirect::to("/").into_response();
-    let value = format!("{SESSION_COOKIE}={cookie}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200");
-    resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&value).expect("cookie is ASCII"));
-    resp
+    match app.check_credential(checked, client) {
+        Ok(login) => logged_in(&app, login),
+        Err(Rejected::RateLimited) => {
+            (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."), false)).into_response()
+        }
+        Err(Rejected::Invalid(())) => (StatusCode::UNAUTHORIZED, login_page(Some("Email or password is incorrect."), false)).into_response(),
+    }
 }
 
 pub async fn logout(user: UiUser, State(app): State<AppState>, Form(f): Form<CsrfForm>) -> Response {
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    app.sessions.remove(&user.cookie);
+    app.control.logout(&user.who, &user.cookie);
     let mut resp = Redirect::to("/login").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,

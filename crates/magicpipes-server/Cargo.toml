@@ -38,4 +38,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 time.workspace = true
 socket2.workspace = true
+argon2.workspace = true
 tower = { version = "0.5", features = ["util"] }

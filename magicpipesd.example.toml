@@ -57,6 +57,11 @@ acme_directory = "letsencrypt"
 # max_new_certificates_per_day = 20    # ACME: new hostnames one agent may add per 24 hours
 # enrollment_ttl_secs = 3600
 
+[users]
+# Accounts are created by administrators in the UI (Users) or the API; see the README.
+# session_max_age_secs = 43200         # how long a sign-in lasts
+# audit_retention_days = 90
+
 [ports]
 # Raw TCP and UDP tunnels (`magicpipes add 5432 --tcp`, `add 53 --udp`). Off unless `range` is
 # set. Every port in the range must be reachable from the internet for TCP and UDP (firewall,

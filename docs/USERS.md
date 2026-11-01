@@ -787,7 +787,9 @@ useful.
    - `Principal` plus `authorize()` over today's model (admin token and agents).
    - Split `control/mod.rs`, and add `AccessPolicy` on routes for HTTP and ports.
    - Audit design items 1, 3, 4, 5 and 6.
-2. **Users with passwords.**
+2. **Users with passwords.** *Done:* the users migration (the agent and enrollment ownership
+   columns move to step 3, where they are first used), database sessions, the sign-in and
+   password pages, user administration, API tokens and the audit log.
    - The users migration, sessions in the database, and the login screen.
    - Admin-created users with forced password changes, and memberships with roles.
    - API tokens and the audit log.

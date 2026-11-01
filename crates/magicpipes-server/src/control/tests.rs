@@ -106,7 +106,7 @@ async fn management_follows_authorize() {
     assert!(f.cp.tunnel(&pb, "one").is_none());
     assert!(f.cp.status(&Principal::Anonymous).is_none());
     assert!(f.cp.status(&Principal::AdminToken).is_some());
-    assert!(f.cp.create_enrollment(&pa).unwrap_err().is(ErrorCode::Unauthorized));
+    assert!(f.cp.create_enrollment(&pa).unwrap_err().is(ErrorCode::Forbidden));
 
     // Deleting and revoking need Manage; refusals look like "not found".
     assert!(!f.cp.delete_tunnel(&pb, &ta.id).unwrap());
