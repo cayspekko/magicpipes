@@ -123,7 +123,7 @@ pub async fn account(user: UiUser, State(app): State<AppState>) -> Response {
 <div class="card panel" style="margin-top:20px"><div><h3>Password</h3><p>Changing it signs you out on other devices.</p></div><a class="btn" href="/password">Change password</a></div>
 <div class="section"><h2>API tokens</h2></div>
 <div class="card scroll"><table><thead><tr><th>Token</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
-<div class="card" style="margin-top:12px"><form method="post" action="/account/tokens">{csrf}
+<div class="card form" style="margin-top:12px"><form method="post" action="/account/tokens">{csrf}
 <label for="tn" style="margin-top:0">Name</label><input id="tn" name="name" maxlength="64" placeholder="ci-deploy" required>
 <label for="te">Expires after (days, empty = never)</label><input id="te" name="expires_in_days" inputmode="numeric" pattern="[0-9]*">
 <button class="btn primary" style="margin-top:14px">Create API token</button></form>
@@ -227,7 +227,7 @@ fn users_page(user: &UiUser, users: &[UserView], error: Option<&str>) -> Respons
 <p class="lede">People sign in with their email and a password. A password you set here must be changed at first sign-in. Access tags decide which private tunnels they reach; create tags under <a href="/tags">Tags</a>.</p></div></div>
 {err}<div class="card scroll"><table><thead><tr><th>User</th><th>Role</th><th>Access tags</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="section"><h2>Add a user</h2></div>
-<div class="card"><form method="post" action="/users">{csrf}
+<div class="card form"><form method="post" action="/users">{csrf}
 <label for="ue" style="margin-top:0">Email</label><input id="ue" type="email" name="email" required>
 <label for="un">Name</label><input id="un" name="display_name" maxlength="100">
 <label for="ur">Role</label><select id="ur" name="role"><option value="member">Member</option><option value="admin">Administrator</option></select>
@@ -485,7 +485,7 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
 <p class="lede">A person reaches a private tunnel when they share one of its access tags, or own it. Matching is exact. Deleting a tag removes it from everyone and everything at once.</p></div></div>
 {err}<div class="card scroll"><table><thead><tr><th>Tag</th><th>Description</th><th>Created</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="section"><h2>Create a tag</h2></div>
-<div class="card"><form method="post" action="/tags">{csrf}
+<div class="card form"><form method="post" action="/tags">{csrf}
 <label for="tn" style="margin-top:0">Name</label><input id="tn" name="name" placeholder="team:dev" maxlength="64" required>
 <label for="td">Description</label><input id="td" name="description" maxlength="200">
 <button class="btn primary" style="margin-top:14px">Create tag</button></form>

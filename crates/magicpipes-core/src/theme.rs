@@ -80,9 +80,15 @@ dl>:nth-last-child(-n+2){border-bottom:0}
 .note{margin:16px 0 0;color:var(--muted);font-size:13.5px}
 .auth{width:100%;max-width:400px;margin:6vh auto 0}
 .auth .card{padding:30px 28px 26px}
+.card.form{padding:22px 24px 24px}
 label{display:block;font-size:13px;font-weight:500;color:var(--ink-2);margin:22px 0 8px}
-input[type=password]{width:100%;font:14px var(--mono);padding:12px 14px;border-radius:10px;border:1px solid var(--line-2);background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
-input[type=password]:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent)}
+input:not([type]),input[type=text],input[type=email],input[type=password],input[type=search],select{width:100%;font:14px var(--sans);padding:12px 14px;border-radius:10px;border:1px solid var(--line-2);background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
+input[type=password]{font-family:var(--mono)}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent)}
+input::placeholder{color:var(--muted)}
+input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;margin:0 8px 0 0;vertical-align:-3px}
+label:has(input[type=checkbox]){font-weight:400;color:var(--ink);margin:14px 0 0}
+td input:not([type]),td input[type=text]{padding:7px 10px;font-size:13px;border-radius:8px}
 .alert{margin:0 0 20px;padding:11px 14px;border-radius:10px;font-size:13.5px;color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--bad) 25%,var(--line))}
 @media (max-width:640px){.top-in,main,.foot{padding-left:16px;padding-right:16px}main{padding-top:32px}dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:2px}dd{padding-top:0}}
 "#;

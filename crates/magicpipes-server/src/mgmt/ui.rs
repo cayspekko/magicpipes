@@ -453,7 +453,7 @@ fn enroll_panel(app: &AppState, user: &UiUser) -> String {
     let private = if users.is_empty() { "" } else { " checked" };
     format!(
         r#"<div class="section"><h2>Enroll a machine</h2></div>
-<div class="card"><p class="note" style="margin-top:0">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>
+<div class="card form"><p class="note" style="margin-top:0">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>
 <form method="post" action="/enrollments"><input type="hidden" name="csrf" value="{csrf}">
 <label for="eo">Belongs to</label><select id="eo" name="owner"><option value="">Nobody (a service agent, managed by administrators)</option>{owners}</select>
 <label for="et">Access tags</label><input id="et" name="tags" placeholder="team:dev, team:ops">
