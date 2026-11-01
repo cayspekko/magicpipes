@@ -9,6 +9,8 @@ use std::io::{BufRead, Seek};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+use magicpipes_core::error::ErrorCode;
+
 use crate::ipc::{self, ErrorInfo, IpcRequest, Step, StepState};
 use crate::platform::{self, IpcClient};
 use crate::state::{self, AgentConfig};
@@ -24,10 +26,10 @@ pub fn require_login() -> Result<AgentConfig, ErrorInfo> {
     match AgentConfig::load() {
         Ok(Some(c)) => Ok(c),
         Ok(None) => Err(ErrorInfo::new(
-            "not_logged_in",
+            ErrorCode::NotLoggedIn,
             "this machine is not enrolled; run `magicpipes login --server https://<server>:8443 --token <enrollment token>`",
         )),
-        Err(e) => Err(ErrorInfo::new("config_error", format!("{e:#}"))),
+        Err(e) => Err(ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}"))),
     }
 }
 
@@ -37,8 +39,8 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
         return Ok(false);
     }
     require_login()?;
-    state::ensure_home().map_err(|e| ErrorInfo::new("config_error", format!("{e:#}")))?;
-    let mut child = spawn_detached().map_err(|e| ErrorInfo::new("agent_start_failed", format!("could not start agent: {e}")))?;
+    state::ensure_home().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
+    let mut child = spawn_detached().map_err(|e| ErrorInfo::new(ErrorCode::AgentStartFailed, format!("could not start agent: {e}")))?;
     let started = Instant::now();
     let mut exited_ok = false;
     while started.elapsed() < START_TIMEOUT {
@@ -53,7 +55,7 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
                 Ok(Some(s)) if s.success() => exited_ok = true,
                 Ok(Some(_)) => {
                     return Err(ErrorInfo::new(
-                        "agent_start_failed",
+                        ErrorCode::AgentStartFailed,
                         format!("the agent exited during startup:\n{}", tail_log(5).join("\n")),
                     ));
                 }
@@ -62,7 +64,7 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
         }
     }
     Err(ErrorInfo::new(
-        "agent_start_failed",
+        ErrorCode::AgentStartFailed,
         format!("the agent did not become ready within {}s; see {}", START_TIMEOUT.as_secs(), state::log_path().display()),
     ))
 }
@@ -81,11 +83,11 @@ fn spawn_detached() -> std::io::Result<Child> {
 
 /// One IPC request to a running agent.
 pub async fn request(req: &IpcRequest, on_step: impl FnMut(Step, StepState)) -> Result<serde_json::Value, ErrorInfo> {
-    let stream = connect().await.ok_or_else(|| ErrorInfo::new("agent_not_running", "the agent is not running"))?;
+    let stream = connect().await.ok_or_else(|| ErrorInfo::new(ErrorCode::AgentNotRunning, "the agent is not running"))?;
     ipc::call(stream, req, on_step).await.map_err(|mut e| {
         // A request this CLI builds is always valid, so the agent must be an older version.
-        if e.code == "bad_request" {
-            e.code = "agent_outdated".into();
+        if e.is(ErrorCode::BadRequest) {
+            e.code = ErrorCode::AgentOutdated.to_string();
             e.message = format!(
                 "the running agent does not understand this request ({}); it is probably an older version. \
                  Restart it with `magicpipes agent stop`, then run the command again",

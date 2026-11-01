@@ -18,6 +18,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{Request, header};
 use http_body_util::Full;
+use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::{ERROR_HEADER, PROBE_ACK_HEADER, PROBE_HEADER};
 use rustls::ClientConfig;
 
@@ -75,14 +76,15 @@ async fn probe_once(t: &LocalTunnel, path: &str, tls: &Arc<ClientConfig>, tunnel
         .map_err(|e| format!("request to public endpoint failed: {e:#}"))?;
     let status = resp.status().as_u16();
     if let Some(code) = resp.headers().get(ERROR_HEADER).and_then(|v| v.to_str().ok()) {
-        let message = match code {
-            "local_unreachable" => "the server reached the agent, but the local application refused the connection".into(),
-            "upstream_error" => "the local application accepted the connection but sent no valid HTTP response".into(),
-            "agent_offline" | "agent_unavailable" => "the server does not see this agent as connected".into(),
-            "tunnel_not_found" => "the server does not route this hostname (yet)".into(),
-            other => format!("the server answered with error '{other}' (HTTP {status})"),
+        let known = ErrorCode::parse(code);
+        let message = match known {
+            Some(ErrorCode::LocalUnreachable) => "the server reached the agent, but the local application refused the connection".into(),
+            Some(ErrorCode::UpstreamError) => "the local application accepted the connection but sent no valid HTTP response".into(),
+            Some(ErrorCode::AgentOffline | ErrorCode::AgentUnavailable) => "the server does not see this agent as connected".into(),
+            Some(ErrorCode::TunnelNotFound) => "the server does not route this hostname (yet)".into(),
+            _ => format!("the server answered with error '{code}' (HTTP {status})"),
         };
-        return Err(ProbeError { message, app_closed: code == "upstream_error" });
+        return Err(ProbeError { message, app_closed: known == Some(ErrorCode::UpstreamError) });
     }
     let expected = format!("{} {nonce}", t.id);
     let ack = resp.headers().get(PROBE_ACK_HEADER).and_then(|v| v.to_str().ok());

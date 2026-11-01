@@ -8,7 +8,8 @@ use http::{HeaderValue, StatusCode, header};
 use magicpipes_core::theme::{GLYPH, STYLE};
 use serde::Deserialize;
 
-use super::{AppState, ClientIp, SESSION_COOKIE};
+use super::{AppState, ClientIp, Rejected, SESSION_COOKIE};
+use crate::authz::Principal;
 use crate::control::TunnelView;
 
 fn esc(s: &str) -> String {
@@ -41,6 +42,7 @@ fn cookie_value(parts: &Parts) -> Option<String> {
 /// Extractor: a logged-in UI session. Redirects to the login page otherwise.
 pub struct UiUser {
     cookie: String,
+    who: Principal,
     csrf: String,
 }
 
@@ -49,8 +51,8 @@ impl FromRequestParts<AppState> for UiUser {
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Self::Rejection> {
         let cookie = cookie_value(parts).ok_or_else(|| Redirect::to("/login").into_response())?;
-        let csrf = app.sessions.csrf_for(&cookie).ok_or_else(|| Redirect::to("/login").into_response())?;
-        Ok(UiUser { cookie, csrf })
+        let (who, csrf) = app.sessions.get(&cookie).ok_or_else(|| Redirect::to("/login").into_response())?;
+        Ok(UiUser { cookie, who, csrf })
     }
 }
 
@@ -178,9 +180,9 @@ fn public_address(t: &TunnelView, class: &str) -> String {
 }
 
 pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
-    let agents = app.control.agents();
+    let agents = app.control.agents(&user.who);
     let agent_name = |id: &str| agents.iter().find(|a| a.id == id).map(|a| a.name.clone()).unwrap_or_else(|| id.to_string());
-    let tunnels = app.control.tunnels();
+    let tunnels = app.control.tunnels(&user.who);
     let mut rows = String::new();
     for t in &tunnels {
         rows.push_str(&format!(
@@ -213,7 +215,9 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     if agents.is_empty() {
         agent_rows = r#"<tr><td colspan="5" class="empty">No agents enrolled yet.</td></tr>"#.into();
     }
-    let status = app.control.status();
+    let Some(status) = app.control.status(&user.who) else {
+        return Redirect::to("/login").into_response();
+    };
     let online = agents.iter().filter(|a| a.connected).count();
     let requests: u64 = tunnels.iter().map(|t| t.requests).sum();
     let errors: u64 = tunnels.iter().map(|t| t.upstream_errors).sum();
@@ -243,11 +247,11 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
 }
 
 pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
-    let Some(t) = app.control.tunnel(&id) else {
+    let Some(t) = app.control.tunnel(&user.who, &id) else {
         let body = r#"<a class="crumb" href="/">← Tunnels</a><h1>Not found</h1><p class="lede">There is no tunnel with that id or name. It may have been deleted.</p>"#;
         return (StatusCode::NOT_FOUND, page("Not found", Some(&user), body)).into_response();
     };
-    let agent = app.control.agent_name(&t.agent_id).unwrap_or_default();
+    let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf))
 }
 
@@ -305,7 +309,7 @@ pub async fn delete_tunnel(user: UiUser, State(app): State<AppState>, Path(id): 
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    let _ = app.control.delete_tunnel(&id);
+    let _ = app.control.delete_tunnel(&user.who, &id);
     Redirect::to("/").into_response()
 }
 
@@ -313,7 +317,7 @@ pub async fn revoke_agent(user: UiUser, State(app): State<AppState>, Path(id): P
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    let _ = app.control.revoke_agent(&id);
+    let _ = app.control.revoke_agent(&user.who, &id);
     Redirect::to("/").into_response()
 }
 
@@ -321,7 +325,7 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, Form(f
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    let Ok(token) = app.control.create_enrollment() else {
+    let Ok(token) = app.control.create_enrollment(&user.who) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "could not create enrollment token").into_response();
     };
     let cfg = app.control.config();
@@ -366,14 +370,17 @@ pub struct LoginForm {
 }
 
 pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<ClientIp>>, Form(f): Form<LoginForm>) -> Response {
-    if !app.control.verify_admin(f.token.trim()) {
-        if app.limiter.reject(client.map(|c| c.0.0)) {
+    let who = match app.check_credential(app.admin(f.token.trim()).ok_or(()), client.map(|c| c.0.0)) {
+        Ok(who) => who,
+        Err(Rejected::RateLimited) => {
             return (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."))).into_response();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        return (StatusCode::UNAUTHORIZED, login_page(Some("Invalid admin token."))).into_response();
-    }
-    let (cookie, _) = app.sessions.create();
+        Err(Rejected::Invalid(())) => {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            return (StatusCode::UNAUTHORIZED, login_page(Some("Invalid admin token."))).into_response();
+        }
+    };
+    let (cookie, _) = app.sessions.create(who);
     let mut resp = Redirect::to("/").into_response();
     let value = format!("{SESSION_COOKIE}={cookie}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200");
     resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&value).expect("cookie is ASCII"));

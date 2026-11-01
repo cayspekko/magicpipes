@@ -4,6 +4,7 @@
 //! answers with zero or more [`IpcEvent::Step`] lines followed by exactly one terminal
 //! [`IpcEvent::Ok`] or [`IpcEvent::Error`] line, then closes the connection.
 
+use magicpipes_core::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -110,8 +111,16 @@ pub struct ErrorInfo {
 }
 
 impl ErrorInfo {
-    pub fn new(code: &str, message: impl Into<String>) -> Self {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::wire(code.as_str(), message)
+    }
+    /// A code received from the server or the agent, passed through even if this build does not
+    /// know it.
+    pub fn wire(code: &str, message: impl Into<String>) -> Self {
         Self { code: code.into(), message: message.into(), step: None }
+    }
+    pub fn is(&self, code: ErrorCode) -> bool {
+        self.code == code.as_str()
     }
     pub fn at(mut self, step: Step) -> Self {
         self.step = Some(step);
@@ -140,19 +149,19 @@ pub async fn call(
     mut on_step: impl FnMut(Step, StepState),
 ) -> Result<Value, ErrorInfo> {
     let (r, mut w) = tokio::io::split(stream);
-    write_line(&mut w, req).await.map_err(|e| ErrorInfo::new("agent_unavailable", format!("talking to agent: {e}")))?;
+    write_line(&mut w, req).await.map_err(|e| ErrorInfo::new(ErrorCode::AgentUnavailable, format!("talking to agent: {e}")))?;
     let mut lines = BufReader::new(r).lines();
     loop {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
-            Ok(None) => return Err(ErrorInfo::new("agent_unavailable", "agent closed the connection unexpectedly")),
-            Err(e) => return Err(ErrorInfo::new("agent_unavailable", format!("reading from agent: {e}"))),
+            Ok(None) => return Err(ErrorInfo::new(ErrorCode::AgentUnavailable, "agent closed the connection unexpectedly")),
+            Err(e) => return Err(ErrorInfo::new(ErrorCode::AgentUnavailable, format!("reading from agent: {e}"))),
         };
         match serde_json::from_str::<IpcEvent>(&line) {
             Ok(IpcEvent::Step { step, state }) => on_step(step, state),
             Ok(IpcEvent::Ok { data }) => return Ok(data),
             Ok(IpcEvent::Error(e)) => return Err(e),
-            Err(e) => return Err(ErrorInfo::new("agent_protocol", format!("invalid agent response: {e}"))),
+            Err(e) => return Err(ErrorInfo::new(ErrorCode::AgentProtocol, format!("invalid agent response: {e}"))),
         }
     }
 }

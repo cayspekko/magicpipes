@@ -7,27 +7,48 @@
 //! Authorization: Bearer <agent token>
 //! Connection: Upgrade
 //! Upgrade: magicpipes-mux/1
+//! X-MagicPipes-Protocol: 2
 //! ```
 //!
 //! After `101 Switching Protocols` the connection carries a yamux session (agent = client,
-//! server = server). Two kinds of streams exist:
+//! server = server). Both the request and the `101` response carry [`PROTOCOL_HEADER`], so each
+//! side knows what the other understands before it sends anything; a peer that omits it speaks
+//! version 1. Two kinds of streams exist:
 //!
 //! * **Agent-opened streams are RPCs.** The agent writes one [`Request`] frame, the server answers
 //!   with one [`Response`] frame and both sides close the stream.
 //! * **Server-opened streams are pushes or data.** The server writes one [`ServerOpen`] frame.
 //!   For [`ServerOpen::Data`] the agent connects to the tunnel's local target and writes a single
-//!   status byte ([`STREAM_OK`] or an error code); after `STREAM_OK` the stream is a raw,
-//!   bidirectional byte pipe to the local application. [`ServerOpen::Datagram`] is the same for
-//!   one UDP client, except that after `STREAM_OK` both directions carry datagrams framed by
-//!   [`write_datagram`] (a big-endian `u16` length, then the payload).
+//!   [`StreamStatus`] byte; after [`StreamStatus::Ok`] the stream is a raw, bidirectional byte
+//!   pipe to the local application. [`ServerOpen::Datagram`] is the same for one UDP client,
+//!   except that after `Ok` both directions carry datagrams framed by [`write_datagram`] (a
+//!   big-endian `u16` length, then the payload).
 //!
 //! Frames are a big-endian `u32` length followed by a JSON document, capped at [`MAX_FRAME`].
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::error::ErrorCode;
+
 pub const UPGRADE_PROTOCOL: &str = "magicpipes-mux/1";
 pub const AGENT_CONNECT_PATH: &str = "/api/v1/agent/connect";
+
+/// Header on the agent's upgrade request and the server's `101` response: the sender's
+/// protocol version.
+pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
+/// The protocol version this build speaks. Bump it when a peer needs to know about a new
+/// request, stream type or field before using it, and say here what the version adds.
+///
+/// * 1: everything before the handshake (no header).
+/// * 2: the handshake. An unknown request is answered with the error code `unsupported`, and an
+///   unknown server-opened stream with [`StreamStatus::Unsupported`], instead of being dropped.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
+pub fn peer_protocol(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse().ok()).filter(|v| *v >= 1).unwrap_or(1)
+}
 
 /// Header carrying a readiness-probe nonce on a public request.
 pub const PROBE_HEADER: &str = "x-magicpipes-probe";
@@ -39,12 +60,45 @@ pub const ERROR_HEADER: &str = "x-magicpipes-error";
 
 pub const MAX_FRAME: usize = 64 * 1024;
 
-/// Data-stream status byte: the agent connected to the local target.
-pub const STREAM_OK: u8 = 0;
-/// The local target refused or did not answer the connection.
-pub const STREAM_LOCAL_UNREACHABLE: u8 = 1;
-/// The agent does not know (or no longer serves) the requested tunnel.
-pub const STREAM_UNKNOWN_TUNNEL: u8 = 2;
+/// The agent's one-byte answer on a server-opened data stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamStatus {
+    /// Connected to the local target; the stream now carries its bytes (or datagrams).
+    Ok,
+    /// The local target refused or did not answer the connection.
+    LocalUnreachable,
+    /// The agent does not know (or no longer serves) the requested tunnel.
+    UnknownTunnel,
+    /// The agent could not read the stream's [`ServerOpen`] header: the server is newer.
+    /// Protocol 2 and later.
+    Unsupported,
+}
+
+impl StreamStatus {
+    pub fn byte(self) -> u8 {
+        match self {
+            StreamStatus::Ok => 0,
+            StreamStatus::LocalUnreachable => 1,
+            StreamStatus::UnknownTunnel => 2,
+            StreamStatus::Unsupported => 3,
+        }
+    }
+
+    /// `None` for a byte this build does not know.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(StreamStatus::Ok),
+            1 => Some(StreamStatus::LocalUnreachable),
+            2 => Some(StreamStatus::UnknownTunnel),
+            3 => Some(StreamStatus::Unsupported),
+            _ => None,
+        }
+    }
+
+    pub async fn write<W: AsyncWrite + Unpin>(self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&[self.byte()]).await
+    }
+}
 
 /// How a tunnel is reached publicly (the server's concern; the agent's local target is separate).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -101,7 +155,7 @@ pub enum Request {
     /// Wait (up to `wait_ms`) until the certificate for `hostname` is no longer pending.
     CertStatus { hostname: String, wait_ms: u64 },
     /// Readiness check for a port tunnel: the server opens a data stream to this agent for the
-    /// tunnel and answers [`Response::Ok`] once the agent reports [`STREAM_OK`].
+    /// tunnel and answers [`Response::Ok`] once the agent reports [`StreamStatus::Ok`].
     Check { id: String },
 }
 
@@ -159,6 +213,8 @@ pub enum CertState {
     Failed { message: String },
 }
 
+/// An error answer. `code` stays a string on the wire: a newer peer may send codes this build
+/// does not know.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorBody {
     pub code: String,
@@ -166,8 +222,12 @@ pub struct ErrorBody {
 }
 
 impl ErrorBody {
-    pub fn new(code: &str, message: impl Into<String>) -> Self {
-        Self { code: code.to_string(), message: message.into() }
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self { code: code.as_str().to_string(), message: message.into() }
+    }
+
+    pub fn is(&self, code: ErrorCode) -> bool {
+        self.code == code.as_str()
     }
 }
 
@@ -254,6 +314,12 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    Ok(serde_json::from_slice(&read_frame_bytes(r).await?)?)
+}
+
+/// Reads one frame's JSON body without parsing it, so a caller can tell a request it does not
+/// understand (it parses as JSON, not as the expected type) from a broken stream.
+pub async fn read_frame_bytes<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -262,7 +328,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -304,6 +370,24 @@ mod tests {
         // An answer from a server that predates port tunnels says http, whatever was asked.
         let t: TunnelInfo = serde_json::from_str(r#"{"id":"tn","name":"a","hostname":"a.t","public_url":"https://a.t","created":true}"#).unwrap();
         assert_eq!((t.kind, t.public_port), (Kind::Http, None));
+    }
+
+    #[test]
+    fn protocol_versions_and_stream_status() {
+        assert_eq!(peer_protocol(None), 1);
+        assert_eq!(peer_protocol(Some("2")), 2);
+        assert_eq!(peer_protocol(Some(" 7 ")), 7);
+        assert_eq!(peer_protocol(Some("0")), 1);
+        assert_eq!(peer_protocol(Some("two")), 1);
+        // The bytes are on the wire: old agents send 0..=2.
+        for (s, b) in [(StreamStatus::Ok, 0), (StreamStatus::LocalUnreachable, 1), (StreamStatus::UnknownTunnel, 2), (StreamStatus::Unsupported, 3)] {
+            assert_eq!(s.byte(), b);
+            assert_eq!(StreamStatus::from_byte(b), Some(s));
+        }
+        assert_eq!(StreamStatus::from_byte(200), None);
+        // A request from a newer agent is still JSON, so the server can answer `unsupported`.
+        assert!(serde_json::from_str::<Request>(r#"{"op":"from_the_future"}"#).is_err());
+        assert!(serde_json::from_str::<serde_json::Value>(r#"{"op":"from_the_future"}"#).is_ok());
     }
 
     #[tokio::test]

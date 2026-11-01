@@ -26,6 +26,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use magicpipes_core::error::ErrorCode;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -119,7 +120,7 @@ async fn handle_ipc<S: AsyncRead + AsyncWrite>(agent: Arc<Agent>, stream: S) {
     let req: IpcRequest = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(e) => {
-            let _ = ipc::write_line(&mut w, &IpcEvent::Error(ErrorInfo::new("bad_request", e.to_string()))).await;
+            let _ = ipc::write_line(&mut w, &IpcEvent::Error(ErrorInfo::new(ErrorCode::BadRequest, e.to_string()))).await;
             return;
         }
     };

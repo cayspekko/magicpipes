@@ -42,6 +42,7 @@ present a URL. Act on the code:
 | 4 | `local_unreachable` | The app is not listening yet, or binds another address. Wait or fix the app, then retry; use `--host ::1` if it listens only on IPv6. |
 | 5 | `server_unreachable`, `agent_start_failed` | Check `magicpipes status`; see `magicpipes agent logs`. |
 | 6 | `name_conflict`, `name_taken`, `invalid_name` | Choose another `--name`, or `magicpipes remove <name>` first. |
+| 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
 

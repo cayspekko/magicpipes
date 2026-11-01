@@ -1,5 +1,6 @@
 //! `magicpipesd` — the MagicPipes public server.
 
+mod authz;
 mod certs;
 mod config;
 mod control;

@@ -51,10 +51,17 @@ proxy logic (≈300 lines) only routes and rewrites hop-by-hop and forwarding he
 * `magicpipes-server/src/data/` is the data plane: public listeners, `RouteTable` lookup, proxying
   and stream bridging. It reads an immutable `Arc<RouteTable>` snapshot (one read lock to clone
   an `Arc`). It never touches SQLite, the API, or the control plane's mutex.
-* `magicpipes-server/src/control/` is the control plane: the registry (tunnels, agent sessions),
-  validation, persistence, certificate readiness and views for the API/UI. Every mutation
-  writes SQLite and then *publishes* a whole new `RouteTable` to the data plane
-  (`DataPlane::publish`). That is the only interface between the two planes.
+* `magicpipes-server/src/control/` is the control plane: the registry (`registry.rs`: tunnels,
+  ports, readiness checks), agent sessions (`sessions.rs`), validation, persistence, certificate
+  readiness and views for the API/UI (`views.rs`). Every mutation writes SQLite and then
+  *publishes* a whole new `RouteTable` to the data plane (`DataPlane::publish`). That is the only
+  interface between the two planes.
+* `authz.rs` holds the one access decision, `authorize(principal, action, resource)`, used by
+  both planes. Principals are the admin token, agents and anonymous public clients; actions are
+  discover, connect and manage. The control plane checks it for every registry operation and
+  filters every view with it. Each route carries an `AccessPolicy` (network allow-list, then
+  `authorize`), which the data plane checks per HTTP request, TCP connection and UDP flow.
+  Users and tags extend the same table ([USERS.md](USERS.md)); a check never bypasses it.
 * `certs/` belongs to the control plane. The `CertResolver` it fills is read by the TLS
   acceptors in the handshake; issuance never happens on the request path, and only for
   hostnames the control plane authorized.
@@ -74,7 +81,7 @@ to local target, bidirectional copy). `agent/ops.rs` sits on top of both.
 
 A tunnel's local target is a TCP service, a directory or a program in a terminal
 (`state::Target`). For a
-directory, `agent/forward.rs` acknowledges the data stream with `STREAM_OK` and hands it to
+directory, `agent/forward.rs` acknowledges the data stream with `StreamStatus::Ok` and hands it to
 `agent/serve/`, which runs hyper's HTTP/1 server directly on the yamux stream: no local port,
 and no server-side change (to the server it is an ordinary HTTP tunnel; the stored target string
 is `static:<path>`). tower-http's `ServeFile` writes file responses (content type, ranges,
@@ -164,17 +171,31 @@ Planned target and ingress kinds (Unix sockets, SSH gateway, browser desktop) ar
 
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
+* **Handshake**: the agent's upgrade request and the server's `101` carry
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 2). A peer without the header is
+  version 1. Each side knows the other's version before sending anything, so a new feature can
+  be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
+  the version when a peer must know about a new request, stream type or field before using it,
+  and document what the version adds next to the constant. `GET /api/v1/agents` shows each
+  connected agent's `protocol`, and `magicpipes status --json` shows `server_protocol`.
+* **Unknown messages are answered, not dropped** (version 2): a request the server cannot parse
+  gets the error code `unsupported`, and a server-opened stream the agent cannot parse gets the
+  status byte `3` (unsupported). Version 1 peers dropped them, which looked like a dead peer.
 * **Agent-opened stream = one RPC**: a length-prefixed JSON `Request` (`Ping`, `Register`,
   `Unregister`, `CertStatus`, `Check`), answered with one `Response`. A stream per call means no request
   ids and no head-of-line blocking between RPCs.
 * **Server-opened stream = data or push**: a `ServerOpen` frame. For `Data { tunnel_id }` the
   agent looks the id up in **its own** table, connects to the local target and writes one status
-  byte (`0` ok, `1` local unreachable, `2` unknown tunnel), then raw bytes flow both ways.
+  byte (`StreamStatus`: `0` ok, `1` local unreachable, `2` unknown tunnel, `3` unsupported), then
+  raw bytes flow both ways.
   `Datagram { tunnel_id }` is the same for one UDP client, followed by `u16`-length framed
   datagrams. `TunnelRemoved` tells the agent an administrator deleted a tunnel.
 * The status byte is read lazily by the server (`StatusPrefixed`): the HTTP request is written
   immediately, so a successful request costs no extra round trip, but local connection failures
   are still attributed exactly (`local_unreachable` vs `upstream_error` vs `agent_offline`).
+* **Error codes** are one enum, `magicpipes_core::error::ErrorCode`, with each code's HTTP
+  status (API errors and server-generated pages) and CLI exit code. On the wire the code stays
+  a string, so codes from a newer peer pass through unchanged.
 
 ## Readiness
 

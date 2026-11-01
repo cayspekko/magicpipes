@@ -18,10 +18,12 @@ use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
+use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::{self, ERROR_HEADER, PROBE_ACK_HEADER, PROBE_HEADER, ServerOpen};
 
 use super::io::{StatusPrefixed, UpstreamStatus, bridge, find_status};
 use super::{DataPlane, Outcome, Route};
+use crate::authz::Principal;
 use crate::forwarded::{TrustedProxies, client_key};
 use crate::listen::ConnInfo;
 
@@ -50,31 +52,35 @@ pub async fn handle(
 
 async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> Result<Response<ProxyBody>, Response<ProxyBody>> {
     if req.method() == Method::CONNECT {
-        return Err(error_page(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "CONNECT is not supported."));
+        return Err(error_page(ErrorCode::MethodNotAllowed, "CONNECT is not supported."));
     }
     let host = request_host(&req)
-        .ok_or_else(|| error_page(StatusCode::BAD_REQUEST, "bad_host", "Missing or invalid Host header."))?;
+        .ok_or_else(|| error_page(ErrorCode::BadHost, "Missing or invalid Host header."))?;
     // The certificate presented was chosen by SNI; never serve another tunnel's hostname on it.
     if conn.sni.as_deref().is_some_and(|sni| sni != host) {
-        return Err(error_page(StatusCode::MISDIRECTED_REQUEST, "misdirected_request", "Host does not match the TLS server name."));
+        return Err(error_page(ErrorCode::MisdirectedRequest, "Host does not match the TLS server name."));
     }
     let route = dp
         .lookup(&host)
-        .ok_or_else(|| error_page(StatusCode::NOT_FOUND, "tunnel_not_found", "There is no tunnel at this address."))?;
+        .ok_or_else(|| error_page(ErrorCode::TunnelNotFound, "There is no tunnel at this address."))?;
+    let client_ip = dp.settings.trusted_proxies.client_ip(conn.peer.ip(), req.headers());
+    // Fails like an unknown hostname: a client that may not use a tunnel learns nothing about it.
+    if !route.access.admits(&Principal::Anonymous, client_ip) {
+        return Err(error_page(ErrorCode::TunnelNotFound, "There is no tunnel at this address."));
+    }
 
     let session = match &route.session {
         Some(s) if !s.is_closed() => s.clone(),
         _ => {
             route.stats.record(Outcome::AgentOffline);
             return Err(error_page(
-                StatusCode::BAD_GATEWAY,
-                "agent_offline",
+                ErrorCode::AgentOffline,
                 "The MagicPipes agent serving this tunnel is not connected.",
             ));
         }
     };
 
-    let client = client_key(dp.settings.trusted_proxies.client_ip(conn.peer.ip(), req.headers()));
+    let client = client_key(client_ip);
     let probe = take_probe_nonce(req.headers_mut());
     let upgrade = is_upgrade(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
@@ -99,8 +105,7 @@ async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> R
         Err(_) => {
             route.stats.record(Outcome::LocalUnreachable);
             return Err(error_page(
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream_timeout",
+                ErrorCode::UpstreamTimeout,
                 "The local application did not respond in time.",
             ));
         }
@@ -109,7 +114,7 @@ async fn proxy(dp: &DataPlane, conn: &ConnInfo, mut req: Request<Incoming>) -> R
 
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         let Some(client_upgrade) = client_upgrade else {
-            return Err(error_page(StatusCode::BAD_GATEWAY, "bad_upstream", "Unexpected protocol switch."));
+            return Err(error_page(ErrorCode::BadUpstream, "Unexpected protocol switch."));
         };
         let upstream_upgrade = hyper::upgrade::on(&mut resp);
         let idle = dp.settings.websocket_idle_timeout;
@@ -138,14 +143,13 @@ async fn open_upstream(
 ) -> Result<StatusPrefixed<magicpipes_core::mux::MuxStream>, Response<ProxyBody>> {
     let fail = || {
         route.stats.record(Outcome::AgentOffline);
-        error_page(StatusCode::BAD_GATEWAY, "agent_unavailable", "Could not open a stream to the MagicPipes agent.")
+        error_page(ErrorCode::AgentUnavailable, "Could not open a stream to the MagicPipes agent.")
     };
     let mut stream = match session.open_data(dp.settings.stream_open_timeout, client).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             return Err(error_page(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "agent_busy",
+                ErrorCode::AgentBusy,
                 "This tunnel is handling too many connections. Try again shortly.",
             ));
         }
@@ -162,20 +166,18 @@ fn upstream_error(route: &Route, status: UpstreamStatus) -> Response<ProxyBody> 
         UpstreamStatus::LocalUnreachable => {
             route.stats.record(Outcome::LocalUnreachable);
             error_page(
-                StatusCode::BAD_GATEWAY,
-                "local_unreachable",
+                ErrorCode::LocalUnreachable,
                 "The tunnel is connected, but the local application is not accepting connections.",
             )
         }
         UpstreamStatus::UnknownTunnel => {
             route.stats.record(Outcome::AgentOffline);
-            error_page(StatusCode::BAD_GATEWAY, "tunnel_inactive", "The agent no longer serves this tunnel.")
+            error_page(ErrorCode::TunnelInactive, "The agent no longer serves this tunnel.")
         }
         _ => {
             route.stats.record(Outcome::LocalUnreachable);
             error_page(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
+                ErrorCode::UpstreamError,
                 "The local application closed the connection without a valid response.",
             )
         }
@@ -233,7 +235,7 @@ fn prepare_request(
     // Absolute-form -> origin-form.
     if req.uri().authority().is_some() {
         let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
-        *req.uri_mut() = pq.parse::<Uri>().map_err(|_| error_page(StatusCode::BAD_REQUEST, "bad_uri", "Invalid request URI."))?;
+        *req.uri_mut() = pq.parse::<Uri>().map_err(|_| error_page(ErrorCode::BadUri, "Invalid request URI."))?;
     }
     let headers = req.headers_mut();
     let upgrade_value = headers.get(header::UPGRADE).cloned();
@@ -293,7 +295,8 @@ fn clean_response_headers(headers: &mut HeaderMap, switching: bool) {
 }
 
 /// A response generated by MagicPipes (never by the application); tagged with `x-magicpipes-error`.
-pub fn error_page(status: StatusCode, code: &'static str, message: &str) -> Response<ProxyBody> {
+pub fn error_page(code: ErrorCode, message: &str) -> Response<ProxyBody> {
+    let status = StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     // Same palette and type as the management UI, kept self-contained.
     let body = format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>{status}</title><style>
@@ -310,7 +313,7 @@ code{{font:12.5px ui-monospace,"SF Mono",Menlo,monospace}}</style></head>
         .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
-        .header(ERROR_HEADER, code)
+        .header(ERROR_HEADER, code.as_str())
         .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
         .expect("static response is valid")
 }

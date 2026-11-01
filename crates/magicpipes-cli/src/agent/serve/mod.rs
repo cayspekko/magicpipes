@@ -35,6 +35,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use magicpipes_core::error::ErrorCode;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_http::services::ServeFile;
 
@@ -57,7 +58,7 @@ pub struct Site {
 
 /// Validates a directory for `--serve` and returns its canonical path.
 pub async fn check_root(dir: &Path) -> Result<PathBuf, ErrorInfo> {
-    let bad = |m: String| ErrorInfo::new("invalid_directory", m);
+    let bad = |m: String| ErrorInfo::new(ErrorCode::InvalidDirectory, m);
     let root = tokio::fs::canonicalize(dir).await.map_err(|e| bad(format!("cannot serve {}: {e}", dir.display())))?;
     let meta = tokio::fs::metadata(&root).await.map_err(|e| bad(format!("cannot serve {}: {e}", dir.display())))?;
     if !meta.is_dir() {

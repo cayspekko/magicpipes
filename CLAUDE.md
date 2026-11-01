@@ -49,6 +49,8 @@ change and say why.
 - **Wire compatibility.** Old agents talk to new servers and the reverse. New fields in
   `proto.rs` are optional (`#[serde(default)]`, skip-serializing defaults); new enum variants or
   kinds must be detected and reported as `server_outdated` or `agent_outdated`, not misbehave.
+  Before sending something an older peer can't understand, check its protocol version (the
+  `X-MagicPipes-Protocol` handshake); bump `PROTOCOL_VERSION` and say what the new version adds.
   Keep the `old_peers_still_parse` tests passing and extend them.
 - **Persistent formats are append-only.** SQLite schema changes go in a new entry at the end of
   `MIGRATIONS` in `store.rs` (never edit a shipped entry); add a test that migrates an old
@@ -57,9 +59,10 @@ change and say why.
 - **OS-specific code lives in `magicpipes-cli/src/platform.rs`** (sockets, pipes, process
   spawning, file permissions). Everything else stays portable across macOS, Linux and Windows.
 - **Stable machine interfaces.** `--json` output fields, error codes (snake_case strings such as
-  `local_unreachable`) and exit codes (`exit_code()` in the CLI `main.rs`) are an API used by
-  scripts and by `skills/magicpipes`. Add, don't rename or remove; document new codes in the
-  README and map them to an exit code.
+  `local_unreachable`) and exit codes are an API used by scripts and by `skills/magicpipes`.
+  Every code is a variant of `ErrorCode` in `magicpipes-core/src/error.rs`, with its HTTP status
+  and exit code; don't write code strings by hand. Add, don't rename or remove; document new
+  codes in the README.
 - Workspace dependencies are declared once in the root `Cargo.toml` and used with
   `.workspace = true`. Shared logic goes in `magicpipes-core` only if both binaries need it.
 
@@ -72,8 +75,11 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   `sha256_hex` digests, compare with `secret::verify` / constant-time comparison. Never log a
   token, cookie, enrollment code or shell link key, and never put one in a URL query string
   (the web terminal key lives in the `#fragment`).
-- **Isolation between agents**: every control-plane operation checks that the tunnel belongs
-  to the calling agent. Hostnames and public ports are unique and owned by one agent.
+- **One authorization function**: every access decision (API, UI, agent RPCs, public traffic)
+  goes through `authz::authorize(principal, action, resource)`; never compare owners inline.
+  Refusals look like "not found" so callers learn nothing about other agents' tunnels.
+- **Isolation between agents**: an agent manages only its own tunnels (`authorize`'s Manage
+  rule). Hostnames and public ports are unique and owned by one agent.
 - **Fail closed**: if a stored policy (allow-list, ownership, permission) cannot be read or
   parsed, deny and log. Never fall back to a default that means "anyone", such as an empty
   allow-list.

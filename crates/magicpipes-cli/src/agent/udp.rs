@@ -5,7 +5,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use magicpipes_core::mux::MuxStream;
-use magicpipes_core::proto::{self, STREAM_LOCAL_UNREACHABLE, STREAM_OK};
+use magicpipes_core::proto::{self, StreamStatus};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
@@ -14,12 +14,12 @@ pub async fn relay(mut stream: MuxStream, host: &str, port: u16, streams_ok: &At
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(%host, port, error = %e, "local UDP target unusable");
-            let _ = stream.write_all(&[STREAM_LOCAL_UNREACHABLE]).await;
+            let _ = StreamStatus::LocalUnreachable.write(&mut stream).await;
             let _ = stream.shutdown().await;
             return;
         }
     };
-    if stream.write_all(&[STREAM_OK]).await.is_err() {
+    if StreamStatus::Ok.write(&mut stream).await.is_err() {
         return;
     }
     streams_ok.fetch_add(1, Ordering::Relaxed);

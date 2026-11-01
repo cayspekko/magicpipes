@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tower::ServiceExt;
 
+use crate::authz::Principal;
 use crate::control::ControlPlane;
 use crate::forwarded::client_key;
 use crate::listen::{ListenOpts, serve};
@@ -48,6 +49,31 @@ pub struct AppState {
     pub control: Arc<ControlPlane>,
     sessions: Arc<UiSessions>,
     limiter: Arc<FailureLimiter>,
+}
+
+/// Why a presented credential was refused.
+pub enum Rejected<E> {
+    Invalid(E),
+    /// Too many failed attempts from this client.
+    RateLimited,
+}
+
+impl AppState {
+    /// The one sequence for every presented credential. A valid one is accepted even from a
+    /// rate-limited client, so nobody can lock an administrator out; an invalid one counts
+    /// against the client, which is refused once it is over the limit.
+    fn check_credential<T, E>(&self, checked: Result<T, E>, client: Option<IpAddr>) -> Result<T, Rejected<E>> {
+        match checked {
+            Ok(v) => Ok(v),
+            Err(_) if self.limiter.reject(client) => Err(Rejected::RateLimited),
+            Err(e) => Err(Rejected::Invalid(e)),
+        }
+    }
+
+    /// The principal an admin token stands for.
+    fn admin(&self, token: &str) -> Option<Principal> {
+        self.control.verify_admin(token).then_some(Principal::AdminToken)
+    }
 }
 
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -178,6 +204,7 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const SESSION_COOKIE: &str = "__Host-mp_session";
 
 struct UiSession {
+    who: Principal,
     csrf: String,
     expires: Instant,
 }
@@ -190,19 +217,19 @@ struct UiSessions {
 
 impl UiSessions {
     /// Returns `(cookie value, csrf token)`.
-    fn create(&self) -> (String, String) {
+    fn create(&self, who: Principal) -> (String, String) {
         let cookie = secret::random_string(43);
         let csrf = secret::random_string(32);
         let mut map = self.map.lock().unwrap();
         map.retain(|_, s| s.expires > Instant::now());
-        map.insert(secret::sha256_hex(&cookie), UiSession { csrf: csrf.clone(), expires: Instant::now() + SESSION_TTL });
+        map.insert(secret::sha256_hex(&cookie), UiSession { who, csrf: csrf.clone(), expires: Instant::now() + SESSION_TTL });
         (cookie, csrf)
     }
 
-    /// Returns the CSRF token for a valid session cookie.
-    fn csrf_for(&self, cookie: &str) -> Option<String> {
+    /// Returns who is logged in and the CSRF token, for a valid session cookie.
+    fn get(&self, cookie: &str) -> Option<(Principal, String)> {
         let map = self.map.lock().unwrap();
-        map.get(&secret::sha256_hex(cookie)).filter(|s| s.expires > Instant::now()).map(|s| s.csrf.clone())
+        map.get(&secret::sha256_hex(cookie)).filter(|s| s.expires > Instant::now()).map(|s| (s.who.clone(), s.csrf.clone()))
     }
 
     fn remove(&self, cookie: &str) {

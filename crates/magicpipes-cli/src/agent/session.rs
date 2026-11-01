@@ -9,8 +9,12 @@ use bytes::Bytes;
 use http::{Request, StatusCode, header};
 use http_body_util::Full;
 use hyper_util::rt::TokioIo;
+use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::{self, Mode, MuxHandle, MuxStream};
-use magicpipes_core::proto::{self, AGENT_CONNECT_PATH, RegisterTunnel, Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL};
+use magicpipes_core::proto::{
+    self, AGENT_CONNECT_PATH, PROTOCOL_HEADER, PROTOCOL_VERSION, RegisterTunnel, Request as Rpc, Response as RpcResponse,
+    UPGRADE_PROTOCOL,
+};
 use rustls::ClientConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
@@ -28,7 +32,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 pub enum ConnState {
     Connecting { attempt: u32, last_error: Option<String> },
-    Connected { handle: MuxHandle, since: i64 },
+    /// `server_protocol`: the server's protocol version (`proto::PROTOCOL_VERSION`).
+    Connected { handle: MuxHandle, since: i64, server_protocol: u32 },
     /// The server rejected our credentials; retried slowly in case of a transient server issue.
     Unauthorized(String),
 }
@@ -81,9 +86,9 @@ impl Session {
                 r = self.connect() => r,
             };
             match result {
-                Ok((handle, inbound)) => {
+                Ok((handle, inbound, server_protocol)) => {
                     attempt = 0;
-                    self.serve(handle, inbound, &shutdown).await;
+                    self.serve(handle, inbound, server_protocol, &shutdown).await;
                     if shutdown.is_cancelled() {
                         return;
                     }
@@ -115,7 +120,7 @@ impl Session {
         }
     }
 
-    async fn connect(&self) -> Result<(MuxHandle, mpsc::Receiver<MuxStream>), ConnectError> {
+    async fn connect(&self) -> Result<(MuxHandle, mpsc::Receiver<MuxStream>, u32), ConnectError> {
         let (host, port) = https::parse_server(&self.cfg.server)?;
         let stream = https::connect(&host, port, &self.tls, None).await?;
         let req = Request::get(AGENT_CONNECT_PATH)
@@ -123,6 +128,7 @@ impl Session {
             .header(header::AUTHORIZATION, format!("Bearer {}", self.cfg.agent_token))
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, UPGRADE_PROTOCOL)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
             .header(header::USER_AGENT, concat!("magicpipes/", env!("CARGO_PKG_VERSION")))
             .body(Full::new(Bytes::new()))
             .map_err(|e| ConnectError::Other(e.into()))?;
@@ -136,13 +142,22 @@ impl Session {
             }
             s => return Err(ConnectError::Other(anyhow!("unexpected response from server: {s}"))),
         }
+        let server_protocol = proto::peer_protocol(resp.headers().get(PROTOCOL_HEADER).and_then(|v| v.to_str().ok()));
         let upgraded = hyper::upgrade::on(resp).await.map_err(|e| ConnectError::Other(e.into()))?;
-        Ok(mux::spawn(TokioIo::new(upgraded), Mode::Client))
+        let (handle, inbound) = mux::spawn(TokioIo::new(upgraded), Mode::Client);
+        Ok((handle, inbound, server_protocol))
     }
 
-    async fn serve(self: &Arc<Self>, handle: MuxHandle, inbound: mpsc::Receiver<MuxStream>, shutdown: &CancellationToken) {
-        tracing::info!(server = %self.cfg.server, "connected to server");
-        self.state.send_replace(ConnState::Connected { handle: handle.clone(), since: magicpipes_core::unix_now() });
+    async fn serve(
+        self: &Arc<Self>,
+        handle: MuxHandle,
+        inbound: mpsc::Receiver<MuxStream>,
+        server_protocol: u32,
+        shutdown: &CancellationToken,
+    ) {
+        tracing::info!(server = %self.cfg.server, server_protocol, "connected to server");
+        let since = magicpipes_core::unix_now();
+        self.state.send_replace(ConnState::Connected { handle: handle.clone(), since, server_protocol });
         let fwd = tokio::spawn(forward::serve(inbound, self.tunnels.clone()));
         let me = self.clone();
         let restore = tokio::spawn(async move { me.restore().await });
@@ -203,7 +218,7 @@ impl Session {
                     };
                     self.tunnels.upsert(updated, Registration::Registered);
                 }
-                Err(RpcError::Server(e)) if e.code == "not_found" => {
+                Err(RpcError::Server(e)) if e.is(ErrorCode::NotFound) => {
                     tracing::warn!(tunnel = %t.name, "tunnel no longer exists on the server; removing it locally");
                     self.tunnels.remove(&t.id);
                 }

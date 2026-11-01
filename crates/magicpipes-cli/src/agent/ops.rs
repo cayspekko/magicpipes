@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use magicpipes_core::cidr;
+use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::{CertState, Kind, RegisterTunnel, Request as Rpc, Response as RpcResponse, TunnelInfo};
 use rustls::ClientConfig;
 use serde_json::{Value, json};
@@ -93,7 +94,7 @@ impl Agent {
         ev.step(Step::Connect, StepState::Running).await;
         if let Err(msg) = self.session.wait_connected(remaining().min(Duration::from_secs(20))).await {
             ev.step(Step::Connect, StepState::Failed).await;
-            let code = if matches!(self.session.state(), ConnState::Unauthorized(_)) { "unauthorized" } else { "server_unreachable" };
+            let code = if matches!(self.session.state(), ConnState::Unauthorized(_)) { ErrorCode::Unauthorized } else { ErrorCode::ServerUnreachable };
             return Err(ErrorInfo::new(code, msg).at(Step::Connect));
         }
         ev.step(Step::Connect, StepState::Done).await;
@@ -157,7 +158,7 @@ impl Agent {
     async fn register(&self, req: &AddRequest, mut target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
         let _lock = self.register_lock.lock().await;
         let name = match &req.name {
-            Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new("invalid_name", m))?),
+            Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new(ErrorCode::InvalidName, m))?),
             None => None,
         };
         let existing = match &name {
@@ -168,7 +169,7 @@ impl Agent {
             && (t.kind != req.kind || !t.target.same_destination(&target))
         {
             return Err(ErrorInfo::new(
-                "name_conflict",
+                ErrorCode::NameConflict,
                 format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.describe()),
             ));
         }
@@ -182,7 +183,7 @@ impl Agent {
         }
         // Settings follow the latest `add`: re-adding without --allow-cidr opens the port to anyone.
         let allow: Vec<String> = cidr::parse_list(&req.allow)
-            .map_err(|m| ErrorInfo::new("invalid_cidr", m))?
+            .map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -197,16 +198,16 @@ impl Agent {
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
                 Ok(RpcResponse::Tunnel(info)) => break info,
-                Err(RpcError::Server(e)) if e.code == "not_found" && rpc_req.id.is_some() => {
+                Err(RpcError::Server(e)) if e.is(ErrorCode::NotFound) && rpc_req.id.is_some() => {
                     // Deleted on the server while we still had it: forget it and register anew.
                     if let Some(id) = rpc_req.id.take() {
                         self.tunnels.remove(&id);
                     }
                     rpc_req.name = name.clone();
                 }
-                Err(RpcError::Server(e)) => return Err(ErrorInfo::new(&e.code, e.message)),
-                Err(e) => return Err(ErrorInfo::new("server_unreachable", e.to_string())),
-                Ok(other) => return Err(ErrorInfo::new("protocol", format!("unexpected response {other:?}"))),
+                Err(RpcError::Server(e)) => return Err(ErrorInfo::wire(&e.code, e.message)),
+                Err(e) => return Err(ErrorInfo::new(ErrorCode::ServerUnreachable, e.to_string())),
+                Ok(other) => return Err(ErrorInfo::new(ErrorCode::Protocol, format!("unexpected response {other:?}"))),
             }
         };
         if info.kind != req.kind {
@@ -215,7 +216,7 @@ impl Agent {
                 let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
             }
             return Err(ErrorInfo::new(
-                "server_outdated",
+                ErrorCode::ServerOutdated,
                 format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind),
             ));
         }
@@ -246,13 +247,13 @@ impl Agent {
                 Ok(RpcResponse::Cert(CertState::Ready)) => break,
                 Ok(RpcResponse::Cert(CertState::Failed { message })) => {
                     ev.step(Step::Tls, StepState::Failed).await;
-                    return Err(ErrorInfo::new("tls_failed", format!("certificate provisioning failed.\n{message}")).at(Step::Tls));
+                    return Err(ErrorInfo::new(ErrorCode::TlsFailed, format!("certificate provisioning failed.\n{message}")).at(Step::Tls));
                 }
                 Ok(RpcResponse::Cert(CertState::Pending)) if !remaining().is_zero() => continue,
                 Ok(RpcResponse::Cert(CertState::Pending)) => {
                     ev.step(Step::Tls, StepState::Failed).await;
                     return Err(ErrorInfo::new(
-                        "tls_timeout",
+                        ErrorCode::TlsTimeout,
                         format!(
                             "the certificate for {} is still being issued after {}s. The server keeps trying; run the command again shortly",
                             t.hostname, req.timeout_secs
@@ -260,14 +261,14 @@ impl Agent {
                     )
                     .at(Step::Tls));
                 }
-                Ok(other) => return Err(ErrorInfo::new("protocol", format!("unexpected response {other:?}")).at(Step::Tls)),
+                Ok(other) => return Err(ErrorInfo::new(ErrorCode::Protocol, format!("unexpected response {other:?}")).at(Step::Tls)),
                 Err(e) => {
                     ev.step(Step::Tls, StepState::Failed).await;
                     let code = match &e {
                         RpcError::Server(b) => b.code.clone(),
-                        RpcError::Unavailable(_) => "server_unreachable".into(),
+                        RpcError::Unavailable(_) => ErrorCode::ServerUnreachable.to_string(),
                     };
-                    return Err(ErrorInfo::new(&code, e.to_string()).at(Step::Tls));
+                    return Err(ErrorInfo::wire(&code, e.to_string()).at(Step::Tls));
                 }
             }
         }
@@ -285,7 +286,7 @@ impl Agent {
             };
             if remaining() < Duration::from_millis(500) {
                 ev.step(Step::Probe, StepState::Failed).await;
-                return Err(ErrorInfo::new("probe_failed", format!("public endpoint verification failed: {last}")).at(Step::Probe));
+                return Err(ErrorInfo::new(ErrorCode::ProbeFailed, format!("public endpoint verification failed: {last}")).at(Step::Probe));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -303,11 +304,11 @@ impl Agent {
             Err(e) => {
                 ev.step(Step::Check, StepState::Failed).await;
                 let err = match e {
-                    RpcError::Server(b) if b.code == "local_unreachable" => {
-                        ErrorInfo::new("local_unreachable", format!("the server reached this agent, but {} refused the connection", t.describe()))
+                    RpcError::Server(b) if b.is(ErrorCode::LocalUnreachable) => {
+                        ErrorInfo::new(ErrorCode::LocalUnreachable, format!("the server reached this agent, but {} refused the connection", t.describe()))
                     }
-                    RpcError::Server(b) => ErrorInfo::new(&b.code, b.message),
-                    RpcError::Unavailable(m) => ErrorInfo::new("server_unreachable", m),
+                    RpcError::Server(b) => ErrorInfo::wire(&b.code, b.message),
+                    RpcError::Unavailable(m) => ErrorInfo::new(ErrorCode::ServerUnreachable, m),
                 };
                 return Err(err.at(Step::Check));
             }
@@ -336,14 +337,14 @@ impl Agent {
             .filter(|t| t.name == selector || t.id == selector || matches!(&t.target, Target::Port { port: p, .. } if port == Some(*p)))
             .collect();
         let t = match matches.as_slice() {
-            [] => return Err(ErrorInfo::new("not_found", format!("no tunnel named '{selector}'"))),
+            [] => return Err(ErrorInfo::new(ErrorCode::NotFound, format!("no tunnel named '{selector}'"))),
             [t] => t.clone(),
             many => match many.iter().find(|t| t.name == selector || t.id == selector) {
                 Some(t) => t.clone(),
                 None => {
                     let names: Vec<&str> = many.iter().map(|t| t.name.as_str()).collect();
                     return Err(ErrorInfo::new(
-                        "name_conflict",
+                        ErrorCode::NameConflict,
                         format!("several tunnels use port {selector} ({}); give the tunnel's name", names.join(", ")),
                     ));
                 }
@@ -356,7 +357,7 @@ impl Agent {
             Ok(_) => {}
             Err(e) if !force => {
                 return Err(ErrorInfo::new(
-                    "server_unreachable",
+                    ErrorCode::ServerUnreachable,
                     format!("could not unregister '{}' on the server: {e}. Use --force to remove it locally only", t.name),
                 ));
             }
@@ -407,10 +408,10 @@ impl Agent {
 
     pub fn status(&self) -> Value {
         let (conn, err) = self.connection();
-        let (connected_since, reconnect_attempt) = match self.session.state() {
-            ConnState::Connected { since, .. } => (Some(magicpipes_core::rfc3339(since)), None),
-            ConnState::Connecting { attempt, .. } => (None, Some(attempt)),
-            ConnState::Unauthorized(_) => (None, None),
+        let (connected_since, reconnect_attempt, server_protocol) = match self.session.state() {
+            ConnState::Connected { since, server_protocol, .. } => (Some(magicpipes_core::rfc3339(since)), None, Some(server_protocol)),
+            ConnState::Connecting { attempt, .. } => (None, Some(attempt), None),
+            ConnState::Unauthorized(_) => (None, None, None),
         };
         json!({
             "agent": {
@@ -423,6 +424,7 @@ impl Agent {
             "connection": conn,
             "connected_since": connected_since,
             "reconnect_attempt": reconnect_attempt,
+            "server_protocol": server_protocol,
             "last_error": err,
             "tunnels": self.tunnels.len(),
         })
@@ -431,7 +433,7 @@ impl Agent {
     pub fn shutdown(&self, if_idle: bool) -> Result<Value, ErrorInfo> {
         // The request asking for shutdown is not itself counted as in-flight work.
         if if_idle && (self.tunnels.len() > 0 || self.inflight.load(Ordering::SeqCst) > 0) {
-            return Err(ErrorInfo::new("busy", "agent has active tunnels or operations"));
+            return Err(ErrorInfo::new(ErrorCode::Busy, "agent has active tunnels or operations"));
         }
         self.shutdown.cancel();
         Ok(json!({ "stopping": true }))
@@ -442,19 +444,19 @@ impl Agent {
 /// run in a web terminal.
 async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
     if let Some(command) = &req.shell {
-        let cwd = req.cwd.clone().ok_or_else(|| ErrorInfo::new("invalid_request", "--shell needs a working directory"))?;
+        let cwd = req.cwd.clone().ok_or_else(|| ErrorInfo::new(ErrorCode::InvalidRequest, "--shell needs a working directory"))?;
         shell::check(command, &cwd)?;
         let max_clients = req.max_clients.unwrap_or(shell::DEFAULT_MAX_CLIENTS);
         if max_clients == 0 {
-            return Err(ErrorInfo::new("invalid_request", "--max-clients must be at least 1"));
+            return Err(ErrorInfo::new(ErrorCode::InvalidRequest, "--max-clients must be at least 1"));
         }
         // The key is assigned at registration (kept from an existing tunnel when re-added).
         return Ok(Target::Shell { shell: command.clone(), cwd, writable: req.writable, key: None, max_clients });
     }
     if !req.kind.is_http() && (req.serve.is_some() || req.port.is_none()) {
-        return Err(ErrorInfo::new("invalid_request", format!("--{} needs a local port", req.kind)));
+        return Err(ErrorInfo::new(ErrorCode::InvalidRequest, format!("--{} needs a local port", req.kind)));
     }
-    cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new("invalid_cidr", m))?;
+    cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?;
     match (&req.serve, req.port) {
         (Some(dir), _) => Ok(Target::Static { serve: serve::check_root(dir).await?, list: req.list }),
         // A UDP service cannot be probed: anything may or may not answer a datagram.
@@ -462,18 +464,18 @@ async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
             let host = req.host.clone().unwrap_or_else(|| "127.0.0.1".into());
             check_host(&host)?;
             if port == 0 {
-                return Err(ErrorInfo::new("invalid_port", "port must be between 1 and 65535"));
+                return Err(ErrorInfo::new(ErrorCode::InvalidPort, "port must be between 1 and 65535"));
             }
             Ok(Target::Port { host, port })
         }
         (None, Some(port)) => Ok(Target::Port { host: resolve_local(req.host.as_deref(), port, req.kind).await?, port }),
-        (None, None) => Err(ErrorInfo::new("invalid_request", "give a local port, --serve <dir> or --shell")),
+        (None, None) => Err(ErrorInfo::new(ErrorCode::InvalidRequest, "give a local port, --serve <dir> or --shell")),
     }
 }
 
 fn check_host(h: &str) -> Result<(), ErrorInfo> {
     if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b)) {
-        return Err(ErrorInfo::new("invalid_host", format!("invalid host '{h}'")));
+        return Err(ErrorInfo::new(ErrorCode::InvalidHost, format!("invalid host '{h}'")));
     }
     Ok(())
 }
@@ -481,7 +483,7 @@ fn check_host(h: &str) -> Result<(), ErrorInfo> {
 /// Finds where the local application listens: the given host, or 127.0.0.1 then ::1.
 async fn resolve_local(host: Option<&str>, port: u16, kind: Kind) -> Result<String, ErrorInfo> {
     if port == 0 {
-        return Err(ErrorInfo::new("invalid_port", "port must be between 1 and 65535"));
+        return Err(ErrorInfo::new(ErrorCode::InvalidPort, "port must be between 1 and 65535"));
     }
     let candidates: Vec<&str> = match host {
         Some(h) => {
@@ -496,7 +498,7 @@ async fn resolve_local(host: Option<&str>, port: u16, kind: Kind) -> Result<Stri
         }
     }
     Err(ErrorInfo::new(
-        "local_unreachable",
+        ErrorCode::LocalUnreachable,
         format!(
             "nothing is accepting connections on {}. Start your application first",
             if kind.is_http() { target_url(candidates[0], port) } else { address(kind.as_str(), candidates[0], port) }

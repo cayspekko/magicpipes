@@ -38,6 +38,7 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use magicpipes_core::error::ErrorCode;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
@@ -55,13 +56,13 @@ pub const DEFAULT_MAX_CLIENTS: u16 = 5;
 /// and the program can be found (on the agent's `PATH`, as it will be run).
 pub fn check(command: &[String], cwd: &Path) -> Result<(), ErrorInfo> {
     let Some(program) = command.first().filter(|p| !p.is_empty()) else {
-        return Err(ErrorInfo::new("invalid_command", "no program given"));
+        return Err(ErrorInfo::new(ErrorCode::InvalidCommand, "no program given"));
     };
     if !cwd.is_dir() {
-        return Err(ErrorInfo::new("invalid_command", format!("working directory {} does not exist", cwd.display())));
+        return Err(ErrorInfo::new(ErrorCode::InvalidCommand, format!("working directory {} does not exist", cwd.display())));
     }
     if find_program(program, cwd).is_none() {
-        return Err(ErrorInfo::new("invalid_command", format!("program '{program}' was not found on the PATH")));
+        return Err(ErrorInfo::new(ErrorCode::InvalidCommand, format!("program '{program}' was not found on the PATH")));
     }
     Ok(())
 }

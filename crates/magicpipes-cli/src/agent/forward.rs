@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use magicpipes_core::mux::MuxStream;
-use magicpipes_core::proto::{self, Kind, STREAM_LOCAL_UNREACHABLE, STREAM_OK, STREAM_UNKNOWN_TUNNEL, ServerOpen};
+use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -30,9 +30,19 @@ pub async fn serve(mut inbound: mpsc::Receiver<MuxStream>, tunnels: Arc<Tunnels>
 }
 
 async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
-    let open: ServerOpen = match tokio::time::timeout(HEADER_TIMEOUT, proto::read_frame(&mut stream)).await {
-        Ok(Ok(o)) => o,
+    let open = match tokio::time::timeout(HEADER_TIMEOUT, proto::read_frame_bytes(&mut stream)).await {
+        Ok(Ok(body)) => serde_json::from_slice::<ServerOpen>(&body),
         _ => return,
+    };
+    let open = match open {
+        Ok(o) => o,
+        Err(e) => {
+            // A newer server's stream type: say so, rather than leaving the server to time out.
+            tracing::debug!(error = %e, "unsupported server-opened stream");
+            let _ = StreamStatus::Unsupported.write(&mut stream).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
     };
     match open {
         ServerOpen::TunnelRemoved { tunnel_id } => {
@@ -46,21 +56,21 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 udp::relay(stream, &host, port, &streams_ok).await;
             }
             _ => {
-                let _ = stream.write_all(&[STREAM_UNKNOWN_TUNNEL]).await;
+                let _ = StreamStatus::UnknownTunnel.write(&mut stream).await;
                 let _ = stream.shutdown().await;
             }
         },
         ServerOpen::Data { tunnel_id, peer } => {
             let route = tunnels.route(&tunnel_id).filter(|r| r.kind != Kind::Udp);
             let Some(Route { target, streams_ok: counter, ended, sessions, .. }) = route else {
-                let _ = stream.write_all(&[STREAM_UNKNOWN_TUNNEL]).await;
+                let _ = StreamStatus::UnknownTunnel.write(&mut stream).await;
                 let _ = stream.shutdown().await;
                 return;
             };
             let (host, port) = match target {
                 Target::Port { host, port } => (host, port),
                 Target::Static { serve: root, list } => {
-                    if stream.write_all(&[STREAM_OK]).await.is_err() {
+                    if StreamStatus::Ok.write(&mut stream).await.is_err() {
                         return;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -68,7 +78,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                     return;
                 }
                 Target::Shell { shell: command, cwd, writable, key, max_clients } => {
-                    if stream.write_all(&[STREAM_OK]).await.is_err() {
+                    if StreamStatus::Ok.write(&mut stream).await.is_err() {
                         return;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -82,12 +92,12 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::debug!(%host, port, error = %e, "local target unreachable");
-                    let _ = stream.write_all(&[STREAM_LOCAL_UNREACHABLE]).await;
+                    let _ = StreamStatus::LocalUnreachable.write(&mut stream).await;
                     let _ = stream.shutdown().await;
                     return;
                 }
                 Err(_) => {
-                    let _ = stream.write_all(&[STREAM_LOCAL_UNREACHABLE]).await;
+                    let _ = StreamStatus::LocalUnreachable.write(&mut stream).await;
                     let _ = stream.shutdown().await;
                     return;
                 }
@@ -96,7 +106,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
             if let Some(peer) = peer {
                 tracing::debug!(%host, port, %peer, "TCP client");
             }
-            if stream.write_all(&[STREAM_OK]).await.is_err() {
+            if StreamStatus::Ok.write(&mut stream).await.is_err() {
                 return;
             }
             counter.fetch_add(1, Ordering::Relaxed);
@@ -104,5 +114,32 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 tracing::debug!(error = %e, "data stream ended");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use magicpipes_core::mux::{self, Mode};
+    use serde_json::json;
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    /// The status byte the agent answers a server-opened stream with.
+    async fn status_for(header: serde_json::Value) -> u8 {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (server, _rpcs) = mux::spawn(a, Mode::Server);
+        let (_agent, inbound) = mux::spawn(b, Mode::Client);
+        tokio::spawn(serve(inbound, Arc::new(Tunnels::default())));
+        let mut s = server.open(Duration::from_secs(5)).await.unwrap();
+        proto::write_frame(&mut s, &header).await.unwrap();
+        s.read_u8().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn unknown_streams_are_answered() {
+        // A newer server's stream type gets an answer instead of a timeout.
+        assert_eq!(status_for(json!({ "kind": "from_the_future" })).await, StreamStatus::Unsupported.byte());
+        assert_eq!(status_for(json!({ "kind": "data", "tunnel_id": "tn_unknown" })).await, StreamStatus::UnknownTunnel.byte());
     }
 }

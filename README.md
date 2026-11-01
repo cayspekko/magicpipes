@@ -424,10 +424,14 @@ On failure:
 | 0 | | Success (for `add`: verified ready) |
 | 1 | `internal`, ... | Unexpected error |
 | 2 | | Invalid command-line usage |
-| 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token` | Enrollment or credentials |
-| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
-| 5 | `server_unreachable`, `agent_start_failed`, `agent_not_running`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
-| 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `invalid_cidr` | Naming/registry, or the server cannot give out that port |
+| 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error` | Enrollment, credentials or local configuration |
+| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
+| 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
+| 6 | `name_conflict`, `name_taken`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
+
+`name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:
+another machine's agent owns it. Codes are listed in `crates/magicpipes-core/src/error.rs`; new
+ones may appear in later versions, so treat an unknown code like `internal`.
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
 | 8 | `probe_failed` | Public URL did not reach the application |
 
@@ -472,6 +476,9 @@ All endpoints except `enroll` and the agent endpoint require `Authorization: Bea
 | POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}` |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
+
+Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
+agent's protocol version), `last_seen_at`, `tunnels`, `created_at`.
 
 Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `status`
 (`connected` / `disconnected` / `error` = local app unreachable on the last request), `tls`

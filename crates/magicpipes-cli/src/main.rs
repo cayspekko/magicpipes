@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::Kind;
 use serde_json::{Value, json};
 
@@ -169,19 +170,6 @@ enum AgentCommand {
 }
 
 /// Exit codes (documented in the README).
-fn exit_code(code: &str) -> u8 {
-    match code {
-        "not_logged_in" | "unauthorized" | "invalid_enrollment_token" | "config_error" => 3,
-        "local_unreachable" | "invalid_port" | "invalid_host" | "invalid_directory" | "invalid_command" => 4,
-        "server_unreachable" | "agent_unavailable" | "agent_start_failed" | "agent_not_running" | "agent_protocol" | "agent_outdated" => 5,
-        "name_conflict" | "name_taken" | "invalid_name" | "limit_reached" | "not_found" | "port_unavailable" | "kind_mismatch"
-        | "ports_disabled" | "server_outdated" | "invalid_cidr" => 6,
-        "tls_failed" | "tls_timeout" => 7,
-        "probe_failed" => 8,
-        _ => 1,
-    }
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     check_add_args(&cli.command);
@@ -317,7 +305,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
             if !out.json || !out.quiet {
                 eprintln!("\nError: {}", e.message);
             }
-            ExitCode::from(exit_code(&e.code))
+            ExitCode::from(magicpipes_core::error::exit_code(&e.code))
         }
     }
 }
@@ -339,37 +327,37 @@ fn login_shell() -> Vec<String> {
 
 async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, name: Option<String>, out: Output) -> Result<(), ErrorInfo> {
     let server = server.trim().trim_end_matches('/').to_string();
-    https::parse_server(&server).map_err(|e| ErrorInfo::new("invalid_server", e.to_string()))?;
+    https::parse_server(&server).map_err(|e| ErrorInfo::new(ErrorCode::InvalidServer, e.to_string()))?;
     let token = match token {
         Some(t) => t,
         None => {
             if !std::io::stdin().is_terminal() {
-                return Err(ErrorInfo::new("invalid_enrollment_token", "pass --token or set MAGICPIPES_TOKEN"));
+                return Err(ErrorInfo::new(ErrorCode::InvalidEnrollmentToken, "pass --token or set MAGICPIPES_TOKEN"));
             }
             eprint!("Enrollment token: ");
             let _ = std::io::stderr().flush();
             let mut line = String::new();
-            std::io::stdin().read_line(&mut line).map_err(|e| ErrorInfo::new("config_error", e.to_string()))?;
+            std::io::stdin().read_line(&mut line).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, e.to_string()))?;
             line
         }
     };
     let ca_pem = match &ca_cert {
-        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| ErrorInfo::new("config_error", format!("reading {}: {e}", p.display())))?),
+        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("reading {}: {e}", p.display())))?),
         None => None,
     };
-    let tls = https::tls_config(ca_pem.as_deref()).map_err(|e| ErrorInfo::new("config_error", format!("{e:#}")))?;
+    let tls = https::tls_config(ca_pem.as_deref()).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     let agent_name = name.unwrap_or_else(platform::hostname);
     let body = json!({ "enrollment_token": token.trim(), "agent_name": agent_name });
     let (status, resp) = https::post_json(&server, "/api/v1/enroll", &tls, &body)
         .await
-        .map_err(|e| ErrorInfo::new("server_unreachable", format!("{e:#}")))?;
+        .map_err(|e| ErrorInfo::new(ErrorCode::ServerUnreachable, format!("{e:#}")))?;
     if !status.is_success() {
         let msg = resp["error"]["message"].as_str().unwrap_or("enrollment failed").to_string();
-        let code = resp["error"]["code"].as_str().unwrap_or("invalid_enrollment_token");
-        return Err(ErrorInfo::new(code, msg));
+        let code = resp["error"]["code"].as_str().unwrap_or(ErrorCode::InvalidEnrollmentToken.as_str());
+        return Err(ErrorInfo::wire(code, msg));
     }
     let enrolled: magicpipes_core::proto::EnrollResponse =
-        serde_json::from_value(resp).map_err(|e| ErrorInfo::new("protocol", e.to_string()))?;
+        serde_json::from_value(resp).map_err(|e| ErrorInfo::new(ErrorCode::Protocol, e.to_string()))?;
     // A running agent still uses the previous identity: stop it; the next command restarts it.
     let was_running = client::connect().await.is_some();
     if was_running {
@@ -383,7 +371,7 @@ async fn login(server: String, token: Option<String>, ca_cert: Option<PathBuf>, 
         base_domain: enrolled.base_domain.clone(),
         ca_cert_pem: ca_pem,
     };
-    cfg.save().map_err(|e| ErrorInfo::new("config_error", format!("{e:#}")))?;
+    cfg.save().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     if out.json {
         print_json(&json!({ "server": server, "agent_id": enrolled.agent_id, "base_domain": enrolled.base_domain }));
     } else {
@@ -437,12 +425,12 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
     // The agent runs elsewhere (another working directory), so it needs an absolute path.
     if let Some(dir) = &req.serve {
         let abs = std::fs::canonicalize(dir)
-            .map_err(|e| ErrorInfo::new("invalid_directory", format!("cannot serve {}: {e}", dir.display())))?;
+            .map_err(|e| ErrorInfo::new(ErrorCode::InvalidDirectory, format!("cannot serve {}: {e}", dir.display())))?;
         req.serve = Some(abs);
     }
     if req.shell.is_some() {
         let cwd = std::env::current_dir().and_then(std::fs::canonicalize);
-        req.cwd = Some(cwd.map_err(|e| ErrorInfo::new("invalid_command", format!("cannot use the current directory: {e}")))?);
+        req.cwd = Some(cwd.map_err(|e| ErrorInfo::new(ErrorCode::InvalidCommand, format!("cannot use the current directory: {e}")))?);
     }
     let kind = req.kind;
     let open_to_anyone = req.allow.is_empty();
@@ -535,7 +523,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
 async fn list(out: Output) -> Result<(), ErrorInfo> {
     let data = match client::request(&IpcRequest::List, |_, _| {}).await {
         Ok(d) => d,
-        Err(e) if e.code == "agent_not_running" => {
+        Err(e) if e.is(ErrorCode::AgentNotRunning) => {
             let tunnels: Vec<Value> = state::load_tunnels()
                 .unwrap_or_default()
                 .into_iter()
@@ -579,7 +567,7 @@ async fn status(out: Output) -> Result<(), ErrorInfo> {
     let cfg = AgentConfig::load().ok().flatten();
     let agent = match client::request(&IpcRequest::Status, |_, _| {}).await {
         Ok(d) => Some(d),
-        Err(e) if e.code == "agent_not_running" => None,
+        Err(e) if e.is(ErrorCode::AgentNotRunning) => None,
         Err(e) => return Err(e),
     };
     let data = json!({
@@ -589,6 +577,7 @@ async fn status(out: Output) -> Result<(), ErrorInfo> {
         "agent": agent.as_ref().map(|a| a["agent"].clone()).unwrap_or(json!({ "running": false })),
         "connection": agent.as_ref().map(|a| a["connection"].clone()).unwrap_or(json!("stopped")),
         "last_error": agent.as_ref().map(|a| a["last_error"].clone()).unwrap_or(Value::Null),
+        "server_protocol": agent.as_ref().map(|a| a["server_protocol"].clone()).unwrap_or(Value::Null),
         "tunnels": agent.as_ref().map(|a| a["tunnels"].clone()).unwrap_or(json!(state::load_tunnels().map(|t| t.len()).unwrap_or(0))),
     });
     if out.json {
@@ -647,7 +636,7 @@ async fn agent_stop(out: Output) -> Result<(), ErrorInfo> {
     if running {
         client::request(&IpcRequest::Shutdown { if_idle: false }, |_, _| {}).await?;
         if !client::wait_stopped(Duration::from_secs(10)).await {
-            return Err(ErrorInfo::new("agent_unavailable", "agent did not stop within 10s"));
+            return Err(ErrorInfo::new(ErrorCode::AgentUnavailable, "agent did not stop within 10s"));
         }
     }
     if out.json {

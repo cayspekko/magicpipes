@@ -16,16 +16,18 @@ mod ports;
 mod proxy;
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use magicpipes_core::cidr::Cidr;
+use magicpipes_core::cidr::{self, Cidr};
 use magicpipes_core::mux::MuxHandle;
 use magicpipes_core::proto::Kind;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::authz::{self, Action, Principal, Resource, TunnelAuthz};
 use crate::config::Config;
 use crate::forwarded::TrustedProxies;
 pub use ports::PortSettings;
@@ -37,8 +39,23 @@ pub struct Route {
     /// `None` while the owning agent is disconnected.
     pub session: Option<MuxHandle>,
     pub stats: Arc<RouteStats>,
-    /// Port tunnels: client networks allowed to connect (empty = anyone).
+    pub access: AccessPolicy,
+}
+
+/// Who may use a route: the client's network first, then [`authz::authorize`]. The one check
+/// for HTTP requests, TCP connections and UDP flows.
+#[derive(Debug)]
+pub struct AccessPolicy {
+    /// Client networks allowed to connect (empty = anyone). Port tunnels only, for now.
     pub allow: Vec<Cidr>,
+    pub authz: TunnelAuthz,
+}
+
+impl AccessPolicy {
+    /// Whether `who`, connecting from `ip`, may reach the tunnel.
+    pub fn admits(&self, who: &Principal, ip: IpAddr) -> bool {
+        cidr::allowed(&self.allow, ip) && authz::authorize(who, Action::Connect, Resource::Tunnel(&self.authz))
+    }
 }
 
 /// Counters written by the data plane and read by the control plane for status display.

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use magicpipes_core::proto::{STREAM_LOCAL_UNREACHABLE, STREAM_OK, STREAM_UNKNOWN_TUNNEL};
+use magicpipes_core::proto::StreamStatus;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Error surfaced when the agent reports that it could not serve a data stream.
@@ -71,13 +71,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatusPrefixed<S> {
             std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
             let status = match rb.filled() {
                 [] => UpstreamStatus::Closed,
-                [STREAM_OK] => {
-                    self.open = true;
-                    return Pin::new(&mut self.inner).poll_read(cx, buf);
-                }
-                [STREAM_LOCAL_UNREACHABLE] => UpstreamStatus::LocalUnreachable,
-                [STREAM_UNKNOWN_TUNNEL] => UpstreamStatus::UnknownTunnel,
-                [c, ..] => UpstreamStatus::Other(*c),
+                [c, ..] => match StreamStatus::from_byte(*c) {
+                    Some(StreamStatus::Ok) => {
+                        self.open = true;
+                        return Pin::new(&mut self.inner).poll_read(cx, buf);
+                    }
+                    Some(StreamStatus::LocalUnreachable) => UpstreamStatus::LocalUnreachable,
+                    Some(StreamStatus::UnknownTunnel) => UpstreamStatus::UnknownTunnel,
+                    Some(StreamStatus::Unsupported) | None => UpstreamStatus::Other(*c),
+                },
             };
             return Poll::Ready(Err(io::Error::other(status)));
         }

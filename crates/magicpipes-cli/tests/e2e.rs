@@ -128,6 +128,9 @@ async fn http_websocket_and_lifecycle() {
     let (s, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
     assert_eq!(s, 200);
     assert_eq!(v["agents"][0]["connected"], true);
+    // Both sides announced their protocol version on connect.
+    assert_eq!(v["agents"][0]["protocol"], magicpipes_core::proto::PROTOCOL_VERSION);
+    assert_eq!(env.cli_json(&["status", "--json"]).await["server_protocol"], magicpipes_core::proto::PROTOCOL_VERSION);
     assert_eq!(env.api("GET", "/api/v1/tunnels", None).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(env.api("GET", "/api/v1/tunnels", Some("mpadm_wrong")).await.0, StatusCode::UNAUTHORIZED);
 

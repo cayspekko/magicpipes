@@ -237,6 +237,8 @@ secret link until then):
 - an audit log of who opened which session and when; optional terminal session recording
   (asciinema format).
 
+The design, with tag-based access in place of per-user grants, is in [USERS.md](USERS.md).
+
 ## Compatibility
 
 - New protocol fields default so old agents keep working (missing `kind` = `http`).
@@ -256,7 +258,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | `kind` done (with phase 3); Unix sockets planned |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
-| 4 | Users, web login, grants, audit log | yes | planned |
+| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork done) |
 | 5 | SSH gateway + SSH web terminal | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | done (with phase 3) |

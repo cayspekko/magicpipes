@@ -1,7 +1,7 @@
 //! Port tunnels: a TCP listener or UDP socket per allocated public port.
 //!
 //! Each accepted TCP connection becomes one [`ServerOpen::Data`] stream to the owning agent,
-//! piped byte for byte once the agent reports [`STREAM_OK`]. UDP has no connections, so each
+//! piped byte for byte once the agent reports [`StreamStatus::Ok`]. UDP has no connections, so each
 //! client address (a "flow") gets one [`ServerOpen::Datagram`] stream carrying its datagrams in
 //! both directions; a flow ends after `udp_idle_timeout` without traffic.
 //!
@@ -17,9 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use magicpipes_core::cidr;
 use magicpipes_core::mux::{MuxHandle, MuxStream};
-use magicpipes_core::proto::{self, Kind, STREAM_LOCAL_UNREACHABLE, STREAM_OK, ServerOpen};
+use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -27,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{DataPlane, Outcome, Route};
+use crate::authz::Principal;
 use crate::forwarded::client_key;
 use crate::proxy_header;
 use crate::config::PortsConfig;
@@ -81,8 +81,8 @@ pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: Cancellati
 /// The route for a new connection or flow, if the client may use it and the agent is online.
 fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr) -> Option<(Arc<Route>, MuxHandle)> {
     let route = dp.lookup_port(kind, port)?;
-    if !cidr::allowed(&route.allow, peer.ip()) {
-        tracing::debug!(%kind, port, %peer, "client not in the tunnel's allow-list");
+    if !route.access.admits(&Principal::Anonymous, peer.ip()) {
+        tracing::debug!(%kind, port, %peer, "client not admitted by the tunnel's access policy");
         return None;
     }
     match &route.session {
@@ -115,12 +115,12 @@ async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr
         proto::write_frame(&mut stream, &header).await?;
         stream.read_u8().await
     };
-    match tokio::time::timeout(timeout, status).await {
-        Ok(Ok(STREAM_OK)) => {
+    match tokio::time::timeout(timeout, status).await.ok().and_then(Result::ok).and_then(StreamStatus::from_byte) {
+        Some(StreamStatus::Ok) => {
             route.stats.record(Outcome::Ok);
             Some(stream)
         }
-        Ok(Ok(STREAM_LOCAL_UNREACHABLE)) => {
+        Some(StreamStatus::LocalUnreachable) => {
             route.stats.record(Outcome::LocalUnreachable);
             None
         }

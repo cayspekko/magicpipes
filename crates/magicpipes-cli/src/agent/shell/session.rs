@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use magicpipes_core::error::ErrorCode;
 use portable_pty::{ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::Deserialize;
 use serde_json::json;
@@ -63,7 +64,7 @@ where
         _ => None,
     };
     let Some(Control::Hello { key, cols, rows }) = hello else {
-        return finish(ws, json!({ "type": "error", "code": "protocol", "message": "expected a hello message" })).await;
+        return finish(ws, json!({ "type": "error", "code": ErrorCode::Protocol.as_str(), "message": "expected a hello message" })).await;
     };
     let writable = match (&term.key, key) {
         (None, _) => false,
@@ -76,14 +77,14 @@ where
     };
     let Some(_slot) = Slot::take(&term.sessions, term.max_clients) else {
         let message = format!("This terminal already has {} open sessions. Try again later.", term.max_clients);
-        return finish(ws, json!({ "type": "error", "code": "busy", "message": message })).await;
+        return finish(ws, json!({ "type": "error", "code": ErrorCode::Busy.as_str(), "message": message })).await;
     };
     let mut pty = match Pty::spawn(&term, size(cols, rows)) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "web terminal could not start the program");
             let message = format!("Could not start {}: {e:#}", crate::state::command_line(&term.command));
-            return finish(ws, json!({ "type": "error", "code": "spawn_failed", "message": message })).await;
+            return finish(ws, json!({ "type": "error", "code": ErrorCode::SpawnFailed.as_str(), "message": message })).await;
         }
     };
     let mode = if writable { "read-write" } else { "read-only" };
