@@ -290,7 +290,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   per-session CSRF token on every form (Lax, so a private tunnel on another site can send the
   browser here to sign in). The management CSP has `form-action 'self'`, which browsers apply to
   a form's redirects too, so a form never redirects off the management host: sign-in continues
-  to a tunnel through a page that navigates on its own. Sessions are rows in SQLite (hash of the cookie): they
+  to a tunnel through a page that navigates on its own. It also allows `img-src 'self'`,
+  for the favicons (`mgmt/assets/`). Sessions are rows in SQLite (hash of the cookie): they
   survive restarts, at most 20 per user, and end on logout, "sign out everywhere"
   (`users.sessions_valid_after`), a password change, or when the user is disabled.
 

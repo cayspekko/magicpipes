@@ -104,6 +104,20 @@ pub async fn script() -> Response {
     ([(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"))], SCRIPT).into_response()
 }
 
+/// The browser icons: an SVG that follows the light or dark theme, and bitmaps for browsers
+/// without SVG icons and for home screens. The bitmaps come from `assets/favicon-tile.svg`
+/// (`scripts/favicons.sh`).
+pub const ICONS: [(&str, &[u8], &str); 3] = [
+    ("/favicon.svg", include_bytes!("assets/favicon.svg"), "image/svg+xml"),
+    ("/favicon.ico", include_bytes!("assets/favicon.ico"), "image/x-icon"),
+    ("/apple-touch-icon.png", include_bytes!("assets/apple-touch-icon.png"), "image/png"),
+];
+
+pub fn icon(body: &'static [u8], kind: &'static str) -> Response {
+    let headers = [(header::CONTENT_TYPE, HeaderValue::from_static(kind)), (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"))];
+    (headers, body).into_response()
+}
+
 pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     let logout = user
         .map(|u| {
@@ -123,7 +137,8 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
         .unwrap_or_default();
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title><style>{STYLE}{picker}</style><script src="/ui.js" defer></script></head><body>
+<meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title>
+<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{picker}</style><script src="/ui.js" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{logout}</div></header>
 <main>{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),

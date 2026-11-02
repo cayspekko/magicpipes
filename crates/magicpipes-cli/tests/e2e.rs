@@ -829,6 +829,14 @@ async fn authentication_and_input_failures() {
     let url = env.server_url();
     let ca = env.ca_path.to_string_lossy().to_string();
 
+    // Browser icons are there before signing in, and every page links them.
+    let login = env.ui("/login", None, None).await;
+    assert!(login.html.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#), "{}", login.html);
+    for path in ["/favicon.svg", "/favicon.ico", "/apple-touch-icon.png"] {
+        assert_eq!(env.ui(path, None, None).await.status, StatusCode::OK, "{path}");
+    }
+    assert!(env.ui("/favicon.svg", None, None).await.html.starts_with("<svg"));
+
     // Not enrolled yet.
     let out = env.cli(&["add", "9", "--json"]).await;
     assert_eq!(out.status.code(), Some(3));

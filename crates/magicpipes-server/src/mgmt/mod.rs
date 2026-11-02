@@ -90,7 +90,11 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 pub fn router(control: Arc<ControlPlane>) -> Router {
     let state = AppState { control, limiter: Arc::new(FailureLimiter::default()) };
-    Router::new()
+    let mut router = Router::new();
+    for (path, body, kind) in ui::ICONS {
+        router = router.route(path, get(move || async move { ui::icon(body, kind) }));
+    }
+    router
         .route("/", get(ui::index))
         .route("/login", get(ui::login_form).post(ui::login))
         .route("/logout", post(ui::logout))
@@ -113,6 +117,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/cli", get(accounts::device).post(accounts::answer_device))
         .route("/auth/tunnel", get(accounts::auth_tunnel))
         .route("/ui.js", get(ui::script))
+
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/tunnels", get(api::list_tunnels))
@@ -182,7 +187,7 @@ async fn security_headers(mut resp: axum::response::Response) -> axum::response:
     h.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"),
+        HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'"),
     );
     resp
 }
