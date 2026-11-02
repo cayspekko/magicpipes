@@ -269,7 +269,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   control plane applies only the difference to what is stored now (`change_user_tags`,
   `change_agent_tags`), reading and writing under the state lock. Two administrators changing
   different tags of the same user at once both keep their change. The API's `PATCH … {tags}`
-  still replaces the whole list. The picker dialog (`mgmt/ui.js`) is an enhancement over a page
+  still replaces the whole list. Tags an administrator makes up in the picker travel as
+  `create` fields and are registered just before the change (`Submitted::create_missing`). The picker dialog (`mgmt/ui.js`) is an enhancement over a page
   of checkboxes at the same URL, so the UI still works without JavaScript; the tag registry
   reaches it as a JSON data block, which the CSP doesn't treat as a script.
 

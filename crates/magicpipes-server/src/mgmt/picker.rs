@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use magicpipes_core::tags;
 
 use super::AppState;
+use crate::authz::Principal;
 use super::accounts::form_urlencoded_pairs;
 use super::ui::{UiUser, chips, esc};
 
@@ -39,6 +40,8 @@ dialog.tagpick::backdrop{background:rgba(0,0,0,.45)}
 .pill.remove .nm{text-decoration:line-through}.pill.add .act,.pill.remove .act{background:transparent;color:inherit}
 .pill[aria-disabled]{cursor:not-allowed;color:var(--muted);border-style:dashed}.pill[aria-disabled]:hover{border-color:var(--line-2)}
 .pill mark{background:color-mix(in srgb,var(--warn) 30%,transparent);color:inherit;border-radius:2px}
+.tp-create{margin-top:12px;padding:5px 12px;border-style:dashed;border-color:var(--accent);color:var(--accent);font-family:var(--sans)}.tp-syntax{margin:10px 2px 0;font-size:12.5px}
+.tp-new{font:10.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.04em;padding:2px 5px;border-radius:5px;background:color-mix(in srgb,currentColor 14%,transparent)}
 .tp-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}"#;
 
 /// The registered tags as JSON for the picker, on administrators' pages. A data block isn't run,
@@ -120,6 +123,7 @@ pub(super) fn fieldset(legend: &str, all: &[(String, String)], checked: &[String
             )
         })
         .collect();
+    let boxes = if boxes.is_empty() { r#"<p class="note" style="margin:0">None yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string() } else { boxes };
     let picker = picker.map(|subject| format!(r#" data-picker data-title="{0}" data-subject="{1}""#, esc(legend), esc(subject))).unwrap_or_default();
     format!(r#"<fieldset class="tags"{picker}><legend>{}</legend><div class="tagboxes">{boxes}</div></fieldset>"#, esc(legend))
 }
@@ -131,6 +135,8 @@ pub(super) struct Submitted {
     pub want: Vec<String>,
     /// The tags shown when the page was made; `None` from a form that replaces the whole list.
     pub base: Option<Vec<String>>,
+    /// New tags the picker made up (`create`), registered before the change is applied.
+    pub create: Vec<String>,
     /// Every field, for forms with more in them.
     pub fields: Vec<(String, String)>,
 }
@@ -143,7 +149,26 @@ impl Submitted {
         let csrf = get("csrf").unwrap_or("").to_string();
         let want = tags::normalize_list(&wanted)?;
         let base = get("base").map(|b| tags::normalize_list(&[b])).transpose()?;
-        Ok(Self { csrf, want, base, fields })
+        let create: Vec<&str> = fields.iter().filter(|(n, _)| n == "create").map(|(_, v)| v.as_str()).collect();
+        let create = tags::normalize_list(&create)?;
+        Ok(Self { csrf, want, base, create, fields })
+    }
+
+    /// Registers the `create` tags that don't exist yet (administrators only: `create_tag`
+    /// refuses anyone else). One made meanwhile by someone else is fine.
+    pub fn create_missing(&self, app: &AppState, who: &Principal) -> Result<(), String> {
+        if self.create.is_empty() {
+            return Ok(());
+        }
+        let known = |n: &str| app.control.tags(who).iter().any(|t| t.name == n);
+        for name in self.create.iter().filter(|n| !known(n)) {
+            if let Err(e) = app.control.create_tag(who, name, "")
+                && !known(name)
+            {
+                return Err(e.message);
+            }
+        }
+        Ok(())
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -180,5 +205,10 @@ mod tests {
         assert_eq!((f.change(), f.want), (None, vec!["a".to_string(), "b".to_string()]));
 
         assert!(Submitted::parse(b"csrf=x&base=&tags=not+ok%21").is_err());
+
+        // Tags the picker made up, from the dialog (one field) or the enrollment form (several).
+        let f = Submitted::parse(b"csrf=x&base=&tags=team%3Aqa&create=Team%3AQA+env%3Anew&create=env%3Anew").unwrap();
+        assert_eq!(f.create, ["env:new", "team:qa"]);
+        assert!(Submitted::parse(b"csrf=x&create=bad%21").is_err());
     }
 }

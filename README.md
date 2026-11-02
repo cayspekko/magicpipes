@@ -173,8 +173,10 @@ administrator when they first sign in.
   everyone and everything at once. In the UI, **Edit** next to a user's or a machine's tags opens a
   picker: every tag as a pill grouped by key, a filter box (Enter picks the first match) and a
   tray of what will be added (green, `+`) or removed (red, `−`), with a warning when a removal
-  closes private tunnels. Nothing changes until you save, and saving applies only those changes,
-  so another administrator's edit made meanwhile is kept. Without JavaScript, Edit opens a page
+  closes private tunnels. Administrators can also type a tag that doesn't exist yet and create
+  it there; it is registered (without a description) only when you save. Nothing changes until
+  you save, and saving applies only those changes, so another administrator's edit made
+  meanwhile is kept. Without JavaScript, Edit opens a page
   of checkboxes instead.
 * **Sign-in protection**: passwords are stored as Argon2id hashes and need at least 12
   characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every

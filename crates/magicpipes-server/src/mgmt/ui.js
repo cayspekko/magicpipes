@@ -68,6 +68,8 @@
   const words = (s) => (s || '').split(/[\s,]+/).filter(Boolean);
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   const GLYPH = { none: '+', held: '−', add: '✓', remove: '−' };
+  // The tag syntax (magicpipes_core::tags): `key` or `key:value`, the value may also hold `@`.
+  const validTag = (t) => t.length <= 64 && /^[a-z0-9][a-z0-9._-]*(:[a-z0-9][a-z0-9._@-]*)?$/.test(t);
 
   let dlg, ui, cur;
 
@@ -78,23 +80,23 @@
 <button type="button" class="btn ghost small tp-x" aria-label="Close">×</button></div>
 <input type="search" class="tp-q" placeholder="Filter tags · Enter picks the first match" autocomplete="off" spellcheck="false" aria-describedby="tp-count">
 <div class="tp-meta"><span id="tp-count" aria-live="polite"></span><span class="tp-hint"></span></div>
-<div class="tp-tray"></div><div class="tp-list"></div>
+<div class="tp-tray"></div><button type="button" class="pill tp-create" hidden></button><p class="note tp-syntax" hidden>A tag is <code>key</code> or <code>key:value</code>, with a-z, 0-9 and <code>._-</code>.</p><div class="tp-list"></div>
 <p class="note tp-locked" hidden>You can remove this machine's tags. Adding one takes an administrator.</p>
 <div class="tp-foot"><button type="button" class="btn tp-cancel">Cancel</button><button type="button" class="btn primary tp-save"></button></div>`;
     document.body.appendChild(dlg);
     const q = (s) => dlg.querySelector(s);
     ui = { title: q('#tp-title'), subject: q('.tp-subject'), filter: q('.tp-q'), count: q('#tp-count'), hint: q('.tp-hint'),
-      tray: q('.tp-tray'), list: q('.tp-list'), locked: q('.tp-locked'), save: q('.tp-save') };
+      tray: q('.tp-tray'), list: q('.tp-list'), locked: q('.tp-locked'), save: q('.tp-save'), create: q('.tp-create'), syntax: q('.tp-syntax') };
     ui.filter.addEventListener('input', update);
     ui.filter.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
       e.preventDefault();
       const first = firstMatch();
-      if (!first) return;
-      toggle(first);
+      if (first) toggle(first); else if (newName()) create(newName()); else return;
       ui.filter.value = '';
       update();
     });
+    ui.create.addEventListener('click', () => { create(newName()); ui.filter.value = ''; update(); ui.filter.focus(); });
     // Escape clears the filter first, then closes (asking when there are changes to lose).
     dlg.addEventListener('cancel', (e) => {
       e.preventDefault();
@@ -103,10 +105,12 @@
     q('.tp-x').addEventListener('click', leave);
     q('.tp-cancel').addEventListener('click', () => dlg.close());
     ui.save.addEventListener('click', () => {
-      if (!cur.pending.size) { dlg.close(); return; }
+      // A form's checkboxes follow even an empty change: undoing everything picked before.
+      if (!cur.pending.size && !cur.opts.inForm) { dlg.close(); return; }
       const want = new Set([...cur.held].filter((n) => cur.pending.get(n) !== 'remove'));
       cur.pending.forEach((v, n) => { if (v === 'add') want.add(n); });
-      if (cur.opts.onSave(want) === 'busy') { ui.save.disabled = true; ui.save.textContent = 'Saving…'; } else { dlg.close(); }
+      const created = [...cur.created].filter((n) => want.has(n));
+      if (cur.opts.onSave(want, created) === 'busy') { ui.save.disabled = true; ui.save.textContent = 'Saving…'; } else { dlg.close(); }
     });
     ui.list.addEventListener('click', (e) => { const p = e.target.closest('.pill'); if (p) { toggle(p.dataset.n); update(); } });
     ui.tray.addEventListener('click', (e) => {
@@ -123,6 +127,17 @@
   const matches = (t, q) => !q || t.n.includes(q) || t.d.toLowerCase().includes(q);
   const query = () => ui.filter.value.trim().toLowerCase();
   const firstMatch = () => { const q = query(); const t = q && cur.tags.find((t) => matches(t, q) && actionable(t.n)); return t ? t.n : null; };
+
+  // What the filter would create: a valid name no tag has, when the viewer may make tags.
+  const newName = () => { const q = query(); return cur.opts.creatable && q && validTag(q) && !cur.descs.has(q) ? q : null; };
+  const create = (n) => {
+    if (!n) return;
+    cur.descs.set(n, '');
+    cur.tags = [...cur.tags, { n, d: '' }].sort((a, b) => a.n.localeCompare(b.n));
+    cur.created.add(n);
+    cur.pending.set(n, 'add');
+    buildList();
+  };
 
   const toggle = (n) => {
     if (cur.pending.has(n)) cur.pending.delete(n);
@@ -142,16 +157,19 @@
   const paint = (pill, n, q, inTray) => {
     const s = stateOf(n);
     const locked = s === 'none' && !canAdd(n);
-    pill.className = `pill ${s}`;
+    const fresh = cur.created.has(n);
+    pill.className = `pill ${s}${fresh ? ' new' : ''}`;
     if (locked) pill.setAttribute('aria-disabled', 'true'); else pill.removeAttribute('aria-disabled');
     pill.setAttribute('aria-pressed', String(s === 'add' || s === 'remove'));
     const verb = inTray ? 'undo' : { none: locked ? 'adding a tag takes an administrator' : 'add', held: 'remove', add: 'will be added, undo', remove: 'will be removed, undo' }[s];
-    const desc = cur.descs.get(n);
+    const desc = fresh ? 'New tag, created when you save' : cur.descs.get(n);
     pill.title = desc ? `${desc} (${verb})` : verb;
     pill.setAttribute('aria-label', `${n}: ${verb}`);
     pill.replaceChildren();
     if (inTray) pill.append(make('span', 'sign', s === 'add' ? '+' : '−'));
-    pill.append(nameNode(n, q), make('span', 'act', inTray ? '×' : GLYPH[s]));
+    pill.append(nameNode(n, q));
+    if (fresh) pill.append(make('span', 'tp-new', 'new'));
+    pill.append(make('span', 'act', inTray ? '×' : GLYPH[s]));
   };
 
   const update = () => {
@@ -170,22 +188,22 @@
     const total = cur.tags.length;
     ui.count.textContent = q ? `${shown} of ${plural(total, 'tag', 'tags')}` : `${plural(total, 'tag', 'tags')}${cur.held.size ? ` · ${cur.held.size} ${cur.opts.heldWord}` : ''}`;
     const first = firstMatch();
-    ui.hint.textContent = first ? `Enter: ${cur.pending.has(first) ? 'undo' : cur.held.has(first) ? 'remove' : 'add'} ${first}` : '';
-    if (!shown) {
+    const fresh = newName();
+    ui.hint.textContent = first ? `Enter: ${cur.pending.has(first) ? 'undo' : cur.held.has(first) ? 'remove' : 'add'} ${first}` : fresh ? `Enter: create ${fresh}` : '';
+    ui.create.hidden = !fresh;
+    if (fresh) ui.create.textContent = `+ Create tag “${fresh}” and add it`;
+    ui.syntax.hidden = !(cur.opts.creatable && q && !validTag(q) && !shown);
+    if (!shown && !fresh) {
       const empty = make('p', 'note tp-empty');
-      empty.append(total ? `No tag matches “${q}”. ` : 'There are no access tags yet. ');
-      if (cur.opts.addable && admin) {
-        const a = make('a', null, 'Create tags under Tags');
-        a.href = '/tags';
-        empty.append(a);
-      } else if (!cur.opts.addable) {
-        empty.append('An administrator gives out access tags.');
-      }
+      if (q) empty.append(`No tag matches “${q}”. `);
+      else empty.append(cur.opts.creatable ? 'There are no access tags yet. Type a name to create one.' : 'There are no access tags yet. ');
+      if (!cur.opts.addable) empty.append('An administrator gives out access tags.');
       ui.list.querySelector('.tp-empty')?.remove();
       ui.list.append(empty);
     } else {
       ui.list.querySelector('.tp-empty')?.remove();
     }
+    const made = [...cur.created].filter((n) => cur.pending.get(n) === 'add').length;
     const adds = [...cur.pending].filter(([, v]) => v === 'add').map(([n]) => n).sort();
     const removes = [...cur.pending].filter(([, v]) => v === 'remove').map(([n]) => n).sort();
     ui.tray.replaceChildren();
@@ -208,32 +226,17 @@
       }
     }
     const parts = [];
-    if (adds.length) parts.push(`add ${adds.length}`);
+    if (adds.length) parts.push(`add ${adds.length}${made ? ` (${made} new)` : ''}`);
     if (removes.length) parts.push(`remove ${removes.length}`);
     ui.save.disabled = false;
     ui.save.textContent = parts.length ? `${cur.opts.saveWord}: ${parts.join(', ')}` : (cur.opts.saveWord === 'Save' ? 'No changes' : 'Done');
     ui.locked.hidden = cur.opts.addable || !cur.opts.lockedNote;
   };
 
-  // opts: title, subject, tags [{n, d}], held Set, want Set (defaults to held), addable,
-  // reach Map, reachKind, heldWord, saveWord, lockedNote, onSave(want) -> 'busy' to stay open.
-  const open = (opts) => {
-    if (!dlg) build();
-    const descs = new Map();
-    for (const t of opts.tags) descs.set(t.n, t.d || '');
-    for (const n of opts.held) if (!descs.has(n)) descs.set(n, '');
-    const tags = [...descs.keys()].sort().map((n) => ({ n, d: descs.get(n) }));
-    const pending = new Map();
-    const want = opts.want || opts.held;
-    for (const n of want) if (!opts.held.has(n)) pending.set(n, 'add');
-    for (const n of opts.held) if (!want.has(n)) pending.set(n, 'remove');
-    cur = { opts, held: opts.held, tags, descs, pending, reach: opts.reach || new Map() };
-    ui.title.textContent = opts.title;
-    ui.subject.textContent = opts.subject || '';
-    ui.filter.value = '';
-    // Pills grouped by the part before the colon; tags without one come last.
+  // Pills grouped by the part before the colon; tags without one come last.
+  const buildList = () => {
     const groups = new Map();
-    for (const t of tags) {
+    for (const t of cur.tags) {
       const k = t.n.includes(':') ? t.n.slice(0, t.n.indexOf(':')) : '';
       if (!groups.has(k)) groups.set(k, []);
       groups.get(k).push(t.n);
@@ -248,6 +251,28 @@
       g.append(row);
       ui.list.append(g);
     }
+  };
+
+  // opts: title, subject, tags [{n, d}], held Set, want Set (defaults to held), addable,
+  // creatable (new tags may be made up; the server creates them on save), reach Map,
+  // reachKind, heldWord, saveWord, lockedNote, inForm (setting a form's checkboxes, so saving
+  // nothing still applies), onSave(want, created) -> 'busy' to stay open.
+  const open = (opts) => {
+    if (!dlg) build();
+    const descs = new Map();
+    for (const t of opts.tags) descs.set(t.n, t.d || '');
+    for (const n of opts.held) if (!descs.has(n)) descs.set(n, '');
+    const tags = [...descs.keys()].sort().map((n) => ({ n, d: descs.get(n) }));
+    const pending = new Map();
+    const want = opts.want || opts.held;
+    for (const n of want) if (!opts.held.has(n)) pending.set(n, 'add');
+    for (const n of opts.held) if (!want.has(n)) pending.set(n, 'remove');
+    cur = { opts, held: opts.held, tags, descs, pending, created: new Set(opts.created || []), reach: opts.reach || new Map() };
+    ui.title.textContent = opts.title;
+    ui.subject.textContent = opts.subject || '';
+    ui.filter.value = '';
+    ui.filter.placeholder = opts.creatable ? 'Filter or create tags · Enter picks the first match' : 'Filter tags · Enter picks the first match';
+    buildList();
     update();
     dlg.showModal();
     ui.filter.focus();
@@ -270,16 +295,17 @@
       const held = new Set(words(a.dataset.held));
       const reach = new Map(words(a.dataset.reach).map((kv) => { const i = kv.lastIndexOf('='); return [kv.slice(0, i), Number(kv.slice(i + 1)) || 0]; }));
       const addable = a.dataset.addable === '1';
-      open({ title: a.dataset.title || 'Edit access tags', subject: a.dataset.subject, tags: addable ? registry : [], held, addable, reach,
-        reachKind: a.dataset.reachKind, heldWord: 'held', saveWord: 'Save', lockedNote: true,
-        onSave: (want) => post(a.href, { csrf: a.dataset.csrf, base: [...held].join(' '), tags: [...want].join(' ') }) });
+      open({ title: a.dataset.title || 'Edit access tags', subject: a.dataset.subject, tags: addable ? registry : [], held, addable,
+        creatable: addable && admin, reach, reachKind: a.dataset.reachKind, heldWord: 'held', saveWord: 'Save', lockedNote: true,
+        onSave: (want, created) => post(a.href, { csrf: a.dataset.csrf, base: [...held].join(' '), tags: [...want].join(' '), create: created.join(' ') }) });
     });
   });
 
   document.querySelectorAll('fieldset[data-picker]').forEach((fs) => {
     const boxes = [...fs.querySelectorAll('input[type=checkbox][name=tag]')];
     const list = fs.querySelector('.tagboxes');
-    if (!boxes.length || !list) return;
+    // Administrators may make up tags here too, so they get the picker even with none yet.
+    if (!list || (!boxes.length && !admin)) return;
     const held = new Set(boxes.filter((b) => b.checked).map((b) => b.value));
     const tags = boxes.map((b) => ({ n: b.value, d: b.closest('label')?.title || '' }));
     list.hidden = true;
@@ -297,8 +323,28 @@
       const btn = make('button', 'btn small', 'Choose tags');
       btn.type = 'button';
       btn.addEventListener('click', () => open({ title: fs.dataset.title || 'Access tags', subject: fs.dataset.subject, tags, held, want, addable: true,
-        heldWord: 'selected', saveWord: 'Done', lockedNote: false,
-        onSave: (w) => { boxes.forEach((b) => { b.checked = w.has(b.value); }); render(); } }));
+        inForm: true, creatable: admin, created: boxes.filter((b) => b.dataset.created).map((b) => b.value), heldWord: 'selected', saveWord: 'Done', lockedNote: false,
+        onSave: (w, created) => {
+          // A new tag becomes a checkbox like the others, plus a `create` field for the server.
+          for (const n of created.filter((n) => !boxes.some((b) => b.value === n))) {
+            const box = make('input');
+            Object.assign(box, { type: 'checkbox', name: 'tag', value: n });
+            box.dataset.created = '1';
+            const made = make('input');
+            Object.assign(made, { type: 'hidden', name: 'create', value: n });
+            const label = make('label');
+            label.append(box, made, ' ', make('code', null, n));
+            list.append(label);
+            boxes.push(box);
+            tags.push({ n, d: '' });
+          }
+          boxes.forEach((b) => {
+            b.checked = w.has(b.value);
+            const made = b.parentElement.querySelector('input[name=create]');
+            if (made) made.disabled = !b.checked;
+          });
+          render();
+        } }));
       sum.append(btn);
     };
     render();

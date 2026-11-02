@@ -435,6 +435,9 @@ pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Pat
     if let Err(r) = user.check_csrf(&form.csrf) {
         return r;
     }
+    if let Err(e) = form.create_missing(&app, &user.who) {
+        return failed(&e);
+    }
     let result = match form.change() {
         Some((add, remove)) => app.control.change_agent_tags(&user.who, &id, &add, &remove).map(drop),
         None => app.control.update_agent(&user.who, &id, Some(&form.want), None),
@@ -499,11 +502,7 @@ fn enroll_panel(app: &AppState, user: &UiUser) -> String {
         .collect();
     let private = if users.is_empty() { "" } else { " checked" };
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
-    let tags = if all.is_empty() {
-        r#"<label>Access tags</label><p class="note" style="margin-top:0">None yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string()
-    } else {
-        picker::fieldset("Access tags", &all, &[], Some("For the new machine"))
-    };
+    let tags = picker::fieldset("Access tags", &all, &[], Some("For the new machine"));
     format!(
         r#"<div class="section"><h2>Enroll a machine</h2></div>
 <div class="card form"><p class="note" style="margin-top:0">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>
@@ -540,6 +539,9 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
     };
     if let Err(r) = user.check_csrf(&form.csrf) {
         return r;
+    }
+    if let Err(e) = form.create_missing(&app, &user.who) {
+        return failed(&e);
     }
     let owner = form.get("owner").unwrap_or("");
     let opts = EnrollmentOptions {

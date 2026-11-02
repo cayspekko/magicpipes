@@ -1106,6 +1106,17 @@ async fn tag_forms_apply_only_what_changed() {
     assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("not an access tag"), "{}", refused.html);
     let forged = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", "wrong"), ("base", ""), ("tags", "env:prod")])).await;
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    // The picker can make up a tag: it's created on save, then given.
+    let made = env
+        .ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "team:ops"), ("tags", "team:ops team:qa"), ("create", "team:qa")]))
+        .await;
+    assert_eq!(made.location.as_deref(), Some("/users"), "{}", made.html);
+    assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["team:ops", "team:qa"]));
+    let (_, v) = env.api("GET", "/api/v1/tags", Some(&admin)).await;
+    assert!(v["tags"].as_array().unwrap().iter().any(|t| t["name"] == "team:qa"));
+    // Creating one that exists by now is fine.
+    env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "team:ops team:qa"), ("tags", "team:qa"), ("create", "team:qa")])).await;
+    assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["team:qa"]));
 
     // Agents work the same way.
     let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
@@ -1123,8 +1134,10 @@ async fn tag_forms_apply_only_what_changed() {
     assert!(index.html.contains(r#"fieldset class="tags" data-picker"#), "{}", index.html);
     let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:ops"), ("labels", ""), ("allow_public", "on")])).await;
     assert!(made.status == StatusCode::OK && made.html.contains("--token"), "{}", made.html);
-    let bad = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:qa")])).await;
+    let bad = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:nope")])).await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "env:new"), ("create", "env:new")])).await;
+    assert!(made.status == StatusCode::OK && made.html.contains("--token"), "{}", made.html);
 }
 
 async fn sign_in(env: &Env, email: &str, password: &str) -> String {

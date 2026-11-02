@@ -365,6 +365,9 @@ pub async fn user_tags(user: UiUser, State(app): State<AppState>, Path(id): Path
     if let Err(r) = user.check_csrf(&form.csrf) {
         return r;
     }
+    if let Err(e) = form.create_missing(&app, &user.who) {
+        return (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e))).into_response();
+    }
     let result = match form.change() {
         Some((add, remove)) => app.control.change_user_tags(&user.who, &id, &add, &remove),
         None => app.control.set_user_tags(&user.who, &id, &form.want),
