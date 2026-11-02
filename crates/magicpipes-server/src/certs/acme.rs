@@ -33,6 +33,28 @@ impl Http01Challenges {
     }
 }
 
+/// The tokens one order published; removed when it ends in any way, including when its future
+/// is dropped by a timeout around it.
+struct PublishedTokens<'a> {
+    challenges: &'a Http01Challenges,
+    tokens: Vec<String>,
+}
+
+impl PublishedTokens<'_> {
+    fn insert(&mut self, token: String, key_auth: String) {
+        self.challenges.insert(token.clone(), key_auth);
+        self.tokens.push(token);
+    }
+}
+
+impl Drop for PublishedTokens<'_> {
+    fn drop(&mut self) {
+        for t in &self.tokens {
+            self.challenges.remove(t);
+        }
+    }
+}
+
 pub struct AcmeClient {
     directory: String,
     email: Option<String>,
@@ -97,8 +119,8 @@ impl AcmeClient {
         let account = self.account().await?;
         let ids = [Identifier::Dns(host.to_string())];
         let mut order = account.new_order(&NewOrder::new(&ids)).await.context("creating ACME order")?;
-        let mut tokens = Vec::new();
-        let result = async {
+        let mut tokens = PublishedTokens { challenges: &self.challenges, tokens: Vec::new() };
+        async {
             let mut authzs = order.authorizations();
             while let Some(authz) = authzs.next().await {
                 let mut authz = authz.context("fetching ACME authorization")?;
@@ -110,9 +132,7 @@ impl AcmeClient {
                 let mut challenge = authz
                     .challenge(ChallengeType::Http01)
                     .ok_or_else(|| anyhow!("ACME server offered no HTTP-01 challenge"))?;
-                let token = challenge.token.clone();
-                self.challenges.insert(token.clone(), challenge.key_authorization().as_str().to_string());
-                tokens.push(token);
+                tokens.insert(challenge.token.clone(), challenge.key_authorization().as_str().to_string());
                 challenge.set_ready().await.context("submitting ACME challenge")?;
             }
             let retry = RetryPolicy::new().initial_delay(Duration::from_millis(500)).timeout(self.timeout);
@@ -128,11 +148,7 @@ impl AcmeClient {
             let chain_pem = order.poll_certificate(&retry).await.context("downloading certificate")?;
             Ok((chain_pem, key_pem))
         }
-        .await;
-        for t in tokens {
-            self.challenges.remove(&t);
-        }
-        result
+        .await
     }
 }
 
@@ -140,4 +156,20 @@ impl AcmeClient {
 struct StoredAccount {
     directory: String,
     credentials: AccountCredentials,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_are_removed_however_the_order_ends() {
+        let challenges = Http01Challenges::default();
+        {
+            let mut tokens = PublishedTokens { challenges: &challenges, tokens: Vec::new() };
+            tokens.insert("t1".into(), "auth".into());
+            assert_eq!(challenges.get("t1").as_deref(), Some("auth"));
+        }
+        assert!(challenges.get("t1").is_none());
+    }
 }

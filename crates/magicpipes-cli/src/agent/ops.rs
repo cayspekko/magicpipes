@@ -206,7 +206,9 @@ impl Agent {
             (None, Some(t)) => t.visibility == Some(Visibility::Private),
             (None, None) => false,
         };
-        if (req.visibility.is_some() || !req.labels.is_empty()) && self.session.server_protocol().is_some_and(|v| v < 3) {
+        // An older server makes every tunnel public, so `--public` gets what it asks for there.
+        let needs_v3 = req.visibility == Some(Visibility::Private) || !req.access.is_empty() || !req.labels.is_empty();
+        if needs_v3 && self.session.server_protocol().is_some_and(|v| v < 3) {
             return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels or labels; it needs a newer magicpipesd"));
         }
         let mut rpc_req = RegisterTunnel {

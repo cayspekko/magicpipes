@@ -70,7 +70,8 @@ where
         (None, _) => false,
         (Some(want), Some(given)) if magicpipes_core::secret::constant_time_eq(want.as_bytes(), given.as_bytes()) => true,
         (Some(_), _) => {
-            tracing::info!(peer = %peer, "web terminal refused: missing or wrong key");
+            // Debug only: anyone can send wrong keys, and agent.log grows until the agent restarts.
+            tracing::debug!(peer = %peer, "web terminal refused: missing or wrong key");
             let message = "This terminal needs its full link, including the secret after #k=. Ask whoever shared it.";
             return finish(ws, json!({ "type": "error", "code": "key", "message": message })).await;
         }
@@ -88,14 +89,21 @@ where
         }
     };
     let mode = if writable { "read-write" } else { "read-only" };
-    tracing::info!(peer = %peer, mode, pid = pty.pid, "web terminal session started");
+    // Read-write sessions need the key, so they are worth a line each; read-only ones are
+    // anonymous and could be opened in a loop.
+    let pid = pty.pid;
+    let log = |what: &str| match writable {
+        true => tracing::info!(peer = %peer, mode, pid, "web terminal session {what}"),
+        false => tracing::debug!(peer = %peer, mode, pid, "web terminal session {what}"),
+    };
+    log("started");
     let outcome = pump(&mut ws, &mut pty, &term, writable).await;
     let last = match &outcome {
         Outcome::Exited(status) => Some(exit_message(status)),
         Outcome::Ended => Some(json!({ "type": "ended", "message": "The terminal was stopped or its settings changed." })),
         Outcome::ClientGone => None,
     };
-    tracing::info!(peer = %peer, mode, pid = pty.pid, "web terminal session ended");
+    log("ended");
     pty.stop();
     if let Some(msg) = last {
         finish(ws, msg).await;

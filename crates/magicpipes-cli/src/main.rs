@@ -635,8 +635,11 @@ async fn list(out: Output) -> Result<(), ErrorInfo> {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|t| {
+                    // The same fields as a running agent's listing, from tunnels.json.
                     json!({ "id": t.id, "name": t.name, "kind": t.kind, "public_url": t.public_url, "target": t.describe(),
-                            "status": "stopped", "created_at": magicpipes_core::rfc3339(t.created_at) })
+                            "share_url": t.share_url(), "status": "stopped", "error": null,
+                            "created_at": magicpipes_core::rfc3339(t.created_at),
+                            "visibility": t.visibility, "access": t.access, "labels": t.labels })
                 })
                 .collect();
             json!({ "agent_running": false, "connection": "stopped", "tunnels": tunnels })

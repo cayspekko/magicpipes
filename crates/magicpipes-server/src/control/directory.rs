@@ -39,6 +39,11 @@ impl Directory {
         self.agents.get(agent_id)?.owner_user_id.as_deref()
     }
 
+    /// Is the agent owned by a member (not an administrator)?
+    pub(super) fn member_owned(&self, agent_id: &str) -> bool {
+        self.owner(agent_id).and_then(|u| self.users.get(u)).is_some_and(|u| u.role == crate::authz::Role::Member)
+    }
+
     pub(super) fn email(&self, user_id: &str) -> Option<&str> {
         self.users.get(user_id).map(|u| u.email.as_str())
     }

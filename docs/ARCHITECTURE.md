@@ -352,6 +352,12 @@ a connection to the public port that must arrive back at the agent (a warning, n
   hostname, so trusting it cannot vouch for other sites (CAs created before this was added are
   unconstrained; delete `data_dir/dev-ca` to replace one).
 * Public tunnels are anonymous by design; this is stated in the CLI output, the UI and the README.
+* The agent serves only what it added: when restoring after a reconnect, a tunnel the server
+  registered differently (public instead of private, an HTTPS hostname instead of a raw port)
+  is withdrawn locally, so its streams are refused even if removing it on the server fails.
+* `POST /login` is refused when the browser says it came from another site (`Sec-Fetch-Site`,
+  `Origin`), so a third-party page can't sign a browser into the attacker's account. An agent
+  missing from the in-memory directory gets the narrowest enrollment settings (private only).
 
 ## Known limitations
 

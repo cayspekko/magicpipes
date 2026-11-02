@@ -311,3 +311,24 @@ async fn ports_outside_the_range_stay_closed() {
     let f = fixture_in(f.stop(), "");
     assert!(f.data.lookup_port(Kind::Tcp, port).is_none());
 }
+
+#[tokio::test]
+async fn members_can_publish_applies_to_enrolled_machines() {
+    use magicpipes_core::proto::Visibility;
+
+    use crate::authz::Role;
+    use crate::control::EnrollmentOptions;
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let opts = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), allow_public: Some(true), ..Default::default() };
+    let token = f.cp.create_enrollment(&admin, opts).unwrap();
+    let laptop = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "laptop".into() }).unwrap().agent_id;
+    let public = |name: &str| RegisterTunnel { visibility: Some(Visibility::Public), ..http(name) };
+    f.cp.register(&laptop, &public("before")).unwrap();
+    // The administrator turns public tunnels off for members and restarts the server.
+    let f = fixture_in(f.stop(), "[users]\nmembers_can_publish = false");
+    assert!(f.cp.register(&laptop, &public("after")).unwrap_err().is(ErrorCode::PublicNotAllowed));
+    let private = RegisterTunnel { visibility: Some(Visibility::Private), ..http("after") };
+    assert_eq!(f.cp.register(&laptop, &private).unwrap().visibility, Some(Visibility::Private));
+}

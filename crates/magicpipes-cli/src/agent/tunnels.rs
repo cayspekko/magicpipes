@@ -33,11 +33,21 @@ struct Entry {
     ended: CancellationToken,
     /// Open web terminal sessions.
     sessions: Arc<AtomicUsize>,
+    /// The agent refuses to serve what the server made of this tunnel (see [`Tunnels::withdraw`]).
+    withdrawn: bool,
 }
 
 impl Entry {
     fn new(tunnel: LocalTunnel, registration: Registration) -> Self {
-        Self { tunnel, registration, last_error: None, streams_ok: Arc::default(), ended: CancellationToken::new(), sessions: Arc::default() }
+        Self {
+            tunnel,
+            registration,
+            last_error: None,
+            streams_ok: Arc::default(),
+            ended: CancellationToken::new(),
+            sessions: Arc::default(),
+            withdrawn: false,
+        }
     }
 }
 
@@ -94,6 +104,7 @@ impl Tunnels {
                 e.tunnel = t;
                 e.registration = registration;
                 e.last_error = None;
+                e.withdrawn = false;
             }
             None => {
                 map.insert(t.id.clone(), Entry::new(t, registration));
@@ -128,6 +139,19 @@ impl Tunnels {
         }
     }
 
+    /// Stops serving a tunnel the server registered differently from what was asked (public
+    /// instead of private, HTTPS instead of a raw port), whether or not the server then removed
+    /// it. It stays in the table, failed, until it is added again.
+    pub fn withdraw(&self, id: &str, error: String) {
+        if let Some(e) = self.map.lock().unwrap().get_mut(id) {
+            e.registration = Registration::Failed;
+            e.last_error = Some(error);
+            e.withdrawn = true;
+            e.ended.cancel();
+            e.ended = CancellationToken::new();
+        }
+    }
+
     pub fn mark_all_pending(&self) {
         for e in self.map.lock().unwrap().values_mut() {
             e.registration = Registration::Pending;
@@ -156,10 +180,10 @@ impl Tunnels {
         self.map.lock().unwrap().len()
     }
 
-    /// Local destination for a data stream.
+    /// Local destination for a data stream; none for a withdrawn tunnel.
     pub fn route(&self, id: &str) -> Option<Route> {
         let map = self.map.lock().unwrap();
-        map.get(id).map(|e| Route {
+        map.get(id).filter(|e| !e.withdrawn).map(|e| Route {
             kind: e.tunnel.kind,
             target: e.tunnel.target.clone(),
             streams_ok: e.streams_ok.clone(),
@@ -174,5 +198,24 @@ impl Tunnels {
 
     pub fn find(&self, pred: impl Fn(&LocalTunnel) -> bool) -> Option<LocalTunnel> {
         self.map.lock().unwrap().values().map(|e| &e.tunnel).find(|t| pred(t)).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawn_tunnels_are_not_served() {
+        let json = r#"{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","host":"127.0.0.1","port":8080,"created_at":1}"#;
+        let t: LocalTunnel = serde_json::from_str(json).unwrap();
+        let tunnels = Tunnels::default();
+        // Inserted directly: `upsert` would write the real ~/.magicpipes/tunnels.json.
+        tunnels.map.lock().unwrap().insert(t.id.clone(), Entry::new(t, Registration::Registered));
+        let ended = tunnels.route("tn_1").expect("served").ended;
+        tunnels.withdraw("tn_1", "the server no longer supports private tunnels".into());
+        assert!(tunnels.route("tn_1").is_none());
+        assert!(ended.is_cancelled(), "what was running for it ends");
+        assert_eq!(tunnels.snapshots()[0].registration, Registration::Failed);
     }
 }

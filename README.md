@@ -175,7 +175,8 @@ administrator when they first sign in.
   characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every
   10 seconds, right password or not. An address with 10 failed attempts within 5 minutes
   (an IPv6 /64 counts as one) gets no password checked at all until it waits. A wrong password
-  and an unknown email get the same answer.
+  and an unknown email get the same answer. The sign-in form only accepts posts from its own
+  page, so another site can't sign your browser into its account.
 * **Sessions** last `[users] session_max_age_secs` (12 hours) and survive server restarts.
   Changing your password, being disabled, or "Sign out everywhere" ends them.
 * **API tokens** (Account page) act as their user with the user's current role:
@@ -508,12 +509,12 @@ On failure:
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent (or, for the server, the machine's magicpipes) is too old for the request |
 | 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
+| 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
+| 8 | `probe_failed` | Public URL did not reach the application |
 
 `name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:
 another machine's agent owns it. Codes are listed in `crates/magicpipes-core/src/error.rs`; new
 ones may appear in later versions, so treat an unknown code like `internal`.
-| 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
-| 8 | `probe_failed` | Public URL did not reach the application |
 
 ### Run the agent under a service manager
 

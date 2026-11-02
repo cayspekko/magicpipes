@@ -231,10 +231,22 @@ impl Session {
             };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
                 // Never let a private tunnel come back public (e.g. after a server downgrade).
+                // Never serve something other than what was added: a private tunnel the server made
+                // public (after a server downgrade), or a raw port it made an HTTPS hostname. The
+                // agent stops serving it even if removing it on the server fails.
                 Ok(RpcResponse::Tunnel(info)) if t.visibility == Some(Visibility::Private) && info.visibility != Some(Visibility::Private) => {
-                    tracing::error!(tunnel = %t.name, "the server did not keep the tunnel private; removing it there");
-                    let _ = self.rpc(&Rpc::Unregister { id: info.id }, Duration::from_secs(10)).await;
-                    self.tunnels.set_registration(&t.id, Registration::Failed, Some("the server no longer supports private tunnels".into()));
+                    tracing::error!(tunnel = %t.name, "the server did not keep the tunnel private; no longer serving it");
+                    self.tunnels.withdraw(&t.id, "the server no longer supports private tunnels".into());
+                    if let Err(e) = self.rpc(&Rpc::Unregister { id: info.id }, Duration::from_secs(10)).await {
+                        tracing::warn!(tunnel = %t.name, error = %e, "could not remove the tunnel on the server");
+                    }
+                }
+                Ok(RpcResponse::Tunnel(info)) if info.kind != t.kind => {
+                    tracing::error!(tunnel = %t.name, kind = %t.kind, "the server registered the tunnel as another kind; no longer serving it");
+                    self.tunnels.withdraw(&t.id, format!("the server no longer supports {} tunnels", t.kind));
+                    if let Err(e) = self.rpc(&Rpc::Unregister { id: info.id }, Duration::from_secs(10)).await {
+                        tracing::warn!(tunnel = %t.name, error = %e, "could not remove the tunnel on the server");
+                    }
                 }
                 Ok(RpcResponse::Tunnel(info)) => {
                     tracing::info!(tunnel = %t.name, "tunnel restored");

@@ -603,9 +603,35 @@ fn continue_page(to: &str) -> Response {
     resp
 }
 
-pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<ClientIp>>, Form(f): Form<LoginForm>) -> Response {
+/// Was this request sent by a page on another site? Browsers say so in `Sec-Fetch-Site`, and
+/// older ones only in `Origin`. Our pages send `Referrer-Policy: no-referrer`, which makes even a
+/// same-origin form post say `Origin: null`, so that value proves nothing. A client that sends
+/// neither header (a script, curl) is not a browser being tricked.
+fn cross_site(headers: &http::HeaderMap) -> bool {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(site) = get("sec-fetch-site") {
+        return site != "same-origin" && site != "none";
+    }
+    match (get("origin"), get("host")) {
+        (None | Some("null"), _) => false,
+        (Some(origin), Some(host)) => !origin.split_once("://").is_some_and(|(_, h)| h.eq_ignore_ascii_case(host)),
+        (Some(_), None) => true,
+    }
+}
+
+pub async fn login(
+    State(app): State<AppState>,
+    client: Option<axum::Extension<ClientIp>>,
+    headers: http::HeaderMap,
+    Form(f): Form<LoginForm>,
+) -> Response {
     let client = client.map(|c| c.0.0);
     let next = f.next.as_deref();
+    // Login CSRF: another site's form would sign this browser into the attacker's account (and a
+    // machine approved there would then be enrolled as theirs).
+    if cross_site(&headers) {
+        return (StatusCode::FORBIDDEN, login_page(Some("Sign in from this page, not from another site."), f.token.is_some(), next)).into_response();
+    }
     if let Some(token) = f.token {
         let checked = match app.control.login_admin_token(token.trim()) {
             Ok(found) => found.ok_or(()),
@@ -665,4 +691,29 @@ pub async fn logout(user: UiUser, State(app): State<AppState>, Form(f): Form<Log
     let mut resp = Redirect::to(&to).into_response();
     resp.headers_mut().insert(header::SET_COOKIE, session_cookie("", 0));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_in_posts_from_other_sites_are_refused() {
+        let req = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = http::HeaderMap::new();
+            h.insert(header::HOST, HeaderValue::from_static("mp.example.com"));
+            for (k, v) in pairs {
+                h.insert(*k, HeaderValue::from_static(v));
+            }
+            cross_site(&h)
+        };
+        assert!(!req(&[]), "a script sends neither header");
+        assert!(!req(&[("sec-fetch-site", "same-origin"), ("origin", "https://mp.example.com")]));
+        assert!(!req(&[("sec-fetch-site", "none")]), "typed or bookmarked");
+        assert!(req(&[("sec-fetch-site", "cross-site")]));
+        assert!(req(&[("sec-fetch-site", "same-site")]), "a tunnel subdomain is another origin");
+        assert!(req(&[("origin", "https://evil.example")]), "a browser without Sec-Fetch-Site");
+        assert!(!req(&[("sec-fetch-site", "same-origin"), ("origin", "null")]), "our own page, under no-referrer");
+        assert!(req(&[("sec-fetch-site", "cross-site"), ("origin", "null")]));
+    }
 }

@@ -111,19 +111,23 @@ impl ControlPlane {
     /// Changes an agent's tags and labels. Administrators set any registered tags; an agent's
     /// owner may only remove tags.
     pub fn update_agent(&self, who: &Principal, agent_id: &str, tag_list: Option<&[String]>, labels: Option<&[String]>) -> Result<(), ErrorBody> {
-        let assigned = {
+        let list = tag_list.map(|l| self.registered(l)).transpose()?;
+        {
+            // Held from the check to the write, with the assignment read from the store, so an
+            // administrator's removal that commits meanwhile can't be undone by a member's save.
             let st = self.state.lock().unwrap();
             if st.dir.agent(agent_id).is_none() || !authz::authorize(who, Action::Manage, st.agent_resource(agent_id)) {
                 return Err(err(ErrorCode::NotFound, "no such agent"));
             }
-            st.dir.assigned_agent_tags(agent_id)
-        };
-        if let Some(list) = tag_list {
-            let list = self.registered(list)?;
-            if !who.is_admin() && list.iter().any(|t| !assigned.contains(t)) {
-                return Err(err(ErrorCode::Forbidden, "you can remove an agent's tags; adding one takes an administrator"));
+            if let Some(list) = &list {
+                let assigned = self.store.agent_tags().map_err(internal)?.remove(agent_id).unwrap_or_default();
+                if !who.is_admin() && list.iter().any(|t| !assigned.contains(t)) {
+                    return Err(err(ErrorCode::Forbidden, "you can remove an agent's tags; adding one takes an administrator"));
+                }
+                self.store.set_agent_tags(agent_id, list).map_err(internal)?;
             }
-            self.store.set_agent_tags(agent_id, &list).map_err(internal)?;
+        }
+        if let Some(list) = &list {
             self.audit(who, "agent.tags", agent_id, &list.join(" "));
         }
         if let Some(labels) = labels {

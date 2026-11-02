@@ -192,6 +192,10 @@ async fn http_websocket_and_lifecycle() {
     assert_eq!((status, err.as_deref()), (StatusCode::BAD_GATEWAY, Some("agent_offline")));
     let list = env.cli_json(&["list", "--json"]).await;
     assert_eq!(list["agent_running"], false);
+    // The same fields as when the agent runs, from tunnels.json.
+    let stopped = &list["tunnels"][0];
+    assert_eq!((stopped["status"].as_str(), stopped["share_url"].as_str()), (Some("stopped"), stopped["public_url"].as_str()), "{stopped}");
+    assert!(stopped.get("visibility").is_some() && stopped["access"].is_array() && stopped["labels"].is_array(), "{stopped}");
 
     env.cli_ok(&["agent", "start"]).await;
     let new_pid = env.agent_pid().unwrap();

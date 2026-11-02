@@ -195,7 +195,9 @@ An email typed in by an admin is not verified.
   - Migrated agents default to `public`, as today.
   - New enrollments default to `private` once the server has users. `--public` is allowed only
     if the enrollment allows it. Members' enrollments allow it when `[users]
-    members_can_publish` is true (the default).
+    members_can_publish` is true (the default). The setting is also checked whenever a
+    member's machine registers a tunnel, so turning it off applies to machines enrolled before;
+    their existing public tunnels stay until removed.
 - **Access set.** A private tunnel's access set defaults to the agent's effective access tags.
   The owner may narrow it (`--access team:dev`), but never widen it beyond the agent's tags:
   `effective access = requested ∩ agent's effective tags`. An agent can't publish to an

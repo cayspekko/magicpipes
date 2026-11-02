@@ -81,7 +81,11 @@ pub fn host_header(host: &str, port: u16) -> String {
     if port == 443 { h } else { format!("{h}:{port}") }
 }
 
-/// POSTs JSON to `<server><path>` and returns the status and parsed JSON body.
+/// Largest JSON answer `post_json` reads (enrollment and device-login answers are tiny).
+const MAX_JSON_RESPONSE: usize = 64 * 1024;
+
+/// POSTs JSON to `<server><path>` and returns the status and parsed JSON body. The whole
+/// exchange, body included, has 30 s and reads at most 64 KiB.
 pub async fn post_json(
     server: &str,
     path: &str,
@@ -95,9 +99,14 @@ pub async fn post_json(
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(http::header::USER_AGENT, concat!("magicpipes/", env!("CARGO_PKG_VERSION")))
         .body(Full::new(Bytes::from(serde_json::to_vec(body)?)))?;
-    let resp = tokio::time::timeout(Duration::from_secs(30), send(stream, req)).await.map_err(|_| anyhow!("request timed out"))??;
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await?.to_bytes();
+    let exchange = async {
+        let resp = send(stream, req).await?;
+        let status = resp.status();
+        let body = http_body_util::Limited::new(resp.into_body(), MAX_JSON_RESPONSE);
+        let bytes = body.collect().await.map_err(|e| anyhow!("reading the server's answer: {e}"))?.to_bytes();
+        anyhow::Ok((status, bytes))
+    };
+    let (status, bytes) = tokio::time::timeout(Duration::from_secs(30), exchange).await.map_err(|_| anyhow!("request timed out"))??;
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     Ok((status, json))
 }

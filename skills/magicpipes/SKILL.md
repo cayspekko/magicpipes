@@ -69,4 +69,6 @@ magicpipes status --json      # login/agent/connection state
 * Dev servers with host checks (e.g. Vite) must allow the public hostname, for example
   `server.allowedHosts: ['.t.example.com']`, or requests get rejected by the app itself.
 * WebSockets work at the same URL with `wss://`.
-* Do not pass secrets from the user into URLs; tunnels have no access control of their own.
+* Do not pass secrets from the user into URLs. Public tunnels have no access control of their
+  own; private ones admit only signed-in users who own the machine or share one of its access
+  tags.

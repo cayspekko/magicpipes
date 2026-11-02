@@ -23,12 +23,15 @@ impl ControlPlane {
     /// send no visibility: a new tunnel then gets the agent's default and an existing one keeps
     /// its settings.
     fn requested_access(&self, st: &State, agent_id: &str, req: &RegisterTunnel, existing: Option<&TunnelRow>) -> Result<Access, ErrorBody> {
-        let (allow_public, default_private) = st.dir.agent(agent_id).map_or((true, false), |a| (a.allow_public, a.default_private));
+        // An agent missing from the directory (it couldn't be reloaded) gets the narrowest
+        // settings, never the widest.
+        let (allow_public, default_private) = st.dir.agent(agent_id).map_or((false, true), |a| (a.allow_public, a.default_private));
+        // `members_can_publish` applies to machines enrolled before it was turned off, too.
+        let members_may_not = st.dir.member_owned(agent_id) && !self.cfg.users.members_can_publish;
         let invalid = |m: String| err(ErrorCode::InvalidRequest, m);
         let protocol = st.sessions.get(agent_id).map_or(proto::PROTOCOL_VERSION, |s| s.protocol);
         let (visibility, access, labels) = match (req.visibility, existing) {
             (None, Some(row)) => return Ok((row.visibility, row.access.clone(), row.access_restricted, row.labels.clone())),
-            // Raw ports can't ask anyone to sign in yet, so they stay public by default.
             // An agent from before private tunnels would wait for its readiness probe, which
             // the sign-in page answers, and fail after minutes; and public isn't what was meant.
             (None, None) if default_private && req.kind.is_http() && protocol < 3 => {
@@ -37,11 +40,15 @@ impl ControlPlane {
                     "this machine's tunnels are private by default, which this version of magicpipes doesn't support; upgrade magicpipes on it",
                 ));
             }
+            // Raw ports can't ask anyone to sign in yet, so they stay public by default.
             (None, None) if default_private && req.kind.is_http() => (Visibility::Private, Vec::new(), tags::normalize_list(&req.labels).map_err(invalid)?),
             (None, None) => (Visibility::Public, Vec::new(), tags::normalize_list(&req.labels).map_err(invalid)?),
             (Some(v), _) => (v, tags::normalize_list(&req.access).map_err(invalid)?, tags::normalize_list(&req.labels).map_err(invalid)?),
         };
         match visibility {
+            Visibility::Public if members_may_not => {
+                return Err(err(ErrorCode::PublicNotAllowed, "members' machines may only publish private tunnels on this server"));
+            }
             Visibility::Public if !allow_public => {
                 return Err(err(ErrorCode::PublicNotAllowed, "this machine may only publish private tunnels (its enrollment doesn't allow public ones)"));
             }
