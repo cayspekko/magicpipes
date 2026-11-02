@@ -305,7 +305,9 @@ magicpipes add 3000 --label environment:staging   # metadata only, never used fo
 * Taking a tag away, disabling a user or "Sign out everywhere" takes effect on the next request,
   and closes open WebSockets.
 * `https://<tunnel>/.magicpipes/` is reserved on private tunnels (`/.magicpipes/logout` signs out
-  of that tunnel).
+  of that tunnel). Signing in to a private tunnel needs JavaScript: the one-time sign-in code
+  travels in the URL fragment, where no server or log sees it, and a small page of MagicPipes'
+  passes it on.
 * The readiness check of a private tunnel goes through the server to the local application
   (the public address would ask for a sign-in).
 * TCP and UDP tunnels can't be private yet: a raw port can't show a sign-in page. Use

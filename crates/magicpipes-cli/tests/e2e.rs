@@ -968,6 +968,9 @@ async fn browser_login_enrolls_your_machine() {
     // Signing in on the way keeps the destination (and the forced password change).
     let page = env.ui(&link, None, None).await;
     assert_eq!(page.location.as_deref(), Some(format!("/login?next={}", link.replace('/', "%2F").replace('?', "%3F").replace('=', "%3D")).as_str()));
+    // The sign-in page keeps the destination in its form and in the link to the other form.
+    let login_page = env.ui(page.location.as_deref().unwrap(), None, None).await;
+    assert!(login_page.html.contains(r#"name="next""#) && login_page.html.contains("method=token&amp;next=%2Fcli"), "{}", login_page.html);
     let signed_in = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", password), ("next", &link)])).await;
     assert!(signed_in.location.as_deref().is_some_and(|l| l.starts_with("/password?next=")), "{:?}", signed_in.location);
     let cookie = signed_in.cookie.unwrap();
@@ -976,7 +979,10 @@ async fn browser_login_enrolls_your_machine() {
     let changed = env
         .ui("/password", Some(&cookie), Some(&[("csrf", &form.csrf()), ("current", password), ("new", new_password), ("repeat", new_password), ("next", &link)]))
         .await;
-    assert_eq!(changed.location.as_deref(), Some(link.as_str()));
+    // A form's redirects must stay on the management host (CSP form-action), so the destination
+    // comes from a page that moves on by itself.
+    assert!(changed.status == 200 && changed.location.is_none() && changed.html.contains("Continuing"), "{}", changed.html);
+    assert!(changed.html.contains(&link.replace('&', "&amp;")), "{}", changed.html);
     let cookie = changed.cookie.unwrap();
     // An outside `next` is ignored.
     let elsewhere = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", new_password), ("next", "//evil.example/")])).await;
@@ -1030,16 +1036,25 @@ async fn sign_in(env: &Env, email: &str, password: &str) -> String {
 async fn open_private(env: &Env, host: &str, path: &str, ui_cookie: &str) -> Result<String, common::UiResponse> {
     let first = env.tunnel_get(host, path, "", true).await;
     assert_eq!(first.status, StatusCode::SEE_OTHER, "{}", first.body);
-    let state = first.cookie("__Host-mp_state").expect("state cookie");
+    let state = first.cookie_prefixed("__Host-mp_state_").expect("state cookie");
     let mgmt = format!("https://localhost:{}", env.mgmt_port);
     let at = first.location.unwrap().strip_prefix(&mgmt).expect("sent to the management host").to_string();
     let auth = env.ui(&at, Some(ui_cookie), None).await;
     let Some(callback) = auth.location.clone().filter(|_| auth.status == StatusCode::SEE_OTHER) else { return Err(auth) };
-    let callback = callback.strip_prefix(&format!("https://{host}:{}", env.https_port)).expect("back to the tunnel").to_string();
-    let done = env.tunnel_get(host, &callback, &state, true).await;
-    assert_eq!((done.status, done.location.as_deref()), (StatusCode::SEE_OTHER, Some(path)), "{}", done.body);
+    // The code travels in the fragment, which no server sees; the callback page posts it back.
+    let (page, fragment) = callback.split_once('#').expect("code in the fragment");
+    assert_eq!(page, format!("https://{host}:{}/.magicpipes/callback", env.https_port));
+    let callback_page = env.tunnel_get(host, "/.magicpipes/callback", "", true).await;
+    assert!(callback_page.status == 200 && callback_page.body.contains("/.magicpipes/callback.js"), "{}", callback_page.body);
+    assert_eq!(env.tunnel_get(host, "/.magicpipes/callback.js", "", false).await.status, 200);
+    // Without the state cookie of the attempt (another browser), the code is refused.
+    assert_eq!(env.tunnel_post(host, "/.magicpipes/callback", "", fragment).await.status, StatusCode::UNAUTHORIZED);
+    let done = env.tunnel_post(host, "/.magicpipes/callback", &state, fragment).await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    let to: Value = serde_json::from_str(&done.body).unwrap();
+    assert_eq!(to["to"], path);
     // The code works once.
-    assert_eq!(env.tunnel_get(host, &callback, &state, true).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(env.tunnel_post(host, "/.magicpipes/callback", &state, fragment).await.status, StatusCode::UNAUTHORIZED);
     Ok(done.cookie("__Host-mp_tunnel").expect("tunnel cookie"))
 }
 
@@ -1097,6 +1112,20 @@ async fn private_tunnels() {
     assert!(r.body.ends_with("cookie=theirs=1"), "{}", r.body);
     let forged = env.tunnel_get(&host, "/whoami", "", false).await;
     assert_eq!(forged.status, StatusCode::UNAUTHORIZED);
+    // Two tabs signing in at once each keep their own attempt: both finish.
+    let mgmt = format!("https://localhost:{}", env.mgmt_port);
+    let mut attempts = Vec::new();
+    for _ in 0..2 {
+        let r = env.tunnel_get(&host, "/whoami", "", true).await;
+        let at = r.location.clone().unwrap().strip_prefix(&mgmt).unwrap().to_string();
+        attempts.push((r.cookie_prefixed("__Host-mp_state_").unwrap(), at));
+    }
+    let jar = format!("{}; {}", attempts[0].0, attempts[1].0);
+    for (_, at) in attempts.iter().rev() {
+        let auth = env.ui(at, Some(&ann), None).await;
+        let fragment = auth.location.unwrap().split_once('#').unwrap().1.to_string();
+        assert_eq!(env.tunnel_post(&host, "/.magicpipes/callback", &jar, &fragment).await.status, 200);
+    }
     // A cookie for one tunnel host is useless on another.
     let other = add_json(&env, &[&port, "--name", "other"]).await;
     let other_host = hostname(other["public_url"].as_str().unwrap());
@@ -1148,6 +1177,65 @@ async fn private_tunnels() {
     env.ui("/account/logout-everywhere", Some(&ann), Some(&[("csrf", &account.csrf())])).await;
     assert_eq!(env.tunnel_get(&host, "/whoami", &ann_cookie, false).await.status, StatusCode::UNAUTHORIZED);
 
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+/// Signing in to private tunnels in a real browser (headless Chrome via `scripts/browser-sign-in.mjs`):
+/// plain HTTP clients don't apply CSP or cookie rules, and that is where sign-in flows break.
+/// Not run by default; needs Chrome and Node 22 or newer:
+///
+/// ```text
+/// cargo test -p magicpipes-cli --test e2e browser_signs_in_to_private_tunnels -- --ignored
+/// ```
+///
+/// `MAGICPIPES_CHROME` overrides the Chrome binary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Chrome and Node"]
+async fn browser_signs_in_to_private_tunnels() {
+    let chrome = std::env::var("MAGICPIPES_CHROME").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") { "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() } else { "google-chrome".into() }
+    });
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    let first_password = "correct horse battery";
+    let body = serde_json::json!({ "email": "ann@example.com", "password": first_password });
+    let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    let ann = v["user"]["id"].as_str().unwrap().to_string();
+    // She has already chosen her own password, like anyone signing in after their first time.
+    sign_in(&env, "ann@example.com", first_password).await;
+    let password = format!("{first_password} again");
+
+    let body = serde_json::json!({ "owner_user_id": ann });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "laptop"]).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let first = add_json(&env, &[&app.port.to_string(), "--private", "--name", "one"]).await;
+    let second = add_json(&env, &[&app.port.to_string(), "--private", "--name", "two"]).await;
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/browser-sign-in.mjs");
+    let profile = std::env::temp_dir().join(format!("mp-chrome-{}", std::process::id()));
+    let opts = serde_json::json!({
+        "chrome": chrome,
+        "first": format!("{}/", first["public_url"].as_str().unwrap()),
+        "second": format!("{}/", second["public_url"].as_str().unwrap()),
+        "management": url,
+        "email": "ann@example.com",
+        "password": password,
+        "resolve": format!("MAP *.{BASE} 127.0.0.1"),
+        "profile": profile,
+    });
+    let out = tokio::process::Command::new("node").arg(&script).arg(opts.to_string()).output().await.expect("run node");
+    std::fs::remove_dir_all(&profile).ok();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+
+    // Signing in on the way lands on the application, not back on the sign-in page.
+    assert!(result["first"]["url"].as_str().unwrap_or("").starts_with(first["public_url"].as_str().unwrap()), "{result}");
+    assert_eq!(result["first"]["text"], "hello from app", "{result}");
+    // Already signed in: the second private tunnel needs no form.
+    assert!(result["second"]["url"].as_str().unwrap_or("").starts_with(second["public_url"].as_str().unwrap()), "{result}");
+    assert_eq!(result["second"]["text"], "hello from app", "{result}");
+    assert!(result["errors"].as_array().unwrap().is_empty(), "the browser reported errors: {result}");
     env.cli_ok(&["agent", "stop"]).await;
 }
 

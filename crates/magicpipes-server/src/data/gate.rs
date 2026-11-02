@@ -1,9 +1,10 @@
 //! Signing in to private tunnels on their own hostnames (see [`crate::tunnel_auth`]).
 //!
-//! For a private route, [`check`] answers the reserved `/.magicpipes/` paths itself, admits a
-//! request whose tunnel cookie names a user who may connect now, and otherwise sends a browser
-//! to sign in (or answers `401 unauthenticated` to anything that isn't a browser navigation). A
-//! signed-in user without access gets `403 forbidden`. Nothing here touches the database.
+//! For a private route, [`reserved`] answers the `/.magicpipes/` paths itself, and [`check`]
+//! admits a request whose tunnel cookie names a user who may connect now, and otherwise sends a
+//! browser to sign in (or answers `401 unauthenticated` to anything that isn't a browser
+//! navigation). A signed-in user without access gets `403 forbidden`. Nothing here touches the
+//! database.
 
 #![allow(clippy::result_large_err)] // responses are returned by value, as in `proxy`
 
@@ -19,7 +20,17 @@ use magicpipes_core::{secret, unix_now};
 use super::proxy::{ProxyBody, error_page};
 use super::{DataPlane, Route, RouteTable, TunnelUser};
 use crate::authz::{self, Action, Resource};
-use crate::tunnel_auth::{CALLBACK_PATH, LOGOUT_PATH, STATE_COOKIE, TUNNEL_COOKIE, token_safe};
+use crate::tunnel_auth::{CALLBACK_PATH, CALLBACK_SCRIPT_PATH, LOGOUT_PATH, RESERVED_PREFIX, STATE_COOKIE, TUNNEL_COOKIE, token_safe};
+
+/// Largest body the code exchange accepts.
+const MAX_EXCHANGE_BODY: usize = 4096;
+const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The state cookie of one sign-in attempt. Each attempt has its own, so tabs that sign in at
+/// the same time don't overwrite each other's.
+fn state_cookie(nonce: &str) -> String {
+    format!("{STATE_COOKIE}{nonce}")
+}
 
 /// The value of cookie `name` in a request.
 fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -41,7 +52,7 @@ pub(super) fn strip_cookies(headers: &mut HeaderMap) {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .map(str::trim)
-        .filter(|kv| !kv.is_empty() && !kv.starts_with(&format!("{TUNNEL_COOKIE}=")) && !kv.starts_with(&format!("{STATE_COOKIE}=")))
+        .filter(|kv| !kv.is_empty() && !kv.starts_with(&format!("{TUNNEL_COOKIE}=")) && !kv.starts_with(STATE_COOKIE))
         .map(str::to_string)
         .collect();
     headers.remove(header::COOKIE);
@@ -143,17 +154,6 @@ pub(super) fn still_admitted(table: &RouteTable, host: &str, user_id: &str, issu
 /// Outcome for a request to a private tunnel: who it is forwarded as, or the response MagicPipes
 /// gives instead.
 pub(super) fn check(dp: &DataPlane, req: &Request<Incoming>, host: &str, route: &Route) -> Result<Admitted, Response<ProxyBody>> {
-    let path = req.uri().path();
-    let query = req.uri().query().unwrap_or("");
-    if path == CALLBACK_PATH {
-        return Err(callback(dp, req.headers(), query, host));
-    }
-    if path == LOGOUT_PATH {
-        let mut resp = error_page(ErrorCode::Unauthenticated, "You are signed out of this tunnel.");
-        *resp.status_mut() = StatusCode::OK;
-        set_cookie(&mut resp, TUNNEL_COOKIE, "", 0);
-        return Err(resp);
-    }
     let table = dp.table();
     if let Some((user, user_id, issued_at)) = cookie_user(dp, &table, req.headers(), host) {
         if may_connect(route, user) {
@@ -180,24 +180,122 @@ pub(super) fn check(dp: &DataPlane, req: &Request<Incoming>, host: &str, route: 
         percent_encode(back)
     );
     let mut resp = redirect(&to);
-    set_cookie(&mut resp, STATE_COOKIE, &nonce, 600);
+    set_cookie(&mut resp, &state_cookie(&nonce), "1", 600);
     Err(resp)
 }
 
-/// `/.magicpipes/callback?code=…&return=…`: turns a sign-in code into the tunnel cookie.
-fn callback(dp: &DataPlane, headers: &HeaderMap, query: &str, host: &str) -> Response<ProxyBody> {
-    let bad = || error_page(ErrorCode::Unauthenticated, "This sign-in link is invalid or has expired. Open the tunnel's address again.");
-    let Some(claims) = query_param(query, "code").and_then(|c| dp.signer().verify_code(&c, host)) else { return bad() };
-    // Only the browser that started the sign-in may finish it, and only once.
-    let state = cookie(headers, STATE_COOKIE).filter(|s| token_safe(s));
-    if state != Some(claims.nonce.as_str()) || claims.issued_at > unix_now() + 5 || !dp.use_code(&claims.nonce) {
-        return bad();
+/// The `/.magicpipes/` paths of a private tunnel host, which MagicPipes answers itself:
+///
+/// * `GET /.magicpipes/callback#code=…&return=…`: where the management host sends a browser
+///   after sign-in. The code is in the fragment, so it never reaches a server, a log or the
+///   history; the page's script clears it and posts it back to this host.
+/// * `POST /.magicpipes/callback`: exchanges the code for the tunnel cookie.
+/// * `/.magicpipes/logout`: forgets the tunnel cookie.
+pub(super) async fn reserved(dp: &DataPlane, req: Request<Incoming>, host: &str) -> Response<ProxyBody> {
+    match (req.method().clone(), req.uri().path()) {
+        (Method::GET | Method::HEAD, CALLBACK_PATH) => callback_page(),
+        (Method::GET | Method::HEAD, CALLBACK_SCRIPT_PATH) => callback_script(),
+        (Method::POST, CALLBACK_PATH) => exchange(dp, req, host).await,
+        (_, LOGOUT_PATH) => {
+            let mut resp = error_page(ErrorCode::Unauthenticated, "You are signed out of this tunnel.");
+            *resp.status_mut() = StatusCode::OK;
+            set_cookie(&mut resp, TUNNEL_COOKIE, "", 0);
+            resp
+        }
+        (_, path) => {
+            debug_assert!(path.starts_with(RESERVED_PREFIX));
+            error_page(ErrorCode::NotFound, "There is nothing here.")
+        }
     }
-    let mut resp = redirect(&safe_return(query_param(query, "return")));
-    resp.headers_mut().remove(ERROR_HEADER);
+}
+
+/// Our own pages on a tunnel host: only our script, and requests back to this host.
+fn own_page(content_type: &'static str, body: &'static str) -> Response<ProxyBody> {
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
+        .body(Full::new(Bytes::from_static(body.as_bytes())).map_err(|never| match never {}).boxed())
+        .unwrap_or_else(|_| error_page(ErrorCode::Internal, "Something went wrong."))
+}
+
+fn callback_page() -> Response<ProxyBody> {
+    own_page(
+        "text/html; charset=utf-8",
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Signing in…</title><script src="/.magicpipes/callback.js" defer></script></head>
+<body style="margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.55 ui-sans-serif,-apple-system,'Helvetica Neue',sans-serif"><main style="padding:24px 16px;max-width:30em"><p id="msg">Signing you in…</p><noscript><p>Signing in to a private tunnel needs JavaScript.</p></noscript></main></body></html>"#,
+    )
+}
+
+fn callback_script() -> Response<ProxyBody> {
+    own_page(
+        "text/javascript; charset=utf-8",
+        r#"(() => {
+  const params = new URLSearchParams(location.hash.slice(1));
+  // The code is single-use; keep it out of the history either way.
+  history.replaceState(null, "", location.pathname);
+  const say = (m) => { document.getElementById("msg").textContent = m; };
+  const again = "This sign-in link is invalid or has expired. Open the tunnel's address again.";
+  if (!params.get("code")) { say(again); return; }
+  fetch("/.magicpipes/callback", {
+    method: "POST",
+    credentials: "same-origin",
+    body: new URLSearchParams({ code: params.get("code"), return: params.get("return") || "/" }),
+  })
+    .then(async (r) => {
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && typeof d.to === "string" && d.to.startsWith("/")) location.replace(d.to);
+      else say((d.error && d.error.message) || again);
+    })
+    .catch(() => say("Couldn't finish signing in. Reload the page to try again."));
+})();
+"#,
+    )
+}
+
+fn json(status: StatusCode, value: &serde_json::Value) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(value.to_string())).map_err(|never| match never {}).boxed())
+        .unwrap_or_else(|_| error_page(ErrorCode::Internal, "Something went wrong."))
+}
+
+/// `POST /.magicpipes/callback` with `code` and `return`: the browser that started the sign-in
+/// (its state cookie matches the code's nonce) gets the tunnel cookie, once.
+async fn exchange(dp: &DataPlane, req: Request<Incoming>, host: &str) -> Response<ProxyBody> {
+    let bad = |message: &str| {
+        let mut resp = json(StatusCode::UNAUTHORIZED, &serde_json::json!({ "error": { "code": ErrorCode::Unauthenticated.as_str(), "message": message } }));
+        if let Ok(v) = HeaderValue::from_str(ErrorCode::Unauthenticated.as_str()) {
+            resp.headers_mut().insert(ERROR_HEADER, v);
+        }
+        resp
+    };
+    let expired = "This sign-in link is invalid or has expired. Open the tunnel's address again.";
+    let headers = req.headers().clone();
+    let body = http_body_util::Limited::new(req.into_body(), MAX_EXCHANGE_BODY);
+    let body = match tokio::time::timeout(EXCHANGE_TIMEOUT, body.collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        _ => return bad("The sign-in request was incomplete. Reload the page to try again."),
+    };
+    let form = String::from_utf8_lossy(&body);
+    let Some(claims) = query_param(&form, "code").and_then(|c| dp.signer().verify_code(&c, host)) else { return bad(expired) };
+    let state = state_cookie(&claims.nonce);
+    let started_here = token_safe(&claims.nonce) && cookie(&headers, &state).is_some();
+    // Only the browser that started the sign-in may finish it, and only once.
+    if !started_here || claims.issued_at > unix_now() + 5 || !dp.use_code(&claims.nonce) {
+        return bad(expired);
+    }
+    let mut resp = json(StatusCode::OK, &serde_json::json!({ "to": safe_return(query_param(&form, "return")) }));
     let ttl = dp.settings.tunnel_cookie_ttl_secs;
     set_cookie(&mut resp, TUNNEL_COOKIE, &dp.signer().cookie(&claims.user_id, host, ttl), ttl);
-    set_cookie(&mut resp, STATE_COOKIE, "", 0);
+    set_cookie(&mut resp, &state, "", 0);
     resp
 }
 
@@ -209,7 +307,7 @@ mod tests {
     fn cookies_and_return_paths() {
         let mut h = HeaderMap::new();
         h.insert(header::COOKIE, HeaderValue::from_static("a=1; __Host-mp_tunnel=secret; b=2"));
-        h.append(header::COOKIE, HeaderValue::from_static("__Host-mp_state=n"));
+        h.append(header::COOKIE, HeaderValue::from_static("__Host-mp_state_n1=1; __Host-mp_state_n2=1"));
         assert_eq!(cookie(&h, TUNNEL_COOKIE), Some("secret"));
         strip_cookies(&mut h);
         assert_eq!(h.get(header::COOKIE).unwrap(), "a=1; b=2");

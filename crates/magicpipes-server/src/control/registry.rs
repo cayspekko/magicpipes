@@ -323,7 +323,8 @@ impl ControlPlane {
 
 /// The answer to "may this user into the private tunnel at this host?".
 pub enum TunnelSignIn {
-    /// A one-time code for the tunnel host, and where to send it.
+    /// Where to send the browser: the tunnel's callback page, with the one-time code in the
+    /// fragment.
     Allowed { callback: String },
     Denied,
     NotFound,
@@ -353,6 +354,6 @@ impl ControlPlane {
         self.audit(who, "tunnel.sign_in", &host, "");
         let code = self.data.signer().code(id, &host, state);
         let enc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
-        TunnelSignIn::Allowed { callback: format!("{}{}?code={}", self.cfg.public_url(&host), crate::tunnel_auth::CALLBACK_PATH, enc(&code)) }
+        TunnelSignIn::Allowed { callback: format!("{}{}#code={}", self.cfg.public_url(&host), crate::tunnel_auth::CALLBACK_PATH, enc(&code)) }
     }
 }

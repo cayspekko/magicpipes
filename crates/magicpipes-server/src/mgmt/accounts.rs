@@ -355,10 +355,16 @@ pub async fn auth_tunnel(user: UiUser, State(app): State<AppState>, axum::extrac
             let body = format!(
                 r#"<div class="auth"><div class="eyebrow">Private tunnel</div><h1>No <em>access</em></h1>
 <p class="lede">You're signed in as {email}, but you don't have access to <code>{host}</code>. Ask its owner or an administrator.</p>
-<form method="post" action="/logout" style="margin-top:20px">{csrf}<button class="btn">Switch account</button></form></div>"#,
+<form method="post" action="/logout" style="margin-top:20px">{csrf}<input type="hidden" name="next" value="{here}"><button class="btn">Switch account</button></form></div>"#,
                 email = esc(&me.email),
                 host = esc(&q.host),
                 csrf = csrf(&user),
+                here = esc(&format!(
+                    "/auth/tunnel?host={}&state={}&return={}",
+                    super::ui::url_encode(&q.host),
+                    super::ui::url_encode(&q.state),
+                    super::ui::url_encode(&q.back)
+                )),
             );
             (StatusCode::FORBIDDEN, page("No access", Some(&user), &body)).into_response()
         }

@@ -313,14 +313,26 @@ udp_idle_timeout_secs = 5
 
     /// GET on a tunnel hostname with cookies, as a browser (`html`) or not.
     pub async fn tunnel_get(&self, hostname: &str, path: &str, cookies: &str, html: bool) -> TunnelResponse {
-        let mut b = Request::get(path).header(header::HOST, format!("{hostname}:{}", self.https_port));
+        self.tunnel_request("GET", hostname, path, cookies, html, String::new()).await
+    }
+
+    /// POST of a form body to a tunnel hostname, as a page's script would.
+    pub async fn tunnel_post(&self, hostname: &str, path: &str, cookies: &str, form: &str) -> TunnelResponse {
+        self.tunnel_request("POST", hostname, path, cookies, false, form.to_string()).await
+    }
+
+    async fn tunnel_request(&self, method: &str, hostname: &str, path: &str, cookies: &str, html: bool, body: String) -> TunnelResponse {
+        let mut b = Request::builder().method(method).uri(path).header(header::HOST, format!("{hostname}:{}", self.https_port));
         if !cookies.is_empty() {
             b = b.header(header::COOKIE, cookies);
         }
         if html {
             b = b.header(header::ACCEPT, "text/html,application/xhtml+xml");
         }
-        let resp = self.send(hostname, self.https_port, b.body(Full::new(Bytes::new())).unwrap()).await;
+        if !body.is_empty() {
+            b = b.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        }
+        let resp = self.send(hostname, self.https_port, b.body(Full::new(Bytes::from(body))).unwrap()).await;
         let get = |n| resp.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
         let (location, error) = (get(header::LOCATION), get(http::HeaderName::from_static("x-magicpipes-error")));
         let set_cookies = resp
@@ -658,5 +670,10 @@ pub struct TunnelResponse {
 impl TunnelResponse {
     pub fn cookie(&self, name: &str) -> Option<String> {
         self.set_cookies.iter().find(|c| c.starts_with(&format!("{name}="))).cloned()
+    }
+
+    /// The first cookie set whose name starts with `prefix`.
+    pub fn cookie_prefixed(&self, prefix: &str) -> Option<String> {
+        self.set_cookies.iter().find(|c| c.starts_with(prefix)).cloned()
     }
 }

@@ -24,6 +24,10 @@ cargo deny check
   user-visible behavior gets an e2e test; parsing and validation get unit tests next to the code.
 - `scripts/smoke-test.sh <bin dir>` is the release smoke test (all platforms, including Windows).
   Extend it when you add a tunnel kind or CLI command.
+- Changes to sign-in, cookies, redirects or CSPs: also run the ignored e2e test
+  `browser_signs_in_to_private_tunnels` (headless Chrome via `scripts/browser-sign-in.mjs`;
+  needs Chrome and Node 22+). The other e2e tests use a plain HTTP client, which applies neither
+  CSP nor cookie rules.
 - The code is hand-formatted at roughly 120 columns. Do not run `cargo fmt` over whole files; it
   rewrites hundreds of lines. Match the surrounding style instead.
 - CI (`.github/workflows/ci.yml`) runs the three commands above plus a Windows clippy check.
@@ -99,7 +103,10 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   escape every interpolated value. Keep the CSPs tight; don't add inline event handlers or
   third-party origins. Vendored browser assets live in `agent/shell/assets/` with a README
   (source, version) and their license file, which `release.yml` must copy into archives.
-- **Management UI**: state-changing requests need the session cookie *and* the CSRF token.
+- **Management UI**: state-changing requests need the session cookie *and* the CSRF token. A
+  form submission never redirects off the management host (browsers apply `form-action 'self'`
+  to its redirects); continue with a page that navigates on its own. Never put a secret in a
+  URL query string; a one-time code to another host goes in the fragment.
   Tunnel subdomains share the base domain with the management host, so the management listener
   answers only for `management.hostname` (`SingleHost` certificates, `require_host`), the
   cookie keeps its `__Host-` prefix, and its scope is never widened.

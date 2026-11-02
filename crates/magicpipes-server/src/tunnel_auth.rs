@@ -4,12 +4,16 @@
 //!
 //! The management cookie never leaves the management host, so a tunnel host gets its own:
 //!
-//! 1. The tunnel host sets `__Host-mp_state` (a nonce) and sends the browser to
-//!    `/auth/tunnel?host=…&state=…` on the management host.
+//! 1. The tunnel host sets `__Host-mp_state_<nonce>` and sends the browser to
+//!    `/auth/tunnel?host=…&state=<nonce>` on the management host.
 //! 2. There, a signed-in user who may connect gets a code, valid for 60 s and bound to the host
-//!    and the nonce, and is sent to `https://<host>/.magicpipes/callback?code=…`.
-//! 3. The tunnel host accepts the code once, only with the matching state cookie, and sets
-//!    `__Host-mp_tunnel`: the user and host, signed, until the session's maximum age.
+//!    and the nonce, and is sent to `https://<host>/.magicpipes/callback#code=…`. The code is in
+//!    the fragment, so no server, log or Referer sees it. Sign-in forms never redirect there
+//!    directly: browsers apply `form-action 'self'` to a form's redirects, so the management
+//!    host answers a sign-in with a page that moves on by itself.
+//! 3. The callback page's script posts the code to its own host, which accepts it once, only
+//!    with the matching state cookie, and sets `__Host-mp_tunnel`: the user and host, signed,
+//!    until the session's maximum age.
 //!
 //! Every request then rechecks the cookie against the current users and tags, so revoking access
 //! takes effect at once. Tokens are `kind~user~host~nonce~issued~expires~hmac` with an
@@ -22,9 +26,12 @@ use magicpipes_core::{secret, unix_now};
 use sha2::Sha256;
 
 pub const TUNNEL_COOKIE: &str = "__Host-mp_tunnel";
-pub const STATE_COOKIE: &str = "__Host-mp_state";
+/// Prefix of the per-attempt state cookies, `__Host-mp_state_<nonce>`.
+pub const STATE_COOKIE: &str = "__Host-mp_state_";
 /// Paths on every private tunnel host that MagicPipes answers itself.
+pub const RESERVED_PREFIX: &str = "/.magicpipes/";
 pub const CALLBACK_PATH: &str = "/.magicpipes/callback";
+pub const CALLBACK_SCRIPT_PATH: &str = "/.magicpipes/callback.js";
 pub const LOGOUT_PATH: &str = "/.magicpipes/logout";
 pub const CODE_TTL_SECS: i64 = 60;
 

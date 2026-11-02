@@ -523,21 +523,24 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, Form(f
 
 fn login_page(error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
     let err = error.map(|e| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(e))).unwrap_or_default();
-    let next = safe_next(next).map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
+    let next = safe_next(next);
+    // Switching between the two forms keeps the destination.
+    let nq = next.map(|n| format!("&amp;next={}", url_encode(n))).unwrap_or_default();
+    let next = next.map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
     let form = if admin_token {
         r#"<form method="post" action="/login">{next}<label for="t" style="margin-top:0">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
 <button class="btn primary block" style="margin-top:18px">Log in</button></form></div>
-<p class="note"><a href="/login">Sign in with email and password</a> instead. The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>; create another with <code>magicpipesd admin-token</code>.</p>"#
+<p class="note"><a href="/login?method=password{nq}">Sign in with email and password</a> instead. The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>; create another with <code>magicpipesd admin-token</code>.</p>"#
     } else {
         r#"<form method="post" action="/login">{next}<label for="e" style="margin-top:0">Email</label><input id="e" type="email" name="email" autocomplete="username" autofocus required>
 <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required>
 <button class="btn primary block" style="margin-top:18px">Sign in</button></form></div>
-<p class="note">Administrators create accounts. <a href="/login?method=token">Use an admin token</a></p>"#
+<p class="note">Administrators create accounts. <a href="/login?method=token{nq}">Use an admin token</a></p>"#
     };
     page(
         "Sign in",
         None,
-        &format!(r#"<div class="auth"><div class="eyebrow">MagicPipes</div><h1>Sign <em>in</em></h1><div class="card" style="margin-top:28px">{err}{form}</div>"#, form = form.replace("{next}", &next)),
+        &format!(r#"<div class="auth"><div class="eyebrow">MagicPipes</div><h1>Sign <em>in</em></h1><div class="card" style="margin-top:28px">{err}{form}</div>"#, form = form.replace("{next}", &next).replace("{nq}", &nq)),
     )
 }
 
@@ -559,20 +562,44 @@ pub struct LoginForm {
     next: Option<String>,
 }
 
+/// The session cookie. `SameSite=Lax` so it comes along when a private tunnel on another site
+/// sends the browser here to sign in; every state-changing form also needs its CSRF token.
+pub(super) fn session_cookie(value: &str, max_age: u64) -> HeaderValue {
+    let c = format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}");
+    HeaderValue::from_str(&c).expect("cookie is ASCII")
+}
+
 /// Sets the session cookie and sends the browser on: to `next` (a path on this site), via the
 /// password page if the user must replace an administrator-set password first.
+///
+/// This answers a form submission, and browsers apply the CSP's `form-action 'self'` to every
+/// redirect after one. `next` can lead off this host (`/auth/tunnel` sends the browser to a
+/// tunnel), so it is reached through a page of ours that starts a fresh navigation, never a
+/// redirect.
 pub(super) fn logged_in(app: &AppState, login: Login, next: Option<&str>) -> Response {
     let next = safe_next(next);
-    let to = match (login.must_change_password, next) {
-        (true, Some(n)) => format!("/password?next={}", url_encode(n)),
-        (true, None) => "/password".to_string(),
-        (false, Some(n)) => n.to_string(),
-        (false, None) => "/".to_string(),
+    let mut resp = match (login.must_change_password, next) {
+        (true, Some(n)) => Redirect::to(&format!("/password?next={}", url_encode(n))).into_response(),
+        (true, None) => Redirect::to("/password").into_response(),
+        (false, Some(n)) => continue_page(n),
+        (false, None) => Redirect::to("/").into_response(),
     };
-    let mut resp = Redirect::to(&to).into_response();
     let max_age = app.control.config().users.session_max_age_secs;
-    let value = format!("{SESSION_COOKIE}={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}", login.cookie);
-    resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&value).expect("cookie is ASCII"));
+    resp.headers_mut().insert(header::SET_COOKIE, session_cookie(&login.cookie, max_age));
+    resp
+}
+
+/// "Signed in; continuing…": a page that moves on with a `Refresh`, a navigation of its own that
+/// the form's CSP no longer covers, plus a link for browsers that don't follow it.
+fn continue_page(to: &str) -> Response {
+    let body = format!(
+        r#"<div class="auth"><div class="eyebrow">Signed in</div><h1>Continuing…</h1><p class="lede"><a href="{0}">Continue</a> if nothing happens.</p></div>"#,
+        esc(to)
+    );
+    let mut resp = page("Signed in", None, &body);
+    if let Ok(v) = HeaderValue::from_str(&format!("0;url={to}")) {
+        resp.headers_mut().insert("refresh", v);
+    }
     resp
 }
 
@@ -616,16 +643,23 @@ pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<C
     }
 }
 
-pub async fn logout(user: UiUser, State(app): State<AppState>, Form(f): Form<CsrfForm>) -> Response {
+#[derive(Deserialize)]
+pub struct LogoutForm {
+    csrf: String,
+    /// "Switch account": where to go after signing in again.
+    next: Option<String>,
+}
+
+pub async fn logout(user: UiUser, State(app): State<AppState>, Form(f): Form<LogoutForm>) -> Response {
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
     app.control.logout(&user.who, &user.cookie);
-    let mut resp = Redirect::to("/login").into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"))
-            .expect("cookie is ASCII"),
-    );
+    let to = match safe_next(f.next.as_deref()) {
+        Some(n) => format!("/login?next={}", url_encode(n)),
+        None => "/login".to_string(),
+    };
+    let mut resp = Redirect::to(&to).into_response();
+    resp.headers_mut().insert(header::SET_COOKIE, session_cookie("", 0));
     resp
 }

@@ -70,6 +70,10 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     if !route.access.allows_network(client_ip) {
         return Err(error_page(ErrorCode::TunnelNotFound, "There is no tunnel at this address."));
     }
+    // Private tunnel hosts: MagicPipes answers its own sign-in paths.
+    if !route.access.authz.public && req.uri().path().starts_with(crate::tunnel_auth::RESERVED_PREFIX) {
+        return Err(gate::reserved(dp, req, &host).await);
+    }
     // Public tunnels admit anyone; private ones a signed-in user who may connect.
     let admitted = match route.access.admits(&Principal::Anonymous, client_ip) {
         true => None,

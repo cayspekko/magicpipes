@@ -432,30 +432,41 @@ the management host, so it is the same page whether they started at the UI or at
 The management cookie is deliberately confined to the management host, so a tunnel host needs
 a cookie of its own:
 
-1. A browser without a valid tunnel cookie gets a short-lived `__Host-mp_state` cookie on the
-   tunnel host, holding a random nonce. It is then redirected to
+1. A browser without a valid tunnel cookie gets a short-lived state cookie on the tunnel host,
+   `__Host-mp_state_<nonce>`, one per sign-in attempt so tabs signing in at once don't overwrite
+   each other's. It is then redirected to
    `https://<management>/auth/tunnel?host=<tunnel host>&state=<nonce>&return=<path>`. The
    `return` path must be relative.
-2. **Not signed in there?** The login screen above is shown, with "Sign in to continue to
-   <tunnel host>".
+2. **Not signed in there?** The login screen above is shown. After signing in (and a forced
+   password change, if any) the browser is not redirected onward: browsers apply the
+   management CSP's `form-action 'self'` to every redirect after a form submission, and the
+   next hop leaves the management host. A small "Continuing…" page moves on with a `Refresh`
+   instead, a navigation of its own.
 3. **Signed in?** The server runs `authorize(user, Connect, tunnel)`.
-   - If denied, it shows the access-denied page.
-   - If allowed, it redirects to `https://<tunnel host>/.magicpipes/callback?code=…`. The code
-     is HMAC-signed, valid for 60 s, and bound to the host and the nonce.
-   - The code is single-use, enforced by a nonce cache in the data plane. The cache is bounded
-     and entries expire after 60 s.
-   - The callback accepts the code only if the nonce matches the browser's `__Host-mp_state`.
-     Without that check, someone could send a victim a link that logs them into the tunnel
-     under the sender's account.
-4. The data plane exchanges the code for a cookie `__Host-mp_tunnel`: HttpOnly, Secure,
-   `SameSite=Lax`. It contains `{user, host, issued_at, expiry}` and is HMAC-signed with a
-   server key in `data_dir/session-key` (0600). Every request checks the signature and then
-   runs `authorize()` against the current snapshot, so revocation still works.
-5. The proxy removes `__Host-mp_tunnel` and `__Host-mp_state` from the `Cookie` header before
+   - If denied, it shows the access-denied page, whose "Switch account" comes back here.
+   - If allowed, it redirects to `https://<tunnel host>/.magicpipes/callback#code=…&return=…`.
+     The code is HMAC-signed, valid for 60 s, and bound to the host and the nonce. It travels
+     in the URL fragment, so no server, log or Referer header sees it.
+4. The callback page (served by MagicPipes on the tunnel host, under a CSP that allows only its
+   own script and requests to its own host) removes the fragment from the history and posts the
+   code to `/.magicpipes/callback`. Signing in to a private tunnel therefore needs JavaScript.
+   - The code is accepted once (a bounded nonce cache in the data plane, entries kept 60 s),
+     and only with the attempt's state cookie. Without that check, someone could send a victim
+     a link that logs them into the tunnel under the sender's account.
+   - The answer sets `__Host-mp_tunnel`: HttpOnly, Secure, `SameSite=Lax`, with
+     `{user, host, issued_at, expiry}`, HMAC-signed with a server key in
+     `data_dir/session-key` (0600). Every request checks the signature and then runs
+     `authorize()` against the current snapshot, so revocation still works.
+5. The proxy removes `__Host-mp_tunnel` and the state cookies from the `Cookie` header before
    forwarding, so the tunnel app never sees them. The proxy reserves `/.magicpipes/` on tunnel
    hosts.
 6. The app receives `X-MagicPipes-User` (email) and `X-MagicPipes-User-Id`. Clients can't
    forge them: the proxy already strips client-sent `x-magicpipes-*` headers.
+
+The management session cookie is `SameSite=Lax` (every form also needs its CSRF token), so it
+comes along when a tunnel on another registrable domain sends the browser to the management
+host. `scripts/browser-sign-in.mjs` and the ignored e2e test
+`browser_signs_in_to_private_tunnels` check this flow in headless Chrome.
 
 Signing out of the management UI also ends that user's tunnel cookies. Like "log out
 everywhere", it bumps `sessions_valid_after`. A per-tunnel "sign out" link lives at
