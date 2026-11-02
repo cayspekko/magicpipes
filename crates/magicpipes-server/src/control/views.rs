@@ -1,5 +1,7 @@
 //! What the management API and UI show. Every list is filtered by [`authz::authorize`].
 
+use std::collections::HashMap;
+
 use magicpipes_core::proto::{Kind, Visibility};
 use magicpipes_core::rfc3339;
 use serde::Serialize;
@@ -97,6 +99,13 @@ pub struct StatusView {
     pub started_at: String,
     pub tunnels: usize,
     pub agents_connected: usize,
+}
+
+/// See [`ControlPlane::private_reach`].
+#[derive(Debug, Default)]
+pub struct PrivateReach {
+    pub by_tag: HashMap<String, usize>,
+    pub by_agent: HashMap<String, HashMap<String, usize>>,
 }
 
 impl ControlPlane {
@@ -202,6 +211,20 @@ impl ControlPlane {
                 }
             })
             .collect()
+    }
+
+    /// How many private tunnels `who` manages admit people through each access tag, over all
+    /// of them and per agent: what removing a tag would close.
+    pub fn private_reach(&self, who: &Principal) -> PrivateReach {
+        let st = self.state.lock().unwrap();
+        let mut reach = PrivateReach::default();
+        for t in st.tunnels.values().filter(|t| t.row.visibility == Visibility::Private && st.may(who, Action::Manage, t)) {
+            for tag in st.tunnel_authz(t).access {
+                *reach.by_agent.entry(t.row.agent_id.clone()).or_default().entry(tag.clone()).or_default() += 1;
+                *reach.by_tag.entry(tag).or_default() += 1;
+            }
+        }
+        reach
     }
 
     pub fn agent_name(&self, who: &Principal, agent_id: &str) -> Option<String> {

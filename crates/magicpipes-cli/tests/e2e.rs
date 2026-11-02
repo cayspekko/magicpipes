@@ -1052,6 +1052,70 @@ async fn browser_login_enrolls_your_machine() {
 }
 
 /// Signs a new user in and replaces the password an administrator set; returns the session cookie.
+#[tokio::test]
+async fn tag_forms_apply_only_what_changed() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let admin = env.admin_token();
+    for (name, description) in [("team:dev", "Engineering"), ("team:ops", "</script><b>ops</b>"), ("env:prod", "")] {
+        env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": name, "description": description })).await;
+    }
+    let mut ids = Vec::new();
+    for (email, role) in [("ad@example.com", "admin"), ("ann@example.com", "member")] {
+        let body = serde_json::json!({ "email": email, "password": "correct horse battery", "role": role });
+        ids.push(env.api_json("POST", "/api/v1/users", Some(&admin), body).await.1["user"]["id"].as_str().unwrap().to_string());
+    }
+    let ann = &ids[1];
+    let tags_of = |id: String| {
+        let env = &env;
+        let admin = admin.clone();
+        async move { env.api("GET", &format!("/api/v1/users/{id}"), Some(&admin)).await.1["tags"].clone() }
+    };
+    env.api_json("PATCH", &format!("/api/v1/users/{ann}"), Some(&admin), serde_json::json!({ "tags": ["team:dev"] })).await;
+    let cookie = sign_in(&env, "ad@example.com", "correct horse battery").await;
+
+    // The users page carries the registry for the picker, with descriptions unable to end it.
+    let users = env.ui("/users", Some(&cookie), None).await;
+    assert!(users.html.contains(r#"id="mp-tags""#) && users.html.contains(&format!(r#"href="/users/{ann}/tags" data-tag-edit"#)), "{}", users.html);
+    assert!(users.html.contains(r#"\u003c/script>\u003cb>ops"#) && !users.html.contains("</script><b>"), "{}", users.html);
+    // Without scripts the Edit link opens a page of checkboxes.
+    let page = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), None).await;
+    assert!(page.html.contains(r#"value="team:dev" checked"#) && page.html.contains(r#"name="base" value="team:dev""#), "{}", page.html);
+
+    // Another administrator adds a tag after the page was shown: saving keeps it.
+    env.api_json("PATCH", &format!("/api/v1/users/{ann}"), Some(&admin), serde_json::json!({ "tags": ["env:prod", "team:dev"] })).await;
+    let csrf = users.csrf();
+    let saved = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "team:dev"), ("tags", "team:dev team:ops")])).await;
+    assert_eq!(saved.location.as_deref(), Some("/users"));
+    assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["env:prod", "team:dev", "team:ops"]));
+    // Checkboxes from the page: everything unchecked but one.
+    env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "env:prod team:dev team:ops"), ("tag", "team:ops")])).await;
+    assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["team:ops"]));
+    let refused = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", ""), ("tags", "team:qa")])).await;
+    assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("not an access tag"), "{}", refused.html);
+    let forged = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", "wrong"), ("base", ""), ("tags", "env:prod")])).await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+
+    // Agents work the same way.
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent = v["agents"][0]["id"].as_str().unwrap().to_string();
+    let index = env.ui("/", Some(&cookie), None).await;
+    assert!(index.html.contains(&format!(r#"href="/agents/{agent}/tags" data-tag-edit"#)), "{}", index.html);
+    env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", ""), ("tags", "team:dev env:prod")])).await;
+    env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "env:prod team:dev"), ("tags", "team:dev")])).await;
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    assert_eq!(v["agents"][0]["tags"], serde_json::json!(["team:dev"]));
+    let page = env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), None).await;
+    assert!(page.html.contains(r#"value="team:dev" checked"#) && page.html.contains(r#"value="team:ops">"#), "{}", page.html);
+
+    // Enrollment tokens take checkboxes too.
+    assert!(index.html.contains(r#"fieldset class="tags" data-picker"#), "{}", index.html);
+    let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:ops"), ("labels", ""), ("allow_public", "on")])).await;
+    assert!(made.status == StatusCode::OK && made.html.contains("--token"), "{}", made.html);
+    let bad = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:qa")])).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}
+
 async fn sign_in(env: &Env, email: &str, password: &str) -> String {
     let first = env.ui("/login", None, Some(&[("email", email), ("password", password)])).await;
     let cookie = first.cookie.expect("signed in");

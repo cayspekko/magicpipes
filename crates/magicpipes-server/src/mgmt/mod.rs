@@ -12,6 +12,7 @@
 
 mod accounts;
 mod api;
+mod picker;
 mod ui;
 
 use std::collections::HashMap;
@@ -96,7 +97,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/tunnels/{id}", get(ui::tunnel_detail))
         .route("/tunnels/{id}/delete", post(ui::delete_tunnel))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
-        .route("/agents/{id}/tags", post(ui::agent_tags))
+        .route("/agents/{id}/tags", get(ui::agent_tags_page).post(ui::agent_tags))
         .route("/tags", get(accounts::tags).post(accounts::create_tag))
         .route("/tags/delete", post(accounts::delete_tag))
         .route("/enrollments", post(ui::create_enrollment))
@@ -107,6 +108,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/account/logout-everywhere", post(accounts::logout_everywhere))
         .route("/users", get(accounts::users).post(accounts::create_user))
         .route("/users/{id}", post(accounts::update_user))
+        .route("/users/{id}/tags", get(accounts::user_tags_page).post(accounts::user_tags))
         .route("/audit", get(accounts::audit))
         .route("/cli", get(accounts::device).post(accounts::answer_device))
         .route("/auth/tunnel", get(accounts::auth_tunnel))

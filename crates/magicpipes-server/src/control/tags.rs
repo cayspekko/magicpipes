@@ -38,6 +38,27 @@ fn invalid(msg: String) -> ErrorBody {
     err(ErrorCode::InvalidRequest, msg)
 }
 
+/// Tags to take away: normalized, but not necessarily registered any more.
+fn removable(list: &[String]) -> Result<Vec<String>, ErrorBody> {
+    let list = tags::normalize_list(list).map_err(invalid)?;
+    if list.len() > MAX_TAGS {
+        return Err(invalid(format!("at most {MAX_TAGS} tags")));
+    }
+    Ok(list)
+}
+
+/// `current` without `remove`, plus `add`; sorted and bounded.
+fn changed(current: Vec<String>, add: &[String], remove: &[String]) -> Result<Vec<String>, ErrorBody> {
+    let mut list: Vec<String> = current.into_iter().filter(|t| !remove.contains(t)).collect();
+    list.extend(add.iter().filter(|t| !remove.contains(t)).cloned());
+    list.sort();
+    list.dedup();
+    if list.len() > MAX_TAGS {
+        return Err(invalid(format!("at most {MAX_TAGS} tags")));
+    }
+    Ok(list)
+}
+
 impl ControlPlane {
     /// Normalized, registered tags; `tag_unknown` names the first unregistered one.
     pub(super) fn registered(&self, list: &[String]) -> Result<Vec<String>, ErrorBody> {
@@ -94,16 +115,61 @@ impl ControlPlane {
 
     /// Replaces a user's tags (administrators only).
     pub fn set_user_tags(&self, who: &Principal, user_id: &str, list: &[String]) -> Result<Vec<String>, ErrorBody> {
+        self.edit_user_tags(who, user_id, |_| self.registered(list))
+    }
+
+    /// Adds and removes some of a user's tags (administrators only), keeping the others as they
+    /// are now, so two administrators changing different tags don't undo each other.
+    pub fn change_user_tags(&self, who: &Principal, user_id: &str, add: &[String], remove: &[String]) -> Result<Vec<String>, ErrorBody> {
+        let (add, remove) = (self.registered(add)?, removable(remove)?);
+        self.edit_user_tags(who, user_id, |current| changed(current, &add, &remove))
+    }
+
+    /// Reads the user's tags, computes the new list and writes it under the state lock, so
+    /// concurrent edits apply one after the other.
+    fn edit_user_tags(
+        &self,
+        who: &Principal,
+        user_id: &str,
+        edit: impl FnOnce(Vec<String>) -> Result<Vec<String>, ErrorBody>,
+    ) -> Result<Vec<String>, ErrorBody> {
         if !authz::authorize(who, Action::Manage, Resource::Org) {
             return Err(err(ErrorCode::Forbidden, "only administrators assign tags"));
         }
         if self.store.user(user_id).map_err(internal)?.is_none() {
             return Err(err(ErrorCode::NotFound, "no such user"));
         }
-        let list = self.registered(list)?;
-        let by = matches!(who, Principal::User { .. }).then(|| who.actor());
-        self.store.set_user_tags(user_id, &list, by).map_err(internal)?;
+        let list = {
+            let _st = self.state.lock().unwrap();
+            let current = self.store.user_tags().map_err(internal)?.remove(user_id).unwrap_or_default();
+            let list = edit(current)?;
+            let by = matches!(who, Principal::User { .. }).then(|| who.actor());
+            self.store.set_user_tags(user_id, &list, by).map_err(internal)?;
+            list
+        };
         self.audit(who, "user.tags", user_id, &list.join(" "));
+        self.refresh();
+        Ok(list)
+    }
+
+    /// Adds and removes some of an agent's tags, keeping the others. Administrators add any
+    /// registered tag; an agent's owner may only remove tags.
+    pub fn change_agent_tags(&self, who: &Principal, agent_id: &str, add: &[String], remove: &[String]) -> Result<Vec<String>, ErrorBody> {
+        let (add, remove) = (self.registered(add)?, removable(remove)?);
+        let list = {
+            let st = self.state.lock().unwrap();
+            if st.dir.agent(agent_id).is_none() || !authz::authorize(who, Action::Manage, st.agent_resource(agent_id)) {
+                return Err(err(ErrorCode::NotFound, "no such agent"));
+            }
+            let assigned = self.store.agent_tags().map_err(internal)?.remove(agent_id).unwrap_or_default();
+            if !who.is_admin() && add.iter().any(|t| !assigned.contains(t)) {
+                return Err(err(ErrorCode::Forbidden, "you can remove an agent's tags; adding one takes an administrator"));
+            }
+            let list = changed(assigned, &add, &remove)?;
+            self.store.set_agent_tags(agent_id, &list).map_err(internal)?;
+            list
+        };
+        self.audit(who, "agent.tags", agent_id, &list.join(" "));
         self.refresh();
         Ok(list)
     }

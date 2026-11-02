@@ -2,7 +2,7 @@
 //! Tunnels, agents and the login screen live here; accounts and users in `accounts`.
 
 use axum::Form;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, RawForm, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use http::request::Parts;
 use http::{HeaderValue, StatusCode, header};
@@ -10,6 +10,7 @@ use magicpipes_core::proto::Visibility;
 use magicpipes_core::theme::{GLYPH, STYLE};
 use serde::Deserialize;
 
+use super::picker::{self, Holder, Submitted};
 use super::{AppState, ClientIp, Rejected, SESSION_COOKIE};
 use crate::authz::Principal;
 use crate::control::{EnrollmentOptions, Login, LoginError, TunnelView, UserView};
@@ -97,53 +98,7 @@ impl UiUser {
 /// Progressive enhancement for every page: a copy-to-clipboard button on each `pre.term` code
 /// block. Add `data-nocopy` to a block to leave it without one. Served from `/ui.js` because the
 /// CSP forbids inline scripts.
-const SCRIPT: &str = r#"(() => {
-  const COPY = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>';
-  const DONE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
-  // The text a user would want to paste: the block's content without prompt markers.
-  const text = (pre) => {
-    const c = pre.cloneNode(true);
-    c.querySelectorAll('.p').forEach((p) => p.remove());
-    return c.textContent.trim();
-  };
-  const fallback = (s) => {
-    const t = document.createElement('textarea');
-    t.value = s;
-    t.setAttribute('readonly', '');
-    t.style.cssText = 'position:fixed;opacity:0';
-    document.body.appendChild(t);
-    t.select();
-    const ok = document.execCommand('copy');
-    t.remove();
-    return ok;
-  };
-  document.querySelectorAll('pre.term:not([data-nocopy])').forEach((pre) => {
-    const box = document.createElement('div');
-    box.className = 'codebox';
-    pre.replaceWith(box);
-    box.appendChild(pre);
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'copy';
-    btn.title = 'Copy to clipboard';
-    btn.setAttribute('aria-label', 'Copy to clipboard');
-    btn.innerHTML = COPY;
-    let timer;
-    btn.addEventListener('click', async () => {
-      const s = text(pre);
-      let ok;
-      try { await navigator.clipboard.writeText(s); ok = true; } catch { ok = fallback(s); }
-      if (!ok) return;
-      btn.classList.add('done');
-      btn.innerHTML = DONE;
-      btn.title = 'Copied';
-      clearTimeout(timer);
-      timer = setTimeout(() => { btn.classList.remove('done'); btn.innerHTML = COPY; btn.title = 'Copy to clipboard'; }, 1600);
-    });
-    box.appendChild(btn);
-  });
-})();
-"#;
+const SCRIPT: &str = include_str!("ui.js");
 
 pub async fn script() -> Response {
     ([(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"))], SCRIPT).into_response()
@@ -168,10 +123,11 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
         .unwrap_or_default();
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title><style>{STYLE}</style><script src="/ui.js" defer></script></head><body>
+<meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title><style>{STYLE}{picker}</style><script src="/ui.js" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{logout}</div></header>
 <main>{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),
+        picker = super::picker::STYLE,
         version = esc(magicpipes_core::VERSION),
     ))
     .into_response()
@@ -255,14 +211,15 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     if tunnels.is_empty() {
         rows = r#"<tr><td colspan="7" class="empty">No tunnels yet. Run <code>magicpipes add 8080</code> on an enrolled machine.</td></tr>"#.into();
     }
+    let reach = app.control.private_reach(&user.who);
     let mut agent_rows = String::new();
     for a in &agents {
         let last_seen = a.last_seen_at.as_deref().map(when).unwrap_or_else(|| r#"<span class="when">never</span>"#.into());
         let owner = a.owner_email.as_deref().map(esc).unwrap_or_else(|| r#"<span class="sub">service agent</span>"#.into());
         agent_rows.push_str(&format!(
-            r#"<tr><td><span class="name">{name}</span><code class="sub">{id}</code></td><td>{owner}</td><td><form method="post" action="/agents/{id}/tags" style="display:flex;gap:6px;align-items:center"><input type="hidden" name="csrf" value="{csrf}"><input name="tags" value="{tags}" aria-label="Tags" style="min-width:9em"><button class="btn small">Save</button></form></td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num"><form method="post" action="/agents/{id}/revoke"><input type="hidden" name="csrf" value="{csrf}"><button class="btn danger small">Revoke</button></form></td></tr>"#,
+            r#"<tr><td><span class="name">{name}</span><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num"><form method="post" action="/agents/{id}/revoke"><input type="hidden" name="csrf" value="{csrf}"><button class="btn danger small">Revoke</button></form></td></tr>"#,
             name = esc(&a.name),
-            tags = esc(&a.tags.join(", ")),
+            tags = picker::cell(&user, &a.tags, &format!("/agents/{}/tags", a.id), &a.name, admin, Holder::Agent, reach.by_agent.get(&a.id)),
             status = badge(if a.connected { "connected" } else { "disconnected" }),
             tunnels = a.tunnels,
             id = esc(&a.id),
@@ -291,7 +248,8 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
 {shared}
 <div class="section"><h2>Agents<span class="count">{agents_total}</span></h2></div>
 <div class="card scroll"><table><thead><tr><th>Agent</th><th>Owner</th><th>Access tags</th><th>Status</th><th class="num">Tunnels</th><th>Last seen</th><th></th></tr></thead><tbody>{agent_rows}</tbody></table></div>
-{enroll}"#,
+{enroll}{registry}"#,
+        registry = picker::registry(&app, &user),
         domain = esc(&domain),
         n = tunnels.len(),
         agents_total = agents.len(),
@@ -378,23 +336,51 @@ pub async fn delete_tunnel(user: UiUser, State(app): State<AppState>, Path(id): 
     Redirect::to("/").into_response()
 }
 
-#[derive(Deserialize)]
-pub struct TagsForm {
-    csrf: String,
-    #[serde(default)]
-    tags: String,
+/// Without scripts, an agent's Edit link opens this page of checkboxes.
+pub async fn agent_tags_page(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(agent) = app.control.agents(&user.who).into_iter().find(|a| a.id == id) else {
+        let body = r#"<a class="crumb" href="/">← Tunnels</a><h1>Not found</h1><p class="lede">There is no agent with that id.</p>"#;
+        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), body)).into_response();
+    };
+    // Members see only the machine's tags, which they may remove.
+    let all: Vec<(String, String)> = if user.who.is_admin() {
+        app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect()
+    } else {
+        agent.tags.iter().map(|t| (t.clone(), String::new())).collect()
+    };
+    let note = if user.who.is_admin() { "" } else { r#"<p class="note">You can remove this machine's tags. Adding one takes an administrator.</p>"# };
+    let body = format!(
+        r#"<a class="crumb" href="/">← Tunnels</a><div class="head"><div><div class="eyebrow">Agent</div><h1>Access tags of <em>{name}</em></h1></div></div>
+<div class="card form"><form method="post" action="/agents/{id}/tags"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="base" value="{base}">
+{boxes}{note}<button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
+        name = esc(&agent.name),
+        id = esc(&agent.id),
+        csrf = esc(&user.csrf),
+        base = esc(&agent.tags.join(" ")),
+        boxes = picker::fieldset("Access tags", &all, &agent.tags, None),
+    );
+    page("Agent tags", Some(&user), &body)
 }
 
-pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<TagsForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
+pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, RawForm(raw): RawForm) -> Response {
+    let failed = |message: &str| {
+        let body = format!(r#"<a class="crumb" href="/">← Tunnels</a><div class="alert" role="alert">{}</div>"#, esc(message));
+        (StatusCode::BAD_REQUEST, page("Agent", Some(&user), &body)).into_response()
+    };
+    let form = match Submitted::parse(&raw) {
+        Ok(f) => f,
+        Err(e) => return failed(&e),
+    };
+    if let Err(r) = user.check_csrf(&form.csrf) {
         return r;
     }
-    match app.control.update_agent(&user.who, &id, Some(&[f.tags]), None) {
+    let result = match form.change() {
+        Some((add, remove)) => app.control.change_agent_tags(&user.who, &id, &add, &remove).map(drop),
+        None => app.control.update_agent(&user.who, &id, Some(&form.want), None),
+    };
+    match result {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => {
-            let body = format!(r#"<a class="crumb" href="/">← Tunnels</a><div class="alert" role="alert">{}</div>"#, esc(&e.message));
-            (StatusCode::BAD_REQUEST, page("Agent", Some(&user), &body)).into_response()
-        }
+        Err(e) => failed(&e.message),
     }
 }
 
@@ -451,12 +437,18 @@ fn enroll_panel(app: &AppState, user: &UiUser) -> String {
         .map(|u| format!(r#"<option value="{}">{}</option>"#, esc(&u.id), esc(&u.email)))
         .collect();
     let private = if users.is_empty() { "" } else { " checked" };
+    let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
+    let tags = if all.is_empty() {
+        r#"<label>Access tags</label><p class="note" style="margin-top:0">None yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string()
+    } else {
+        picker::fieldset("Access tags", &all, &[], Some("For the new machine"))
+    };
     format!(
         r#"<div class="section"><h2>Enroll a machine</h2></div>
 <div class="card form"><p class="note" style="margin-top:0">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>
 <form method="post" action="/enrollments"><input type="hidden" name="csrf" value="{csrf}">
 <label for="eo">Belongs to</label><select id="eo" name="owner"><option value="">Nobody (a service agent, managed by administrators)</option>{owners}</select>
-<label for="et">Access tags</label><input id="et" name="tags" placeholder="team:dev, team:ops">
+{tags}
 <label for="el">Labels (not used for access)</label><input id="el" name="labels" placeholder="environment:staging">
 <label><input type="checkbox" name="allow_public" checked> Its tunnels may be public</label>
 <label><input type="checkbox" name="default_private"{private}> Its tunnels are private unless asked otherwise</label>
@@ -475,36 +467,30 @@ fn member_enroll_hint(app: &AppState) -> String {
     )
 }
 
-#[derive(Deserialize)]
-pub struct EnrollForm {
-    csrf: String,
-    #[serde(default)]
-    owner: String,
-    #[serde(default)]
-    tags: String,
-    #[serde(default)]
-    labels: String,
-    allow_public: Option<String>,
-    default_private: Option<String>,
-}
-
-pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, Form(f): Form<EnrollForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
+pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawForm(raw): RawForm) -> Response {
+    let failed = |message: &str| {
+        let body = format!(r#"<a class="crumb" href="/">← Tunnels</a><div class="alert" role="alert">{}</div>"#, esc(message));
+        (StatusCode::BAD_REQUEST, page("Enrollment token", Some(&user), &body)).into_response()
+    };
+    // Checkboxes named `tag`, or a `tags` field from an older page.
+    let form = match Submitted::parse(&raw) {
+        Ok(f) => f,
+        Err(e) => return failed(&e),
+    };
+    if let Err(r) = user.check_csrf(&form.csrf) {
         return r;
     }
+    let owner = form.get("owner").unwrap_or("");
     let opts = EnrollmentOptions {
-        owner_user_id: (!f.owner.is_empty()).then_some(f.owner),
-        tags: vec![f.tags],
-        labels: vec![f.labels],
-        allow_public: Some(f.allow_public.is_some()),
-        default_private: Some(f.default_private.is_some()),
+        owner_user_id: (!owner.is_empty()).then(|| owner.to_string()),
+        tags: form.want.clone(),
+        labels: vec![form.get("labels").unwrap_or("").to_string()],
+        allow_public: Some(form.get("allow_public").is_some()),
+        default_private: Some(form.get("default_private").is_some()),
     };
     let token = match app.control.create_enrollment(&user.who, opts) {
         Ok(t) => t,
-        Err(e) => {
-            let body = format!(r#"<a class="crumb" href="/">← Tunnels</a><div class="alert" role="alert">{}</div>"#, esc(&e.message));
-            return (StatusCode::BAD_REQUEST, page("Enrollment token", Some(&user), &body)).into_response();
-        }
+        Err(e) => return failed(&e.message),
     };
     let cfg = app.control.config();
     let server = server_url(&app);

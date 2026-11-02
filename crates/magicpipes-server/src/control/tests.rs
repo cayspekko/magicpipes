@@ -221,6 +221,45 @@ async fn tags_limit_enrollments_and_personal_agents() {
 }
 
 #[tokio::test]
+async fn tag_changes_keep_other_edits() {
+    use magicpipes_core::proto::Visibility;
+
+    use crate::authz::Role;
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    for t in ["team:dev", "team:ops", "env:prod"] {
+        f.cp.create_tag(&admin, t, "").unwrap();
+    }
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let s = |l: &[&str]| l.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+    // Two administrators editing from the same page: each change keeps the other's.
+    f.cp.set_user_tags(&admin, &ann.id, &s(&["team:dev"])).unwrap();
+    f.cp.change_user_tags(&admin, &ann.id, &s(&["team:ops"]), &[]).unwrap();
+    assert_eq!(f.cp.change_user_tags(&admin, &ann.id, &s(&["env:prod"]), &s(&["team:dev"])).unwrap(), s(&["env:prod", "team:ops"]));
+    assert!(f.cp.change_user_tags(&admin, &ann.id, &s(&["team:qa"]), &[]).unwrap_err().is(ErrorCode::TagUnknown));
+    let who = Principal::User { id: ann.id.clone(), role: Role::Member, tags: s(&["team:ops"]) };
+    assert!(f.cp.change_user_tags(&who, &ann.id, &s(&["team:dev"]), &[]).unwrap_err().is(ErrorCode::Forbidden));
+
+    // Agents: administrators add and remove; an owner only removes.
+    let ci = f.agent("ci");
+    f.cp.change_agent_tags(&admin, &ci, &s(&["team:dev", "team:ops"]), &[]).unwrap();
+    let t = f.cp.register(&ci, &RegisterTunnel { visibility: Some(Visibility::Private), access: s(&["team:dev"]), ..http("dev") }).unwrap();
+    f.cp.register(&ci, &RegisterTunnel { visibility: Some(Visibility::Private), ..http("both") }).unwrap();
+    let web = f.agent("web");
+    f.cp.change_agent_tags(&admin, &web, &s(&["team:ops"]), &[]).unwrap();
+    f.cp.register(&web, &RegisterTunnel { visibility: Some(Visibility::Public), ..http("public") }).unwrap();
+    let reach = f.cp.private_reach(&admin);
+    assert_eq!((reach.by_tag.get("team:dev"), reach.by_tag.get("team:ops")), (Some(&2), Some(&1)), "public tunnels don't count");
+    assert_eq!(reach.by_agent[&ci].get("team:dev"), Some(&2));
+    assert!(f.cp.private_reach(&who).by_tag.is_empty(), "members count only their own tunnels");
+
+    f.cp.change_agent_tags(&admin, &ci, &[], &s(&["team:dev"])).unwrap();
+    assert!(f.data.lookup(&t.hostname).unwrap().access.authz.access.is_empty(), "the removal applies to the tunnel at once");
+    assert!(f.cp.change_agent_tags(&who, &ci, &[], &s(&["team:ops"])).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
+}
+
+#[tokio::test]
 async fn registration_respects_the_enrollment() {
     use magicpipes_core::proto::{Kind, Visibility};
 

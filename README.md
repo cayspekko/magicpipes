@@ -170,7 +170,12 @@ administrator when they first sign in.
 * **Access tags** (Tags page, e.g. `team:dev`): administrators create them and assign them to
   users. Someone reaches a private tunnel when they share one of its access tags, or own it.
   Matching is exact; nobody can give themselves a tag. Deleting a tag takes it away from
-  everyone and everything at once.
+  everyone and everything at once. In the UI, **Edit** next to a user's or a machine's tags opens a
+  picker: every tag as a pill grouped by key, a filter box (Enter picks the first match) and a
+  tray of what will be added (green, `+`) or removed (red, `−`), with a warning when a removal
+  closes private tunnels. Nothing changes until you save, and saving applies only those changes,
+  so another administrator's edit made meanwhile is kept. Without JavaScript, Edit opens a page
+  of checkboxes instead.
 * **Sign-in protection**: passwords are stored as Argon2id hashes and need at least 12
   characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every
   10 seconds, right password or not. An address with 10 failed attempts within 5 minutes

@@ -8,9 +8,10 @@ use http::StatusCode;
 use serde::Deserialize;
 
 use super::AppState;
+use super::picker::{self, Holder, Submitted};
 use super::ui::{CsrfForm, UiUser, chips, esc, logged_in, page, safe_next, when};
 use crate::authz::{Principal, Role};
-use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn, UserView};
+use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
 
 fn alert(msg: Option<&str>) -> String {
     msg.map(|m| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(m))).unwrap_or_default()
@@ -182,9 +183,11 @@ pub async fn logout_everywhere(user: UiUser, State(app): State<AppState>, Form(f
 
 // ---- users -----------------------------------------------------------------------------------
 
-fn users_page(user: &UiUser, users: &[UserView], error: Option<&str>) -> Response {
+fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
+    let users = app.control.users(&user.who);
+    let reach = app.control.private_reach(&user.who);
     let mut rows = String::new();
-    for u in users {
+    for u in &users {
         let state = match (u.disabled, u.must_change_password) {
             (true, _) => r#"<span class="status bad">disabled</span>"#,
             (false, true) => r#"<span class="status warn">must change password</span>"#,
@@ -205,12 +208,7 @@ fn users_page(user: &UiUser, users: &[UserView], error: Option<&str>) -> Respons
             let status = if u.disabled { button("enable", "Enable", "") } else { button("disable", "Disable", "danger") };
             format!("{role} {status} {}", button("reset", "Reset password", ""))
         };
-        let tags = format!(
-            r#"<form method="post" action="/users/{id}" style="display:flex;gap:6px;align-items:center">{csrf}<input type="hidden" name="action" value="tags"><input name="tags" value="{tags}" aria-label="Access tags" style="min-width:9em"><button class="btn small">Save</button></form>"#,
-            id = esc(&u.id),
-            csrf = csrf(user),
-            tags = esc(&u.tags.join(", ")),
-        );
+        let tags = picker::cell(user, &u.tags, &format!("/users/{}/tags", u.id), &u.email, true, Holder::User, Some(&reach.by_tag));
         rows.push_str(&format!(
             r#"<tr><td><span class="name">{name}</span><span class="sub">{email}</span></td><td>{role}</td><td>{tags}</td><td>{state}</td><td>{last}</td><td class="num">{actions}</td></tr>"#,
             name = esc(if u.display_name.is_empty() { &u.email } else { &u.display_name }),
@@ -232,7 +230,8 @@ fn users_page(user: &UiUser, users: &[UserView], error: Option<&str>) -> Respons
 <label for="un">Name</label><input id="un" name="display_name" maxlength="100">
 <label for="ur">Role</label><select id="ur" name="role"><option value="member">Member</option><option value="admin">Administrator</option></select>
 <label for="up">Password (empty = generate one)</label><input id="up" type="password" name="password" autocomplete="new-password" minlength="{min}">
-<button class="btn primary" style="margin-top:14px">Add user</button></form></div>"#,
+<button class="btn primary" style="margin-top:14px">Add user</button></form></div>{registry}"#,
+        registry = picker::registry(app, user),
         err = alert(error),
         csrf = csrf(user),
         min = MIN_PASSWORD_CHARS,
@@ -248,7 +247,7 @@ pub async fn users(user: UiUser, State(app): State<AppState>) -> Response {
     if let Some(r) = admins_only(&user) {
         return r;
     }
-    users_page(&user, &app.control.users(&user.who), None)
+    users_page(&user, &app, None)
 }
 
 #[derive(Deserialize)]
@@ -277,7 +276,7 @@ pub async fn create_user(user: UiUser, State(app): State<AppState>, Form(f): For
             "/users",
         ),
         Ok(_) => Redirect::to("/users").into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, users_page(&user, &app.control.users(&user.who), Some(&e.message))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e.message))).into_response(),
     }
 }
 
@@ -316,7 +315,52 @@ pub async fn update_user(user: UiUser, State(app): State<AppState>, Path(id): Pa
     };
     match result {
         Ok(()) => Redirect::to("/users").into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, users_page(&user, &app.control.users(&user.who), Some(&e.message))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e.message))).into_response(),
+    }
+}
+
+/// Without scripts, a user's Edit link opens this page of checkboxes.
+pub async fn user_tags_page(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
+    if let Some(r) = admins_only(&user) {
+        return r;
+    }
+    let Some(u) = app.control.user(&user.who, &id) else {
+        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), r#"<a class="crumb" href="/users">← Users</a><h1>Not found</h1>"#)).into_response();
+    };
+    let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
+    let boxes = if all.is_empty() {
+        r#"<p class="note">There are no access tags yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string()
+    } else {
+        picker::fieldset("Access tags", &all, &u.tags, None)
+    };
+    let body = format!(
+        r#"<a class="crumb" href="/users">← Users</a><div class="head"><div><div class="eyebrow">User</div><h1>Access tags of <em>{email}</em></h1></div></div>
+<div class="card form"><form method="post" action="/users/{id}/tags">{csrf}<input type="hidden" name="base" value="{base}">
+{boxes}<button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
+        email = esc(&u.email),
+        id = esc(&u.id),
+        csrf = csrf(&user),
+        base = esc(&u.tags.join(" ")),
+    );
+    page("User tags", Some(&user), &body)
+}
+
+/// Saves a user's tags from the picker or the page above: only what changed since it was shown.
+pub async fn user_tags(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, axum::extract::RawForm(raw): axum::extract::RawForm) -> Response {
+    let form = match Submitted::parse(&raw) {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e))).into_response(),
+    };
+    if let Err(r) = user.check_csrf(&form.csrf) {
+        return r;
+    }
+    let result = match form.change() {
+        Some((add, remove)) => app.control.change_user_tags(&user.who, &id, &add, &remove),
+        None => app.control.set_user_tags(&user.who, &id, &form.want),
+    };
+    match result {
+        Ok(_) => Redirect::to("/users").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e.message))).into_response(),
     }
 }
 
@@ -392,18 +436,18 @@ pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Qu
         );
         return (StatusCode::NOT_FOUND, page("Approve a machine", Some(&user), &body)).into_response();
     };
-    let boxes: String = me
-        .tags
-        .iter()
-        .map(|t| format!(r#"<label><input type="checkbox" name="tag" value="{0}" checked> <code>{0}</code></label>"#, esc(t)))
-        .collect();
-    let tags = if boxes.is_empty() { r#"<p class="note">You hold no access tags, so this machine gets none: its private tunnels are for you alone.</p>"#.to_string() } else { boxes };
+    let held: Vec<(String, String)> = me.tags.iter().map(|t| (t.clone(), String::new())).collect();
+    let tags = if held.is_empty() {
+        r#"<p class="note">You hold no access tags, so this machine gets none: its private tunnels are for you alone.</p>"#.to_string()
+    } else {
+        picker::fieldset("Access tags for this machine", &held, &me.tags, Some(&req.agent_name))
+    };
     let body = format!(
         r#"<div class="auth"><div class="eyebrow">magicpipes login</div><h1>Approve <em>{name}</em>?</h1>
 <p class="lede">A machine asked to sign in as you {ago} seconds ago, from <code>{client}</code>. Compare the code with the one in its terminal.</p>
 <div class="card" style="margin-top:20px"><div class="stat"><div class="k">Code</div><div class="v sm"><code>{code}</code></div></div>
 <form method="post" action="/cli">{csrf}<input type="hidden" name="code" value="{code}">
-<h3 style="margin-top:18px">Access tags for this machine</h3>{tags}
+{tags}
 <div style="display:flex;gap:10px;margin-top:18px"><button class="btn primary" name="answer" value="approve">Approve</button><button class="btn danger" name="answer" value="deny">Deny</button></div></form></div>
 <p class="note">Only approve a request you just started yourself: an approved machine acts as you and can publish tunnels in your name.</p></div>"#,
         name = esc(&req.agent_name),
@@ -439,7 +483,7 @@ pub async fn answer_device(user: UiUser, State(app): State<AppState>, axum::extr
 }
 
 /// `application/x-www-form-urlencoded` pairs, decoded.
-fn form_urlencoded_pairs(body: &[u8]) -> Vec<(String, String)> {
+pub(super) fn form_urlencoded_pairs(body: &[u8]) -> Vec<(String, String)> {
     let decode = |s: &str| {
         let s = s.replace('+', " ");
         let b = s.as_bytes();
