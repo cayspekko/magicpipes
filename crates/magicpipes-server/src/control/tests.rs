@@ -23,13 +23,27 @@ pub(crate) struct Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
+        if !self.dir.as_os_str().is_empty() {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+}
+
+impl Fixture {
+    /// Stops this control plane, as a restart would, and keeps its data directory.
+    fn stop(mut self) -> std::path::PathBuf {
+        std::mem::take(&mut self.dir)
     }
 }
 
 pub(crate) fn fixture() -> Fixture {
     let dir = std::env::temp_dir().join(format!("mp-control-{}", secret::random_string(8)));
     std::fs::create_dir_all(&dir).unwrap();
+    fixture_in(dir, "")
+}
+
+/// A control plane over the database in `dir`, with extra configuration appended.
+fn fixture_in(dir: std::path::PathBuf, extra: &str) -> Fixture {
     let cfg: Config = toml::from_str(&format!(
         r#"
 base_domain = "t.example.test"
@@ -40,6 +54,7 @@ hostname = "mgmt.example.test"
 mode = "dev-ca"
 [agents]
 max_tunnels_per_agent = 2
+{extra}
 "#,
         dir.display()
     ))
@@ -250,4 +265,49 @@ async fn registration_respects_the_enrollment() {
     assert!(f.data.lookup(&t.hostname).unwrap().access.authz.public);
     let later = f.agent("later");
     assert_eq!(f.cp.register(&later, &http("site2")).unwrap().visibility, Some(Visibility::Private));
+
+    // An agent from before private tunnels can't check one; it is told to upgrade, and gets
+    // neither a private tunnel it would time out on nor a public one.
+    let old = f.agent("old");
+    let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
+    f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 2).unwrap();
+    assert!(f.cp.register(&old, &http("legacy")).unwrap_err().is(ErrorCode::AgentOutdated));
+}
+
+#[tokio::test]
+async fn deleting_an_access_tag_narrows_tunnels() {
+    use magicpipes_core::proto::Visibility;
+
+    use crate::control::EnrollmentOptions;
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    for t in ["team:dev", "team:secret"] {
+        f.cp.create_tag(&admin, t, "").unwrap();
+    }
+    let opts = EnrollmentOptions { tags: vec!["team:dev".into(), "team:secret".into()], ..Default::default() };
+    let token = f.cp.create_enrollment(&admin, opts).unwrap();
+    let agent = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "box".into() }).unwrap().agent_id;
+    let req = RegisterTunnel { visibility: Some(Visibility::Private), access: vec!["team:secret".into()], ..http("db") };
+    let t = f.cp.register(&agent, &req).unwrap();
+    let access = || f.data.lookup(&t.hostname).unwrap().access.authz.access.clone();
+    assert_eq!(access(), ["team:secret"]);
+    assert!(f.cp.delete_tag(&admin, "team:secret").unwrap());
+    assert!(access().is_empty(), "owner-only, not all of the agent's tags");
+    // A new tag with the old name grants nothing until someone asks for it again.
+    f.cp.create_tag(&admin, "team:secret", "").unwrap();
+    assert!(access().is_empty());
+}
+
+#[tokio::test]
+async fn ports_outside_the_range_stay_closed() {
+    use magicpipes_core::proto::Kind;
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let ports = format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\"");
+    let f = fixture_in(fixture().stop(), &ports);
+    let agent = f.agent("db");
+    f.cp.register(&agent, &RegisterTunnel { kind: Kind::Tcp, target: "tcp://127.0.0.1:5432".into(), ..http("db") }).unwrap();
+    assert!(f.data.lookup_port(Kind::Tcp, port).is_some());
+    // The operator turns raw ports off and restarts: the port is not opened again.
+    let f = fixture_in(f.stop(), "");
+    assert!(f.data.lookup_port(Kind::Tcp, port).is_none());
 }

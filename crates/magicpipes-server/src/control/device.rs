@@ -78,6 +78,26 @@ impl DeviceLogins {
     fn prune(map: &mut HashMap<String, Pending>) {
         map.retain(|_, p| p.created.elapsed() < DEVICE_LOGIN_TTL);
     }
+
+    /// The table is full: makes room for a client with `holding` waiting logins by dropping the
+    /// oldest waiting login of the client holding the most, if that is more than `holding`. So
+    /// clients with many addresses can't keep everyone else out; approved logins are kept.
+    fn evict_for(map: &mut HashMap<String, Pending>, holding: usize) -> bool {
+        let mut per_client: HashMap<IpAddr, usize> = HashMap::new();
+        for p in map.values().filter(|p| matches!(p.state, State::Waiting)) {
+            *per_client.entry(client_key(p.client)).or_default() += 1;
+        }
+        let Some((&top, &n)) = per_client.iter().max_by_key(|(_, n)| **n) else { return false };
+        if n <= holding {
+            return false;
+        }
+        let victim = map
+            .iter()
+            .filter(|(_, p)| matches!(p.state, State::Waiting) && client_key(p.client) == top)
+            .min_by_key(|(_, p)| p.created)
+            .map(|(k, _)| k.clone());
+        victim.is_some_and(|k| map.remove(&k).is_some())
+    }
 }
 
 impl ControlPlane {
@@ -87,8 +107,11 @@ impl ControlPlane {
         let mut map = self.devices.map.lock().unwrap();
         DeviceLogins::prune(&mut map);
         let from_client = map.values().filter(|p| client_key(p.client) == client_key(client)).count();
-        if map.len() >= MAX_PENDING || from_client >= MAX_PENDING_PER_CLIENT {
+        if from_client >= MAX_PENDING_PER_CLIENT {
             return Err(err(ErrorCode::RateLimited, "too many pending logins; finish or wait for the others"));
+        }
+        if map.len() >= MAX_PENDING && !DeviceLogins::evict_for(&mut map, from_client) {
+            return Err(err(ErrorCode::RateLimited, "too many pending logins; try again in a few minutes"));
         }
         let device_code = secret::new_token("mpdev");
         let code = user_code();
@@ -172,5 +195,23 @@ mod tests {
         assert!(c.bytes().all(|b| b == b'-' || CODE_ALPHABET.contains(&b)), "{c}");
         assert_eq!(normalize_user_code("abcd efgh"), "ABCD-EFGH");
         assert_eq!(normalize_user_code(&c.to_lowercase()), c);
+    }
+
+    #[tokio::test]
+    async fn many_addresses_cannot_fill_the_table() {
+        let f = crate::control::tests::fixture();
+        // 200 /64s, five logins each: the table is full.
+        for i in 0..MAX_PENDING / MAX_PENDING_PER_CLIENT {
+            for _ in 0..MAX_PENDING_PER_CLIENT {
+                f.cp.start_device_login("x", format!("2001:db8:0:{i:x}::1").parse().unwrap()).unwrap();
+            }
+        }
+        // Someone else still gets in, at the expense of a client holding several.
+        for i in 0..20u8 {
+            f.cp.start_device_login("laptop", IpAddr::from([198, 51, 100, i])).unwrap();
+        }
+        let map = f.cp.devices.map.lock().unwrap();
+        assert_eq!(map.len(), MAX_PENDING);
+        assert_eq!(map.values().filter(|p| p.agent_name == "laptop").count(), 20);
     }
 }

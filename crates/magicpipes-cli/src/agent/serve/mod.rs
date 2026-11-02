@@ -178,7 +178,12 @@ async fn selection(req: Request<Incoming>) -> Result<Vec<String>, Response<Body>
         .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "selection too large\n"))?
         .to_bytes();
     let body = std::str::from_utf8(&body).map_err(|_| text(StatusCode::BAD_REQUEST, "invalid form\n"))?;
-    let mut names = Vec::new();
+    parse_selection(body).map_err(|(status, msg)| text(status, msg))
+}
+
+/// The distinct `f` fields of a selection form, in order.
+fn parse_selection(body: &str) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    let (mut names, mut seen) = (Vec::new(), std::collections::HashSet::new());
     for pair in body.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         if k != "f" {
@@ -186,11 +191,15 @@ async fn selection(req: Request<Incoming>) -> Result<Vec<String>, Response<Body>
         }
         match percent_decode(&v.replace('+', " ")) {
             Some(name) if servable_name(&name) => {
-                if !names.contains(&name) {
+                if seen.insert(name.clone()) {
                     names.push(name);
                 }
             }
-            _ => return Err(text(StatusCode::BAD_REQUEST, "invalid file name in selection\n")),
+            _ => return Err((StatusCode::BAD_REQUEST, "invalid file name in selection\n")),
+        }
+        // A listing shows at most this many entries to pick from.
+        if names.len() > MAX_LISTED {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "too many files selected\n"));
         }
     }
     Ok(names)
@@ -398,6 +407,17 @@ mod tests {
         for bad in ["/..", "/a/../b", "/%2e%2e/x", "/.env", "/a/.git/config", "/a%2Fb", "/a%5Cb", "/a%00", "/%zz", "/%C3", "/%"] {
             assert_eq!(parse_path(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn selections_are_distinct_and_bounded() {
+        assert_eq!(parse_selection("f=a&x=1&f=b+c&f=a").unwrap(), ["a", "b c"]);
+        assert!(parse_selection("f=.env").is_err());
+        // About a megabyte of distinct names: refused at once rather than compared pairwise.
+        let many: String = (0..140_000).map(|i| format!("f={i}&")).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(parse_selection(&many).unwrap_err().0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[cfg(unix)]

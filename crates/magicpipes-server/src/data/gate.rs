@@ -289,7 +289,7 @@ async fn exchange(dp: &DataPlane, req: Request<Incoming>, host: &str) -> Respons
     let state = state_cookie(&claims.nonce);
     let started_here = token_safe(&claims.nonce) && cookie(&headers, &state).is_some();
     // Only the browser that started the sign-in may finish it, and only once.
-    if !started_here || claims.issued_at > unix_now() + 5 || !dp.use_code(&claims.nonce) {
+    if !started_here || claims.issued_at > unix_now() + 5 || !dp.use_code(&claims.user_id, &claims.nonce) {
         return bad(expired);
     }
     let mut resp = json(StatusCode::OK, &serde_json::json!({ "to": safe_return(query_param(&form, "return")) }));
@@ -322,5 +322,21 @@ mod tests {
         }
         assert_eq!(query_param("x=1&return=%2Fa%3Fb%3Dc", "return").as_deref(), Some("/a?b=c"));
         assert_eq!(percent_decode(&percent_encode("/p?q=1 2&r")), "/p?q=1 2&r");
+    }
+
+    #[test]
+    fn one_user_cannot_use_up_sign_ins() {
+        let cfg: crate::config::Config =
+            toml::from_str("base_domain = \"t.test\"\n[management]\nhostname = \"m.t.test\"\n[tls]\nmode = \"dev-ca\"").unwrap();
+        let settings = super::super::ProxySettings::from_config(&cfg, crate::tunnel_auth::Signer::for_tests());
+        let dp = DataPlane::new(settings, tokio_util::sync::CancellationToken::new());
+        assert!(dp.use_code("us_a", "n0"));
+        assert!(!dp.use_code("us_a", "n0"), "a code works once");
+        let mut taken = 1;
+        while dp.use_code("us_a", &format!("n{taken}")) {
+            taken += 1;
+        }
+        assert!(taken < 100, "each user has a bounded share");
+        assert!(dp.use_code("us_b", "n0"), "others still sign in");
     }
 }

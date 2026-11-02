@@ -9,7 +9,7 @@
 mod acme;
 mod devca;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -61,6 +61,10 @@ impl CertResolver {
         } else {
             self.exact.write().unwrap().insert(name, key);
         }
+    }
+
+    fn remove(&self, name: &str) {
+        self.exact.write().unwrap().remove(&name.to_ascii_lowercase());
     }
 
     pub fn lookup(&self, host: &str) -> Option<Arc<CertifiedKey>> {
@@ -170,7 +174,19 @@ struct HostCert {
     not_after: i64,
     issuing: bool,
     failed_at: Option<Instant>,
+    /// Since when no tunnel uses this hostname (see [`CertManager::set_wanted`]).
+    unwanted_since: Option<Instant>,
 }
+
+impl HostCert {
+    fn new() -> Self {
+        Self { status: watch::channel(CertStatus::Pending).0, not_before: 0, not_after: 0, issuing: false, failed_at: None, unwanted_since: None }
+    }
+}
+
+/// A hostname no tunnel uses is no longer renewed, and is forgotten (resolver, cache) after this
+/// long, so a tunnel removed and added again soon keeps its certificate.
+const FORGET_UNWANTED_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub struct CertManager {
     cfg: TlsConfig,
@@ -255,7 +271,12 @@ impl CertManager {
                     Ok(l) if l.not_after > unix_now() && covers(&l.names, &host) => {
                         self.install(&host, l);
                     }
-                    Ok(_) => tracing::info!(%host, "cached certificate expired or mismatched; will reissue"),
+                    Ok(_) => {
+                        // Reissued if a tunnel still uses the name; otherwise nobody needs it.
+                        tracing::info!(%host, "removing an expired or mismatched cached certificate");
+                        let _ = std::fs::remove_file(&crt);
+                        let _ = std::fs::remove_file(&key);
+                    }
                     Err(err) => tracing::warn!(%host, %err, "ignoring unreadable cached certificate"),
                 },
                 Err(err) => tracing::warn!(%host, %err, "ignoring unreadable cached certificate"),
@@ -266,13 +287,7 @@ impl CertManager {
     fn install(&self, host: &str, cert: LoadedCert) {
         self.resolver.insert(host, cert.key.clone());
         let mut hosts = self.hosts.lock().unwrap();
-        let entry = hosts.entry(host.to_string()).or_insert_with(|| HostCert {
-            status: watch::channel(CertStatus::Pending).0,
-            not_before: 0,
-            not_after: 0,
-            issuing: false,
-            failed_at: None,
-        });
+        let entry = hosts.entry(host.to_string()).or_insert_with(HostCert::new);
         entry.not_before = cert.not_before;
         entry.not_after = cert.not_after;
         entry.issuing = false;
@@ -302,17 +317,12 @@ impl CertManager {
         }
         let backoff = Duration::from_secs(self.cfg.failure_backoff_secs);
         let mut hosts = self.hosts.lock().unwrap();
-        let entry = hosts.entry(host.to_string()).or_insert_with(|| HostCert {
-            status: watch::channel(CertStatus::Pending).0,
-            not_before: 0,
-            not_after: 0,
-            issuing: false,
-            failed_at: None,
-        });
+        let entry = hosts.entry(host.to_string()).or_insert_with(HostCert::new);
+        let retry = entry.failed_at.is_none_or(|t| t.elapsed() >= backoff);
         let needs = match &*entry.status.borrow() {
-            CertStatus::Ready => needs_renewal(entry.not_before, entry.not_after),
+            CertStatus::Ready => needs_renewal(entry.not_before, entry.not_after) && retry,
             CertStatus::Pending => true,
-            CertStatus::Failed(_) => entry.failed_at.is_none_or(|t| t.elapsed() >= backoff),
+            CertStatus::Failed(_) => retry,
         };
         if !needs || entry.issuing {
             return;
@@ -386,7 +396,43 @@ impl CertManager {
         }
     }
 
-    /// Periodically renews certificates that passed two thirds of their lifetime.
+    /// The hostnames the control plane serves now (its tunnels and the management hostname);
+    /// called on every publish. Others are no longer renewed, and are forgotten after a while.
+    pub fn set_wanted(&self, wanted: &HashSet<&str>) {
+        for (host, h) in self.hosts.lock().unwrap().iter_mut() {
+            if wanted.contains(host.as_str()) {
+                h.unwanted_since = None;
+            } else if h.unwanted_since.is_none() {
+                h.unwanted_since = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Forgets hostnames unused for `forget_after`; returns the wanted ones due for renewal.
+    fn maintain(&self, forget_after: Duration) -> Vec<String> {
+        let mut hosts = self.hosts.lock().unwrap();
+        let stale: Vec<String> = hosts
+            .iter()
+            .filter(|(_, h)| !h.issuing && h.unwanted_since.is_some_and(|t| t.elapsed() >= forget_after))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for host in stale {
+            tracing::info!(%host, "forgetting the certificate of a hostname no tunnel uses");
+            hosts.remove(&host);
+            self.resolver.remove(&host);
+            let (crt, key) = self.cache_paths(&host);
+            let _ = std::fs::remove_file(crt);
+            let _ = std::fs::remove_file(key);
+        }
+        hosts
+            .iter()
+            .filter(|(_, h)| h.unwanted_since.is_none() && matches!(*h.status.borrow(), CertStatus::Ready) && needs_renewal(h.not_before, h.not_after))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Periodically renews certificates that passed two thirds of their lifetime, and forgets
+    /// those of hostnames no tunnel has used for a week.
     pub fn spawn_renewal(self: &Arc<Self>, shutdown: CancellationToken) {
         let me = self.clone();
         tokio::spawn(async move {
@@ -396,15 +442,7 @@ impl CertManager {
                     _ = shutdown.cancelled() => return,
                     _ = tick.tick() => {}
                 }
-                let due: Vec<String> = me
-                    .hosts
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, h)| matches!(*h.status.borrow(), CertStatus::Ready) && needs_renewal(h.not_before, h.not_after))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for host in due {
+                for host in me.maintain(FORGET_UNWANTED_AFTER) {
                     tracing::info!(%host, "renewing certificate");
                     me.ensure(&host);
                 }
@@ -429,5 +467,22 @@ mod tests {
         assert!(!covers(&names, "a.b.t.example.com"));
         assert!(covers(&names, "example.com"));
         assert!(!covers(&names, "t.example.com"));
+    }
+
+    #[tokio::test]
+    async fn unused_hostnames_are_forgotten() {
+        let dir = std::env::temp_dir().join(format!("mp-certs-{}", magicpipes_core::secret::random_string(8)));
+        let cfg: TlsConfig = toml::from_str("mode = \"dev-ca\"").unwrap();
+        let certs = CertManager::new(&cfg, &dir, &["t.test"]).unwrap();
+        for h in ["a.t.test", "b.t.test"] {
+            assert_eq!(certs.wait(h, Duration::from_secs(10)).await, CertStatus::Ready);
+        }
+        certs.set_wanted(&HashSet::from(["a.t.test"]));
+        assert!(certs.maintain(Duration::from_secs(3600)).is_empty(), "nothing is due, and b's grace period runs");
+        assert_eq!(certs.status("b.t.test"), CertStatus::Ready);
+        certs.maintain(Duration::ZERO);
+        assert_eq!(certs.status("b.t.test"), CertStatus::Pending);
+        assert!(certs.resolver.lookup("b.t.test").is_none() && certs.resolver.lookup("a.t.test").is_some());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

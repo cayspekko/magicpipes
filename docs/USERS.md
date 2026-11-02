@@ -77,7 +77,8 @@ holder.
 The existing admin tokens (`admin_tokens`) stay permanently, whatever login methods are
 configured. They are a break-glass principal with admin rights for the default org, and they
 are how the first user gets created. Disabling and regenerating them from the UI comes later;
-today `magicpipesd admin-token --rotate` replaces them. For scripts, named API tokens owned by
+today `magicpipesd admin-token --rotate` replaces them and ends every UI session signed in with
+one. For scripts, named API tokens owned by
 users (below) are the better choice.
 
 ## Principals, actions and resources
@@ -213,7 +214,7 @@ Every change below takes effect on the next request through the published snapsh
 |---|---|
 | Remove an access tag from a user | That user loses it; their personal agents lose it; tunnels whose effective access drops it shrink |
 | Delete a rule | Every user who got a tag only through that rule loses it |
-| Delete an access tag | Cascades to every user, agent, enrollment token, rule and tunnel access row; tunnels left with an empty set become owner-only |
+| Delete an access tag | Cascades to every user, agent, enrollment token, rule and tunnel access row; tunnels left with an empty set become owner-only, also after a restart (`tunnels.access_restricted`, migration 4) |
 | Disable a user or remove their membership | Sessions, API tokens and tunnel cookies are rejected. Their personal agents can't connect, and their tunnels are unpublished |
 | "Log out everywhere" | Bumps `sessions_valid_after`; every session and tunnel cookie issued before it is rejected |
 | Revoke an agent | As today, plus its tunnels' access rows |
@@ -703,7 +704,16 @@ Schema notes:
 - **`RegisterTunnel` and `TunnelInfo` gain optional fields.** `visibility`, `access`
   (`Vec<String>`) and `labels`, each `#[serde(default)]` and skipped when empty.
   - An old agent sends none of them. Its tunnel takes the agent's defaults, which for a migrated
-    agent means public, exactly as today.
+    agent means public, exactly as today. An agent before protocol 3 enrolled with a private
+    default gets `agent_outdated` instead: it couldn't check a private tunnel, and public isn't
+    what its enrollment asked for.
+  - A current agent restoring its tunnels after a reconnect, or re-adding one without
+    `--private`/`--public`, sends no visibility either, so the server keeps what it stored
+    (the agent's copy may name tags deleted since). It still checks that a private tunnel came
+    back private.
+  - The CLI asks a running agent for its `ipc_version` before an `add` with options an older
+    agent would silently drop (private, access, labels, TCP/UDP, allow-lists, `--serve`,
+    `--shell`), and stops with `agent_outdated` rather than get a public HTTPS tunnel.
   - A new agent that asked for `private` checks that `TunnelInfo` echoes it back. If an old
     server doesn't, the new agent removes the tunnel again and reports `server_outdated`. This
     is the same pattern as `kind`. It must never fall back to a public tunnel.

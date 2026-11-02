@@ -22,7 +22,7 @@ use magicpipes_core::proto::{CertState, Kind, RegisterTunnel, Request as Rpc, Re
 use rustls::ClientConfig;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::probe;
@@ -38,8 +38,6 @@ pub struct Agent {
     pub tunnels: Arc<Tunnels>,
     pub shutdown: CancellationToken,
     tls: Arc<ClientConfig>,
-    /// Serializes the find-or-register step so concurrent `add`s of one port don't duplicate.
-    register_lock: Mutex<()>,
     inflight: AtomicUsize,
     started_at: i64,
 }
@@ -66,7 +64,6 @@ impl Agent {
             tunnels,
             shutdown,
             tls,
-            register_lock: Mutex::new(()),
             inflight: AtomicUsize::new(0),
             started_at: magicpipes_core::unix_now(),
         })
@@ -161,7 +158,9 @@ impl Agent {
     }
 
     async fn register(&self, req: &AddRequest, mut target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
-        let _lock = self.register_lock.lock().await;
+        // Serializes the find-or-register step so concurrent `add`s of one port don't duplicate,
+        // and keeps it apart from restoring tunnels after a reconnect.
+        let _lock = self.session.register_lock.lock().await;
         let name = match &req.name {
             Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new(ErrorCode::InvalidName, m))?),
             None => None,
@@ -192,12 +191,20 @@ impl Agent {
             .iter()
             .map(ToString::to_string)
             .collect();
-        // Without --private/--public a re-add keeps the tunnel's access; a new one gets the
-        // machine's default from the server.
+        // Without --private/--public a re-add keeps the tunnel's access as the server has it (our
+        // copy may name tags deleted since); a new one gets the machine's default from the server.
+        // If the server lost the tunnel, it is registered again with our copy.
+        let kept = |t: &LocalTunnel| (t.visibility, t.access.clone(), if req.labels.is_empty() { t.labels.clone() } else { req.labels.clone() });
         let (visibility, access, labels) = match (req.visibility, &existing) {
             (Some(v), _) => (Some(v), req.access.clone(), req.labels.clone()),
-            (None, Some(t)) => (t.visibility, t.access.clone(), if req.labels.is_empty() { t.labels.clone() } else { req.labels.clone() }),
+            (None, Some(_)) if req.labels.is_empty() => (None, Vec::new(), Vec::new()),
+            (None, Some(t)) => kept(t),
             (None, None) => (None, Vec::new(), req.labels.clone()),
+        };
+        let expect_private = match (req.visibility, &existing) {
+            (Some(v), _) => v == Visibility::Private,
+            (None, Some(t)) => t.visibility == Some(Visibility::Private),
+            (None, None) => false,
         };
         if (req.visibility.is_some() || !req.labels.is_empty()) && self.session.server_protocol().is_some_and(|v| v < 3) {
             return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels or labels; it needs a newer magicpipesd"));
@@ -217,11 +224,15 @@ impl Agent {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
                 Ok(RpcResponse::Tunnel(info)) => break info,
                 Err(RpcError::Server(e)) if e.is(ErrorCode::NotFound) && rpc_req.id.is_some() => {
-                    // Deleted on the server while we still had it: forget it and register anew.
+                    // Deleted on the server while we still had it: forget it and register anew,
+                    // with the access it had.
                     if let Some(id) = rpc_req.id.take() {
                         self.tunnels.remove(&id);
                     }
                     rpc_req.name = name.clone();
+                    if let (None, Some(t)) = (rpc_req.visibility, &existing) {
+                        (rpc_req.visibility, rpc_req.access, rpc_req.labels) = kept(t);
+                    }
                 }
                 Err(RpcError::Server(e)) => return Err(ErrorInfo::wire(&e.code, e.message)),
                 Err(e) => return Err(ErrorInfo::new(ErrorCode::ServerUnreachable, e.to_string())),
@@ -238,7 +249,7 @@ impl Agent {
                 format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind),
             ));
         }
-        if rpc_req.visibility == Some(Visibility::Private) && info.visibility != Some(Visibility::Private) {
+        if (expect_private || rpc_req.visibility == Some(Visibility::Private)) && info.visibility != Some(Visibility::Private) {
             // A server that predates private tunnels would have made it public: never leave that.
             if info.created {
                 let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
@@ -456,6 +467,7 @@ impl Agent {
                 "running": true,
                 "pid": std::process::id(),
                 "version": magicpipes_core::VERSION,
+                "ipc_version": crate::ipc::IPC_VERSION,
                 "started_at": magicpipes_core::rfc3339(self.started_at),
             },
             "server": self.session.server(),

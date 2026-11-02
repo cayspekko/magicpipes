@@ -38,8 +38,11 @@ pub struct TunnelRow {
     pub allow: Vec<String>,
     pub visibility: Visibility,
     /// Private tunnels: the requested access tags (the effective set is limited to the agent's
-    /// tags when routes are published); empty = all of the agent's tags.
+    /// tags when routes are published); empty and not `access_restricted` = all of the agent's tags.
     pub access: Vec<String>,
+    /// Tags were asked for. Deleting them (which removes their rows) leaves the tunnel owner-only,
+    /// never open to all of the agent's tags.
+    pub access_restricted: bool,
     pub labels: Vec<String>,
 }
 
@@ -225,6 +228,12 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
     );
     "#,
+    // 4: remember that a tunnel asked for access tags, so that deleting them (which cascades to
+    // tunnel_access) can't turn "these tags" into "all of the agent's tags" on the next start.
+    r#"
+    ALTER TABLE tunnels ADD COLUMN access_restricted INTEGER NOT NULL DEFAULT 0;
+    UPDATE tunnels SET access_restricted = 1 WHERE id IN (SELECT tunnel_id FROM tunnel_access);
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -239,7 +248,8 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-const TUNNEL_COLUMNS: &str = "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, labels";
+const TUNNEL_COLUMNS: &str =
+    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, labels, access_restricted";
 
 fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
     let kind: String = r.get(6)?;
@@ -259,6 +269,7 @@ fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
         // A visibility that can't be read keeps the tunnel private.
         visibility: Visibility::parse(&visibility).unwrap_or(Visibility::Private),
         access: Vec::new(),
+        access_restricted: r.get(11)?,
         labels: labels.split_whitespace().map(str::to_string).collect(),
     })
 }
@@ -285,18 +296,21 @@ impl Store {
         self.with(|c| c.query_row("SELECT COUNT(*) FROM admin_tokens", [], |r| r.get(0)))
     }
 
-    /// Creates a new admin token. With `replace_all`, every existing admin token is revoked.
+    /// Creates a new admin token. With `replace_all`, every existing admin token is revoked,
+    /// and so is every UI session signed in with one (sessions without a user).
     pub fn create_admin_token(&self, replace_all: bool) -> anyhow::Result<String> {
         let token = secret::new_token("mpadm");
-        self.with(|c| {
-            if replace_all {
-                c.execute("DELETE FROM admin_tokens", [])?;
-            }
-            c.execute(
-                "INSERT INTO admin_tokens (id, token_hash, created_at) VALUES (?1, ?2, ?3)",
-                params![secret::new_id("adm"), secret::sha256_hex(&token), unix_now()],
-            )
-        })?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        if replace_all {
+            tx.execute("DELETE FROM admin_tokens", [])?;
+            tx.execute("DELETE FROM sessions WHERE user_id IS NULL", [])?;
+        }
+        tx.execute(
+            "INSERT INTO admin_tokens (id, token_hash, created_at) VALUES (?1, ?2, ?3)",
+            params![secret::new_id("adm"), secret::sha256_hex(&token), unix_now()],
+        )?;
+        tx.commit()?;
         Ok(token)
     }
 
@@ -461,7 +475,7 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
             params![
                 t.id,
                 t.name,
@@ -473,7 +487,8 @@ impl Store {
                 t.public_port,
                 t.allow.join(" "),
                 t.visibility.as_str(),
-                t.labels.join(" ")
+                t.labels.join(" "),
+                t.access_restricted
             ],
         )?;
         Self::write_access(&tx, t)?;
@@ -486,8 +501,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, labels = ?5 WHERE id = ?6",
-            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.labels.join(" "), t.id],
+            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, labels = ?5, access_restricted = ?6 WHERE id = ?7",
+            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.labels.join(" "), t.access_restricted, t.id],
         )?;
         Self::write_access(&tx, t)?;
         tx.commit()?;
@@ -517,6 +532,12 @@ mod tests {
         let adm = store.create_admin_token(false).unwrap();
         assert!(store.verify_admin_token(&adm).unwrap());
         assert!(!store.verify_admin_token("mpadm_nope").unwrap());
+        // Rotating revokes the old tokens and the UI sessions signed in with them.
+        let (cookie, _) = store.create_session(None, 3600).unwrap();
+        assert!(store.session(&cookie).unwrap().is_some());
+        let fresh = store.create_admin_token(true).unwrap();
+        assert!(!store.verify_admin_token(&adm).unwrap() && store.verify_admin_token(&fresh).unwrap());
+        assert!(store.session(&cookie).unwrap().is_none());
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -541,6 +562,7 @@ mod tests {
                     allow: vec![],
                     visibility: Visibility::Public,
                     access: vec![],
+                    access_restricted: false,
                     labels: vec![],
                 })
                 .unwrap();
@@ -586,6 +608,7 @@ mod tests {
             allow: vec!["10.0.0.0/8".into(), "192.0.2.1/32".into()],
             visibility: Visibility::Public,
             access: vec![],
+            access_restricted: false,
             labels: vec![],
         };
         store.insert_tunnel(&row("tn_tcp", Kind::Tcp, 65500)).unwrap();
@@ -598,6 +621,40 @@ mod tests {
         drop(store);
         // Opening again does not re-run migrations.
         assert_eq!(Store::open(&path).unwrap().tunnels().unwrap().len(), 3);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn deleting_a_tunnels_access_tag_keeps_it_restricted() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let store = Store::open(&path).unwrap();
+        let (agent, _) = store.enroll(&store.create_enrollment(60, &EnrollmentSpec::default()).unwrap(), "laptop").unwrap().unwrap();
+        assert!(store.create_tag("team:secret", "", None).unwrap());
+        let row = |id: &str, access: Vec<String>| TunnelRow {
+            id: id.into(),
+            name: id.into(),
+            hostname: format!("{id}.t.test"),
+            agent_id: agent.clone(),
+            target: "http://127.0.0.1:1".into(),
+            created_at: 0,
+            kind: Kind::Http,
+            public_port: None,
+            allow: vec![],
+            visibility: Visibility::Private,
+            access_restricted: !access.is_empty(),
+            access,
+            labels: vec![],
+        };
+        store.insert_tunnel(&row("tn_narrow", vec!["team:secret".into()])).unwrap();
+        store.insert_tunnel(&row("tn_all", vec![])).unwrap();
+        assert!(store.delete_tag("team:secret").unwrap());
+        drop(store);
+        let rows = Store::open(&path).unwrap().tunnels().unwrap();
+        let get = |id: &str| rows.iter().find(|t| t.id == id).map(|t| (t.access.len(), t.access_restricted)).unwrap();
+        assert_eq!(get("tn_narrow"), (0, true), "its only tag is gone: owner-only, not all of the agent's tags");
+        assert_eq!(get("tn_all"), (0, false));
         std::fs::remove_dir_all(dir).ok();
     }
 }

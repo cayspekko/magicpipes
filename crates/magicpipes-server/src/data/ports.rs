@@ -5,9 +5,11 @@
 //! client address (a "flow") gets one [`ServerOpen::Datagram`] stream carrying its datagrams in
 //! both directions; a flow ends after `udp_idle_timeout` without traffic.
 //!
-//! Routes are looked up per connection or flow, so an agent reconnecting or a tunnel changing
-//! its allow-list takes effect immediately. A port stays open while its agent is offline (so no
-//! other program can take it); connections then close at once and datagrams are dropped.
+//! Routes are looked up per connection or flow, and open connections and flows are checked again
+//! on every publish, so an agent reconnecting or a tunnel changing its allow-list takes effect
+//! immediately. A port stays open while its agent is offline (so no other program can take it);
+//! connections then close at once and datagrams are dropped. One client address (see
+//! [`client_key`]) may hold only a share of a tunnel's UDP flows.
 
 use std::collections::HashMap;
 use std::io;
@@ -55,6 +57,11 @@ impl PortSettings {
 /// Queued datagrams per UDP flow while its stream is opening or busy; more are dropped.
 const FLOW_QUEUE: usize = 64;
 
+/// The part of `udp_max_flows` one client address may hold.
+fn flows_per_client(max_flows: usize) -> usize {
+    (max_flows / 8).max(1)
+}
+
 /// Binds `port` and serves it until `stop` is cancelled. Binding is synchronous so the caller
 /// learns at once if the port is taken.
 pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: CancellationToken) -> io::Result<()> {
@@ -93,6 +100,18 @@ fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr) -> Option<(Arc
         _ => {
             route.stats.record(Outcome::AgentOffline);
             None
+        }
+    }
+}
+
+/// Returns once `peer` may no longer use the tunnel on `port`: it was removed, or its allow-list
+/// no longer admits the client. Checked on every publish.
+async fn revoked(dp: &DataPlane, kind: Kind, port: u16, peer: IpAddr, tunnel_id: &str) {
+    let mut changes = dp.generation.subscribe();
+    loop {
+        let ok = dp.lookup_port(kind, port).is_some_and(|r| r.tunnel_id == tunnel_id && r.access.admits(&Principal::Anonymous, peer));
+        if !ok || changes.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -169,8 +188,15 @@ async fn tcp_connection(dp: &DataPlane, port: u16, mut tcp: TcpStream, mut peer:
     let Some((route, session)) = admit(dp, Kind::Tcp, port, peer) else { return };
     let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
     let Some(mut stream) = open(dp, &route, &session, peer.ip(), header).await else { return };
-    if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await {
-        tracing::debug!(port, %peer, error = %e, "port connection ended");
+    tokio::select! {
+        r = tokio::io::copy_bidirectional(&mut tcp, &mut stream) => {
+            if let Err(e) = r {
+                tracing::debug!(port, %peer, error = %e, "port connection ended");
+            }
+        }
+        _ = revoked(dp, Kind::Tcp, port, peer.ip(), &route.tunnel_id) => {
+            tracing::debug!(port, %peer, "closing a port connection the tunnel no longer admits");
+        }
     }
 }
 
@@ -198,21 +224,28 @@ async fn serve_udp(dp: Arc<DataPlane>, port: u16, socket: Arc<UdpSocket>, stop: 
             continue;
         }
         flows.retain(|_, tx| !tx.is_closed());
-        if flows.len() >= dp.settings.ports.udp_max_flows {
+        let max = dp.settings.ports.udp_max_flows;
+        if flows.len() >= max {
             tracing::debug!(port, %peer, "too many UDP clients; dropping datagram");
+            continue;
+        }
+        let key = client_key(peer.ip());
+        if flows.keys().filter(|a| client_key(a.ip()) == key).count() >= flows_per_client(max) {
+            tracing::debug!(port, %peer, "too many UDP flows from this client; dropping datagram");
             continue;
         }
         let Some((route, session)) = admit(&dp, Kind::Udp, port, peer) else { continue };
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         let _ = tx.try_send(datagram);
         flows.insert(peer, tx);
-        tokio::spawn(udp_flow(dp.clone(), route, session, socket.clone(), peer, rx));
+        tokio::spawn(udp_flow(dp.clone(), port, route, session, socket.clone(), peer, rx));
     }
 }
 
 /// One UDP client: its datagrams go to the agent on one stream, and replies come back on it.
 async fn udp_flow(
     dp: Arc<DataPlane>,
+    port: u16,
     route: Arc<Route>,
     session: MuxHandle,
     socket: Arc<UdpSocket>,
@@ -261,6 +294,16 @@ async fn udp_flow(
     tokio::select! {
         _ = replies => {}
         _ = requests => {}
+        _ = revoked(&dp, Kind::Udp, port, peer.ip(), &route.tunnel_id) => {}
     }
-    tracing::debug!(port = ?socket.local_addr().map(|a| a.port()), %peer, "UDP flow ended");
+    tracing::debug!(port, %peer, "UDP flow ended");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_client_holds_a_share_of_the_flows() {
+        assert_eq!(super::flows_per_client(128), 16);
+        assert_eq!(super::flows_per_client(4), 1);
+    }
 }

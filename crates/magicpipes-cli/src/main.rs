@@ -534,6 +534,9 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
     let listing = serving.is_some() && req.list;
     let shell = req.shell.as_ref().map(|argv| (state::command_line(argv), req.writable, req.cwd.clone().unwrap_or_default()));
     let spawned = client::ensure_agent().await?;
+    if !spawned {
+        client::check_agent_understands(&req).await?;
+    }
     let local = if serving.is_some() {
         Some("Checking directory...")
     } else if shell.is_some() {

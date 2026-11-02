@@ -654,6 +654,17 @@ async fn port_tunnels() {
     let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-cidr", "10.0.0.0/8", "--allow-cidr", "127.0.0.1"]).await;
     assert_eq!(t["reachable"], true);
     assert_eq!(tcp_roundtrip(port, b"allowed").await, b"allowed");
+    // Narrowing the allow-list closes a connection already open from a network it now excludes.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut open = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        open.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        open.read_exact(&mut got).await.unwrap();
+        add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-cidr", "10.0.0.0/8"]).await;
+        let read = tokio::time::timeout(Duration::from_secs(5), open.read(&mut got)).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the open connection was closed: {read:?}");
+    }
     add_json(&env, &[&echo.port.to_string(), "--tcp"]).await;
 
     // --- the local service stops, the agent goes away, the server restarts ---------------------
@@ -684,6 +695,18 @@ async fn port_tunnels() {
     assert_eq!(udp_roundtrip(&a, uport, b"one").await, b"echo:one");
     assert_eq!(udp_roundtrip(&b, uport, b"two").await, b"echo:two", "each client gets its own replies");
     assert_eq!(udp_roundtrip(&a, uport, b"three").await, b"echo:three");
+    // One client address gets a share of the tunnel's flows (16 of the default 128).
+    let mut more = Vec::new();
+    for i in 0..14 {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(udp_roundtrip(&s, uport, format!("f{i}").as_bytes()).await, format!("echo:f{i}").into_bytes());
+        more.push(s);
+    }
+    let extra = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    extra.send_to(b"seventeenth", ("127.0.0.1", uport)).await.unwrap();
+    let mut buf = [0u8; 64];
+    assert!(tokio::time::timeout(Duration::from_millis(1500), extra.recv_from(&mut buf)).await.is_err(), "over the per-client share");
+    drop(more);
     // macOS caps UDP datagrams at 9216 bytes by default.
     let big = vec![7u8; 9_000];
     assert_eq!(udp_roundtrip(&a, uport, &big).await.len(), 9_005, "large datagrams keep their size");
@@ -910,7 +933,8 @@ async fn user_accounts() {
     assert_eq!(login("ann@example.com", new_password.into()).await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(env.api("GET", "/api/v1/status", Some(&admin)).await.0, StatusCode::OK);
 
-    // After repeated failures an account accepts one attempt every few seconds, right or not.
+    // After repeated failures, password logins are refused, right password or not: from this
+    // address before the password is even checked (the per-account limit has a unit test).
     let (_, v) = env
         .api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": "bo@example.com", "password": new_password, "role": "admin" }))
         .await;
@@ -920,7 +944,9 @@ async fn user_accounts() {
     }
     let throttled = login("bo@example.com", new_password.into()).await;
     assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
-    assert!(throttled.html.contains("this account"), "{}", throttled.html);
+    assert!(throttled.html.contains("Too many failed attempts"), "{}", throttled.html);
+    let (s, _) = env.api("GET", "/api/v1/status", Some(&admin)).await;
+    assert_eq!(s, StatusCode::OK, "a valid admin token still works from a blocked address");
 
     let (s, v) = env.api("GET", "/api/v1/audit", Some(&admin)).await;
     assert_eq!(s, StatusCode::OK);

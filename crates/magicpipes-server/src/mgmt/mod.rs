@@ -60,6 +60,11 @@ pub enum Rejected<E> {
 }
 
 impl AppState {
+    /// Should a password login from this client be refused before it is checked?
+    fn password_blocked(&self, client: Option<IpAddr>) -> bool {
+        self.limiter.over_limit(client)
+    }
+
     /// The one sequence for every presented credential. A valid one is accepted even from a
     /// rate-limited client, so nobody can lock an administrator out; an invalid one counts
     /// against the client, which is refused once it is over the limit.
@@ -226,15 +231,24 @@ const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(300);
 const MAX_TRACKED: usize = 10_000;
 
-/// Failed credential checks per client. Every credential carries at least 192 bits, so this
-/// sheds load from guessing rather than protecting the secret: callers check credentials first,
-/// and valid ones are accepted even from a blocked address, so nobody can lock an admin out.
+/// Failed credential checks per client. Admin and API tokens carry at least 192 bits, so for
+/// them this sheds load from guessing rather than protecting the secret: callers check them
+/// first, and valid ones are accepted even from a blocked address, so nobody can lock an admin
+/// out. Passwords are guessable, so a blocked client's password logins are refused before they
+/// are hashed (`over_limit`).
 #[derive(Default)]
 struct FailureLimiter {
     map: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl FailureLimiter {
+    /// Is the client over the limit? Records nothing.
+    fn over_limit(&self, ip: Option<IpAddr>) -> bool {
+        let Some(ip) = ip.map(client_key) else { return false };
+        let map = self.map.lock().unwrap();
+        map.get(&ip).is_some_and(|(n, since)| *n >= MAX_FAILURES && since.elapsed() < FAILURE_WINDOW)
+    }
+
     /// Records a failed attempt; `true` when the client was already over the limit.
     fn reject(&self, ip: Option<IpAddr>) -> bool {
         let Some(ip) = ip.map(client_key) else { return false };
@@ -266,7 +280,9 @@ mod tests {
         for _ in 0..MAX_FAILURES {
             assert!(!l.reject(Some(a)));
         }
+        assert!(l.over_limit(Some(a)));
         assert!(l.reject(Some(a)));
+        assert!(!l.over_limit(Some("203.0.113.10".parse().unwrap())));
         assert!(!l.reject(Some("203.0.113.10".parse().unwrap())));
         for i in 0..MAX_FAILURES {
             assert!(!l.reject(Some(format!("2001:db8::{i:x}").parse().unwrap())));

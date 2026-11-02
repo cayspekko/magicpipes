@@ -78,9 +78,15 @@ impl ControlPlane {
         if !authz::authorize(who, Action::Manage, Resource::Org) {
             return Err(err(ErrorCode::Forbidden, "only administrators delete tags"));
         }
-        let deleted = self.store.delete_tag(&name.trim().to_ascii_lowercase()).map_err(internal)?;
+        let name = name.trim().to_ascii_lowercase();
+        let deleted = self.store.delete_tag(&name).map_err(internal)?;
         if deleted {
-            self.audit(who, "tag.delete", name, "");
+            // The store cascaded it out of tunnel_access; do the same in memory, so a new tag of
+            // the same name doesn't bring the old grant back.
+            for t in self.state.lock().unwrap().tunnels.values_mut() {
+                t.row.access.retain(|a| *a != name);
+            }
+            self.audit(who, "tag.delete", &name, "");
             self.refresh();
         }
         Ok(deleted)

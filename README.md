@@ -151,7 +151,7 @@ On first start the server creates an admin token and writes it to `<data_dir>/ad
 ```bash
 cat /var/lib/magicpipes/admin-token        # first start
 magicpipesd --config ... admin-token       # create another admin token
-magicpipesd --config ... admin-token --rotate   # revoke all others
+magicpipesd --config ... admin-token --rotate   # revoke all others, and their UI sessions
 ```
 
 Log in to the UI at `https://example.com:8443` with that token ("Use an admin token" on the
@@ -173,8 +173,9 @@ administrator when they first sign in.
   everyone and everything at once.
 * **Sign-in protection**: passwords are stored as Argon2id hashes and need at least 12
   characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every
-  10 seconds, right password or not; failed attempts also count against the client's address.
-  A wrong password and an unknown email get the same answer.
+  10 seconds, right password or not. An address with 10 failed attempts within 5 minutes
+  (an IPv6 /64 counts as one) gets no password checked at all until it waits. A wrong password
+  and an unknown email get the same answer.
 * **Sessions** last `[users] session_max_age_secs` (12 hours) and survive server restarts.
   Changing your password, being disabled, or "Sign out everywhere" ends them.
 * **API tokens** (Account page) act as their user with the user's current role:
@@ -505,7 +506,7 @@ On failure:
 | 2 | | Invalid command-line usage |
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden`, `unauthenticated` | Enrollment, credentials or local configuration |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
-| 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent is older than the CLI |
+| 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent (or, for the server, the machine's magicpipes) is too old for the request |
 | 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 
 `name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:

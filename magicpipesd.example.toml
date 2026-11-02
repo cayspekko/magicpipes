@@ -24,7 +24,7 @@ http_listen = "0.0.0.0:80"
 # max_connections = 10000
 # max_connections_per_client = 256   # per client address (per /64 for IPv6); trusted proxies exempt
 # header_read_timeout_secs = 30
-# upstream_response_timeout_secs = 60
+# upstream_response_timeout_secs = 60  # for the app to start answering, after the request body (or its last chunk)
 # websocket_idle_timeout_secs = 600
 # proxy_protocol = false             # true behind a TCP load balancer passing TLS through (HAProxy send-proxy-v2)
 
@@ -73,4 +73,4 @@ acme_directory = "letsencrypt"
 # proxy_protocol = false               # as in [public]; the proxy must be in trusted_proxies
 # max_connections = 10000              # open TCP connections across all port tunnels
 # udp_idle_timeout_secs = 60
-# udp_max_flows = 128                  # UDP clients tracked at once per tunnel
+# udp_max_flows = 128                  # UDP clients tracked at once per tunnel; one address may hold an eighth

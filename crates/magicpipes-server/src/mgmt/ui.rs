@@ -622,6 +622,11 @@ pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<C
             }
         };
     }
+    let too_many = || (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."), false, next)).into_response();
+    // A password can be guessed, so a client over the limit isn't even checked (or hashed).
+    if app.password_blocked(client) {
+        return too_many();
+    }
     let (email, password) = (f.email.unwrap_or_default(), f.password.unwrap_or_default());
     let checked = match app.control.login_password(&email, &password).await {
         Ok(login) => Ok(login),
@@ -636,9 +641,7 @@ pub async fn login(State(app): State<AppState>, client: Option<axum::Extension<C
     };
     match app.check_credential(checked, client) {
         Ok(login) => logged_in(&app, login, next),
-        Err(Rejected::RateLimited) => {
-            (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."), false, next)).into_response()
-        }
+        Err(Rejected::RateLimited) => too_many(),
         Err(Rejected::Invalid(())) => (StatusCode::UNAUTHORIZED, login_page(Some("Email or password is incorrect."), false, next)).into_response(),
     }
 }

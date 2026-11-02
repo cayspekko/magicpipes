@@ -11,6 +11,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 pub const MAX_LINE: usize = 64 * 1024;
 
+/// Bumped when [`AddRequest`] gains fields that an older agent would silently ignore (it parses
+/// the request and drops what it doesn't know). Agents report it in `status` as
+/// `agent.ipc_version`; one that doesn't is older than 2.
+pub const IPC_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
@@ -64,6 +69,21 @@ pub struct AddRequest {
     pub access: Vec<String>,
     #[serde(default)]
     pub labels: Vec<String>,
+}
+
+impl AddRequest {
+    /// Does it ask for something an agent before [`IPC_VERSION`] 2 would ignore? Such an agent
+    /// would publish a public HTTPS tunnel instead, without an error.
+    pub fn needs_current_agent(&self) -> bool {
+        self.serve.is_some()
+            || self.shell.is_some()
+            || self.kind != magicpipes_core::proto::Kind::Http
+            || self.remote_port.is_some()
+            || !self.allow.is_empty()
+            || self.visibility.is_some()
+            || !self.access.is_empty()
+            || !self.labels.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +189,30 @@ pub async fn call(
             Ok(IpcEvent::Ok { data }) => return Ok(data),
             Ok(IpcEvent::Error(e)) => return Err(e),
             Err(e) => return Err(ErrorInfo::new(ErrorCode::AgentProtocol, format!("invalid agent response: {e}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn options_an_older_agent_would_drop_need_a_current_one() {
+        let base = serde_json::json!({ "port": 3000, "host": null, "name": null, "probe_path": "/", "timeout_secs": 60 });
+        let req = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<AddRequest>(v).unwrap()
+        };
+        assert!(!req(serde_json::json!({})).needs_current_agent(), "a plain HTTP tunnel works with any agent");
+        for extra in [
+            serde_json::json!({ "visibility": "private" }),
+            serde_json::json!({ "access": ["team:dev"] }),
+            serde_json::json!({ "kind": "tcp" }),
+            serde_json::json!({ "allow": ["10.0.0.0/8"] }),
+        ] {
+            assert!(req(extra.clone()).needs_current_agent(), "{extra}");
         }
     }
 }

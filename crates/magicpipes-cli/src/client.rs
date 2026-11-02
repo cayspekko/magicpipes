@@ -98,6 +98,23 @@ pub async fn request(req: &IpcRequest, on_step: impl FnMut(Step, StepState)) -> 
     })
 }
 
+/// Refuses before a running agent of an older version could ignore part of `req`, for example
+/// publishing a public tunnel when a private one was asked for.
+pub async fn check_agent_understands(req: &ipc::AddRequest) -> Result<(), ErrorInfo> {
+    if !req.needs_current_agent() {
+        return Ok(());
+    }
+    let status = request(&IpcRequest::Status, |_, _| {}).await?;
+    if status["agent"]["ipc_version"].as_u64().unwrap_or(1) >= u64::from(ipc::IPC_VERSION) {
+        return Ok(());
+    }
+    Err(ErrorInfo::new(
+        ErrorCode::AgentOutdated,
+        "the running agent is an older version that would ignore some of these options. \
+         Restart it with `magicpipes agent stop`, then run the command again",
+    ))
+}
+
 /// Waits for a stopping agent to release its socket.
 pub async fn wait_stopped(timeout: Duration) -> bool {
     let start = Instant::now();

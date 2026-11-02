@@ -48,7 +48,8 @@ pub struct PublicConfig {
     /// Open connections per client address (per /64 for IPv6). Trusted proxies are exempt.
     pub max_connections_per_client: usize,
     pub header_read_timeout_secs: u64,
-    /// Time allowed for the local application to start answering a request.
+    /// Time allowed for the local application to start answering a request, counted from the
+    /// end of the request body (or from the last chunk of a body still being uploaded).
     pub upstream_response_timeout_secs: u64,
     /// Upgraded (WebSocket) connections are closed after this long without traffic.
     pub websocket_idle_timeout_secs: u64,

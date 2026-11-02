@@ -47,6 +47,7 @@ present a URL. Act on the code:
 | 3 | `not_logged_in`, `unauthorized` | The machine is not enrolled. Ask the user to run `magicpipes login --server <url>` in their terminal (they approve it in the browser), or for an enrollment token: `magicpipes login --server <url> --token <token>`. |
 | 4 | `local_unreachable` | The app is not listening yet, or binds another address. Wait or fix the app, then retry; use `--host ::1` if it listens only on IPv6. |
 | 5 | `server_unreachable`, `agent_start_failed` | Check `magicpipes status`; see `magicpipes agent logs`. |
+| 5 | `agent_outdated` | The background agent is older than the CLI: run `magicpipes agent stop`, then the command again (the agent restarts). If the message says to upgrade magicpipes, the machine's install is too old for its server. |
 | 6 | `name_conflict`, `name_taken`, `invalid_name` | Choose another `--name`, or `magicpipes remove <name>` first. |
 | 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. |
 | 6 | `public_not_allowed` | This machine may only publish private tunnels. Retry without `--public`. |

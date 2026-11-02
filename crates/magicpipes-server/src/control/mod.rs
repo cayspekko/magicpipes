@@ -77,10 +77,11 @@ struct TunnelRecord {
 
 impl State {
     /// The tunnel's effective access: its requested tags (all of the agent's when none were
-    /// asked for), limited to the tags the agent holds now.
+    /// asked for), limited to the tags the agent holds now. Requested tags that were deleted
+    /// since leave it narrower (owner-only when none are left), never wider.
     fn tunnel_authz(&self, t: &TunnelRecord) -> TunnelAuthz {
         let held = self.dir.agent_tags(&t.row.agent_id);
-        let access = if t.row.access.is_empty() { held } else { t.row.access.iter().filter(|a| held.contains(a)).cloned().collect() };
+        let access = if t.row.access_restricted { t.row.access.iter().filter(|a| held.contains(a)).cloned().collect() } else { held };
         TunnelAuthz {
             agent_id: t.row.agent_id.clone(),
             owner_user_id: self.dir.owner(&t.row.agent_id).map(str::to_string),
@@ -122,6 +123,11 @@ impl ControlPlane {
     pub fn new(cfg: Arc<Config>, store: Store, certs: Arc<CertManager>, data: Arc<DataPlane>) -> anyhow::Result<Arc<Self>> {
         let mut state = State { dir: directory::Directory::load(&store)?, ..State::default() };
         for row in store.tunnels()? {
+            if let Some(port) = row.public_port
+                && !cfg.port_range().is_some_and(|r| r.contains(port))
+            {
+                tracing::warn!(tunnel = %row.name, port, "the tunnel's port is outside the [ports] range; it stays closed");
+            }
             state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default() });
         }
         let cp = Arc::new(Self {
@@ -201,13 +207,20 @@ impl ControlPlane {
                 (Kind::Http, _) => {
                     table.by_host.insert(t.row.hostname.clone(), route);
                 }
-                (kind, Some(port)) => {
+                // The [ports] range may have been narrowed or removed since: then the port stays
+                // closed (the tunnel shows as offline) rather than reopening outside it.
+                (kind, Some(port)) if self.cfg.port_range().is_some_and(|r| r.contains(port)) => {
                     table.by_port.insert((kind, port), route);
                 }
+                (_, Some(_)) => {}
                 (_, None) => {}
             }
         }
         self.data.publish(table);
+        let mut wanted: std::collections::HashSet<&str> =
+            st.tunnels.values().filter(|t| t.row.kind.is_http()).map(|t| t.row.hostname.as_str()).collect();
+        wanted.insert(&self.cfg.management.hostname);
+        self.certs.set_wanted(&wanted);
     }
 
     // ---- identities ------------------------------------------------------------------------

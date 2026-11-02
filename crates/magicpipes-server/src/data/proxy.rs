@@ -108,7 +108,11 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     }
 
     let upstream = open_upstream(dp, &route, &session, client).await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Incoming>(TokioIo::new(upstream))
+    // An upgraded connection outlives this HTTP connection; it keeps the listener's limits.
+    let limits = conn.limits.clone();
+    let (progress, uploading) = tokio::sync::watch::channel(());
+    let req = req.map(|inner| Progress { inner, progress });
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Progress<Incoming>>(TokioIo::new(upstream))
         .await
         .map_err(|_| upstream_error(&route, UpstreamStatus::Closed))?;
     tokio::spawn(async move {
@@ -117,13 +121,13 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         }
     });
 
-    let mut resp = match tokio::time::timeout(dp.settings.upstream_response_timeout, sender.send_request(req)).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
+    let mut resp = match response_within(sender.send_request(req), uploading, dp.settings.upstream_response_timeout).await {
+        Some(Ok(resp)) => resp,
+        Some(Err(e)) => {
             let status = find_status(&e).unwrap_or(UpstreamStatus::Closed);
             return Err(upstream_error(&route, status));
         }
-        Err(_) => {
+        None => {
             route.stats.record(Outcome::LocalUnreachable);
             return Err(error_page(
                 ErrorCode::UpstreamTimeout,
@@ -165,6 +169,7 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
             }
             // Ends the watcher, if any.
             stop.cancel();
+            drop(limits);
         });
         clean_response_headers(resp.headers_mut(), true);
     } else {
@@ -175,6 +180,63 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
             resp.headers_mut().insert(PROBE_ACK_HEADER, v);
         }
     Ok(resp.map(|b| b.boxed()))
+}
+
+/// A request body that reports each chunk it passes on, so a long upload counts as progress.
+struct Progress<B> {
+    inner: B,
+    progress: tokio::sync::watch::Sender<()>,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for Progress<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(_))) = &polled {
+            self.progress.send_replace(());
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Waits for the response head, allowing `timeout` without progress: each request body chunk
+/// starts the wait again, so an upload can take as long as it needs while it keeps moving, and
+/// the application then has `timeout` to start answering. `None` when the time ran out.
+async fn response_within<F: std::future::Future>(send: F, mut uploading: tokio::sync::watch::Receiver<()>, timeout: std::time::Duration) -> Option<F::Output> {
+    tokio::pin!(send);
+    let mut body_open = true;
+    loop {
+        let step = async {
+            if body_open {
+                tokio::select! {
+                    r = &mut send => return Some(r),
+                    // An error means the body is finished (and dropped): only the answer is left.
+                    changed = uploading.changed() => body_open = changed.is_ok(),
+                }
+                None
+            } else {
+                Some((&mut send).await)
+            }
+        };
+        match tokio::time::timeout(timeout, step).await {
+            Ok(Some(r)) => return Some(r),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 async fn open_upstream(
@@ -358,4 +420,40 @@ code{{font:12.5px ui-monospace,"SF Mono",Menlo,monospace}}</style></head>
         .header(ERROR_HEADER, code.as_str())
         .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
         .expect("static response is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::response_within;
+
+    #[tokio::test]
+    async fn uploads_count_as_progress() {
+        let timeout = Duration::from_millis(200);
+        // The answer comes 600 ms in, after an upload that kept sending until 450 ms.
+        let (tx, rx) = tokio::sync::watch::channel(());
+        tokio::spawn(async move {
+            for _ in 0..9 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tx.send_replace(());
+            }
+        });
+        let answer = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            "ok"
+        };
+        assert_eq!(response_within(answer, rx, timeout).await, Some("ok"));
+
+        // No upload and no answer: the wait ends after the timeout.
+        let (_tx, rx) = tokio::sync::watch::channel(());
+        assert_eq!(response_within(std::future::pending::<()>(), rx, timeout).await, None);
+        // The body is finished: the application has the timeout to answer, no more.
+        let (tx, rx) = tokio::sync::watch::channel(());
+        drop(tx);
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        };
+        assert_eq!(response_within(late, rx, timeout).await, None);
+    }
 }

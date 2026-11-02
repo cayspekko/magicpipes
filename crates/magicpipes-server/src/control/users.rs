@@ -54,8 +54,15 @@ impl AccountLimiter {
         if map.len() >= ACCOUNT_TRACKED && !map.contains_key(email) {
             map.retain(|_, (_, since, _)| since.elapsed() < ACCOUNT_WINDOW);
             if map.len() >= ACCOUNT_TRACKED {
-                let oldest = map.iter().min_by_key(|(_, (_, since, _))| *since).map(|(k, _)| k.clone());
-                oldest.map(|k| map.remove(&k));
+                // Make room by forgetting a few failures, never an account that is being slowed
+                // down: otherwise a flood of made-up emails would reset its throttle.
+                let oldest = map.iter().filter(|(_, (n, _, _))| *n < ACCOUNT_FAILURES).min_by_key(|(_, (_, since, _))| *since);
+                match oldest.map(|(k, _)| k.clone()) {
+                    Some(k) => {
+                        map.remove(&k);
+                    }
+                    None => return,
+                }
             }
         }
         let now = Instant::now();
@@ -531,9 +538,13 @@ mod tests {
         assert!(!l.throttled("other@b.c"));
         l.succeeded("a@b.c");
         assert!(!l.throttled("a@b.c"));
+        for _ in 0..ACCOUNT_FAILURES {
+            l.failed("a@b.c");
+        }
         for i in 0..ACCOUNT_TRACKED + 5 {
             l.failed(&format!("{i}@b.c"));
         }
         assert!(l.map.lock().unwrap().len() <= ACCOUNT_TRACKED);
+        assert!(l.throttled("a@b.c"), "made-up emails don't push a throttled account out");
     }
 }

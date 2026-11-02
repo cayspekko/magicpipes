@@ -28,6 +28,9 @@ use crate::state::{AgentConfig, LocalTunnel};
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A session that lasted this long resets the reconnect backoff; a shorter one (the server closing
+/// it at once, say, or another machine with the same credentials) keeps it growing.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub enum ConnState {
@@ -43,6 +46,9 @@ pub struct Session {
     tls: Arc<ClientConfig>,
     tunnels: Arc<Tunnels>,
     state: watch::Sender<ConnState>,
+    /// Held while registering a tunnel (`add`, and restoring after a reconnect), so the two never
+    /// interleave and an older copy of a tunnel's settings can't overwrite a newer one.
+    pub register_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -66,7 +72,7 @@ impl Session {
     pub fn new(cfg: AgentConfig, tunnels: Arc<Tunnels>) -> anyhow::Result<Arc<Self>> {
         let tls = https::tls_config(cfg.ca_cert_pem.as_deref())?;
         let (state, _) = watch::channel(ConnState::Connecting { attempt: 0, last_error: None });
-        Ok(Arc::new(Self { cfg, tls, tunnels, state }))
+        Ok(Arc::new(Self { cfg, tls, tunnels, state, register_lock: tokio::sync::Mutex::new(()) }))
     }
 
     pub fn server(&self) -> &str {
@@ -95,14 +101,15 @@ impl Session {
             };
             match result {
                 Ok((handle, inbound, server_protocol)) => {
-                    attempt = 0;
+                    let started = std::time::Instant::now();
                     self.serve(handle, inbound, server_protocol, &shutdown).await;
                     if shutdown.is_cancelled() {
                         return;
                     }
-                    tracing::warn!("disconnected from server; reconnecting");
+                    attempt = if started.elapsed() >= STABLE_SESSION { 0 } else { attempt.saturating_add(1) };
+                    tracing::warn!(attempt, "disconnected from server; reconnecting");
                     self.tunnels.mark_all_pending();
-                    self.state.send_replace(ConnState::Connecting { attempt: 0, last_error: Some("connection lost".into()) });
+                    self.state.send_replace(ConnState::Connecting { attempt, last_error: Some("connection lost".into()) });
                 }
                 Err(ConnectError::Unauthorized(msg)) => {
                     tracing::error!(error = %msg, "server rejected agent credentials; run `magicpipes login` again");
@@ -202,9 +209,12 @@ impl Session {
         fwd.abort();
     }
 
-    /// Re-registers every local tunnel on a new session (idempotent on the server).
+    /// Re-registers every local tunnel on a new session (idempotent on the server). Each one is
+    /// read again under `register_lock`, so an `add` that changed it meanwhile wins.
     async fn restore(&self) {
-        for t in self.tunnels.list() {
+        for id in self.tunnels.list().into_iter().map(|t| t.id) {
+            let _lock = self.register_lock.lock().await;
+            let Some(t) = self.tunnels.find(|t| t.id == id) else { continue };
             let req = RegisterTunnel {
                 id: Some(t.id.clone()),
                 name: Some(t.name.clone()),
@@ -213,9 +223,11 @@ impl Session {
                 // Keeps the port if the server had to recreate the tunnel (e.g. a restored backup).
                 remote_port: t.public_port,
                 allow: t.allow.clone(),
-                visibility: t.visibility,
-                access: t.access.clone(),
-                labels: t.labels.clone(),
+                // The server keeps the tunnel's stored visibility, access tags and labels. Sending
+                // ours would replay tags an administrator may have deleted since.
+                visibility: None,
+                access: Vec::new(),
+                labels: Vec::new(),
             };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
                 // Never let a private tunnel come back public (e.g. after a server downgrade).

@@ -163,7 +163,12 @@ a certificate or an HTTP route.
 * **UDP**: one `ServerOpen::Datagram` stream per client address ("flow"), carrying `u16`-length
   framed datagrams both ways; the agent relays them through a connected UDP socket of its own,
   so replies reach the right client. Flows end after `udp_idle_timeout_secs` and are capped per
-  tunnel (`udp_max_flows`); a full flow queue drops datagrams, as a congested network would.
+  tunnel (`udp_max_flows`, of which one client address may hold an eighth); a full flow queue
+  drops datagrams, as a congested network would.
+* **Changes apply to open connections**: on every publish, open TCP connections and UDP flows
+  check their tunnel again and close if it is gone or its allow-list no longer admits them. A
+  port outside the current `[ports] range` is not opened (after the range is narrowed or
+  removed), and the server logs it at startup.
 * **Allow-lists** (`--allow-cidr`) are validated by the CLI, the agent and the server, stored in
   canonical form and enforced by the server on every connection and flow.
 * **Readiness**: the `Check` RPC makes the server open a data (or datagram) stream for the tunnel
@@ -183,7 +188,8 @@ Planned target and ingress kinds (Unix sockets, SSH gateway, browser desktop) ar
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 2). A peer without the header is
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 3: 2 added the handshake and
+  answers to unknown messages, 3 visibility, access tags and labels). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,
@@ -325,8 +331,16 @@ a connection to the public port that must arrive back at the agent (a warning, n
   64 KiB control frames and IPC lines (5 s to send one), ≤256 concurrent streams per agent
   session of which public traffic may use 224 (64 per client), so pings and RPCs always get
   through; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
-  concurrent ACME orders, per-hostname failure backoff; at most 8 archive downloads at once
-  per agent, each dropped after 60 s without reading.
+  concurrent ACME orders, per-hostname failure backoff (renewals included); at most 8 archive
+  downloads at once per agent, each dropped after 30 s without reading or, after its first 30 s,
+  when it averages under 16 KiB/s; at most 5000 names in a selection. Upgraded (WebSocket)
+  connections keep their listener's connection slots until they close. Used private-tunnel
+  sign-in codes are remembered per user (32 per minute each), so one account can't use up
+  everyone's sign-ins; pending device logins are capped at 5 per address and 1000 in total, and
+  a full table drops a waiting login of the address holding the most rather than refusing.
+* Certificates: the control plane tells the certificate manager which hostnames it serves on
+  every publish. Others are no longer renewed, and are forgotten (resolver and cache) after a
+  week, so a hostname removed and added again soon keeps its certificate.
 * Secrets are never logged. The bootstrap admin token goes to a 0600 file, not to the log.
 * The server sees only what it needs about local targets: the program name of a web terminal
   (not its arguments) and the folder name of a static site (not its path). The public terminal
@@ -357,7 +371,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   inherit its retransmissions and ordering (poor for VPNs and real-time media).
 * At most 256 streams per agent session: HTTP requests in flight, TCP connections and UDP
   clients together.
-* There is no body idle timeout for regular HTTP requests, only a time-to-first-response timeout.
+* There is no body idle timeout for regular HTTP requests, only a time-to-first-response timeout,
+  counted from the last request body chunk (so uploads can take as long as they keep moving).
   Upgraded (WebSocket) connections have an idle timeout.
 * UI sessions live in memory; restarting the server logs administrators out.
 * Read-only web terminals are anonymous: anyone with the link can hold one of its

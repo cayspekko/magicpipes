@@ -166,8 +166,9 @@ pub struct DataPlane {
     me: Weak<DataPlane>,
     /// Bumped on every publish, so long-lived connections to private tunnels recheck access.
     generation: watch::Sender<u64>,
-    /// Nonces of sign-in codes already used, with when they were seen (bounded, 60 s each).
-    used_codes: Mutex<HashMap<String, std::time::Instant>>,
+    /// Nonces of sign-in codes already used, per user, with when they were seen (bounded per
+    /// user and in total, 65 s each).
+    used_codes: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
 
 impl DataPlane {
@@ -193,19 +194,32 @@ impl DataPlane {
         self.routes.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Marks a sign-in code's nonce as used; false if it was already.
-    fn use_code(&self, nonce: &str) -> bool {
-        const MAX_TRACKED: usize = 10_000;
+    /// Marks a sign-in code's nonce as used; false if it was already. Kept per user, so one
+    /// account signing in over and over can only use up its own share.
+    fn use_code(&self, user_id: &str, nonce: &str) -> bool {
+        // More sign-ins than this within a code's lifetime is a script, not a person.
+        const PER_USER: usize = 32;
+        // Codes are signed for real users, so this bounds memory, not who may sign in.
+        const MAX_USERS: usize = 10_000;
         let mut used = self.used_codes.lock().unwrap_or_else(|e| e.into_inner());
         let ttl = Duration::from_secs(crate::tunnel_auth::CODE_TTL_SECS as u64 + 5);
-        if used.len() >= MAX_TRACKED {
-            used.retain(|_, at| at.elapsed() < ttl);
-            if used.len() >= MAX_TRACKED {
-                // Codes expire in a minute; refusing new sign-ins briefly beats unbounded memory.
+        if !used.contains_key(user_id) && used.len() >= MAX_USERS {
+            used.retain(|_, codes| {
+                codes.retain(|_, at| at.elapsed() < ttl);
+                !codes.is_empty()
+            });
+            if used.len() >= MAX_USERS {
                 return false;
             }
         }
-        used.insert(nonce.to_string(), std::time::Instant::now()).is_none()
+        let codes = used.entry(user_id.to_string()).or_default();
+        if codes.len() >= PER_USER {
+            codes.retain(|_, at| at.elapsed() < ttl);
+            if codes.len() >= PER_USER {
+                return false;
+            }
+        }
+        codes.insert(nonce.to_string(), std::time::Instant::now()).is_none()
     }
 
     /// Atomically replaces the routing table (called by the control plane only), then binds the
