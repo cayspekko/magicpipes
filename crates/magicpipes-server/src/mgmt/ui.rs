@@ -138,7 +138,7 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title>
-<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{picker}</style><script src="/ui.js" defer></script></head><body>
+<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{picker}{MENU_STYLE}</style><script src="/ui.js" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{logout}</div></header>
 <main>{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),
@@ -194,6 +194,39 @@ pub(super) fn server_url(app: &AppState) -> String {
     }
 }
 
+/// Row menus (`row_menu`).
+const MENU_STYLE: &str = r#"details.menu{display:inline-block;position:relative;text-align:left}
+details.menu>summary{list-style:none;font-size:16px;letter-spacing:1px;padding:5px 10px}details.menu>summary::-webkit-details-marker{display:none}
+details.menu[open]>summary{border-color:var(--line-2);color:var(--ink)}
+.menu-list{display:flex;flex-direction:column;min-width:12em;margin-top:6px;padding:5px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+details.menu.float .menu-list{position:fixed;z-index:20;margin:0;box-shadow:0 10px 30px rgba(0,0,0,.14)}
+.menu-list form{margin:0}.menu-list hr{border:0;border-top:1px solid var(--line);margin:4px 2px}
+.menu-item{display:block;width:100%;text-align:left;font:13.5px/1.2 var(--sans);padding:9px 11px;border:0;border-radius:7px;background:none;color:var(--ink);cursor:pointer;text-decoration:none;white-space:nowrap}
+.menu-item:hover,.menu-item:focus-visible{background:var(--hover);outline:none}.menu-item.danger{color:var(--bad)}"#;
+
+/// A row's "More actions" menu. Without scripts the list opens in place; `ui.js` floats it next
+/// to the button.
+pub(super) fn row_menu(subject: &str, items: &[String]) -> String {
+    format!(
+        r#"<details class="menu"><summary class="btn small ghost" aria-label="More actions for {}" title="More actions">⋯</summary><div class="menu-list">{}</div></details>"#,
+        esc(subject),
+        items.concat()
+    )
+}
+
+/// A menu entry that posts `fields` to `action`; `confirm`: a question asked first (by `ui.js`).
+pub(super) fn menu_post(action: &str, csrf: &str, fields: &[(&str, &str)], label: &str, danger: bool, confirm: Option<&str>) -> String {
+    let hidden: String = fields.iter().map(|(k, v)| format!(r#"<input type="hidden" name="{}" value="{}">"#, esc(k), esc(v))).collect();
+    format!(
+        r#"<form method="post" action="{action}"{confirm}><input type="hidden" name="csrf" value="{csrf}">{hidden}<button class="menu-item{danger}">{label}</button></form>"#,
+        action = esc(action),
+        confirm = confirm.map(|c| format!(r#" data-confirm="{}""#, esc(c))).unwrap_or_default(),
+        csrf = esc(csrf),
+        danger = if danger { " danger" } else { "" },
+        label = esc(label),
+    )
+}
+
 /// Tags as small chips; `none` when empty.
 pub(super) fn chips(tags: &[String]) -> String {
     if tags.is_empty() {
@@ -231,14 +264,27 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     for a in &agents {
         let last_seen = a.last_seen_at.as_deref().map(when).unwrap_or_else(|| r#"<span class="when">never</span>"#.into());
         let owner = a.owner_email.as_deref().map(esc).unwrap_or_else(|| r#"<span class="sub">service agent</span>"#.into());
+        let edit = picker::Edit {
+            held: &a.tags,
+            href: format!("/agents/{}/tags", a.id),
+            subject: &a.name,
+            addable: admin,
+            holder: Holder::Agent,
+            reach: reach.by_agent.get(&a.id),
+        };
         agent_rows.push_str(&format!(
-            r#"<tr><td><span class="name">{name}</span><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num"><form method="post" action="/agents/{id}/revoke"><input type="hidden" name="csrf" value="{csrf}"><button class="btn danger small">Revoke</button></form></td></tr>"#,
+            r#"<tr><td><span class="name">{name}</span><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num">{menu}</td></tr>"#,
             name = esc(&a.name),
-            tags = picker::cell(&user, &a.tags, &format!("/agents/{}/tags", a.id), &a.name, admin, Holder::Agent, reach.by_agent.get(&a.id)),
+            tags = edit.cell(&user),
+            menu = row_menu(&a.name, &[
+                edit.link(&user, "menu-item", "Edit tags", &format!("Edit tags of {}", a.name)),
+                "<hr>".into(),
+                menu_post(&format!("/agents/{}/revoke", a.id), &user.csrf, &[], "Revoke", true,
+                    Some(&format!("Revoke {}? Its tunnels are deleted, and it can't connect again until it is enrolled again.", a.name))),
+            ]),
             status = badge(if a.connected { "connected" } else { "disconnected" }),
             tunnels = a.tunnels,
             id = esc(&a.id),
-            csrf = esc(&user.csrf),
         ));
     }
     if agents.is_empty() {

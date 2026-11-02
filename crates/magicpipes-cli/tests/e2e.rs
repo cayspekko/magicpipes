@@ -1084,8 +1084,11 @@ async fn tag_forms_apply_only_what_changed() {
 
     // The users page carries the registry for the picker, with descriptions unable to end it.
     let users = env.ui("/users", Some(&cookie), None).await;
-    assert!(users.html.contains(r#"id="mp-tags""#) && users.html.contains(&format!(r#"href="/users/{ann}/tags" data-tag-edit"#)), "{}", users.html);
+    assert!(users.html.contains(r#"id="mp-tags""#) && users.html.contains(&format!(r#"href="/users/{ann}/tags" aria-label="Edit tags of ann@example.com" data-tag-edit"#)), "{}", users.html);
     assert!(users.html.contains(r#"\u003c/script>\u003cb>ops"#) && !users.html.contains("</script><b>"), "{}", users.html);
+    // The row's other actions are in a menu; the irreversible ones ask first.
+    assert!(users.html.contains(r#"aria-label="More actions for ann@example.com""#), "{}", users.html);
+    assert!(users.html.contains(r#"data-confirm="Disable ann@example.com?"#), "{}", users.html);
     // Without scripts the Edit link opens a page of checkboxes.
     let page = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), None).await;
     assert!(page.html.contains(r#"value="team:dev" checked"#) && page.html.contains(r#"name="base" value="team:dev""#), "{}", page.html);
@@ -1108,7 +1111,7 @@ async fn tag_forms_apply_only_what_changed() {
     let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
     let agent = v["agents"][0]["id"].as_str().unwrap().to_string();
     let index = env.ui("/", Some(&cookie), None).await;
-    assert!(index.html.contains(&format!(r#"href="/agents/{agent}/tags" data-tag-edit"#)), "{}", index.html);
+    assert!(index.html.contains(&format!(r#"href="/agents/{agent}/tags" aria-label="Edit tags of"#)), "{}", index.html);
     env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", ""), ("tags", "team:dev env:prod")])).await;
     env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "env:prod team:dev"), ("tags", "team:dev")])).await;
     let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;

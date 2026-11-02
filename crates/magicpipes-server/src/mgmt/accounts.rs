@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::picker::{self, Holder, Submitted};
-use super::ui::{CsrfForm, UiUser, chips, esc, logged_in, page, safe_next, when};
+use super::ui::{CsrfForm, UiUser, chips, esc, logged_in, menu_post, page, row_menu, safe_next, when};
 use crate::authz::{Principal, Role};
 use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
 
@@ -194,21 +194,32 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
             (false, false) => r#"<span class="status ok">active</span>"#,
         };
         let me = matches!(&user.who, Principal::User { id, .. } if *id == u.id);
-        let button = |action: &str, label: &str, class: &str| {
-            format!(
-                r#"<form method="post" action="/users/{id}" style="display:inline">{csrf}<input type="hidden" name="action" value="{action}"><button class="btn small {class}">{label}</button></form>"#,
-                id = esc(&u.id),
-                csrf = csrf(user),
-            )
+        let edit = picker::Edit {
+            held: &u.tags,
+            href: format!("/users/{}/tags", u.id),
+            subject: &u.email,
+            addable: true,
+            holder: Holder::User,
+            reach: Some(&reach.by_tag),
         };
-        let actions = if me {
-            r#"<span class="sub">you</span>"#.to_string()
-        } else {
-            let role = if u.role == Role::Admin { button("member", "Make member", "") } else { button("admin", "Make admin", "") };
-            let status = if u.disabled { button("enable", "Enable", "") } else { button("disable", "Disable", "danger") };
-            format!("{role} {status} {}", button("reset", "Reset password", ""))
+        let tags = edit.cell(user);
+        let post = |action: &str, label: &str, danger: bool, confirm: Option<String>| {
+            menu_post(&format!("/users/{}", u.id), &user.csrf, &[("action", action)], label, danger, confirm.as_deref())
         };
-        let tags = picker::cell(user, &u.tags, &format!("/users/{}/tags", u.id), &u.email, true, Holder::User, Some(&reach.by_tag));
+        let mut items = vec![edit.link(user, "menu-item", "Edit tags", &format!("Edit tags of {}", u.email))];
+        if !me {
+            items.push(if u.role == Role::Admin { post("member", "Make member", false, None) } else { post("admin", "Make admin", false, None) });
+            let reset = format!("Reset the password of {}? Their sessions end, and they must replace the new password when they next sign in.", u.email);
+            items.push(post("reset", "Reset password", false, Some(reset)));
+            items.push("<hr>".into());
+            items.push(if u.disabled {
+                post("enable", "Enable", false, None)
+            } else {
+                post("disable", "Disable", true, Some(format!("Disable {}? They are signed out, and their machines stop serving tunnels.", u.email)))
+            });
+        }
+        let you = if me { r#"<span class="sub" style="display:inline;margin-right:8px">you</span>"# } else { "" };
+        let actions = format!("{you}{}", row_menu(&u.email, &items));
         rows.push_str(&format!(
             r#"<tr><td><span class="name">{name}</span><span class="sub">{email}</span></td><td>{role}</td><td>{tags}</td><td>{state}</td><td>{last}</td><td class="num">{actions}</td></tr>"#,
             name = esc(if u.display_name.is_empty() { &u.email } else { &u.display_name }),

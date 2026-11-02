@@ -60,27 +60,50 @@ pub(super) enum Holder {
     Agent,
 }
 
-/// A row's tags and an Edit link: the picker, or without scripts the page at `href` (which also
-/// takes the picker's POST). `reach`: private tunnels per tag that removing it would close.
-pub(super) fn cell(user: &UiUser, held: &[String], href: &str, subject: &str, addable: bool, holder: Holder, reach: Option<&HashMap<String, usize>>) -> String {
-    if held.is_empty() && !addable {
-        return chips(held);
+/// What a row's tag Edit link opens: the picker, or without scripts the page at `href` (which
+/// also takes the picker's POST).
+pub(super) struct Edit<'a> {
+    pub held: &'a [String],
+    pub href: String,
+    /// Whose tags, as the picker and screen readers name it.
+    pub subject: &'a str,
+    pub addable: bool,
+    pub holder: Holder,
+    /// Private tunnels per tag that removing it would close.
+    pub reach: Option<&'a HashMap<String, usize>>,
+}
+
+impl Edit<'_> {
+    /// The row's tags with a small Edit link next to them.
+    pub fn cell(&self, user: &UiUser) -> String {
+        if self.held.is_empty() && !self.addable {
+            return chips(self.held);
+        }
+        let label = format!("Edit tags of {}", self.subject);
+        format!(r#"<div class="tagcell"><span class="tagchips">{}</span>{}</div>"#, chips(self.held), self.link(user, "btn small ghost", "Edit", &label))
     }
-    let reach: Vec<String> = reach.map(|r| held.iter().filter_map(|t| r.get(t).map(|n| format!("{t}={n}"))).collect()).unwrap_or_default();
-    format!(
-        r#"<div class="tagcell"><span class="tagchips">{chips}</span><a class="btn small" href="{href}" data-tag-edit data-subject="{subject}" data-held="{held}" data-addable="{addable}" data-reach="{reach}" data-reach-kind="{kind}" data-csrf="{csrf}">Edit</a></div>"#,
-        chips = chips(held),
-        href = esc(href),
-        subject = esc(subject),
-        held = esc(&held.join(" ")),
-        addable = if addable { "1" } else { "0" },
-        reach = esc(&reach.join(" ")),
-        kind = match holder {
-            Holder::User => "user",
-            Holder::Agent => "agent",
-        },
-        csrf = esc(&user.csrf),
-    )
+
+    /// A link that opens the picker; `aria` names it for screen readers when `text` is short.
+    pub fn link(&self, user: &UiUser, class: &str, text: &str, aria: &str) -> String {
+        let reach: Vec<String> =
+            self.reach.map(|r| self.held.iter().filter_map(|t| r.get(t).map(|n| format!("{t}={n}"))).collect()).unwrap_or_default();
+        format!(
+            r#"<a class="{class}" href="{href}" aria-label="{aria}" data-tag-edit data-subject="{subject}" data-held="{held}" data-addable="{addable}" data-reach="{reach}" data-reach-kind="{kind}" data-csrf="{csrf}">{text}</a>"#,
+            class = esc(class),
+            href = esc(&self.href),
+            aria = esc(aria),
+            subject = esc(self.subject),
+            held = esc(&self.held.join(" ")),
+            addable = if self.addable { "1" } else { "0" },
+            reach = esc(&reach.join(" ")),
+            kind = match self.holder {
+                Holder::User => "user",
+                Holder::Agent => "agent",
+            },
+            csrf = esc(&user.csrf),
+            text = esc(text),
+        )
+    }
 }
 
 /// Checkboxes named `tag` for `(name, description)` pairs, in a fieldset. With `picker` the

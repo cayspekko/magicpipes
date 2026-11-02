@@ -304,3 +304,39 @@
     render();
   });
 })();
+
+// Row menus (`details.menu`): without the script the list opens in place, inside the row. With
+// it the list floats next to its button, outside the table's scroll box, one menu at a time; it
+// closes on Escape, a click elsewhere, choosing an item, or scrolling. Forms with `data-confirm`
+// ask first.
+(() => {
+  const menus = [...document.querySelectorAll('details.menu')];
+  const closeAll = (except) => menus.forEach((d) => { if (d !== except) d.open = false; });
+  const place = (d) => {
+    const list = d.querySelector('.menu-list');
+    const r = d.querySelector('summary').getBoundingClientRect();
+    const below = r.bottom + 4 + list.offsetHeight <= innerHeight - 8;
+    list.style.top = `${below ? r.bottom + 4 : Math.max(8, r.top - 4 - list.offsetHeight)}px`;
+    list.style.left = `${Math.min(innerWidth - list.offsetWidth - 8, Math.max(8, r.right - list.offsetWidth))}px`;
+  };
+  for (const d of menus) {
+    d.classList.add('float');
+    d.addEventListener('toggle', () => {
+      if (!d.open) return;
+      closeAll(d);
+      place(d);
+      d.querySelector('.menu-item')?.focus();
+    });
+    d.querySelector('.menu-list').addEventListener('click', (e) => { if (e.target.closest('.menu-item')) d.open = false; });
+  }
+  document.addEventListener('click', (e) => { if (!e.target.closest('details.menu')) closeAll(); });
+  document.addEventListener('keydown', (e) => {
+    const d = menus.find((m) => m.open);
+    if (e.key === 'Escape' && d) { d.open = false; d.querySelector('summary').focus(); }
+  });
+  addEventListener('resize', () => closeAll());
+  addEventListener('scroll', (e) => { if (!e.target.closest?.('.menu-list')) closeAll(); }, true);
+  document.querySelectorAll('form[data-confirm]').forEach((f) => {
+    f.addEventListener('submit', (e) => { if (!confirm(f.dataset.confirm)) e.preventDefault(); });
+  });
+})();
