@@ -223,11 +223,10 @@ impl Session {
                 // Keeps the port if the server had to recreate the tunnel (e.g. a restored backup).
                 remote_port: t.public_port,
                 allow: t.allow.clone(),
-                // The server keeps the tunnel's stored visibility, access tags and labels. Sending
+                // The server keeps the tunnel's stored visibility and access tags. Sending
                 // ours would replay tags an administrator may have deleted since.
                 visibility: None,
                 access: Vec::new(),
-                labels: Vec::new(),
             };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
                 // Never let a private tunnel come back public (e.g. after a server downgrade).
@@ -257,7 +256,6 @@ impl Session {
                         public_port: info.public_port.or(t.public_port),
                         visibility: info.visibility,
                         access: info.access,
-                        labels: info.labels,
                         ..t
                     };
                     self.tunnels.upsert(updated, Registration::Registered);

@@ -85,7 +85,6 @@ fn http(name: &str) -> RegisterTunnel {
         allow: vec![],
         visibility: None,
         access: vec![],
-        labels: vec![],
     }
 }
 
@@ -199,13 +198,13 @@ async fn tags_limit_enrollments_and_personal_agents() {
     assert_eq!(view(&laptop).tags, ["team:dev"]);
 
     // Owners may remove an agent's tags but not add them; administrators may.
-    assert!(f.cp.update_agent(&who, &laptop, Some(&["team:dev".into(), "team:ops".into()]), None).unwrap_err().is(ErrorCode::Forbidden));
-    f.cp.update_agent(&who, &laptop, Some(&[]), Some(&["env:laptop".into()])).unwrap();
-    assert_eq!((view(&laptop).tags.len(), view(&laptop).labels.clone()), (0, vec!["env:laptop".to_string()]));
+    assert!(f.cp.update_agent(&who, &laptop, Some(&["team:dev".into(), "team:ops".into()])).unwrap_err().is(ErrorCode::Forbidden));
+    f.cp.update_agent(&who, &laptop, Some(&[])).unwrap();
+    assert!(view(&laptop).tags.is_empty());
     let service = f.agent("ci");
-    f.cp.update_agent(&admin, &service, Some(&["team:ops".into()]), None).unwrap();
+    f.cp.update_agent(&admin, &service, Some(&["team:ops".into()])).unwrap();
     assert_eq!(view(&service).tags, ["team:ops"], "a service agent keeps what an administrator gave it");
-    assert!(f.cp.update_agent(&who, &service, Some(&[]), None).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
+    assert!(f.cp.update_agent(&who, &service, Some(&[])).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
 
     // A disabled owner's agents can't connect and serve nothing.
     f.cp.register(&laptop, &http("annsapp")).unwrap();

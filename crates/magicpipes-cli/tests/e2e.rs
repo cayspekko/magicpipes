@@ -195,7 +195,7 @@ async fn http_websocket_and_lifecycle() {
     // The same fields as when the agent runs, from tunnels.json.
     let stopped = &list["tunnels"][0];
     assert_eq!((stopped["status"].as_str(), stopped["share_url"].as_str()), (Some("stopped"), stopped["public_url"].as_str()), "{stopped}");
-    assert!(stopped.get("visibility").is_some() && stopped["access"].is_array() && stopped["labels"].is_array(), "{stopped}");
+    assert!(stopped.get("visibility").is_some() && stopped["access"].is_array(), "{stopped}");
 
     env.cli_ok(&["agent", "start"]).await;
     let new_pid = env.agent_pid().unwrap();
@@ -1132,7 +1132,7 @@ async fn tag_forms_apply_only_what_changed() {
 
     // Enrollment tokens take checkboxes too.
     assert!(index.html.contains(r#"fieldset class="tags" data-picker"#), "{}", index.html);
-    let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:ops"), ("labels", ""), ("allow_public", "on")])).await;
+    let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:ops"), ("allow_public", "on")])).await;
     assert!(made.status == StatusCode::OK && made.html.contains("--token"), "{}", made.html);
     let bad = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:nope")])).await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
@@ -1210,7 +1210,7 @@ async fn private_tunnels() {
     let out = env.cli(&["add", &port, "--access", "team:ops", "--json", "--timeout", "30"]).await;
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "forbidden", "the machine doesn't hold team:ops: {v}");
-    let t = add_json(&env, &[&port, "--name", "wiki", "--label", "env:test"]).await;
+    let t = add_json(&env, &[&port, "--name", "wiki"]).await;
     assert_eq!(t["status"], "ready", "private tunnels are verified through the server: {t}");
     assert_eq!((t["visibility"].as_str(), t["access"].clone()), (Some("private"), serde_json::json!([])), "{t}");
     let host = hostname(t["public_url"].as_str().unwrap());

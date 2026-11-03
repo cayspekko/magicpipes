@@ -14,9 +14,9 @@ use crate::certs::CertStatus;
 use crate::config::{PortRange, TlsMode};
 use crate::store::TunnelRow;
 
-/// Visibility, access tags, whether tags were asked for (`TunnelRow::access_restricted`), and
-/// labels of a tunnel.
-type Access = (Visibility, Vec<String>, bool, Vec<String>);
+/// Visibility, access tags, and whether tags were asked for (`TunnelRow::access_restricted`) of a
+/// tunnel.
+type Access = (Visibility, Vec<String>, bool);
 
 impl ControlPlane {
     /// What a registration asks for, within the agent's enrollment. Agents before protocol 3
@@ -30,8 +30,8 @@ impl ControlPlane {
         let members_may_not = st.dir.member_owned(agent_id) && !self.cfg.users.members_can_publish;
         let invalid = |m: String| err(ErrorCode::InvalidRequest, m);
         let protocol = st.sessions.get(agent_id).map_or(proto::PROTOCOL_VERSION, |s| s.protocol);
-        let (visibility, access, labels) = match (req.visibility, existing) {
-            (None, Some(row)) => return Ok((row.visibility, row.access.clone(), row.access_restricted, row.labels.clone())),
+        let (visibility, access) = match (req.visibility, existing) {
+            (None, Some(row)) => return Ok((row.visibility, row.access.clone(), row.access_restricted)),
             // An agent from before private tunnels would wait for its readiness probe, which
             // the sign-in page answers, and fail after minutes; and public isn't what was meant.
             (None, None) if default_private && req.kind.is_http() && protocol < 3 => {
@@ -41,9 +41,9 @@ impl ControlPlane {
                 ));
             }
             // Raw ports can't ask anyone to sign in yet, so they stay public by default.
-            (None, None) if default_private && req.kind.is_http() => (Visibility::Private, Vec::new(), tags::normalize_list(&req.labels).map_err(invalid)?),
-            (None, None) => (Visibility::Public, Vec::new(), tags::normalize_list(&req.labels).map_err(invalid)?),
-            (Some(v), _) => (v, tags::normalize_list(&req.access).map_err(invalid)?, tags::normalize_list(&req.labels).map_err(invalid)?),
+            (None, None) if default_private && req.kind.is_http() => (Visibility::Private, Vec::new()),
+            (None, None) => (Visibility::Public, Vec::new()),
+            (Some(v), _) => (v, tags::normalize_list(&req.access).map_err(invalid)?),
         };
         match visibility {
             Visibility::Public if members_may_not => {
@@ -66,7 +66,7 @@ impl ControlPlane {
             return Err(err(ErrorCode::Forbidden, format!("this machine doesn't have the access tag '{t}', so it can't share with it")));
         }
         let restricted = !access.is_empty();
-        Ok((visibility, access, restricted, labels))
+        Ok((visibility, access, restricted))
     }
 
     pub fn register(&self, agent_id: &str, req: &RegisterTunnel) -> Result<TunnelInfo, ErrorBody> {
@@ -111,7 +111,7 @@ impl ControlPlane {
 
         if let Some(id) = existing {
             let mut row = st.tunnels[&id].row.clone();
-            (row.visibility, row.access, row.access_restricted, row.labels) = self.requested_access(&st, agent_id, req, Some(&row))?;
+            (row.visibility, row.access, row.access_restricted) = self.requested_access(&st, agent_id, req, Some(&row))?;
             if row.kind != req.kind {
                 return Err(err(
                     ErrorCode::KindMismatch,
@@ -126,8 +126,7 @@ impl ControlPlane {
                 row.public_port = Some(self.claim_port(&st, row.kind, p)?);
             }
             let t = st.tunnels.get_mut(&id).expect("checked above");
-            let settings =
-                |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.access.clone(), r.access_restricted, r.labels.clone());
+            let settings = |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.access.clone(), r.access_restricted);
             if settings(&t.row) != settings(&row) {
                 self.store.update_tunnel(&row).map_err(internal)?;
                 t.row = row.clone();
@@ -170,7 +169,7 @@ impl ControlPlane {
                 return Err(err(ErrorCode::LimitReached, format!("an agent may add at most {max} new hostnames per day; reuse a name or try later")));
             }
         }
-        let (visibility, access, access_restricted, labels) = self.requested_access(&st, agent_id, req, None)?;
+        let (visibility, access, access_restricted) = self.requested_access(&st, agent_id, req, None)?;
         let public_port = match (range, req.remote_port) {
             (None, _) => None,
             (Some(_), Some(p)) => Some(self.claim_port(&st, req.kind, p)?),
@@ -189,7 +188,6 @@ impl ControlPlane {
             visibility,
             access,
             access_restricted,
-            labels,
         };
         self.store.insert_tunnel(&row).map_err(internal)?;
         if new_cert {
@@ -247,7 +245,6 @@ impl ControlPlane {
             public_port: row.public_port,
             visibility: Some(row.visibility),
             access: row.access.clone(),
-            labels: row.labels.clone(),
         }
     }
 

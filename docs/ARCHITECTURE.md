@@ -189,7 +189,7 @@ Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgrad
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
   `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 3: 2 added the handshake and
-  answers to unknown messages, 3 visibility, access tags and labels). A peer without the header is
+  answers to unknown messages, 3 visibility and access tags). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,

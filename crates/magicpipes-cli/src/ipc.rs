@@ -67,8 +67,6 @@ pub struct AddRequest {
     pub visibility: Option<magicpipes_core::proto::Visibility>,
     #[serde(default)]
     pub access: Vec<String>,
-    #[serde(default)]
-    pub labels: Vec<String>,
 }
 
 impl AddRequest {
@@ -82,7 +80,6 @@ impl AddRequest {
             || !self.allow.is_empty()
             || self.visibility.is_some()
             || !self.access.is_empty()
-            || !self.labels.is_empty()
     }
 }
 

@@ -29,8 +29,6 @@ pub struct TunnelView {
     /// Private tunnels: the access tags in effect (limited to the agent's); empty = owner only.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
     /// `connected`, `disconnected` (agent offline) or `error` (local application unreachable,
     /// or the tunnel's port could not be opened).
     pub status: &'static str,
@@ -67,7 +65,6 @@ pub struct AgentView {
     pub owner_email: Option<String>,
     /// Access tags in effect (a personal agent's are limited to its owner's).
     pub tags: Vec<String>,
-    pub labels: Vec<String>,
     /// May its tunnels be public?
     pub allow_public: bool,
     /// Are its tunnels private unless asked otherwise?
@@ -87,8 +84,6 @@ pub struct SharedTunnelView {
     pub visibility: Visibility,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,7 +127,6 @@ impl ControlPlane {
             agent_id: t.row.agent_id.clone(),
             visibility: t.row.visibility,
             access: if t.row.visibility == Visibility::Private { st.tunnel_authz(t).access } else { Vec::new() },
-            labels: t.row.labels.clone(),
             status,
             port_error,
             tls: cert.as_ref().map_or("none", CertStatus::label),
@@ -168,7 +162,6 @@ impl ControlPlane {
                 kind: t.row.kind,
                 visibility: t.row.visibility,
                 owner_email: st.dir.owner(&t.row.agent_id).and_then(|o| st.dir.email(o)).map(str::to_string),
-                labels: t.row.labels.clone(),
             })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
@@ -199,7 +192,6 @@ impl ControlPlane {
                     protocol: s.map(|s| s.protocol),
                     owner_email: a.owner_user_id.as_deref().and_then(|u| st.dir.email(u)).map(str::to_string),
                     tags: st.dir.agent_tags(&a.id),
-                    labels: a.labels,
                     allow_public: a.allow_public,
                     default_private: a.default_private,
                     owner_user_id: a.owner_user_id,

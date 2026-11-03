@@ -27,7 +27,6 @@ pub struct EnrollmentOptions {
     /// Members always enroll their own machines.
     pub owner_user_id: Option<String>,
     pub tags: Vec<String>,
-    pub labels: Vec<String>,
     /// Default: allowed (members: `[users] members_can_publish`).
     pub allow_public: Option<bool>,
     /// Default: private once the server has user accounts; always for members.
@@ -174,9 +173,9 @@ impl ControlPlane {
         Ok(list)
     }
 
-    /// Changes an agent's tags and labels. Administrators set any registered tags; an agent's
-    /// owner may only remove tags.
-    pub fn update_agent(&self, who: &Principal, agent_id: &str, tag_list: Option<&[String]>, labels: Option<&[String]>) -> Result<(), ErrorBody> {
+    /// Changes an agent's tags. Administrators set any registered tags; an agent's owner may
+    /// only remove tags.
+    pub fn update_agent(&self, who: &Principal, agent_id: &str, tag_list: Option<&[String]>) -> Result<(), ErrorBody> {
         let list = tag_list.map(|l| self.registered(l)).transpose()?;
         {
             // Held from the check to the write, with the assignment read from the store, so an
@@ -196,11 +195,6 @@ impl ControlPlane {
         if let Some(list) = &list {
             self.audit(who, "agent.tags", agent_id, &list.join(" "));
         }
-        if let Some(labels) = labels {
-            let labels = tags::normalize_list(labels).map_err(invalid)?;
-            self.store.set_agent_labels(agent_id, &labels).map_err(internal)?;
-            self.audit(who, "agent.labels", agent_id, &labels.join(" "));
-        }
         self.refresh();
         Ok(())
     }
@@ -210,7 +204,6 @@ impl ControlPlane {
     /// they hold.
     pub fn create_enrollment(&self, who: &Principal, opts: EnrollmentOptions) -> Result<String, ErrorBody> {
         let tag_list = self.registered(&opts.tags)?;
-        let labels = tags::normalize_list(&opts.labels).map_err(invalid)?;
         let spec = match who {
             _ if who.is_admin() => {
                 if let Some(owner) = &opts.owner_user_id
@@ -223,7 +216,6 @@ impl ControlPlane {
                     created_by: matches!(who, Principal::User { .. }).then(|| who.actor().to_string()),
                     owner_user_id: opts.owner_user_id,
                     tags: tag_list,
-                    labels,
                     allow_public: opts.allow_public.unwrap_or(true),
                     default_private: opts.default_private.unwrap_or(has_users),
                 }
@@ -239,7 +231,6 @@ impl ControlPlane {
                     created_by: Some(id.clone()),
                     owner_user_id: Some(id.clone()),
                     tags: tag_list,
-                    labels,
                     allow_public: self.cfg.users.members_can_publish && opts.allow_public.unwrap_or(true),
                     default_private: opts.default_private.unwrap_or(true),
                 }

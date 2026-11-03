@@ -30,7 +30,6 @@ pub struct EnrollmentSpec {
     /// The agent's owner; `None` for a service agent.
     pub owner_user_id: Option<String>,
     pub tags: Vec<String>,
-    pub labels: Vec<String>,
     pub allow_public: bool,
     pub default_private: bool,
 }
@@ -38,7 +37,7 @@ pub struct EnrollmentSpec {
 impl Default for EnrollmentSpec {
     /// Today's behavior: a service agent whose tunnels are public.
     fn default() -> Self {
-        Self { created_by: None, owner_user_id: None, tags: Vec::new(), labels: Vec::new(), allow_public: true, default_private: false }
+        Self { created_by: None, owner_user_id: None, tags: Vec::new(), allow_public: true, default_private: false }
     }
 }
 
@@ -126,11 +125,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_agent_labels(&self, agent_id: &str, labels: &[String]) -> anyhow::Result<()> {
-        self.with(|c| c.execute("UPDATE agents SET labels = ?1 WHERE id = ?2", params![labels.join(" "), agent_id]))?;
-        Ok(())
-    }
-
     /// Whether any user account exists (new enrollments then default to private tunnels).
     pub fn has_users(&self) -> anyhow::Result<bool> {
         self.with(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |r| r.get(0)))
@@ -164,14 +158,12 @@ mod tests {
             created_by: Some(user.clone()),
             owner_user_id: Some(user.clone()),
             tags: vec!["team:dev".into()],
-            labels: vec!["env:laptop".into()],
             allow_public: false,
             default_private: true,
         };
         let (agent, _) = s.enroll(&s.create_enrollment(60, &spec).unwrap(), "laptop").unwrap().unwrap();
         let row = s.agents().unwrap().into_iter().find(|a| a.id == agent).unwrap();
         assert_eq!((row.owner_user_id.as_deref(), row.allow_public, row.default_private), (Some(user.as_str()), false, true));
-        assert_eq!(row.labels, ["env:laptop"]);
         assert_eq!(s.agent_tags().unwrap()[&agent], ["team:dev"]);
         let (service, _) = s.enroll(&s.create_enrollment(60, &EnrollmentSpec::default()).unwrap(), "ci").unwrap().unwrap();
         let row = s.agents().unwrap().into_iter().find(|a| a.id == service).unwrap();

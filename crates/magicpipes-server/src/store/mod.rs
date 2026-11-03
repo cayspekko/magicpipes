@@ -43,7 +43,6 @@ pub struct TunnelRow {
     /// Tags were asked for. Deleting them (which removes their rows) leaves the tunnel owner-only,
     /// never open to all of the agent's tags.
     pub access_restricted: bool,
-    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +57,6 @@ pub struct AgentRow {
     pub allow_public: bool,
     /// Are its tunnels private unless asked otherwise?
     pub default_private: bool,
-    pub labels: Vec<String>,
 }
 
 const SCHEMA: &str = r#"
@@ -172,9 +170,9 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX audit_log_at ON audit_log(at);
     "#,
-    // 3: access tags, agent ownership and private tunnels (docs/USERS.md). Labels are a
-    // separate column everywhere and never grant access. Every tag reference points at the
-    // registry, so deleting a tag revokes it everywhere through the cascade.
+    // 3: access tags, agent ownership and private tunnels (docs/USERS.md). Every tag reference
+    // points at the registry, so deleting a tag revokes it everywhere through the cascade. The
+    // `labels` columns held free-form metadata, a feature since removed; nothing reads them.
     r#"
     CREATE TABLE tags (
         org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -249,13 +247,12 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
 }
 
 const TUNNEL_COLUMNS: &str =
-    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, labels, access_restricted";
+    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, access_restricted";
 
 fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
     let kind: String = r.get(6)?;
     let allow: String = r.get(8)?;
     let visibility: String = r.get(9)?;
-    let labels: String = r.get(10)?;
     Ok(TunnelRow {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -269,8 +266,7 @@ fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
         // A visibility that can't be read keeps the tunnel private.
         visibility: Visibility::parse(&visibility).unwrap_or(Visibility::Private),
         access: Vec::new(),
-        access_restricted: r.get(11)?,
-        labels: labels.split_whitespace().map(str::to_string).collect(),
+        access_restricted: r.get(10)?,
     })
 }
 
@@ -329,7 +325,7 @@ impl Store {
     // ---- enrollment & agents --------------------------------------------------------------
 
     /// Creates a single-use enrollment token; the agent enrolled with it gets `spec`'s owner,
-    /// tags, labels and visibility settings.
+    /// tags and visibility settings.
     pub fn create_enrollment(&self, ttl_secs: u64, spec: &EnrollmentSpec) -> anyhow::Result<String> {
         let token = secret::new_token("mpenr");
         let hash = secret::sha256_hex(&token);
@@ -338,8 +334,8 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM enrollments WHERE expires_at < ?1 AND used_at IS NULL", [now])?;
         tx.execute(
-            "INSERT INTO enrollments (token_hash, created_at, expires_at, created_by, owner_user_id, allow_public, default_private, labels)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO enrollments (token_hash, created_at, expires_at, created_by, owner_user_id, allow_public, default_private)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 hash,
                 now,
@@ -347,8 +343,7 @@ impl Store {
                 spec.created_by,
                 spec.owner_user_id,
                 spec.allow_public as i64,
-                spec.default_private as i64,
-                spec.labels.join(" ")
+                spec.default_private as i64
             ],
         )?;
         for t in &spec.tags {
@@ -376,10 +371,10 @@ impl Store {
         if updated != 1 {
             return Ok(None);
         }
-        // The agent takes the token's owner, tags, labels and visibility settings.
+        // The agent takes the token's owner, tags and visibility settings.
         tx.execute(
-            "INSERT INTO agents (id, name, token_hash, created_at, owner_user_id, allow_public, default_private, labels)
-             SELECT ?1, ?2, ?3, ?4, owner_user_id, allow_public, default_private, labels FROM enrollments WHERE token_hash = ?5",
+            "INSERT INTO agents (id, name, token_hash, created_at, owner_user_id, allow_public, default_private)
+             SELECT ?1, ?2, ?3, ?4, owner_user_id, allow_public, default_private FROM enrollments WHERE token_hash = ?5",
             params![agent_id, agent_name, secret::sha256_hex(&agent_token), now, hash],
         )?;
         tx.execute(
@@ -424,10 +419,9 @@ impl Store {
     pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, name, created_at, last_seen_at, owner_user_id, allow_public, default_private, labels FROM agents ORDER BY created_at",
+                "SELECT id, name, created_at, last_seen_at, owner_user_id, allow_public, default_private FROM agents ORDER BY created_at",
             )?;
             st.query_map([], |r| {
-                let labels: String = r.get(7)?;
                 Ok(AgentRow {
                     id: r.get(0)?,
                     name: r.get(1)?,
@@ -436,7 +430,6 @@ impl Store {
                     owner_user_id: r.get(4)?,
                     allow_public: r.get::<_, i64>(5)? != 0,
                     default_private: r.get::<_, i64>(6)? != 0,
-                    labels: labels.split_whitespace().map(str::to_string).collect(),
                 })
             })?
             .collect()
@@ -475,7 +468,7 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
             params![
                 t.id,
                 t.name,
@@ -487,7 +480,6 @@ impl Store {
                 t.public_port,
                 t.allow.join(" "),
                 t.visibility.as_str(),
-                t.labels.join(" "),
                 t.access_restricted
             ],
         )?;
@@ -501,8 +493,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, labels = ?5, access_restricted = ?6 WHERE id = ?7",
-            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.labels.join(" "), t.access_restricted, t.id],
+            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, access_restricted = ?5 WHERE id = ?6",
+            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.access_restricted, t.id],
         )?;
         Self::write_access(&tx, t)?;
         tx.commit()?;
@@ -563,8 +555,7 @@ mod tests {
                     visibility: Visibility::Public,
                     access: vec![],
                     access_restricted: false,
-                    labels: vec![],
-                })
+                        })
                 .unwrap();
         }
         assert!(store.delete_agent(&id).unwrap());
@@ -609,7 +600,6 @@ mod tests {
             visibility: Visibility::Public,
             access: vec![],
             access_restricted: false,
-            labels: vec![],
         };
         store.insert_tunnel(&row("tn_tcp", Kind::Tcp, 65500)).unwrap();
         store.insert_tunnel(&row("tn_udp", Kind::Udp, 65500)).unwrap();
@@ -645,7 +635,6 @@ mod tests {
             visibility: Visibility::Private,
             access_restricted: !access.is_empty(),
             access,
-            labels: vec![],
         };
         store.insert_tunnel(&row("tn_narrow", vec!["team:secret".into()])).unwrap();
         store.insert_tunnel(&row("tn_all", vec![])).unwrap();

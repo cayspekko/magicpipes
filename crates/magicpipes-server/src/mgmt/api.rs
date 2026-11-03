@@ -111,8 +111,6 @@ pub struct NewEnrollment {
     owner_user_id: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
-    labels: Vec<String>,
     allow_public: Option<bool>,
     default_private: Option<bool>,
 }
@@ -127,7 +125,6 @@ pub async fn create_enrollment(
     let opts = EnrollmentOptions {
         owner_user_id: b.owner_user_id,
         tags: b.tags,
-        labels: b.labels,
         allow_public: b.allow_public,
         default_private: b.default_private,
     };
@@ -301,7 +298,6 @@ pub async fn delete_tag(Caller(who): Caller, State(app): State<AppState>, Path(n
 pub struct AgentChange {
     /// Replaces the agent's access tags (owners may only remove).
     tags: Option<Vec<String>>,
-    labels: Option<Vec<String>>,
 }
 
 pub async fn update_agent(
@@ -310,7 +306,7 @@ pub async fn update_agent(
     Path(id): Path<String>,
     Json(req): Json<AgentChange>,
 ) -> Result<impl IntoResponse, ApiError> {
-    app.control.update_agent(&who, &id, req.tags.as_deref(), req.labels.as_deref()).map_err(ApiError)?;
+    app.control.update_agent(&who, &id, req.tags.as_deref()).map_err(ApiError)?;
     let agent = app.control.agents(&who).into_iter().find(|a| a.id == id).ok_or_else(|| api_err(ErrorCode::NotFound, "no such agent"))?;
     Ok(Json(agent))
 }

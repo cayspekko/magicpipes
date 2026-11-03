@@ -553,7 +553,7 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
 <label for="tn" style="margin-top:0">Name</label><input id="tn" name="name" placeholder="team:dev" maxlength="64" required>
 <label for="td">Description</label><input id="td" name="description" maxlength="200">
 <button class="btn primary" style="margin-top:14px">Create tag</button></form>
-<p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>. Labels such as <code>environment:prod</code> on agents and tunnels are separate and never grant access. Example tags: {examples}</p></div>"#,
+<p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>. Example tags: {examples}</p></div>"#,
         err = alert(error),
         csrf = csrf(user),
         examples = chips(&["team:dev".into(), "contractor:acme".into()]),

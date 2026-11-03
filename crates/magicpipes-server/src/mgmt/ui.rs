@@ -335,9 +335,6 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str) -> String {
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
     dl.push_str(&field("Agent", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
     dl.push_str(&field("Who can open it", &access_cell(t)));
-    if !t.labels.is_empty() {
-        dl.push_str(&field("Labels", &chips(&t.labels)));
-    }
     if t.kind.is_http() {
         dl.push_str(&field("TLS certificate", &badge(t.tls)));
     } else {
@@ -440,7 +437,7 @@ pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Pat
     }
     let result = match form.change() {
         Some((add, remove)) => app.control.change_agent_tags(&user.who, &id, &add, &remove).map(drop),
-        None => app.control.update_agent(&user.who, &id, Some(&form.want), None),
+        None => app.control.update_agent(&user.who, &id, Some(&form.want)),
     };
     match result {
         Ok(()) => Redirect::to("/").into_response(),
@@ -480,15 +477,14 @@ fn shared_section(app: &AppState, user: &UiUser) -> String {
                 format!("<code>{}</code>", esc(&t.public_url))
             };
             let owner = t.owner_email.as_deref().map(esc).unwrap_or_else(|| r#"<span class="sub">service agent</span>"#.into());
-            format!(r#"<tr><td>{link}<span class="sub">{name}</span></td><td>{owner}</td><td>{vis}</td><td>{labels}</td></tr>"#,
+            format!(r#"<tr><td>{link}<span class="sub">{name}</span></td><td>{owner}</td><td>{vis}</td></tr>"#,
                 name = esc(&t.name),
-                vis = t.visibility.as_str(),
-                labels = chips(&t.labels))
+                vis = t.visibility.as_str())
         })
         .collect();
     format!(
         r#"<div class="section"><h2>Shared with you<span class="count">{n}</span></h2></div>
-<div class="card scroll"><table><thead><tr><th>Tunnel</th><th>Owner</th><th>Visibility</th><th>Labels</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+<div class="card scroll"><table><thead><tr><th>Tunnel</th><th>Owner</th><th>Visibility</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
         n = shared.len()
     )
 }
@@ -509,7 +505,6 @@ fn enroll_panel(app: &AppState, user: &UiUser) -> String {
 <form method="post" action="/enrollments"><input type="hidden" name="csrf" value="{csrf}">
 <label for="eo">Belongs to</label><select id="eo" name="owner"><option value="">Nobody (a service agent, managed by administrators)</option>{owners}</select>
 {tags}
-<label for="el">Labels (not used for access)</label><input id="el" name="labels" placeholder="environment:staging">
 <label><input type="checkbox" name="allow_public" checked> Its tunnels may be public</label>
 <label><input type="checkbox" name="default_private"{private}> Its tunnels are private unless asked otherwise</label>
 <button class="btn primary" style="margin-top:14px">Create enrollment token</button></form></div>"#,
@@ -547,7 +542,6 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
     let opts = EnrollmentOptions {
         owner_user_id: (!owner.is_empty()).then(|| owner.to_string()),
         tags: form.want.clone(),
-        labels: vec![form.get("labels").unwrap_or("").to_string()],
         allow_public: Some(form.get("allow_public").is_some()),
         default_private: Some(form.get("default_private").is_some()),
     };

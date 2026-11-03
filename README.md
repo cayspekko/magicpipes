@@ -257,7 +257,7 @@ terminal, add `--browser` to wait for the approval anyway.
 
 **With an enrollment token**: create a single-use token (valid 1 hour by default) on the server,
 or in the UI ("Enroll a machine"), or via `POST /api/v1/enrollments`. Administrators choose who
-the machine belongs to (nobody, for a *service agent*), its access tags and labels, and whether
+the machine belongs to (nobody, for a *service agent*), its access tags, and whether
 its tunnels may be public:
 
 ```bash
@@ -303,7 +303,6 @@ before; machines enrolled since make private ones unless asked otherwise.
 magicpipes add 3000 --private                 # the owner, plus everyone who shares the machine's tags
 magicpipes add 3000 --access team:dev         # narrower: only team:dev (the machine must have it)
 magicpipes add 3000 --public                  # anyone; refused if the enrollment doesn't allow it
-magicpipes add 3000 --label environment:staging   # metadata only, never used for access
 ```
 
 * Opening a private tunnel in a browser without being signed in shows the sign-in page, then
@@ -563,11 +562,11 @@ administrators answer `403 forbidden` to members.
 | DELETE | `/api/v1/tunnels/{id or name}` | 204; the owning agent is notified and stops serving it; 404 if absent |
 | GET | `/api/v1/agents` | Enrolled agents and connection state |
 | DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
-| POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "labels"?, "allow_public"?, "default_private"?}`. Members may enroll only their own machines, with tags they hold |
+| POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "allow_public"?, "default_private"?}`. Members may enroll only their own machines, with tags they hold |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
 | GET | `/api/v1/me` | `{"kind": "admin_token"}` or `{"kind": "user", "user": {...}}` |
-| GET | `/api/v1/shared` | Tunnels you can reach but don't manage (`name`, `public_url`, `kind`, `visibility`, `owner_email`, `labels`) |
-| PATCH | `/api/v1/agents/{id}` | `{"tags"?, "labels"?}`; owners may only remove tags |
+| GET | `/api/v1/shared` | Tunnels you can reach but don't manage (`name`, `public_url`, `kind`, `visibility`, `owner_email`) |
+| PATCH | `/api/v1/agents/{id}` | `{"tags"?}`; owners may only remove tags |
 | GET | `/api/v1/tags` | `{"tags": [{"name", "description", "created_at"}]}` (administrators) |
 | POST | `/api/v1/tags` | 201; body `{"name", "description"?}` |
 | DELETE | `/api/v1/tags/{name}` | 204; removes it from every user, agent and tunnel |
@@ -588,11 +587,11 @@ User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_pas
 `created_at`, `last_login_at`.
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
-agent's protocol version), `owner_user_id`, `owner_email`, `tags` (in effect), `labels`,
+agent's protocol version), `owner_user_id`, `owner_email`, `tags` (in effect),
 `allow_public`, `default_private`, `last_seen_at`, `tunnels`, `created_at`.
 
 Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `visibility`,
-`access` (private: the tags in effect), `labels`, `status`
+`access` (private: the tags in effect), `status`
 (`connected` / `disconnected` / `error` = local app unreachable on the last request), `tls`
 (`ready` / `pending` / `failed`), `tls_error`, `created_at`, `requests`, `upstream_errors`,
 `last_request_at`. Errors: `{"error": {"code", "message"}}`.

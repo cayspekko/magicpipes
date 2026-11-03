@@ -125,8 +125,6 @@ pub struct LocalTunnel {
     /// Private tunnels: the access tags asked for (empty = all of the machine's tags).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
 }
 
 impl LocalTunnel {
@@ -268,6 +266,10 @@ mod tests {
         let list: Vec<LocalTunnel> = serde_json::from_str(old).unwrap();
         assert_eq!(list[0].target, Target::Port { host: "127.0.0.1".into(), port: 8080 });
         assert_eq!((list[0].kind, list[0].describe()), (Kind::Http, "http://127.0.0.1:8080".to_string()));
+        // Files from the builds that had labels still load.
+        let labelled = r#"[{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","host":"127.0.0.1","port":8080,"created_at":1,"visibility":"private","labels":["env:dev"]}]"#;
+        let labelled: Vec<LocalTunnel> = serde_json::from_str(labelled).unwrap();
+        assert_eq!(labelled[0].visibility, Some(magicpipes_core::proto::Visibility::Private));
 
         let t = LocalTunnel { target: Target::Static { serve: "/srv/site".into(), list: false }, ..list[0].clone() };
         let json = serde_json::to_value(&t).unwrap();

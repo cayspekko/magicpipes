@@ -194,12 +194,10 @@ impl Agent {
         // Without --private/--public a re-add keeps the tunnel's access as the server has it (our
         // copy may name tags deleted since); a new one gets the machine's default from the server.
         // If the server lost the tunnel, it is registered again with our copy.
-        let kept = |t: &LocalTunnel| (t.visibility, t.access.clone(), if req.labels.is_empty() { t.labels.clone() } else { req.labels.clone() });
-        let (visibility, access, labels) = match (req.visibility, &existing) {
-            (Some(v), _) => (Some(v), req.access.clone(), req.labels.clone()),
-            (None, Some(_)) if req.labels.is_empty() => (None, Vec::new(), Vec::new()),
-            (None, Some(t)) => kept(t),
-            (None, None) => (None, Vec::new(), req.labels.clone()),
+        let kept = |t: &LocalTunnel| (t.visibility, t.access.clone());
+        let (visibility, access) = match req.visibility {
+            Some(v) => (Some(v), req.access.clone()),
+            None => (None, Vec::new()),
         };
         let expect_private = match (req.visibility, &existing) {
             (Some(v), _) => v == Visibility::Private,
@@ -207,9 +205,9 @@ impl Agent {
             (None, None) => false,
         };
         // An older server makes every tunnel public, so `--public` gets what it asks for there.
-        let needs_v3 = req.visibility == Some(Visibility::Private) || !req.access.is_empty() || !req.labels.is_empty();
+        let needs_v3 = req.visibility == Some(Visibility::Private) || !req.access.is_empty();
         if needs_v3 && self.session.server_protocol().is_some_and(|v| v < 3) {
-            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels or labels; it needs a newer magicpipesd"));
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels; it needs a newer magicpipesd"));
         }
         let mut rpc_req = RegisterTunnel {
             id: existing.as_ref().map(|t| t.id.clone()),
@@ -220,7 +218,6 @@ impl Agent {
             allow: allow.clone(),
             visibility,
             access,
-            labels,
         };
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
@@ -233,7 +230,7 @@ impl Agent {
                     }
                     rpc_req.name = name.clone();
                     if let (None, Some(t)) = (rpc_req.visibility, &existing) {
-                        (rpc_req.visibility, rpc_req.access, rpc_req.labels) = kept(t);
+                        (rpc_req.visibility, rpc_req.access) = kept(t);
                     }
                 }
                 Err(RpcError::Server(e)) => return Err(ErrorInfo::wire(&e.code, e.message)),
@@ -270,7 +267,6 @@ impl Agent {
             allow,
             visibility: info.visibility,
             access: info.access,
-            labels: info.labels,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);
         Ok((tunnel, info.created))
@@ -450,7 +446,6 @@ impl Agent {
                     // Absent when the server predates private tunnels (then it is public).
                     "visibility": s.tunnel.visibility,
                     "access": s.tunnel.access,
-                    "labels": s.tunnel.labels,
                 })
             })
             .collect();

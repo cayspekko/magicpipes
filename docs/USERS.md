@@ -36,30 +36,23 @@ Org (workspace)                     every tag, user, agent and tunnel belongs to
  │            tags ← enrollment token (at most the owner's tags)
  └─ tunnels ── owner = its agent's owner
                public, or private with access tags (default: the agent's tags)
-               labels: free-form metadata, never used for access
 ```
 
 **The rule:** a principal may connect to a private tunnel, and see it in lists, when the
 principal shares at least one access tag with the tunnel's effective access set, or owns the
 tunnel. That is the whole access rule. Everything else is about where the tags come from.
 
-### Access tags and labels
+### Access tags
 
-There are two kinds of tags, stored separately so metadata can never grant access:
+Access tags such as `team:dev` or `contractor:acme` are the only kind of tag. Org admins create
+them in the `tags` registry, and they attach to users, agents, enrollment tokens and tunnel
+access sets. The syntax is lowercase, `[a-z0-9][a-z0-9._-]*` with an optional `:value` made of
+`[a-z0-9._@-]`, at most 64 bytes. Names are normalized and validated on write, and matching is
+exact string equality.
 
-| | Access tags | Labels |
-|---|---|---|
-| Example | `team:dev`, `contractor:acme` | `environment:production`, `owner:doug` |
-| Created by | org admins, in the `tags` registry | anyone who can manage the object, free-form |
-| Attached to | users, agents, enrollment tokens, tunnel access sets | agents and tunnels |
-| Read by `authorize()` | yes | **never** |
-| Purpose | who may reach what | search, filters and display in the UI and CLI |
-
-Both kinds use the same syntax: lowercase, `[a-z0-9][a-z0-9._-]*` with an optional `:value`
-made of `[a-z0-9._@-]`, at most 64 bytes. Names are normalized and validated on write, and
-matching is exact string equality. Access tags live in their own tables, and labels in a
-`labels` column. A label string that later gets registered as an access tag therefore grants
-nothing retroactively: no stored row changes kind.
+There is no second, descriptive kind. Free-form *labels* on agents and tunnels shipped briefly
+(2026-11-01 to 2026-11-03) and were removed because nothing used them; with no metadata tags
+at all, nothing can be mistaken for one that grants access.
 
 ### Roles
 
@@ -174,7 +167,7 @@ An email typed in by an admin is not verified.
 ### Agents
 
 - **Agents get tags only through their enrollment token.** The token records who created it,
-  which org it belongs to, the owner the new agent will have, its access tags and labels, and
+  which org it belongs to, the owner the new agent will have, its access tags, and
   whether its tunnels may be public.
   - Admins may create tokens for any owner, including none (a service agent), with any
     registered access tags.
@@ -205,8 +198,6 @@ An email typed in by an admin is not verified.
 - **Empty access set.** A private tunnel whose effective access set is empty is reachable only
   by its owner and its own agent. It is never treated as public. This is the fail-closed case,
   for example after a tag is deleted.
-- **Labels** are inherited: tunnel labels = agent labels + the tunnel's own. They are shown and
-  filterable, never used for access.
 
 ### Revocation summary
 
@@ -482,7 +473,6 @@ magicpipes login --server https://mp.example.com   # opens the login screen in t
 magicpipes add 3000                                 # private, reachable by the agent's tags
 magicpipes add 3000 --access team:dev               # narrower audience
 magicpipes add 3000 --public                        # explicit; refused unless the enrollment allows it
-magicpipes add 3000 --label environment:staging
 magicpipes ls --all                                 # tunnels you can discover in the org
 magicpipes whoami                                   # user, org, role, tags; agent tags
 ```
@@ -519,8 +509,8 @@ magicpipes whoami                                   # user, org, role, tags; age
 New entries are appended to `MIGRATIONS` in `store.rs`, one per implementation step:
 - **users** (step 2): orgs, users, identities, memberships, passwords, sessions, API tokens,
   the audit log, and the agent and enrollment ownership columns;
-- **tags** (step 3): the tag registry, rules and access tables, plus the visibility and label
-  columns;
+- **tags** (step 3): the tag registry, rules and access tables, plus the visibility columns
+  (and `labels` columns, unused since labels were removed);
 - **email** (step 7): email tokens.
 
 Existing tables only gain columns. The first migration creates the default org and assigns
@@ -562,7 +552,7 @@ CREATE TABLE memberships (
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (org_id, user_id)
 );
-CREATE TABLE tags (                         -- access tags only; labels are not registered
+CREATE TABLE tags (                         -- the access tag registry
     org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
@@ -601,7 +591,7 @@ ALTER TABLE agents ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
 ALTER TABLE agents ADD COLUMN owner_user_id TEXT REFERENCES users(id);   -- NULL = service agent
 ALTER TABLE agents ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;   -- migrated agents: as today
 ALTER TABLE agents ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE agents ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN labels TEXT NOT NULL DEFAULT '';        -- unused (labels were removed)
 CREATE TABLE agent_tags (
     agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     org_id      TEXT NOT NULL,
@@ -615,7 +605,7 @@ ALTER TABLE enrollments ADD COLUMN created_by TEXT;                      -- NULL
 ALTER TABLE enrollments ADD COLUMN owner_user_id TEXT;
 ALTER TABLE enrollments ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE enrollments ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE enrollments ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+ALTER TABLE enrollments ADD COLUMN labels TEXT NOT NULL DEFAULT '';   -- unused
 CREATE TABLE enrollment_tags (
     token_hash  TEXT NOT NULL REFERENCES enrollments(token_hash) ON DELETE CASCADE,
     org_id      TEXT NOT NULL,
@@ -626,7 +616,7 @@ CREATE TABLE enrollment_tags (
 
 ALTER TABLE tunnels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'
     CHECK (visibility IN ('public', 'private'));
-ALTER TABLE tunnels ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+ALTER TABLE tunnels ADD COLUMN labels TEXT NOT NULL DEFAULT '';       -- unused
 CREATE TABLE tunnel_access (                -- the requested set; effective = this ∩ agent tags
     tunnel_id   TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
     org_id      TEXT NOT NULL,
@@ -703,8 +693,9 @@ Schema notes:
 
 ## Wire protocol and compatibility
 
-- **`RegisterTunnel` and `TunnelInfo` gain optional fields.** `visibility`, `access`
-  (`Vec<String>`) and `labels`, each `#[serde(default)]` and skipped when empty.
+- **`RegisterTunnel` and `TunnelInfo` gain optional fields.** `visibility` and `access`
+  (`Vec<String>`), each `#[serde(default)]` and skipped when empty. The first protocol 3
+  builds also sent `labels`; both sides now ignore it.
   - An old agent sends none of them. Its tunnel takes the agent's defaults, which for a migrated
     agent means public, exactly as today. An agent before protocol 3 enrolled with a private
     default gets `agent_outdated` instead: it couldn't check a private tunnel, and public isn't
@@ -714,7 +705,7 @@ Schema notes:
     (the agent's copy may name tags deleted since). It still checks that a private tunnel came
     back private.
   - The CLI asks a running agent for its `ipc_version` before an `add` with options an older
-    agent would silently drop (private, access, labels, TCP/UDP, allow-lists, `--serve`,
+    agent would silently drop (private, access, TCP/UDP, allow-lists, `--serve`,
     `--shell`), and stops with `agent_outdated` rather than get a public HTTPS tunnel.
   - A new agent that asked for `private` checks that `TunnelInfo` echoes it back. If an old
     server doesn't, the new agent removes the tunnel again and reports `server_outdated`. This
@@ -828,7 +819,7 @@ useful.
    - Tag rules (IdP groups, claims, email domains) arrive with the SSO steps.
    - The tag registry and admin assignment.
    - Agent tags from enrollment tokens, and the device-style `magicpipes login`.
-   - Tunnel visibility, access and labels.
+   - Tunnel visibility and access (labels shipped too, and were removed on 2026-11-03).
    - The tunnel cookie flow and the access-denied page.
    - Discovery filtering in the API, UI and `ls --all`.
 4. **Authenticating proxy** (method 2), with groups-header rules.

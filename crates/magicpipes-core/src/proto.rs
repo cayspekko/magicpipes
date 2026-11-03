@@ -43,8 +43,9 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 /// * 1: everything before the handshake (no header).
 /// * 2: the handshake. An unknown request is answered with the error code `unsupported`, and an
 ///   unknown server-opened stream with [`StreamStatus::Unsupported`], instead of being dropped.
-/// * 3: private tunnels. [`RegisterTunnel`] carries `visibility`, `access` and `labels`, and
-///   [`TunnelInfo`] echoes them.
+/// * 3: private tunnels. [`RegisterTunnel`] carries `visibility` and `access`, and
+///   [`TunnelInfo`] echoes them. Builds from 2026-11-01 to 2026-11-03 also sent `labels`, which
+///   is now ignored.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
@@ -209,16 +210,13 @@ pub struct RegisterTunnel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
     /// Protocol 3. `None`: the agent's default for a new tunnel, and no change for an existing
-    /// one (older agents never send it). `Some`: `access` and `labels` are the full new values.
+    /// one (older agents never send it). `Some`: `access` is the full new value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
     /// Private tunnels: access tags that may reach it, a subset of the agent's tags; empty = all
     /// of the agent's tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
-    /// Free-form metadata, never used for access.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,8 +247,6 @@ pub struct TunnelInfo {
     pub visibility: Option<Visibility>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -431,10 +427,15 @@ mod tests {
             allow: vec![],
             visibility: Some(Visibility::Private),
             access: vec!["team:dev".into()],
-            labels: vec![],
         });
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""visibility":"private""#) && json.contains(r#""access":["team:dev"]"#), "{json}");
+        // Early protocol 3 builds sent and echoed labels; both sides now ignore them.
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x","visibility":"private","labels":["env:dev"]}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { visibility: Some(Visibility::Private), .. })));
+        let t: TunnelInfo =
+            serde_json::from_str(r#"{"id":"tn","name":"a","hostname":"a.t","public_url":"https://a.t","created":true,"visibility":"private","labels":["env:dev"]}"#).unwrap();
+        assert_eq!(t.visibility, Some(Visibility::Private));
     }
 
     #[test]

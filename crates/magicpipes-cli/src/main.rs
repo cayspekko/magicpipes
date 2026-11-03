@@ -109,9 +109,6 @@ enum Command {
         /// comma-separated; default: all of this machine's tags).
         #[arg(long, value_name = "TAG", value_parser = parse_tag, conflicts_with_all = ["tcp", "udp"])]
         access: Vec<String>,
-        /// Free-form label, e.g. environment:staging (repeatable). Never used for access.
-        #[arg(long = "label", value_name = "LABEL", value_parser = parse_tag)]
-        labels: Vec<String>,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
         name: Option<String>,
@@ -274,7 +271,6 @@ async fn dispatch(cmd: Command) -> ExitCode {
             private,
             public,
             access,
-            labels,
             name,
             host,
             probe_path,
@@ -308,7 +304,6 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 timeout_secs: timeout,
                 visibility,
                 access,
-                labels,
             };
             (out, add(req, out).await)
         }
@@ -639,7 +634,7 @@ async fn list(out: Output) -> Result<(), ErrorInfo> {
                     json!({ "id": t.id, "name": t.name, "kind": t.kind, "public_url": t.public_url, "target": t.describe(),
                             "share_url": t.share_url(), "status": "stopped", "error": null,
                             "created_at": magicpipes_core::rfc3339(t.created_at),
-                            "visibility": t.visibility, "access": t.access, "labels": t.labels })
+                            "visibility": t.visibility, "access": t.access })
                 })
                 .collect();
             json!({ "agent_running": false, "connection": "stopped", "tunnels": tunnels })
