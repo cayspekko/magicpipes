@@ -4,9 +4,11 @@
 //! All queries are short; callers hold the connection mutex only for the duration of one
 //! statement or transaction. Users, sessions, API tokens and the audit log are in [`users`].
 
+mod hostnames;
 mod tags;
 mod users;
 
+pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
 pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
 
@@ -219,6 +221,20 @@ const MIGRATIONS: &[&str] = &[
         tag         TEXT NOT NULL,
         PRIMARY KEY (tunnel_id, tag),
         FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    "#,
+    // 2: custom hostnames. An administrator registers a hostname outside `<name>.<base_domain>`
+    // and assigns it to a user (for their machines) or to a service agent; only that machine
+    // may serve it. Assignments go with their user or agent.
+    r#"
+    CREATE TABLE hostnames (
+        hostname      TEXT PRIMARY KEY,
+        org_id        TEXT NOT NULL DEFAULT 'org_default',
+        owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+        agent_id      TEXT REFERENCES agents(id) ON DELETE CASCADE,
+        created_by    TEXT,
+        created_at    INTEGER NOT NULL,
+        CHECK ((owner_user_id IS NULL) != (agent_id IS NULL))
     );
     "#,
 ];

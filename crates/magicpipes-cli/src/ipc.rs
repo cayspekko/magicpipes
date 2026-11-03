@@ -13,8 +13,9 @@ pub const MAX_LINE: usize = 64 * 1024;
 
 /// Bumped when [`AddRequest`] gains fields that an older agent would silently ignore (it parses
 /// the request and drops what it doesn't know). Agents report it in `status` as
-/// `agent.ipc_version`; one that doesn't is older than 2. 3: `access` became `tags`.
-pub const IPC_VERSION: u32 = 3;
+/// `agent.ipc_version`; one that doesn't is older than 2. 3: `access` became `tags`. 4:
+/// `hostname` and `no_verify`, and the step state `skipped`.
+pub const IPC_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -67,6 +68,12 @@ pub struct AddRequest {
     pub visibility: Option<magicpipes_core::proto::Visibility>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// A custom hostname an administrator assigned to this machine.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Register without waiting for the certificate or checking the public address.
+    #[serde(default)]
+    pub no_verify: bool,
 }
 
 impl AddRequest {
@@ -80,6 +87,8 @@ impl AddRequest {
             || !self.allow.is_empty()
             || self.visibility.is_some()
             || !self.tags.is_empty()
+            || self.hostname.is_some()
+            || self.no_verify
     }
 }
 
@@ -116,6 +125,8 @@ pub enum StepState {
     Failed,
     /// Did not pass, but does not fail the operation (e.g. a public port this machine can't reach).
     Warned,
+    /// Not run, as asked (`--no-verify`).
+    Skipped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

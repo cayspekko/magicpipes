@@ -270,7 +270,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&mut self) -> anyhow::Result<()> {
         self.base_domain = self.base_domain.trim().trim_end_matches('.').to_ascii_lowercase();
         self.management.hostname = self.management.hostname.trim().to_ascii_lowercase();
         if self.base_domain.is_empty() || (!self.base_domain.contains('.') && self.base_domain != "localhost") {

@@ -775,6 +775,58 @@ async fn concurrent_adds_start_one_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_hostnames() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let admin = env.admin_token();
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let port = app.port.to_string();
+    // The development CA issues only under the base domain, so the custom names live there.
+    let (shop, soon) = (format!("shop.app.{BASE}"), format!("soon.app.{BASE}"));
+
+    // Not assigned to this machine yet: refused, and nothing is created.
+    let out = env.cli(&["add", &port, "--hostname", &shop, "--json"]).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "not_found", "{v}");
+
+    // An administrator registers it for this (service) agent; only then can it serve it.
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent = v["agents"][0]["id"].as_str().unwrap().to_string();
+    for h in [&shop, &soon] {
+        let (s, v) = env.api_json("POST", "/api/v1/hostnames", Some(&admin), serde_json::json!({ "hostname": h, "agent_id": agent })).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+    let (s, v) = env.api_json("POST", "/api/v1/hostnames", Some(&admin), serde_json::json!({ "hostname": format!("app.{BASE}"), "agent_id": agent })).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")), "a tunnel name: {v}");
+    let t = add_json(&env, &[&port, "--hostname", &shop]).await;
+    assert_eq!((t["status"].as_str(), t["public_url"].as_str(), t["name"].as_str()), (Some("ready"), Some(format!("https://{shop}:{}", env.https_port).as_str()), Some("shop")), "{t}");
+    assert_eq!(env.get_public(&shop, "/").await.2, "hello from app");
+    assert_eq!(add_json(&env, &[&port, "--hostname", &shop]).await["created"], false, "adding it again finds it");
+    let (_, v) = env.api("GET", "/api/v1/hostnames", Some(&admin)).await;
+    let listed = v["hostnames"].as_array().unwrap().iter().find(|h| h["hostname"] == shop.as_str()).unwrap().clone();
+    assert_eq!((listed["tunnel"].as_str(), listed["tls"].as_str()), (Some("shop"), Some("ready")), "{listed}");
+
+    // --no-verify registers without the certificate wait and the public check.
+    let other = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let out = env.cli(&["add", &other.port.to_string(), "--hostname", &soon, "--no-verify"]).await;
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && stderr.contains("skipped") && stdout.contains("Not verified (--no-verify)"), "{stdout}{stderr}");
+    assert_eq!(env.get_public(&soon, "/").await.0, StatusCode::OK);
+
+    // The UI lists them; removing a registration deletes its tunnel.
+    let body = serde_json::json!({ "email": "ad@example.com", "password": "correct horse battery", "role": "admin" });
+    env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    let cookie = sign_in(&env, "ad@example.com", "correct horse battery").await;
+    let page = env.ui("/hostnames", Some(&cookie), None).await;
+    assert!(page.status == 200 && page.html.contains(&shop) && page.html.contains(r#"value="agent:"#), "{}", page.html);
+    let (s, _) = env.api("DELETE", &format!("/api/v1/hostnames/{soon}"), Some(&admin)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (status, err, _) = env.get_public(&soon, "/").await;
+    assert_eq!((status, err.as_deref()), (StatusCode::NOT_FOUND, Some("tunnel_not_found")));
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_agent_is_cut_off() {
     let env = Env::new(Tls::DevCa).await;
     env.login().await;

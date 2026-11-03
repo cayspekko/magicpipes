@@ -265,6 +265,34 @@ pub async fn audit(Caller(who): Caller, State(app): State<AppState>, Query(q): Q
     Ok(Json(json!({ "entries": entries })))
 }
 
+// ---- hostnames -------------------------------------------------------------------------------
+
+/// Administrators see every hostname, others those assigned to them or their machines.
+pub async fn list_hostnames(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(json!({ "hostnames": app.control.hostnames(&who) })))
+}
+
+#[derive(Deserialize)]
+pub struct NewHostname {
+    hostname: String,
+    /// Exactly one: the user whose machines may serve it, or a service agent.
+    owner_user_id: Option<String>,
+    agent_id: Option<String>,
+}
+
+pub async fn create_hostname(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewHostname>) -> Result<impl IntoResponse, ApiError> {
+    let h = app.control.create_hostname(&who, &req.hostname, req.owner_user_id.as_deref(), req.agent_id.as_deref()).map_err(ApiError)?;
+    Ok((StatusCode::CREATED, Json(h)))
+}
+
+pub async fn delete_hostname(Caller(who): Caller, State(app): State<AppState>, Path(hostname): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.control.delete_hostname(&who, &hostname) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(api_err(ErrorCode::NotFound, "no such hostname")),
+        Err(e) => Err(ApiError(e)),
+    }
+}
+
 // ---- tags ------------------------------------------------------------------------------------
 
 pub async fn list_tags(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {

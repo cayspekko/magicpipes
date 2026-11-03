@@ -128,6 +128,9 @@ pub struct LocalTunnel {
     /// Those of `tags` that granted access when it was registered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
+    /// Served at a custom hostname (`hostname`) rather than `<name>.<base_domain>`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom_hostname: bool,
     /// The owner's personal tag (absent on a service agent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_tag: Option<String>,

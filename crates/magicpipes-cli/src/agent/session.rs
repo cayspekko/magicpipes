@@ -227,6 +227,8 @@ impl Session {
                 // ours would replay tags an administrator may have deleted since.
                 visibility: None,
                 tags: Vec::new(),
+                // If the server lost the tunnel, it comes back at the same custom hostname.
+                hostname: t.custom_hostname.then(|| t.hostname.clone()),
             };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
                 // Never let a private tunnel come back public (e.g. after a server downgrade).
@@ -236,6 +238,13 @@ impl Session {
                 Ok(RpcResponse::Tunnel(info)) if t.visibility == Some(Visibility::Private) && info.visibility != Some(Visibility::Private) => {
                     tracing::error!(tunnel = %t.name, "the server did not keep the tunnel private; no longer serving it");
                     self.tunnels.withdraw(&t.id, "the server no longer supports private tunnels".into());
+                    if let Err(e) = self.rpc(&Rpc::Unregister { id: info.id }, Duration::from_secs(10)).await {
+                        tracing::warn!(tunnel = %t.name, error = %e, "could not remove the tunnel on the server");
+                    }
+                }
+                Ok(RpcResponse::Tunnel(info)) if t.custom_hostname && info.hostname != t.hostname => {
+                    tracing::error!(tunnel = %t.name, hostname = %t.hostname, "the server did not keep the tunnel's hostname; no longer serving it");
+                    self.tunnels.withdraw(&t.id, format!("the server no longer serves {}", t.hostname));
                     if let Err(e) = self.rpc(&Rpc::Unregister { id: info.id }, Duration::from_secs(10)).await {
                         tracing::warn!(tunnel = %t.name, error = %e, "could not remove the tunnel on the server");
                     }

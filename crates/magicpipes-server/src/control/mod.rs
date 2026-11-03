@@ -6,7 +6,8 @@
 //! access decision goes through [`authz::authorize`].
 //!
 //! * `device` — `magicpipes login` approved in the browser;
-//! * `directory` — owners and tags, kept in memory for access decisions;
+//! * `directory` — owners, tags and custom hostnames, kept in memory for access decisions;
+//! * `hostnames` — custom hostnames and who may serve them;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
@@ -15,6 +16,7 @@
 
 mod device;
 mod directory;
+mod hostnames;
 mod registry;
 mod sessions;
 mod tags;
@@ -216,6 +218,8 @@ impl ControlPlane {
         self.data.publish(table);
         let mut wanted: std::collections::HashSet<&str> =
             st.tunnels.values().filter(|t| t.row.kind.is_http()).map(|t| t.row.hostname.as_str()).collect();
+        // Registered hostnames keep their certificates without a tunnel, ready for one.
+        wanted.extend(st.dir.hostnames().map(|h| h.hostname.as_str()));
         wanted.insert(&self.cfg.management.hostname);
         self.certs.set_wanted(&wanted);
     }

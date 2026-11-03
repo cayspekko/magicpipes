@@ -108,6 +108,11 @@ impl Agent {
         ev.step(Step::Register, StepState::Done).await;
 
         let result = match tunnel.kind {
+            Kind::Http if req.no_verify => {
+                ev.step(Step::Tls, StepState::Skipped).await;
+                ev.step(Step::Probe, StepState::Skipped).await;
+                Ok(None)
+            }
             Kind::Http => self.verify(&tunnel, &req, &ev, deadline).await.map(|()| None),
             _ => self.verify_port(&tunnel, &ev, deadline).await,
         };
@@ -148,6 +153,7 @@ impl Agent {
             Kind::Tcp => out["reachable"] = json!(reachable),
             // A datagram service cannot be checked end to end (it need not answer anything).
             Kind::Udp => out["verified"] = json!(false),
+            Kind::Http if req.no_verify => out["verified"] = json!(false),
             Kind::Http => {}
         }
         Ok(out)
@@ -167,9 +173,11 @@ impl Agent {
             Some(n) => Some(magicpipes_core::names::validate(n).map_err(|m| ErrorInfo::new(ErrorCode::InvalidName, m))?),
             None => None,
         };
-        let existing = match &name {
-            Some(n) => self.tunnels.find(|t| &t.name == n),
-            None => self.tunnels.find(|t| t.kind == req.kind && t.target.same_destination(&target)),
+        let hostname = req.hostname.as_deref().map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase());
+        let existing = match (&name, &hostname) {
+            (Some(n), _) => self.tunnels.find(|t| &t.name == n),
+            (None, Some(h)) => self.tunnels.find(|t| t.custom_hostname && &t.hostname == h),
+            (None, None) => self.tunnels.find(|t| t.kind == req.kind && t.target.same_destination(&target) && !t.custom_hostname),
         };
         if let Some(t) = &existing
             && (t.kind != req.kind || !t.target.same_destination(&target))
@@ -178,6 +186,18 @@ impl Agent {
                 ErrorCode::NameConflict,
                 format!("tunnel '{}' already forwards to {}; remove it first or pick another --name", t.name, t.describe()),
             ));
+        }
+        if let (Some(t), Some(h)) = (&existing, &hostname)
+            && &t.hostname != h
+        {
+            return Err(ErrorInfo::new(
+                ErrorCode::NameConflict,
+                format!("tunnel '{}' is served at {}; remove it first to serve it at {h}", t.name, t.hostname),
+            ));
+        }
+        // An older server would ignore the hostname and serve it at <name>.<base domain>.
+        if hostname.is_some() && self.session.server_protocol().is_some_and(|v| v < 4) {
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support custom hostnames; it needs a newer magicpipesd"));
         }
         // A writable shell keeps its key across re-adds, so links already shared keep working.
         if let Target::Shell { writable: true, key, .. } = &mut target {
@@ -223,6 +243,7 @@ impl Agent {
             allow: allow.clone(),
             visibility,
             tags,
+            hostname: hostname.clone(),
         };
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {
@@ -253,6 +274,12 @@ impl Agent {
                 format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind),
             ));
         }
+        if hostname.as_ref().is_some_and(|h| *h != info.hostname) {
+            if info.created {
+                let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
+            }
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server did not serve the tunnel at the hostname asked for; it needs a newer magicpipesd"));
+        }
         if (expect_private || rpc_req.visibility == Some(Visibility::Private)) && info.visibility != Some(Visibility::Private) {
             // A server that predates private tunnels would have made it public: never leave that.
             if info.created {
@@ -273,6 +300,7 @@ impl Agent {
             visibility: info.visibility,
             tags: info.tags,
             access: info.access,
+            custom_hostname: hostname.is_some() || existing.as_ref().is_some_and(|t| t.custom_hostname),
             owner_tag: info.owner_tag,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);

@@ -85,6 +85,7 @@ fn http(name: &str) -> RegisterTunnel {
         allow: vec![],
         visibility: None,
         tags: vec![],
+        hostname: None,
     }
 }
 
@@ -398,6 +399,58 @@ async fn deleting_a_tag_closes_tunnels_shared_with_it() {
     // A new tag with the old name grants nothing until someone puts it on the tunnel again.
     f.cp.create_tag(&admin, "team:secret", "", true).unwrap();
     assert!(access().is_empty());
+}
+
+#[tokio::test]
+async fn custom_hostnames_are_assigned_by_administrators() {
+    use magicpipes_core::proto::{Kind, Visibility};
+
+    use crate::authz::Role;
+    use crate::control::EnrollmentOptions;
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let (bob, _) = f.cp.create_user(&admin, "bob@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let laptop_of = |id: &str| EnrollmentOptions { owner_user_id: Some(id.to_string()), ..Default::default() };
+    let enroll = |opts| f.cp.enroll(&EnrollRequest { enrollment_token: f.cp.create_enrollment(&admin, opts).unwrap(), agent_name: "m".into() }).unwrap().agent_id;
+    let (anns, bobs, ci) = (enroll(laptop_of(&ann.id)), enroll(laptop_of(&bob.id)), f.agent("ci"));
+    let as_member = |u: &crate::control::UserView| Principal::User { id: u.id.clone(), role: Role::Member, tags: vec![] };
+
+    // Only administrators register, for one user or one service agent, and only real hostnames.
+    let shop = "shop.app.t.example.test";
+    assert!(f.cp.create_hostname(&as_member(&ann), shop, Some(&ann.id), None).unwrap_err().is(ErrorCode::Forbidden));
+    assert!(f.cp.create_hostname(&admin, "app.t.example.test", Some(&ann.id), None).unwrap_err().is(ErrorCode::InvalidRequest), "a tunnel name");
+    assert!(f.cp.create_hostname(&admin, shop, None, None).unwrap_err().is(ErrorCode::InvalidRequest));
+    assert!(f.cp.create_hostname(&admin, shop, None, Some(&anns)).unwrap_err().is(ErrorCode::InvalidRequest), "a personal machine: assign its owner");
+    let view = f.cp.create_hostname(&admin, "Shop.App.T.Example.Test.", Some(&ann.id), None).unwrap();
+    assert_eq!((view.hostname.as_str(), view.owner_email.as_deref(), view.tunnel.as_deref()), (shop, Some("ann@example.com"), None));
+    assert!(f.cp.create_hostname(&admin, shop, Some(&bob.id), None).unwrap_err().is(ErrorCode::InvalidRequest), "registered already");
+    f.cp.create_hostname(&admin, "api.app.t.example.test", None, Some(&ci)).unwrap();
+    assert_eq!(f.cp.hostnames(&as_member(&ann)).len(), 1, "members see their own");
+    assert_eq!(f.cp.hostnames(&admin).len(), 2);
+
+    // Only the machines it is assigned to serve it; the name comes from its first label.
+    let on = |host: &str| RegisterTunnel { hostname: Some(host.into()), visibility: Some(Visibility::Public), ..http("x") };
+    let named = |host: &str| RegisterTunnel { name: None, ..on(host) };
+    assert!(f.cp.register(&bobs, &named(shop)).unwrap_err().is(ErrorCode::NotFound), "not bob's");
+    assert!(f.cp.register(&ci, &named(shop)).unwrap_err().is(ErrorCode::NotFound));
+    assert!(f.cp.register(&anns, &named("other.app.t.example.test")).unwrap_err().is(ErrorCode::NotFound), "not registered");
+    let t = f.cp.register(&anns, &named(shop)).unwrap();
+    assert_eq!((t.hostname.as_str(), t.name.as_str(), t.created), (shop, "shop", true));
+    assert_eq!(t.public_url, format!("https://{shop}"));
+    assert!(f.data.lookup(shop).is_some() && f.data.lookup("shop.t.example.test").is_none(), "routed at the custom hostname only");
+    assert!(!f.cp.register(&anns, &named(shop)).unwrap().created, "adding it again is idempotent");
+    let moved = RegisterTunnel { id: Some(t.id.clone()), ..named("api.app.t.example.test") };
+    assert!(f.cp.register(&anns, &moved).unwrap_err().is(ErrorCode::NotFound), "and it can't move to a hostname that isn't hers");
+    assert!(f.cp.register(&ci, &RegisterTunnel { kind: Kind::Tcp, ..named("api.app.t.example.test") }).unwrap_err().is(ErrorCode::InvalidRequest));
+    let api = f.cp.register(&ci, &named("api.app.t.example.test")).unwrap();
+    assert_eq!(f.cp.hostnames(&admin).iter().find(|h| h.hostname == shop).unwrap().tunnel.as_deref(), Some("shop"));
+
+    // Removing the registration deletes its tunnel.
+    assert!(f.cp.delete_hostname(&admin, "api.app.t.example.test").unwrap());
+    assert!(f.data.lookup(&api.hostname).is_none() && f.cp.tunnel(&admin, &api.id).is_none());
+    assert!(!f.cp.delete_hostname(&admin, "api.app.t.example.test").unwrap());
+    assert!(f.cp.delete_hostname(&as_member(&ann), shop).unwrap_err().is(ErrorCode::Forbidden));
 }
 
 #[tokio::test]

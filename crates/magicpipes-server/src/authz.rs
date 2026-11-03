@@ -112,6 +112,13 @@ fn share_any(a: &[String], b: &[String]) -> bool {
     false
 }
 
+/// What [`authorize`] needs to know about a custom hostname: who it is assigned to.
+#[derive(Debug, Clone, Copy)]
+pub struct HostnameAuthz<'a> {
+    pub owner_user_id: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Resource<'a> {
     /// Server-wide management: status, users, enrollments, the audit log, every agent and tunnel.
@@ -120,6 +127,8 @@ pub enum Resource<'a> {
     User(&'a str),
     Agent(AgentAuthz<'a>),
     Tunnel(&'a TunnelAuthz),
+    /// Managing a custom hostname means serving a tunnel on it.
+    Hostname(HostnameAuthz<'a>),
 }
 
 /// The decision table; the first matching rule wins and anything unmatched is denied.
@@ -143,6 +152,12 @@ pub fn authorize(who: &Principal, action: Action, what: Resource<'_>) -> bool {
             who.is_admin() || matches!(who, Principal::Agent(me) if me == a.id) || user_is(a.owner_user_id)
         }
         (Resource::Agent(_), Action::Connect) => false,
+        // A custom hostname is served by the service agent it is assigned to, or by the machines
+        // of the user it is assigned to (a personal agent asks as its owner).
+        (Resource::Hostname(h), Action::Manage | Action::Discover) => {
+            who.is_admin() || matches!(who, Principal::Agent(me) if Some(me.as_str()) == h.agent_id) || user_is(h.owner_user_id)
+        }
+        (Resource::Hostname(_), Action::Connect) => false,
         // A tunnel is managed by its owners and by administrators.
         (Resource::Tunnel(t), Action::Manage) => tunnel_owner(t) || who.is_admin(),
         // Discovering and connecting give the same answer: public, or a shared tag. Owners
@@ -238,6 +253,14 @@ mod tests {
         assert!(!authorize(&carol, Manage, agent("ag_bob", Some("us_bob"))));
         assert!(!authorize(&anon, Discover, agent("ag_a", None)));
         assert!(!authorize(&admin, Connect, agent("ag_a", None)));
+
+        // Custom hostnames: the service agent or the user they are assigned to, and administrators.
+        let for_bob = Resource::Hostname(HostnameAuthz { owner_user_id: Some("us_bob"), agent_id: None });
+        let for_a = Resource::Hostname(HostnameAuthz { owner_user_id: None, agent_id: Some("ag_a") });
+        assert!(authorize(&bob, Manage, for_bob) && authorize(&admin, Manage, for_bob));
+        assert!(!authorize(&carol, Manage, for_bob) && !authorize(&a, Manage, for_bob) && !authorize(&anon, Discover, for_bob));
+        assert!(authorize(&a, Manage, for_a) && !authorize(&b, Manage, for_a) && !authorize(&bob, Manage, for_a));
+        assert!(!authorize(&admin, Connect, for_a));
     }
 
     #[test]

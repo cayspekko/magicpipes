@@ -112,6 +112,14 @@ enum Command {
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
         name: Option<String>,
+        /// Serve it at this hostname instead of <name>.<base domain>. An administrator must have
+        /// assigned the hostname to this machine (or to you), and its DNS must point at the server.
+        #[arg(long, value_name = "HOSTNAME", conflicts_with_all = ["tcp", "udp"])]
+        hostname: Option<String>,
+        /// Register without waiting for the certificate or checking the public address, for
+        /// example before DNS points here. The local service is still checked.
+        #[arg(long)]
+        no_verify: bool,
         /// Local host to connect to (default: 127.0.0.1, falling back to ::1).
         #[arg(long)]
         host: Option<String>,
@@ -272,6 +280,8 @@ async fn dispatch(cmd: Command) -> ExitCode {
             public,
             tags,
             name,
+            hostname,
+            no_verify,
             host,
             probe_path,
             timeout,
@@ -304,6 +314,8 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 timeout_secs: timeout,
                 visibility,
                 tags,
+                hostname,
+                no_verify,
             };
             (out, add(req, out).await)
         }
@@ -506,6 +518,9 @@ impl Progress {
             StepState::Warned => {
                 let _ = writeln!(err, "!");
             }
+            StepState::Skipped => {
+                let _ = writeln!(err, "skipped");
+            }
         }
         let _ = err.flush();
     }
@@ -596,6 +611,9 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             None if kind.is_http() => println!("Tunnel active in background. Anyone with the URL can reach it."),
             None if open_to_anyone => println!("Tunnel active in background. Anyone who finds the port can connect."),
             None => println!("Tunnel active in background. Only the allowed networks can connect."),
+        }
+        if kind.is_http() && data["verified"] == false {
+            println!("Not verified (--no-verify). Once its DNS points at the server, run the same command without --no-verify to check it.");
         }
         println!("Stop it with: magicpipes remove {}", data["name"].as_str().unwrap_or_default());
     }

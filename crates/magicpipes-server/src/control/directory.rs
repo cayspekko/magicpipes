@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::ControlPlane;
-use crate::store::{AgentRow, Store, TagRow, UserRow};
+use crate::store::{AgentRow, HostnameRow, Store, TagRow, UserRow};
 
 #[derive(Default)]
 pub(super) struct Directory {
@@ -15,6 +15,7 @@ pub(super) struct Directory {
     user_tags: HashMap<String, Vec<String>>,
     users: HashMap<String, UserRow>,
     tags: HashMap<String, TagRow>,
+    hostnames: HashMap<String, HostnameRow>,
 }
 
 impl Directory {
@@ -25,7 +26,20 @@ impl Directory {
             user_tags: store.user_tags()?,
             users: store.users()?.into_iter().map(|u| (u.id.clone(), u)).collect(),
             tags: store.tags()?.into_iter().map(|t| (t.name.clone(), t)).collect(),
+            hostnames: store.hostnames()?.into_iter().map(|h| (h.hostname.clone(), h)).collect(),
         })
+    }
+
+    /// A registered custom hostname.
+    pub(super) fn hostname(&self, hostname: &str) -> Option<&HostnameRow> {
+        self.hostnames.get(hostname)
+    }
+
+    /// Every registered custom hostname, in order.
+    pub(super) fn hostnames(&self) -> impl Iterator<Item = &HostnameRow> {
+        let mut list: Vec<&HostnameRow> = self.hostnames.values().collect();
+        list.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+        list.into_iter()
     }
 
     /// Does the tag grant access? False for a tag that isn't known (fail closed).

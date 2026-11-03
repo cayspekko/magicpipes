@@ -1,5 +1,5 @@
 //! UI pages for accounts: changing your password, your API tokens and sessions, user
-//! administration and the audit log.
+//! administration, tags, custom hostnames and the audit log.
 
 use axum::Form;
 use axum::extract::{Path, State};
@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::picker::{self, Holder, Submitted};
-use super::ui::{CsrfForm, UiUser, chips, esc, logged_in, menu_post, page, row_menu, safe_next, when};
+use super::ui::{CsrfForm, UiUser, badge, chips, esc, logged_in, menu_post, page, row_menu, safe_next, when};
 use crate::authz::{Principal, Role};
 use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
 
@@ -609,6 +609,98 @@ pub async fn tag_access(user: UiUser, State(app): State<AppState>, Form(f): Form
         Ok(_) => Redirect::to("/tags").into_response(),
         Err(e) => (StatusCode::FORBIDDEN, tags_page(&user, &app, Some(&e.message))).into_response(),
     }
+}
+
+// ---- hostnames ---------------------------------------------------------------------------------
+
+fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
+    let mut rows = String::new();
+    for h in app.control.hostnames(&user.who) {
+        let served_by = match (&h.owner_email, &h.agent_name) {
+            (Some(email), _) => format!(r#"{} <span class="sub">their machines</span>"#, esc(email)),
+            (None, Some(agent)) => format!(r#"{} <span class="sub">service agent</span>"#, esc(agent)),
+            (None, None) => "—".into(),
+        };
+        let tunnel = h.tunnel.as_deref().map(|t| format!("<code>{}</code>", esc(t))).unwrap_or_else(|| r#"<span class="sub">none yet</span>"#.into());
+        rows.push_str(&format!(
+            r#"<tr><td><span class="name">{host}</span></td><td>{served_by}</td><td>{tunnel}</td><td>{tls}</td><td>{created}</td><td class="num"><form method="post" action="/hostnames/delete" data-confirm="Remove {host}? The tunnel on it is deleted.">{csrf}<input type="hidden" name="hostname" value="{host}"><button class="btn danger small">Remove</button></form></td></tr>"#,
+            host = esc(&h.hostname),
+            tls = badge(h.tls),
+            created = when(&h.created_at),
+            csrf = csrf(user),
+        ));
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="6" class="empty">No custom hostnames yet.</td></tr>"#.into();
+    }
+    let users: String = app
+        .control
+        .users(&user.who)
+        .iter()
+        .filter(|u| !u.disabled)
+        .map(|u| format!(r#"<option value="user:{}">{} (their machines)</option>"#, esc(&u.id), esc(&u.email)))
+        .collect();
+    let agents: String = app
+        .control
+        .agents(&user.who)
+        .iter()
+        .filter(|a| a.owner_user_id.is_none())
+        .map(|a| format!(r#"<option value="agent:{}">{} (service agent)</option>"#, esc(&a.id), esc(&a.name)))
+        .collect();
+    let body = format!(
+        r#"<div class="head"><div><div class="eyebrow">Administration</div><h1>Hostnames</h1>
+<p class="lede">Your own domains, outside <code>{base}</code>. Register a hostname for one person's machines or one service agent; it can then serve a tunnel on it with <code>magicpipes add PORT --hostname NAME</code>. Its DNS must point at this server. The certificate is ordered as soon as you register it, so it can be ready before traffic moves over.</p></div></div>
+{err}<div class="card scroll"><table><thead><tr><th>Hostname</th><th>Served by</th><th>Tunnel</th><th>TLS</th><th>Registered</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="section"><h2>Register a hostname</h2></div>
+<div class="card form"><form method="post" action="/hostnames">{csrf}
+<label for="hn" style="margin-top:0">Hostname</label><input id="hn" name="hostname" placeholder="shop.example.com" maxlength="253" required>
+<label for="ha">Served by</label><select id="ha" name="assign" required><option value="">Choose…</option>{users}{agents}</select>
+<button class="btn primary" style="margin-top:14px">Register</button></form>
+<p class="note">One exact name, no wildcards. Removing it deletes the tunnel on it.</p></div>"#,
+        base = esc(&app.control.config().base_domain),
+        err = alert(error),
+        csrf = csrf(user),
+    );
+    page("Hostnames", Some(user), &body)
+}
+
+pub async fn hostnames(user: UiUser, State(app): State<AppState>) -> Response {
+    if let Some(r) = admins_only(&user) {
+        return r;
+    }
+    hostnames_page(&user, &app, None)
+}
+
+#[derive(Deserialize)]
+pub struct HostnameForm {
+    csrf: String,
+    hostname: String,
+    /// `user:<id>` or `agent:<id>`.
+    #[serde(default)]
+    assign: String,
+}
+
+pub async fn create_hostname(user: UiUser, State(app): State<AppState>, Form(f): Form<HostnameForm>) -> Response {
+    if let Err(r) = user.check_csrf(&f.csrf) {
+        return r;
+    }
+    let (owner, agent) = match f.assign.split_once(':') {
+        Some(("user", id)) => (Some(id), None),
+        Some(("agent", id)) => (None, Some(id)),
+        _ => (None, None),
+    };
+    match app.control.create_hostname(&user.who, &f.hostname, owner, agent) {
+        Ok(_) => Redirect::to("/hostnames").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, hostnames_page(&user, &app, Some(&e.message))).into_response(),
+    }
+}
+
+pub async fn delete_hostname(user: UiUser, State(app): State<AppState>, Form(f): Form<HostnameForm>) -> Response {
+    if let Err(r) = user.check_csrf(&f.csrf) {
+        return r;
+    }
+    let _ = app.control.delete_hostname(&user.who, &f.hostname);
+    Redirect::to("/hostnames").into_response()
 }
 
 // ---- audit log -------------------------------------------------------------------------------

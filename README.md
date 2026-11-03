@@ -319,6 +319,23 @@ magicpipes add 3000 --public                  # anyone; refused if the enrollmen
 A private tunnel of a service agent carries only the tags given with `--tag` (from the agent's
 own): without one, nobody can open it.
 
+### Your own hostnames
+
+Tunnels are `<name>.<base domain>` unless an administrator registers a hostname of your own
+under **Hostnames** (or `POST /api/v1/hostnames`): an exact name such as `shop.example.com`
+(a bare domain works too), for one person's machines or one service agent. Its DNS must point
+at the server. The certificate is ordered as soon as it is registered.
+
+```bash
+magicpipes add 8000 --hostname shop.example.com             # only on a machine it was assigned to
+magicpipes add 8000 --hostname shop.example.com --no-verify # register now; skip the certificate wait and public check
+```
+
+`--no-verify` is for moving a site over: register the tunnel while DNS (or a proxy in front)
+still points at the old server, switch it, then run the same command without `--no-verify` to
+check the public address. Removing the hostname's registration deletes its tunnel. Wildcards
+aren't supported.
+
 * Opening a private tunnel in a browser without being signed in shows the sign-in page, then
   comes back to the same address. Signed in without a shared tag: an "access denied" page. API
   clients and scripts get `401 unauthenticated` or `403 forbidden` instead.
@@ -585,6 +602,9 @@ administrators answer `403 forbidden` to members.
 | POST | `/api/v1/tags` | 201; body `{"name", "description"?, "access"?}` (`access` defaults to true; `user:` names are reserved) |
 | PATCH | `/api/v1/tags/{name}` | `{"access": bool}`: whether it grants access |
 | DELETE | `/api/v1/tags/{name}` | 204; removes it from every user, agent and tunnel |
+| GET | `/api/v1/hostnames` | `{"hostnames": [{"hostname", "owner_user_id"?, "owner_email"?, "agent_id"?, "agent_name"?, "tunnel"?, "tls", "created_at"}]}` (administrators: all; others: those assigned to them) |
+| POST | `/api/v1/hostnames` | 201; body `{"hostname", "owner_user_id"? \| "agent_id"?}` (exactly one; administrators) |
+| DELETE | `/api/v1/hostnames/{hostname}` | 204; deletes the tunnel on it |
 | POST | `/api/v1/device` | Starts a browser-approved `magicpipes login` (used by the CLI) |
 | POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`), `denied` or `expired` |
 | GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |

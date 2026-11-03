@@ -218,8 +218,8 @@ Planned target and ingress kinds (Unix sockets, SSH gateway, browser desktop) ar
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 3: 2 added the handshake and
-  answers to unknown messages, 3 visibility and tags). A peer without the header is
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 4: 2 added the handshake and
+  answers to unknown messages, 3 visibility and tags, 4 custom hostnames). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,
@@ -350,7 +350,13 @@ a connection to the public port that must arrive back at the agent (a warning, n
   session of the agent that owns the tunnel, and the agent only dials targets from its own table.
   The server can name a tunnel, never an address.
 * Hostname ownership: names are unique, tied to one agent, validated (DNS label rules, reserved
-  names, management hostname). Another agent cannot register or query them.
+  names, management hostname). Another agent cannot register or query them. A custom hostname
+  (`add --hostname`) must first be registered by an administrator for one user's machines or one
+  service agent (`control/hostnames.rs`, checked with `authorize` on `Resource::Hostname`; a
+  personal agent asks as its owner, without an administrator's role). It is an exact name, not
+  the management hostname, the base domain or a `<name>.<base_domain>` tunnel name, and with the
+  development CA it must be under the base domain (the CA is name-constrained). Removing the
+  registration deletes the tunnel on it.
 * Private HTTP tunnels admit users who share a tag with them that grants access (exact match),
   after signing in, and nobody else: owners get in through their personal tag (`user:…`), which
   the server puts on every tunnel of their machines; administrators manage tunnels but don't
@@ -385,8 +391,10 @@ a connection to the public port that must arrive back at the agent (a warning, n
   everyone's sign-ins; pending device logins are capped at 5 per address and 1000 in total, and
   a full table drops a waiting login of the address holding the most rather than refusing.
 * Certificates: the control plane tells the certificate manager which hostnames it serves on
-  every publish. Others are no longer renewed, and are forgotten (resolver and cache) after a
-  week, so a hostname removed and added again soon keeps its certificate.
+  every publish, registered custom hostnames included (with or without a tunnel). Others are no
+  longer renewed, and are forgotten (resolver and cache) after a week, so a hostname removed and
+  added again soon keeps its certificate. Registering a custom hostname orders its certificate
+  at once, so it can be ready before traffic moves over.
 * Secrets are never logged. The bootstrap admin token goes to a 0600 file, not to the log.
 * The server sees only what it needs about local targets: the program name of a web terminal
   (not its arguments) and the folder name of a static site (not its path). The public terminal

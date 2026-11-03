@@ -124,7 +124,7 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     let logout = user
         .map(|u| {
             let links: &[(&str, &str)] = if u.who.is_admin() {
-                &[("/", "Tunnels"), ("/users", "Users"), ("/tags", "Tags"), ("/audit", "Audit log"), ("/account", "Account")]
+                &[("/", "Tunnels"), ("/users", "Users"), ("/tags", "Tags"), ("/hostnames", "Hostnames"), ("/audit", "Audit log"), ("/account", "Account")]
             } else {
                 &[("/", "Machines"), ("/account", "Account")]
             };
@@ -151,7 +151,7 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
 }
 
 /// A status dot plus its label. The tone comes from the state, the text stays the raw state name.
-fn badge(state: &str) -> String {
+pub(super) fn badge(state: &str) -> String {
     let tone = match state {
         "connected" | "ready" => "ok",
         "pending" => "warn",

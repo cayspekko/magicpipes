@@ -45,7 +45,9 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   unknown server-opened stream with [`StreamStatus::Unsupported`], instead of being dropped.
 /// * 3: private tunnels. [`RegisterTunnel`] carries `visibility` and `tags`, and
 ///   [`TunnelInfo`] echoes them.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// * 4: custom hostnames. [`RegisterTunnel`] carries `hostname`; an older server would ignore
+///   it and serve the tunnel at `<name>.<base_domain>`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -217,6 +219,10 @@ pub struct RegisterTunnel {
     /// server adds the owner's personal tag.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Protocol 4: a custom hostname (an administrator assigned it to this machine) instead
+    /// of `<name>.<base_domain>`. Fixed when the tunnel is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -434,6 +440,7 @@ mod tests {
             allow: vec![],
             visibility: Some(Visibility::Private),
             tags: vec!["dev".into()],
+            hostname: None,
         });
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""visibility":"private""#) && json.contains(r#""tags":["dev"]"#), "{json}");

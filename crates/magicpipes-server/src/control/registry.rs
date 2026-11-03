@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::{self, CertState, ErrorBody, Kind, RegisterTunnel, ServerOpen, StreamStatus, TunnelInfo, Visibility};
+use magicpipes_core::mux::MuxHandle;
 use magicpipes_core::{cidr, names, secret, tags, unix_now};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -85,6 +86,13 @@ impl ControlPlane {
             .iter()
             .map(ToString::to_string)
             .collect();
+        let custom = match &req.hostname {
+            None => None,
+            Some(_) if !req.kind.is_http() => {
+                return Err(err(ErrorCode::InvalidRequest, "a custom hostname applies only to HTTP tunnels"));
+            }
+            Some(h) => Some(h.trim().trim_end_matches('.').to_ascii_lowercase()),
+        };
         let range = match req.kind {
             Kind::Http if req.remote_port.is_some() || !allow.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "a remote port and an allow-list apply only to TCP and UDP tunnels"));
@@ -101,13 +109,18 @@ impl ControlPlane {
         }
         let mut st = self.state.lock().unwrap();
         let owner_tag = st.dir.owner(agent_id).and_then(|o| st.dir.personal_tag(o)).map(str::to_string);
+        if let Some(h) = &custom
+            && !st.may_serve(agent_id, h)
+        {
+            return Err(err(ErrorCode::NotFound, format!("the hostname '{h}' isn't assigned to this machine; an administrator assigns hostnames")));
+        }
 
-        let existing = match (&req.id, &req.name) {
-            (Some(id), _) => match st.tunnels.get(id) {
+        let existing = match (&req.id, &req.name, &custom) {
+            (Some(id), _, _) => match st.tunnels.get(id) {
                 Some(t) if st.may(&who, Action::Manage, t) => Some(id.clone()),
                 _ => return Err(err(ErrorCode::NotFound, "tunnel no longer exists on the server")),
             },
-            (None, Some(name)) => {
+            (None, Some(name), _) => {
                 let name = names::validate(name).map_err(|m| err(ErrorCode::InvalidName, m))?;
                 match st.tunnels.values().find(|t| t.row.name == name) {
                     Some(t) if st.may(&who, Action::Manage, t) => Some(t.row.id.clone()),
@@ -115,11 +128,24 @@ impl ControlPlane {
                     None => None,
                 }
             }
-            (None, None) => None,
+            (None, None, Some(h)) => match st.tunnels.values().find(|t| &t.row.hostname == h) {
+                Some(t) if st.may(&who, Action::Manage, t) => Some(t.row.id.clone()),
+                Some(_) => return Err(err(ErrorCode::NameTaken, format!("'{h}' is served by another machine"))),
+                None => None,
+            },
+            (None, None, None) => None,
         };
 
         if let Some(id) = existing {
             let mut row = st.tunnels[&id].row.clone();
+            if let Some(h) = &custom
+                && row.hostname != *h
+            {
+                return Err(err(
+                    ErrorCode::InvalidRequest,
+                    format!("tunnel '{}' is served at {}; remove it first to move it to {h}", row.name, row.hostname),
+                ));
+            }
             (row.visibility, row.tags) = self.requested_access(&st, agent_id, req, Some(&row))?;
             if row.kind != req.kind {
                 return Err(err(
@@ -157,16 +183,26 @@ impl ControlPlane {
             return Err(err(ErrorCode::LimitReached, format!("an agent may hold at most {max_ports} public ports")));
         }
 
+        let taken = |n: &str| st.tunnels.values().any(|t| t.row.name == n);
         let name = match &req.name {
             Some(n) => names::validate(n).map_err(|m| err(ErrorCode::InvalidName, m))?,
-            None => (0..10)
-                .map(names::random)
-                .find(|n| !st.tunnels.values().any(|t| &t.row.name == n))
+            // On a custom hostname, its first label when free (shop.example.com: `shop`).
+            None => custom
+                .as_deref()
+                .and_then(|h| h.split('.').next())
+                .and_then(|l| names::validate(l).ok())
+                .filter(|n| !taken(n))
+                .into_iter()
+                .chain((0..10).map(names::random))
+                .find(|n| !taken(n))
                 .ok_or_else(|| err(ErrorCode::Internal, "could not allocate a tunnel name"))?,
         };
-        let hostname = self.cfg.hostname_for(&name);
+        let hostname = custom.clone().unwrap_or_else(|| self.cfg.hostname_for(&name));
         if hostname == self.cfg.management.hostname {
             return Err(err(ErrorCode::InvalidName, format!("'{name}' is reserved")));
+        }
+        if st.tunnels.values().any(|t| t.row.hostname == hostname) {
+            return Err(err(ErrorCode::NameTaken, format!("'{hostname}' is served by another tunnel")));
         }
         // Every new hostname costs a certificate order, and the CA's limits are shared by all
         // agents (Let's Encrypt: 50 certificates per domain per week).
@@ -321,13 +357,7 @@ impl ControlPlane {
         tracing::info!(tunnel = %id, "tunnel deleted by administrator");
         self.audit(who, "tunnel.delete", id, "");
         if let Some(handle) = session {
-            let tunnel_id = id.to_string();
-            tokio::spawn(async move {
-                if let Ok(mut s) = handle.open(Duration::from_secs(5)).await {
-                    let _ = proto::write_frame(&mut s, &ServerOpen::TunnelRemoved { tunnel_id }).await;
-                    let _ = s.shutdown().await;
-                }
-            });
+            tell_removed(handle, id.to_string());
         }
         Ok(true)
     }
@@ -348,6 +378,16 @@ impl ControlPlane {
             CertStatus::Failed(message) => CertState::Failed { message },
         })
     }
+}
+
+/// Tells a connected agent that an administrator removed one of its tunnels.
+pub(super) fn tell_removed(handle: MuxHandle, tunnel_id: String) {
+    tokio::spawn(async move {
+        if let Ok(mut s) = handle.open(Duration::from_secs(5)).await {
+            let _ = proto::write_frame(&mut s, &ServerOpen::TunnelRemoved { tunnel_id }).await;
+            let _ = s.shutdown().await;
+        }
+    });
 }
 
 /// The answer to "may this user into the private tunnel at this host?".
