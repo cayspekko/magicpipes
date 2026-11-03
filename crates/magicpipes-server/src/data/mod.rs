@@ -13,6 +13,7 @@
 mod gate;
 pub mod ingress;
 mod io;
+mod pool;
 mod ports;
 mod proxy;
 
@@ -169,11 +170,13 @@ pub struct DataPlane {
     /// Nonces of sign-in codes already used, per user, with when they were seen (bounded per
     /// user and in total, 65 s each).
     used_codes: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
+    /// Idle HTTP connections to agents, for the next request to the same tunnel.
+    pool: pool::Pool<proxy::Progress<hyper::body::Incoming>>,
 }
 
 impl DataPlane {
     pub fn new(settings: ProxySettings, shutdown: CancellationToken) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self {
+        let dp = Arc::new_cyclic(|me| Self {
             routes: RwLock::new(Arc::new(RouteTable::default())),
             tcp_permits: Arc::new(Semaphore::new(settings.ports.max_connections)),
             settings,
@@ -183,7 +186,26 @@ impl DataPlane {
             me: me.clone(),
             generation: watch::Sender::new(0),
             used_codes: Mutex::default(),
-        })
+            pool: pool::Pool::default(),
+        });
+        // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in
+        // unit tests, nothing is pooled anyway.)
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let (me, stop) = (Arc::downgrade(&dp), dp.shutdown.clone());
+            rt.spawn(async move {
+                let mut tick = tokio::time::interval(pool::IDLE_TIMEOUT / 2);
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = tick.tick() => match me.upgrade() {
+                            Some(dp) => dp.pool.sweep(),
+                            None => return,
+                        },
+                    }
+                }
+            });
+        }
+        dp
     }
 
     pub fn signer(&self) -> &Signer {

@@ -515,21 +515,26 @@ impl Drop for App {
 
 /// HTTP app: `GET /` -> "hello from app", `POST /echo` streams the body back,
 /// `GET /stream` sends "first" then waits for `release` before "second",
-/// `GET /status/401` -> 401, anything else -> 404.
+/// `GET /status/401` -> 401, `GET /conn` -> the number of the TCP connection it came on,
+/// anything else -> 404.
 pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
     use http_body_util::combinators::BoxBody;
     use hyper::service::service_fn;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
+        let mut accepted = 0u64;
         loop {
             let Ok((tcp, _)) = listener.accept().await else { return };
+            accepted += 1;
+            let conn = accepted;
             let release = release.clone();
             tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let release = release.clone();
                     async move {
                         let resp: Response<BoxBody<Bytes, hyper::Error>> = match (req.method().as_str(), req.uri().path()) {
+                            ("GET", "/conn") => Response::new(Full::new(Bytes::from(conn.to_string())).map_err(|never| match never {}).boxed()),
                             ("GET", "/") => {
                                 let xff = req.headers().get("x-forwarded-proto").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
                                 Response::builder()

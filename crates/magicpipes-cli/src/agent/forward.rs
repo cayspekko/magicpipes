@@ -62,7 +62,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
         },
         ServerOpen::Data { tunnel_id, peer } => {
             let route = tunnels.route(&tunnel_id).filter(|r| r.kind != Kind::Udp);
-            let Some(Route { target, streams_ok: counter, ended, sessions, .. }) = route else {
+            let Some(Route { kind, target, streams_ok: counter, ended, sessions }) = route else {
                 let _ = StreamStatus::UnknownTunnel.write(&mut stream).await;
                 let _ = stream.shutdown().await;
                 return;
@@ -74,7 +74,12 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                         return;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
-                    serve::serve(stream, Arc::new(Site { root, list })).await;
+                    // The server keeps HTTP connections for later requests: end this one when the
+                    // tunnel's settings change, so it never serves the old ones.
+                    tokio::select! {
+                        _ = serve::serve(stream, Arc::new(Site { root, list })) => {}
+                        _ = ended.cancelled() => {}
+                    }
                     return;
                 }
                 Target::Shell { shell: command, cwd, writable, key, max_clients } => {
@@ -110,8 +115,18 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 return;
             }
             counter.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut local).await {
-                tracing::debug!(error = %e, "data stream ended");
+            // As for static files: a pooled HTTP connection must not outlive a target change.
+            // Raw TCP connections keep going, as they always have.
+            let changed = async {
+                if kind.is_http() { ended.cancelled().await } else { std::future::pending().await }
+            };
+            tokio::select! {
+                r = tokio::io::copy_bidirectional(&mut stream, &mut local) => {
+                    if let Err(e) = r {
+                        tracing::debug!(error = %e, "data stream ended");
+                    }
+                }
+                _ = changed => {}
             }
         }
     }

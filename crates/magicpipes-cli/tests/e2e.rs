@@ -64,6 +64,19 @@ async fn http_websocket_and_lifecycle() {
     let (status, err, body) = env.get_public(&host1, "/status/401").await;
     assert_eq!((status, err, body.as_str()), (StatusCode::UNAUTHORIZED, None, "nope"));
 
+    // Requests share pooled connections to the app instead of opening one each, whichever
+    // public connection they arrive on.
+    let mut conns = std::collections::HashSet::new();
+    for _ in 0..10 {
+        let (status, _, body) = env.get_public(&host1, "/conn").await;
+        assert_eq!(status, 200, "{body}");
+        conns.insert(body);
+    }
+    assert!(conns.len() <= 2, "ten requests opened {} connections to the app", conns.len());
+    // Concurrent requests each get a connection, and every one of them is answered.
+    let answers = futures_util::future::join_all((0..20).map(|_| env.get_public(&host1, "/conn"))).await;
+    assert!(answers.iter().all(|(s, _, _)| *s == 200), "{answers:?}");
+
     // Large request body streamed through and echoed back.
     let big: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let req = Request::post("/echo")

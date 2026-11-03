@@ -1,9 +1,12 @@
 //! HTTP/1.1 reverse proxy over agent data streams.
 //!
-//! For each public request: resolve the route, open a yamux stream on the owning agent's session,
-//! announce the tunnel id, run a fresh HTTP/1.1 client connection over the stream and forward the
-//! request. Bodies stream in both directions (hyper `Incoming` is passed through untouched).
-//! `Upgrade` requests (WebSockets) are bridged as raw byte streams after the `101` response.
+//! For each public request: resolve the route, then send the request over an HTTP/1.1 client
+//! connection to the owning agent: an idle one from the [`super::pool`] when there is one, else
+//! a new yamux stream on the agent's session that announces the tunnel id. A connection goes
+//! back to the pool once its response has been read to the end. Bodies stream in both directions
+//! (hyper `Incoming` is passed through untouched). `Upgrade` requests (WebSockets) and readiness
+//! probes get a connection of their own; upgrades are bridged as raw byte streams after the
+//! `101` response.
 
 // Error pages are returned by value through `Result<_, Response>` on purpose.
 #![allow(clippy::result_large_err)]
@@ -18,7 +21,9 @@ use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
+use hyper::client::conn::http1::SendRequest;
 use magicpipes_core::error::ErrorCode;
+use magicpipes_core::mux::{ClientUse, MuxHandle};
 use magicpipes_core::proto::{self, ERROR_HEADER, PROBE_ACK_HEADER, PROBE_HEADER, ServerOpen};
 use tokio_util::sync::CancellationToken;
 
@@ -107,35 +112,46 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         }
     }
 
-    let upstream = open_upstream(dp, &route, &session, client).await?;
     // An upgraded connection outlives this HTTP connection; it keeps the listener's limits.
     let limits = conn.limits.clone();
     let (progress, uploading) = tokio::sync::watch::channel(());
     let req = req.map(|inner| Progress { inner, progress });
-    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Progress<Incoming>>(TokioIo::new(upstream))
-        .await
-        .map_err(|_| upstream_error(&route, UpstreamStatus::Closed))?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.with_upgrades().await {
-            tracing::debug!(error = %e, "upstream connection ended");
-        }
-    });
-
-    let mut resp = match response_within(sender.send_request(req), uploading, dp.settings.upstream_response_timeout).await {
-        Some(Ok(resp)) => resp,
-        Some(Err(e)) => {
-            let status = find_status(&e).unwrap_or(UpstreamStatus::Closed);
-            return Err(upstream_error(&route, status));
-        }
-        None => {
-            route.stats.record(Outcome::LocalUnreachable);
-            return Err(error_page(
-                ErrorCode::UpstreamTimeout,
-                "The local application did not respond in time.",
-            ));
-        }
+    let timeout = dp.settings.upstream_response_timeout;
+    // A probe checks that the agent opened a stream for it, and an upgrade keeps its stream:
+    // both get a connection of their own. Everything else shares pooled ones.
+    let (resp, reuse) = if upgrade || probe.is_some() {
+        let upstream = open_upstream(dp, &route, &session, client).await?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Progress<Incoming>>(TokioIo::new(upstream))
+            .await
+            .map_err(|_| upstream_error(&route, UpstreamStatus::Closed))?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!(error = %e, "upstream connection ended");
+            }
+        });
+        (answer(&route, response_within(sender.send_request(req), uploading, timeout).await)?, None)
+    } else {
+        let used = session.client_use(client).ok_or_else(busy)?;
+        let generation = *dp.generation.borrow();
+        let (resp, sender) = send_shared(dp, &route, &session, generation, req, uploading).await?;
+        (resp, Some((sender, used, generation)))
     };
     route.stats.record(Outcome::Ok);
+    // Back to the pool once the response has been read to the end; a response cut short closes
+    // the connection instead. The client's place is kept until then.
+    let resp = match reuse {
+        Some((mut sender, used, generation)) => {
+            let (dp, tunnel, session) = (dp.clone(), route.tunnel_id.clone(), session.clone());
+            tokio::spawn(async move {
+                if sender.ready().await.is_ok() {
+                    dp.pool.put(&tunnel, session, generation, sender);
+                }
+            });
+            resp.map(|inner| Holding { inner, _used: used }.boxed())
+        }
+        None => resp.map(|b| b.boxed()),
+    };
+    let mut resp = resp;
 
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         let Some(client_upgrade) = client_upgrade else {
@@ -179,11 +195,121 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         && let Ok(v) = HeaderValue::from_str(&format!("{} {}", route.tunnel_id, nonce)) {
             resp.headers_mut().insert(PROBE_ACK_HEADER, v);
         }
-    Ok(resp.map(|b| b.boxed()))
+    Ok(resp)
+}
+
+type Sent = Option<Result<Response<Incoming>, hyper::Error>>;
+
+/// The response, or the error page for a failed or timed-out request.
+fn answer(route: &Route, sent: Sent) -> Result<Response<Incoming>, Response<ProxyBody>> {
+    match sent {
+        Some(Ok(resp)) => Ok(resp),
+        Some(Err(e)) => {
+            let status = find_status(&e).unwrap_or(UpstreamStatus::Closed);
+            Err(upstream_error(route, status))
+        }
+        None => {
+            route.stats.record(Outcome::LocalUnreachable);
+            Err(error_page(ErrorCode::UpstreamTimeout, "The local application did not respond in time."))
+        }
+    }
+}
+
+fn busy() -> Response<ProxyBody> {
+    error_page(ErrorCode::AgentBusy, "This tunnel is handling too many connections. Try again shortly.")
+}
+
+/// Sends `req` over an idle pooled connection, or a new one. A pooled connection that the
+/// application closed just as it was taken refuses the request before sending any of it; the
+/// request then goes over a new connection.
+async fn send_shared(
+    dp: &DataPlane,
+    route: &Route,
+    session: &MuxHandle,
+    generation: u64,
+    req: Request<Progress<Incoming>>,
+    uploading: tokio::sync::watch::Receiver<()>,
+) -> Result<(Response<Incoming>, SendRequest<Progress<Incoming>>), Response<ProxyBody>> {
+    let timeout = dp.settings.upstream_response_timeout;
+    let mut req = req;
+    if let Some(mut sender) = dp.pool.take(&route.tunnel_id, session, generation) {
+        match response_within(sender.try_send_request(req), uploading.clone(), timeout).await {
+            Some(Ok(resp)) => return Ok((resp, sender)),
+            Some(Err(mut e)) => match e.take_message() {
+                Some(unsent) => req = unsent,
+                None => return Err(answer(route, Some(Err(e.into_error()))).unwrap_err()),
+            },
+            None => return Err(answer(route, None).unwrap_err()),
+        }
+    }
+    let mut sender = connect_shared(dp, route, session).await?;
+    let resp = answer(route, response_within(sender.send_request(req), uploading, timeout).await)?;
+    Ok((resp, sender))
+}
+
+/// A new HTTP/1.1 connection over a shared stream, for the pool. When the session's streams are
+/// used up, idle pooled ones on it are closed to make room.
+async fn connect_shared(dp: &DataPlane, route: &Route, session: &MuxHandle) -> Result<SendRequest<Progress<Incoming>>, Response<ProxyBody>> {
+    let fail = || {
+        route.stats.record(Outcome::AgentOffline);
+        error_page(ErrorCode::AgentUnavailable, "Could not open a stream to the MagicPipes agent.")
+    };
+    let open = dp.settings.stream_open_timeout;
+    let mut tries = 0;
+    let mut stream = loop {
+        match session.open_shared(open).await {
+            Ok(s) => break s,
+            // A closed connection gives its stream back once its task notices, so wait a moment.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries < 3 && dp.pool.evict(session) => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+            Err(_) => return Err(fail()),
+        }
+    };
+    proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })
+        .await
+        .map_err(|_| fail())?;
+    let (sender, conn) = hyper::client::conn::http1::handshake::<_, Progress<Incoming>>(TokioIo::new(StatusPrefixed::new(stream)))
+        .await
+        .map_err(|_| upstream_error(route, UpstreamStatus::Closed))?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::debug!(error = %e, "upstream connection ended");
+        }
+    });
+    Ok(sender)
+}
+
+/// A response body that keeps the client's place in the agent's budget until it is done.
+struct Holding<B> {
+    inner: B,
+    _used: ClientUse,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for Holding<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// A request body that reports each chunk it passes on, so a long upload counts as progress.
-struct Progress<B> {
+pub(super) struct Progress<B> {
     inner: B,
     progress: tokio::sync::watch::Sender<()>,
 }
@@ -251,12 +377,7 @@ async fn open_upstream(
     };
     let mut stream = match session.open_data(dp.settings.stream_open_timeout, client).await {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            return Err(error_page(
-                ErrorCode::AgentBusy,
-                "This tunnel is handling too many connections. Try again shortly.",
-            ));
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
         Err(_) => return Err(fail()),
     };
     proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })

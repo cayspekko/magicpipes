@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 pub use yamux::Mode;
 
 /// A yamux stream adapted to Tokio's I/O traits. A stream opened with
-/// [`MuxHandle::open_data`] keeps its place in the session's data budget until dropped.
+/// [`MuxHandle::open_data`] or [`MuxHandle::open_shared`] keeps its place in the session's data
+/// budget until dropped.
 pub struct MuxStream {
     io: Compat<yamux::Stream>,
     _slot: Option<DataSlot>,
@@ -59,7 +60,8 @@ pub const MAX_STREAMS: usize = 256;
 /// Streams the server may open for public traffic per session. The remainder stays free for
 /// the agent's RPCs and pings, so public clients can slow a tunnel but never cut its session.
 pub const MAX_DATA_STREAMS: usize = 224;
-/// Data streams one client may hold per session, so one client cannot take all of them.
+/// Data streams one client may hold per session, or requests it may have in flight on shared
+/// streams, so one client cannot take all of them.
 pub const MAX_DATA_STREAMS_PER_CLIENT: usize = 64;
 /// Inbound streams buffered before new ones are refused.
 const INBOUND_QUEUE: usize = 64;
@@ -73,39 +75,55 @@ pub struct MuxHandle {
     data: Arc<DataBudget>,
 }
 
-/// Open data streams: in total and per client.
+/// Open data streams in total, and uses per client (a stream of its own, or a request on a
+/// shared stream).
 #[derive(Debug, Default)]
 struct DataBudget(Mutex<(usize, HashMap<IpAddr, usize>)>);
 
-/// One data stream's place in the budget; released on drop.
-struct DataSlot(Arc<DataBudget>, IpAddr);
+/// A place in the budget: a stream, a client's use, or both; released on drop.
+struct DataSlot {
+    budget: Arc<DataBudget>,
+    stream: bool,
+    client: Option<IpAddr>,
+}
+
+/// One client's use of a shared data stream, for as long as it is held ([`MuxHandle::client_use`]).
+pub struct ClientUse(#[allow(dead_code)] DataSlot);
 
 impl DataBudget {
-    fn acquire(self: &Arc<Self>, client: IpAddr) -> Option<DataSlot> {
+    fn acquire(self: &Arc<Self>, stream: bool, client: Option<IpAddr>) -> Option<DataSlot> {
         let mut guard = self.0.lock().unwrap();
         let (total, per_client) = &mut *guard;
-        let n = per_client.entry(client).or_insert(0);
-        if *total >= MAX_DATA_STREAMS || *n >= MAX_DATA_STREAMS_PER_CLIENT {
-            if *n == 0 {
-                per_client.remove(&client);
-            }
+        if stream && *total >= MAX_DATA_STREAMS {
             return None;
         }
-        *n += 1;
-        *total += 1;
-        Some(DataSlot(self.clone(), client))
+        if let Some(c) = client {
+            let n = per_client.entry(c).or_insert(0);
+            if *n >= MAX_DATA_STREAMS_PER_CLIENT {
+                return None;
+            }
+            *n += 1;
+        }
+        if stream {
+            *total += 1;
+        }
+        Some(DataSlot { budget: self.clone(), stream, client })
     }
 }
 
 impl Drop for DataSlot {
     fn drop(&mut self) {
-        let mut guard = self.0.0.lock().unwrap();
+        let mut guard = self.budget.0.lock().unwrap();
         let (total, per_client) = &mut *guard;
-        *total -= 1;
-        if let Some(n) = per_client.get_mut(&self.1) {
+        if self.stream {
+            *total -= 1;
+        }
+        if let Some(c) = self.client
+            && let Some(n) = per_client.get_mut(&c)
+        {
             *n -= 1;
             if *n == 0 {
-                per_client.remove(&self.1);
+                per_client.remove(&c);
             }
         }
     }
@@ -116,10 +134,31 @@ impl MuxHandle {
     /// /64, before passing them), within the session's data budget. Fails at once with
     /// `WouldBlock` when the budget is used up.
     pub async fn open_data(&self, timeout: Duration, client: IpAddr) -> io::Result<MuxStream> {
-        let slot = self.data.acquire(client).ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "agent stream budget used up"))?;
+        let slot = self.data.acquire(true, Some(client)).ok_or_else(busy)?;
         let mut stream = self.open(timeout).await?;
         stream._slot = Some(slot);
         Ok(stream)
+    }
+
+    /// Opens a stream for public traffic that several clients use in turn (a pooled HTTP
+    /// connection), within the session's total data budget; each use takes a [`Self::client_use`].
+    /// Fails at once with `WouldBlock` when the budget is used up.
+    pub async fn open_shared(&self, timeout: Duration) -> io::Result<MuxStream> {
+        let slot = self.data.acquire(true, None).ok_or_else(busy)?;
+        let mut stream = self.open(timeout).await?;
+        stream._slot = Some(slot);
+        Ok(stream)
+    }
+
+    /// A place for one request from `client` on a shared stream; `None` when the client already
+    /// has [`MAX_DATA_STREAMS_PER_CLIENT`] in flight on this session.
+    pub fn client_use(&self, client: IpAddr) -> Option<ClientUse> {
+        self.data.acquire(false, Some(client)).map(ClientUse)
+    }
+
+    /// Whether both handles belong to the same session.
+    pub fn same_session(&self, other: &MuxHandle) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
     }
 
     /// Opens a new outbound stream, failing after `timeout`.
@@ -147,6 +186,10 @@ impl MuxHandle {
     pub fn close(&self) {
         self.closed.cancel()
     }
+}
+
+fn busy() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "agent stream budget used up")
 }
 
 fn closed() -> io::Error {
@@ -252,18 +295,23 @@ mod tests {
     fn data_budget_limits_clients_and_total() {
         let budget = Arc::new(DataBudget::default());
         let a: IpAddr = "203.0.113.1".parse().unwrap();
-        let mut held: Vec<DataSlot> = (0..MAX_DATA_STREAMS_PER_CLIENT).map(|_| budget.acquire(a).unwrap()).collect();
-        assert!(budget.acquire(a).is_none(), "per-client limit");
+        let mut held: Vec<DataSlot> = (0..MAX_DATA_STREAMS_PER_CLIENT).map(|_| budget.acquire(true, Some(a)).unwrap()).collect();
+        assert!(budget.acquire(true, Some(a)).is_none(), "per-client limit");
+        assert!(budget.acquire(false, Some(a)).is_none(), "uses of shared streams count too");
         held.pop();
-        assert!(budget.acquire(a).is_some(), "released on drop");
+        assert!(budget.acquire(true, Some(a)).is_some(), "released on drop");
         let mut i = 0u32;
-        while let Some(slot) = budget.acquire(IpAddr::from((i + 1).to_be_bytes())) {
+        while let Some(slot) = budget.acquire(true, Some(IpAddr::from((i + 1).to_be_bytes()))) {
             held.push(slot);
             i += 1;
         }
         assert_eq!(budget.0.lock().unwrap().0, MAX_DATA_STREAMS);
+        assert!(budget.acquire(true, None).is_none(), "shared streams count toward the total");
+        let b: IpAddr = "203.0.113.2".parse().unwrap();
+        let used = budget.acquire(false, Some(b)).expect("a use takes no stream");
         drop(held);
         assert_eq!(budget.0.lock().unwrap().0, 0);
+        drop(used);
         assert!(budget.0.lock().unwrap().1.is_empty());
     }
 }

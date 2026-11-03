@@ -42,9 +42,39 @@ at the time of evaluation: two critical request-smuggling issues in March 2026, 
 issues in Oct 2026 fixed in 0.8.1.
 
 With hyper, the upstream is simply `hyper::client::conn::http1::handshake(stream)` over the
-yamux stream. That runs a fresh, correct HTTP/1.1 client per request, and `hyper::upgrade` on
-both sides handles WebSockets. Header parsing, chunked coding and upgrades stay in hyper; the
+yamux stream: a correct HTTP/1.1 client connection, which later requests reuse (see "Upstream
+connection reuse"), and `hyper::upgrade` on both sides handles WebSockets. Header parsing, chunked coding and upgrades stay in hyper; the
 proxy logic (≈300 lines) only routes and rewrites hop-by-hop and forwarding headers.
+
+## Upstream connection reuse
+
+An HTTP request goes over an HTTP/1.1 connection to the agent, which the agent connects to the
+application. Opening one per request cost a stream round trip, a TCP connect and, under load,
+the agent's local ports: every closed connection to the application holds its port for about a
+minute, which capped one tunnel at roughly 470 new connections a second (the 2026-11-03
+benchmark against kiku also showed half of Caddy's throughput). So `data/pool.rs` keeps idle
+connections:
+
+* A connection returns to the pool once its response has been read to the end; a response cut
+  short, an error or a timeout closes it instead. hyper decides whether the connection can carry
+  another request (`SendRequest::ready`), so `Connection: close` from the application is honored.
+* A pooled connection is reused only for the same tunnel, on the same agent session and route
+  table generation, so a reconnected agent, a re-registered target or any publish starts over.
+  Local settings the server never sees (a static site's `--no-list`) end the agent's HTTP and
+  static-file streams for that tunnel (`Entry::ended`), so the server's next request opens a
+  fresh one rather than reaching the old settings.
+* If the application closed an idle connection just as it was taken, hyper hands the request
+  back unsent (`try_send_request`) and it goes over a new connection; a request is never sent
+  twice.
+* Upgrades (WebSockets) and the agent's readiness probe get a connection of their own, as before:
+  an upgrade keeps its stream, and the probe checks that the agent opened a stream for it.
+* Requests from different visitors take turns on a connection, as behind any reverse proxy, so
+  applications must not tie authentication to the TCP connection (NTLM-style).
+* Bounds: at most 32 idle connections per tunnel and 4096 in total, each idle for at most 4 s
+  (shorter than most applications' keep-alive), swept every 2 s. Idle connections count toward
+  the session's 224 data streams but not toward any client's 64; a request holds its client's
+  place until its response body is done. When a session's streams are used up, idle connections
+  on it are closed to make room.
 
 ## Data plane vs control plane
 
@@ -344,7 +374,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * Bounded resources: connection semaphores per listener and per client address, header read
   and TLS handshake timeouts, a 15 s deadline and 64 KiB body limit for management requests,
   64 KiB control frames and IPC lines (5 s to send one), ≤256 concurrent streams per agent
-  session of which public traffic may use 224 (64 per client), so pings and RPCs always get
+  session of which public traffic may use 224 (64 streams or in-flight requests per client;
+  idle pooled HTTP connections count toward the 224, see "Upstream connection reuse"), so pings and RPCs always get
   through; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
   concurrent ACME orders, per-hostname failure backoff (renewals included); at most 8 archive
   downloads at once per agent, each dropped after 30 s without reading or, after its first 30 s,
