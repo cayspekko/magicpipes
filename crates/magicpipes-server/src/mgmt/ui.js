@@ -45,7 +45,7 @@
   });
 })();
 
-// The access tag picker: one dialog that lists every tag as a pill, with a filter box and a tray
+// The tag picker: one dialog that lists every tag as a pill, with a filter box and a tray
 // of the changes picked so far, applied only on save. It enhances two kinds of markup:
 // * `a[data-tag-edit]` next to a row's tags. Without the script the link opens a page of
 //   checkboxes; with it, saving posts `base` (the tags shown) and `tags` (the tags wanted) to the
@@ -196,8 +196,8 @@
     if (!shown && !fresh) {
       const empty = make('p', 'note tp-empty');
       if (q) empty.append(`No tag matches “${q}”. `);
-      else empty.append(cur.opts.creatable ? 'There are no access tags yet. Type a name to create one.' : 'There are no access tags yet. ');
-      if (!cur.opts.addable) empty.append('An administrator gives out access tags.');
+      else empty.append(cur.opts.creatable ? 'There are no tags yet. Type a name to create one.' : 'There are no tags yet. ');
+      if (!cur.opts.addable) empty.append('An administrator gives out tags.');
       ui.list.querySelector('.tp-empty')?.remove();
       ui.list.append(empty);
     } else {
@@ -295,7 +295,7 @@
       const held = new Set(words(a.dataset.held));
       const reach = new Map(words(a.dataset.reach).map((kv) => { const i = kv.lastIndexOf('='); return [kv.slice(0, i), Number(kv.slice(i + 1)) || 0]; }));
       const addable = a.dataset.addable === '1';
-      open({ title: a.dataset.title || 'Edit access tags', subject: a.dataset.subject, tags: addable ? registry : [], held, addable,
+      open({ title: a.dataset.title || 'Edit tags', subject: a.dataset.subject, tags: addable ? registry : [], held, addable,
         creatable: addable && admin, reach, reachKind: a.dataset.reachKind, heldWord: 'held', saveWord: 'Save', lockedNote: true,
         onSave: (want, created) => post(a.href, { csrf: a.dataset.csrf, base: [...held].join(' '), tags: [...want].join(' '), create: created.join(' ') }) });
     });
@@ -322,7 +322,7 @@
       }
       const btn = make('button', 'btn small', 'Choose tags');
       btn.type = 'button';
-      btn.addEventListener('click', () => open({ title: fs.dataset.title || 'Access tags', subject: fs.dataset.subject, tags, held, want, addable: true,
+      btn.addEventListener('click', () => open({ title: fs.dataset.title || 'Tags', subject: fs.dataset.subject, tags, held, want, addable: true,
         inForm: true, creatable: admin, created: boxes.filter((b) => b.dataset.created).map((b) => b.value), heldWord: 'selected', saveWord: 'Done', lockedNote: false,
         onSave: (w, created) => {
           // A new tag becomes a checkbox like the others, plus a `create` field for the server.

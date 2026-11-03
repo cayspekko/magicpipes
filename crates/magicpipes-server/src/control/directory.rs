@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::ControlPlane;
-use crate::store::{AgentRow, Store, UserRow};
+use crate::store::{AgentRow, Store, TagRow, UserRow};
 
 #[derive(Default)]
 pub(super) struct Directory {
@@ -14,6 +14,7 @@ pub(super) struct Directory {
     agent_tags: HashMap<String, Vec<String>>,
     user_tags: HashMap<String, Vec<String>>,
     users: HashMap<String, UserRow>,
+    tags: HashMap<String, TagRow>,
 }
 
 impl Directory {
@@ -23,10 +24,34 @@ impl Directory {
             agent_tags: store.agent_tags()?,
             user_tags: store.user_tags()?,
             users: store.users()?.into_iter().map(|u| (u.id.clone(), u)).collect(),
+            tags: store.tags()?.into_iter().map(|t| (t.name.clone(), t)).collect(),
         })
     }
 
-    /// A user's access tags (sorted).
+    /// Does the tag grant access? False for a tag that isn't known (fail closed).
+    pub(super) fn grants_access(&self, tag: &str) -> bool {
+        self.tags.get(tag).is_some_and(|t| t.access)
+    }
+
+    /// The personal tag of a user.
+    pub(super) fn personal_tag(&self, user_id: &str) -> Option<&str> {
+        self.tags.values().find(|t| t.user_id.as_deref() == Some(user_id)).map(|t| t.name.as_str())
+    }
+
+    /// Every personal tag with the email of its user.
+    pub(super) fn personal_tags(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tags.values().filter_map(|t| {
+            let user = t.user_id.as_deref()?;
+            Some((t.name.as_str(), self.email(user)?))
+        })
+    }
+
+    /// Is it someone's personal tag?
+    pub(super) fn is_personal(&self, tag: &str) -> bool {
+        self.tags.get(tag).is_some_and(|t| t.user_id.is_some())
+    }
+
+    /// A user's tags (sorted), their personal tag included.
     pub(super) fn user_tags(&self, user_id: &str) -> Vec<String> {
         self.user_tags.get(user_id).cloned().unwrap_or_default()
     }
@@ -53,22 +78,14 @@ impl Directory {
         self.users.values().filter(|u| !u.disabled)
     }
 
-    /// The tags assigned to an agent, before limiting them to its owner's.
-    pub(super) fn assigned_agent_tags(&self, agent_id: &str) -> Vec<String> {
-        self.agent_tags.get(agent_id).cloned().unwrap_or_default()
-    }
-
-    /// An agent's access tags (sorted): its assigned tags, limited to its owner's current tags
-    /// for a personal agent, so it never has more access than its owner.
+    /// The tags an agent publishes with (sorted): its owner's for a personal agent, its own for
+    /// a service agent. Its tunnels may carry only these.
     pub(super) fn agent_tags(&self, agent_id: &str) -> Vec<String> {
-        let assigned = self.assigned_agent_tags(agent_id);
-        match self.owner(agent_id) {
-            Some(owner) => {
-                let held = self.user_tags.get(owner);
-                assigned.into_iter().filter(|t| held.is_some_and(|h| h.contains(t))).collect()
-            }
-            None => assigned,
-        }
+        let list = match self.owner(agent_id) {
+            Some(owner) => self.user_tags.get(owner),
+            None => self.agent_tags.get(agent_id),
+        };
+        list.cloned().unwrap_or_default()
     }
 
     /// False for an agent whose owner is disabled or gone: it may not connect, and its tunnels

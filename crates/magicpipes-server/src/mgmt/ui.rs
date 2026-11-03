@@ -1,6 +1,8 @@
 //! Minimal server-rendered management UI. Uses the same control-plane methods as the API.
 //! Tunnels, agents and the login screen live here; accounts and users in `accounts`.
 
+use std::collections::HashMap;
+
 use axum::Form;
 use axum::extract::{FromRequestParts, Path, RawForm, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -241,6 +243,7 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     let agents = app.control.agents(&user.who);
     let agent_name = |id: &str| agents.iter().find(|a| a.id == id).map(|a| a.name.clone()).unwrap_or_else(|| id.to_string());
     let tunnels = app.control.tunnels(&user.who);
+    let people = app.control.people(&user.who);
     let mut rows = String::new();
     for t in &tunnels {
         rows.push_str(&format!(
@@ -249,7 +252,7 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
             name = esc(&t.name),
             address = public_address(t, "sub"),
             target = esc(&t.target),
-            access = access_cell(t),
+            access = access_cell(t, &people),
             agent = esc(&agent_name(&t.agent_id)),
             status = badge(t.status),
             tls = if t.kind.is_http() { badge(t.tls) } else { r#"<span class="sub">—</span>"#.into() },
@@ -272,16 +275,27 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
             holder: Holder::Agent,
             reach: reach.by_agent.get(&a.id),
         };
+        // A personal machine publishes with its owner's tags; only service agents have their own,
+        // which administrators edit.
+        let editable = admin && a.owner_user_id.is_none();
+        let tags = if a.owner_user_id.is_some() {
+            r#"<span class="sub">its owner's</span>"#.to_string()
+        } else if editable {
+            edit.cell(&user)
+        } else {
+            chips(&a.tags)
+        };
+        let mut items = Vec::new();
+        if editable {
+            items.push(edit.link(&user, "menu-item", "Edit tags", &format!("Edit tags of {}", a.name)));
+            items.push("<hr>".into());
+        }
+        items.push(menu_post(&format!("/agents/{}/revoke", a.id), &user.csrf, &[], "Revoke", true,
+            Some(&format!("Revoke {}? Its tunnels are deleted, and it can't connect again until it is enrolled again.", a.name))));
         agent_rows.push_str(&format!(
             r#"<tr><td><span class="name">{name}</span><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num">{menu}</td></tr>"#,
             name = esc(&a.name),
-            tags = edit.cell(&user),
-            menu = row_menu(&a.name, &[
-                edit.link(&user, "menu-item", "Edit tags", &format!("Edit tags of {}", a.name)),
-                "<hr>".into(),
-                menu_post(&format!("/agents/{}/revoke", a.id), &user.csrf, &[], "Revoke", true,
-                    Some(&format!("Revoke {}? Its tunnels are deleted, and it can't connect again until it is enrolled again.", a.name))),
-            ]),
+            menu = row_menu(&a.name, &items),
             status = badge(if a.connected { "connected" } else { "disconnected" }),
             tunnels = a.tunnels,
             id = esc(&a.id),
@@ -296,7 +310,7 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     let errors: u64 = tunnels.iter().map(|t| t.upstream_errors).sum();
     let body = format!(
         r#"<div class="head"><div><div class="eyebrow">Control plane · {domain}</div><h1>Tunnels</h1>
-<p class="lede">Public tunnels are reachable by anyone who knows the address. Private ones ask people to sign in, and let in their owner and anyone who shares one of their access tags.</p></div>
+<p class="lede">Public tunnels are reachable by anyone who knows the address. Private ones ask people to sign in, and let in whoever shares a tag with them that grants access: their owner through the owner's personal tag, and others through tags like <code>dev</code>.</p></div>
 <a class="btn" href="/">Refresh</a></div>
 <div class="stats">
 <div class="stat"><div class="k">Tunnels</div><div class="v">{n}</div></div>
@@ -308,7 +322,7 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
 <div class="card scroll"><table><thead><tr><th>Tunnel</th><th>Target</th><th>Who can open it</th><th>Agent</th><th>Status</th><th>TLS</th><th class="num">Requests</th></tr></thead><tbody>{rows}</tbody></table></div>
 {shared}
 <div class="section"><h2>Agents<span class="count">{agents_total}</span></h2></div>
-<div class="card scroll"><table><thead><tr><th>Agent</th><th>Owner</th><th>Access tags</th><th>Status</th><th class="num">Tunnels</th><th>Last seen</th><th></th></tr></thead><tbody>{agent_rows}</tbody></table></div>
+<div class="card scroll"><table><thead><tr><th>Agent</th><th>Owner</th><th>Tags</th><th>Status</th><th class="num">Tunnels</th><th>Last seen</th><th></th></tr></thead><tbody>{agent_rows}</tbody></table></div>
 {enroll}{registry}"#,
         registry = picker::registry(&app, &user),
         domain = esc(&domain),
@@ -326,15 +340,16 @@ pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): 
         return (StatusCode::NOT_FOUND, page("Not found", Some(&user), body)).into_response();
     };
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf))
+    let people = app.control.people(&user.who);
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf, &people))
 }
 
-fn detail_body(t: &TunnelView, agent: &str, csrf: &str) -> String {
+fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>) -> String {
     let field = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", esc(k), v);
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
     dl.push_str(&field("Agent", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
-    dl.push_str(&field("Who can open it", &access_cell(t)));
+    dl.push_str(&field("Who can open it", &access_cell(t, people)));
     if t.kind.is_http() {
         dl.push_str(&field("TLS certificate", &badge(t.tls)));
     } else {
@@ -400,22 +415,23 @@ pub async fn agent_tags_page(user: UiUser, State(app): State<AppState>, Path(id)
         let body = r#"<a class="crumb" href="/">← Tunnels</a><h1>Not found</h1><p class="lede">There is no agent with that id.</p>"#;
         return (StatusCode::NOT_FOUND, page("Not found", Some(&user), body)).into_response();
     };
-    // Members see only the machine's tags, which they may remove.
-    let all: Vec<(String, String)> = if user.who.is_admin() {
-        app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect()
-    } else {
-        agent.tags.iter().map(|t| (t.clone(), String::new())).collect()
-    };
-    let note = if user.who.is_admin() { "" } else { r#"<p class="note">You can remove this machine's tags. Adding one takes an administrator.</p>"# };
+    if agent.owner_user_id.is_some() || !user.who.is_admin() {
+        let body = format!(
+            r#"<a class="crumb" href="/">← Tunnels</a><h1>Tags of <em>{}</em></h1><p class="lede">A personal machine publishes with its owner's tags. Only service agents have tags of their own, which administrators set.</p>"#,
+            esc(&agent.name)
+        );
+        return page("Agent tags", Some(&user), &body);
+    }
+    let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
     let body = format!(
-        r#"<a class="crumb" href="/">← Tunnels</a><div class="head"><div><div class="eyebrow">Agent</div><h1>Access tags of <em>{name}</em></h1></div></div>
+        r#"<a class="crumb" href="/">← Tunnels</a><div class="head"><div><div class="eyebrow">Service agent</div><h1>Tags of <em>{name}</em></h1></div></div>
 <div class="card form"><form method="post" action="/agents/{id}/tags"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="base" value="{base}">
-{boxes}{note}<button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
+{boxes}<p class="note">Its tunnels can carry only these tags.</p><button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
         name = esc(&agent.name),
         id = esc(&agent.id),
         csrf = esc(&user.csrf),
         base = esc(&agent.tags.join(" ")),
-        boxes = picker::fieldset("Access tags", &all, &agent.tags, None),
+        boxes = picker::fieldset("Tags", &all, &agent.tags, None),
     );
     page("Agent tags", Some(&user), &body)
 }
@@ -437,7 +453,7 @@ pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Pat
     }
     let result = match form.change() {
         Some((add, remove)) => app.control.change_agent_tags(&user.who, &id, &add, &remove).map(drop),
-        None => app.control.update_agent(&user.who, &id, Some(&form.want)),
+        None => app.control.set_agent_tags(&user.who, &id, &form.want).map(drop),
     };
     match result {
         Ok(()) => Redirect::to("/").into_response(),
@@ -453,12 +469,23 @@ pub async fn revoke_agent(user: UiUser, State(app): State<AppState>, Path(id): P
     Redirect::to("/").into_response()
 }
 
-/// Who can open a tunnel: anyone, or the owner plus these tags.
-fn access_cell(t: &TunnelView) -> String {
+/// Who can open a tunnel: anyone, or people with one of these tags; a personal tag shows as its
+/// person where `people` knows them.
+fn access_cell(t: &TunnelView, people: &HashMap<String, String>) -> String {
     match t.visibility {
         Visibility::Public => r#"<span class="status warn">anyone</span>"#.into(),
-        Visibility::Private if t.access.is_empty() => r#"<span class="status ok">private</span> <span class="sub">owner only</span>"#.into(),
-        Visibility::Private => format!(r#"<span class="status ok">private</span> {}"#, chips(&t.access)),
+        Visibility::Private if t.access.is_empty() => r#"<span class="status ok">private</span> <span class="sub">nobody: it has no tag that grants access</span>"#.into(),
+        Visibility::Private => {
+            let tags: Vec<String> = t
+                .access
+                .iter()
+                .map(|tag| match people.get(tag) {
+                    Some(person) => format!(r#"<code title="{}">{}</code>"#, esc(tag), esc(person)),
+                    None => format!("<code>{}</code>", esc(tag)),
+                })
+                .collect();
+            format!(r#"<span class="status ok">private</span> {}"#, tags.join(" "))
+        }
     }
 }
 
@@ -498,7 +525,7 @@ fn enroll_panel(app: &AppState, user: &UiUser) -> String {
         .collect();
     let private = if users.is_empty() { "" } else { " checked" };
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
-    let tags = picker::fieldset("Access tags", &all, &[], Some("For the new machine"));
+    let tags = picker::fieldset("Tags for a service agent", &all, &[], Some("For the new machine"));
     format!(
         r#"<div class="section"><h2>Enroll a machine</h2></div>
 <div class="card form"><p class="note" style="margin-top:0">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>

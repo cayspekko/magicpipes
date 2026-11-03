@@ -135,9 +135,9 @@ impl ControlPlane {
         })
     }
 
-    /// Approves (with `Some(tags)`) or denies a waiting request. Approving creates an
-    /// enrollment token for `who`'s own machine with those tags.
-    pub fn answer_device_login(&self, who: &Principal, user_code: &str, approve: Option<Vec<String>>) -> Result<(), ErrorBody> {
+    /// Approves or denies a waiting request. Approving creates an enrollment token for `who`'s
+    /// own machine, which publishes with their tags.
+    pub fn answer_device_login(&self, who: &Principal, user_code: &str, approve: bool) -> Result<(), ErrorBody> {
         let Principal::User { id, .. } = who else {
             return Err(err(ErrorCode::Forbidden, "sign in with your user account to enroll your own machine"));
         };
@@ -148,12 +148,11 @@ impl ControlPlane {
             let pending = map.values().find(|p| p.user_code == code && matches!(p.state, State::Waiting));
             pending.map(|p| p.agent_name.clone()).ok_or_else(|| err(ErrorCode::NotFound, "this login code is unknown or has expired"))?
         };
-        let state = match approve {
-            Some(tags) => {
-                let opts = EnrollmentOptions { owner_user_id: Some(id.clone()), tags, ..Default::default() };
-                State::Approved(self.create_enrollment(who, opts)?)
-            }
-            None => State::Denied,
+        let state = if approve {
+            let opts = EnrollmentOptions { owner_user_id: Some(id.clone()), ..Default::default() };
+            State::Approved(self.create_enrollment(who, opts)?)
+        } else {
+            State::Denied
         };
         let approved = matches!(state, State::Approved(_));
         let mut map = self.devices.map.lock().unwrap();

@@ -1,8 +1,10 @@
-//! The tag registry, tag assignments to users and agents, and enrollment tokens.
+//! The tag registry, tag assignments to users and service agents, and enrollment tokens.
 //!
-//! Only administrators create tags and assign them to users. Agents get tags only through their
-//! enrollment token: administrators may give any registered tags; members only tags they hold,
-//! and only to their own machines. Afterwards an agent's owner may remove tags but never add one.
+//! Only administrators create tags, decide whether a tag grants access, and assign tags to
+//! users and service agents. Every user also holds a personal tag, made with the account, which
+//! no other user or agent can hold, whose access can't be turned off, and which goes only with
+//! the account; a tunnel may carry it, to share the tunnel with that one person. A personal agent
+//! has no tags of its own: it publishes with its owner's.
 
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::ErrorBody;
@@ -17,6 +19,8 @@ use crate::store::{EnrollmentSpec, MAX_TAGS};
 pub struct TagView {
     pub name: String,
     pub description: String,
+    /// Users and private tunnels sharing it may connect.
+    pub access: bool,
     pub created_at: String,
 }
 
@@ -26,6 +30,7 @@ pub struct EnrollmentOptions {
     /// The user the agent will belong to; `None` for a service agent (administrators only).
     /// Members always enroll their own machines.
     pub owner_user_id: Option<String>,
+    /// Service agents only: a personal agent publishes with its owner's tags.
     pub tags: Vec<String>,
     /// Default: allowed (members: `[users] members_can_publish`).
     pub allow_public: Option<bool>,
@@ -59,38 +64,74 @@ fn changed(current: Vec<String>, add: &[String], remove: &[String]) -> Result<Ve
 }
 
 impl ControlPlane {
-    /// Normalized, registered tags; `tag_unknown` names the first unregistered one.
+    /// Normalized, registered tags that can be assigned to a user or agent (not personal);
+    /// `tag_unknown` names the first unregistered one.
     pub(super) fn registered(&self, list: &[String]) -> Result<Vec<String>, ErrorBody> {
+        self.known_tags(list, false)
+    }
+
+    /// Like [`Self::registered`], and with `personal`, someone's personal tag is fine too (a
+    /// tunnel shared with one person).
+    pub(super) fn known_tags(&self, list: &[String], personal: bool) -> Result<Vec<String>, ErrorBody> {
         let list = tags::normalize_list(list).map_err(invalid)?;
         if list.len() > MAX_TAGS {
             return Err(invalid(format!("at most {MAX_TAGS} tags")));
         }
-        if let Some(t) = self.store.unknown_tags(&list).map_err(internal)?.first() {
-            return Err(err(ErrorCode::TagUnknown, format!("'{t}' is not an access tag; an administrator must create it first")));
+        let known = self.store.tags().map_err(internal)?;
+        for t in &list {
+            match known.iter().find(|k| k.name == *t) {
+                None => return Err(err(ErrorCode::TagUnknown, format!("'{t}' is not a tag; an administrator must create it first"))),
+                Some(k) if k.user_id.is_some() && !personal => {
+                    return Err(err(ErrorCode::Forbidden, format!("'{t}' is a personal tag; only its user holds it")));
+                }
+                Some(_) => {}
+            }
         }
         Ok(list)
     }
 
+    /// The tag registry, without personal tags.
     pub fn tags(&self, who: &Principal) -> Vec<TagView> {
         if !authz::authorize(who, Action::Discover, Resource::Org) {
             return Vec::new();
         }
         let rows = self.store.tags().unwrap_or_default();
-        rows.into_iter().map(|t| TagView { name: t.name, description: t.description, created_at: rfc3339(t.created_at) }).collect()
+        rows.into_iter()
+            .filter(|t| t.user_id.is_none())
+            .map(|t| TagView { name: t.name, description: t.description, access: t.access, created_at: rfc3339(t.created_at) })
+            .collect()
     }
 
-    pub fn create_tag(&self, who: &Principal, name: &str, description: &str) -> Result<TagView, ErrorBody> {
+    pub fn create_tag(&self, who: &Principal, name: &str, description: &str, access: bool) -> Result<TagView, ErrorBody> {
         if !authz::authorize(who, Action::Manage, Resource::Org) {
             return Err(err(ErrorCode::Forbidden, "only administrators create tags"));
         }
         let name = tags::normalize(name).map_err(invalid)?;
+        if name == "user" || name.starts_with("user:") {
+            return Err(invalid("'user:' tags are personal tags, made with each account".into()));
+        }
         let description: String = description.chars().filter(|c| !c.is_control()).take(200).collect();
         let created_by = matches!(who, Principal::User { .. }).then(|| who.actor());
-        if !self.store.create_tag(&name, description.trim(), created_by).map_err(internal)? {
+        if !self.store.create_tag(&name, description.trim(), access, created_by).map_err(internal)? {
             return Err(err(ErrorCode::InvalidRequest, format!("'{name}' exists already, or there are {MAX_TAGS} tags")));
         }
-        self.audit(who, "tag.create", &name, "");
-        Ok(TagView { name, description: description.trim().to_string(), created_at: rfc3339(magicpipes_core::unix_now()) })
+        self.audit(who, "tag.create", &name, if access { "access" } else { "" });
+        self.refresh();
+        Ok(TagView { name, description: description.trim().to_string(), access, created_at: rfc3339(magicpipes_core::unix_now()) })
+    }
+
+    /// Turns a tag's access on or off; everyone it let in loses that at once.
+    pub fn set_tag_access(&self, who: &Principal, name: &str, access: bool) -> Result<bool, ErrorBody> {
+        if !authz::authorize(who, Action::Manage, Resource::Org) {
+            return Err(err(ErrorCode::Forbidden, "only administrators change tags"));
+        }
+        let name = name.trim().to_ascii_lowercase();
+        let changed = self.store.set_tag_access(&name, access).map_err(internal)?;
+        if changed {
+            self.audit(who, "tag.access", &name, if access { "on" } else { "off" });
+            self.refresh();
+        }
+        Ok(changed)
     }
 
     /// Deletes a tag and every assignment of it; access that depended on it ends at once.
@@ -101,10 +142,10 @@ impl ControlPlane {
         let name = name.trim().to_ascii_lowercase();
         let deleted = self.store.delete_tag(&name).map_err(internal)?;
         if deleted {
-            // The store cascaded it out of tunnel_access; do the same in memory, so a new tag of
+            // The store cascaded it out of tunnel_tags; do the same in memory, so a new tag of
             // the same name doesn't bring the old grant back.
             for t in self.state.lock().unwrap().tunnels.values_mut() {
-                t.row.access.retain(|a| *a != name);
+                t.row.tags.retain(|a| *a != name);
             }
             self.audit(who, "tag.delete", &name, "");
             self.refresh();
@@ -112,7 +153,7 @@ impl ControlPlane {
         Ok(deleted)
     }
 
-    /// Replaces a user's tags (administrators only).
+    /// Replaces a user's assigned tags (administrators only); the personal tag stays.
     pub fn set_user_tags(&self, who: &Principal, user_id: &str, list: &[String]) -> Result<Vec<String>, ErrorBody> {
         self.edit_user_tags(who, user_id, |_| self.registered(list))
     }
@@ -124,8 +165,8 @@ impl ControlPlane {
         self.edit_user_tags(who, user_id, |current| changed(current, &add, &remove))
     }
 
-    /// Reads the user's tags, computes the new list and writes it under the state lock, so
-    /// concurrent edits apply one after the other.
+    /// Reads the user's assigned tags, computes the new list and writes it under the state lock,
+    /// so concurrent edits apply one after the other.
     fn edit_user_tags(
         &self,
         who: &Principal,
@@ -139,9 +180,9 @@ impl ControlPlane {
             return Err(err(ErrorCode::NotFound, "no such user"));
         }
         let list = {
-            let _st = self.state.lock().unwrap();
+            let st = self.state.lock().unwrap();
             let current = self.store.user_tags().map_err(internal)?.remove(user_id).unwrap_or_default();
-            let list = edit(current)?;
+            let list = edit(current.into_iter().filter(|t| !st.dir.is_personal(t)).collect())?;
             let by = matches!(who, Principal::User { .. }).then(|| who.actor());
             self.store.set_user_tags(user_id, &list, by).map_err(internal)?;
             list
@@ -151,20 +192,36 @@ impl ControlPlane {
         Ok(list)
     }
 
-    /// Adds and removes some of an agent's tags, keeping the others. Administrators add any
-    /// registered tag; an agent's owner may only remove tags.
+    /// Adds and removes some of a service agent's tags (administrators only), keeping the others.
     pub fn change_agent_tags(&self, who: &Principal, agent_id: &str, add: &[String], remove: &[String]) -> Result<Vec<String>, ErrorBody> {
         let (add, remove) = (self.registered(add)?, removable(remove)?);
+        self.edit_agent_tags(who, agent_id, |current| changed(current, &add, &remove))
+    }
+
+    /// Replaces a service agent's tags (administrators only).
+    pub fn set_agent_tags(&self, who: &Principal, agent_id: &str, list: &[String]) -> Result<Vec<String>, ErrorBody> {
+        self.edit_agent_tags(who, agent_id, |_| self.registered(list))
+    }
+
+    fn edit_agent_tags(
+        &self,
+        who: &Principal,
+        agent_id: &str,
+        edit: impl FnOnce(Vec<String>) -> Result<Vec<String>, ErrorBody>,
+    ) -> Result<Vec<String>, ErrorBody> {
         let list = {
             let st = self.state.lock().unwrap();
             if st.dir.agent(agent_id).is_none() || !authz::authorize(who, Action::Manage, st.agent_resource(agent_id)) {
                 return Err(err(ErrorCode::NotFound, "no such agent"));
             }
-            let assigned = self.store.agent_tags().map_err(internal)?.remove(agent_id).unwrap_or_default();
-            if !who.is_admin() && add.iter().any(|t| !assigned.contains(t)) {
-                return Err(err(ErrorCode::Forbidden, "you can remove an agent's tags; adding one takes an administrator"));
+            if !who.is_admin() {
+                return Err(err(ErrorCode::Forbidden, "only administrators assign tags"));
             }
-            let list = changed(assigned, &add, &remove)?;
+            if st.dir.owner(agent_id).is_some() {
+                return Err(err(ErrorCode::InvalidRequest, "a personal machine uses its owner's tags; change the owner's tags instead"));
+            }
+            let current = self.store.agent_tags().map_err(internal)?.remove(agent_id).unwrap_or_default();
+            let list = edit(current)?;
             self.store.set_agent_tags(agent_id, &list).map_err(internal)?;
             list
         };
@@ -173,43 +230,19 @@ impl ControlPlane {
         Ok(list)
     }
 
-    /// Changes an agent's tags. Administrators set any registered tags; an agent's owner may
-    /// only remove tags.
-    pub fn update_agent(&self, who: &Principal, agent_id: &str, tag_list: Option<&[String]>) -> Result<(), ErrorBody> {
-        let list = tag_list.map(|l| self.registered(l)).transpose()?;
-        {
-            // Held from the check to the write, with the assignment read from the store, so an
-            // administrator's removal that commits meanwhile can't be undone by a member's save.
-            let st = self.state.lock().unwrap();
-            if st.dir.agent(agent_id).is_none() || !authz::authorize(who, Action::Manage, st.agent_resource(agent_id)) {
-                return Err(err(ErrorCode::NotFound, "no such agent"));
-            }
-            if let Some(list) = &list {
-                let assigned = self.store.agent_tags().map_err(internal)?.remove(agent_id).unwrap_or_default();
-                if !who.is_admin() && list.iter().any(|t| !assigned.contains(t)) {
-                    return Err(err(ErrorCode::Forbidden, "you can remove an agent's tags; adding one takes an administrator"));
-                }
-                self.store.set_agent_tags(agent_id, list).map_err(internal)?;
-            }
-        }
-        if let Some(list) = &list {
-            self.audit(who, "agent.tags", agent_id, &list.join(" "));
-        }
-        self.refresh();
-        Ok(())
-    }
-
-    /// Creates a single-use enrollment token. Administrators may enroll service agents and
-    /// anyone's machines with any registered tags; members only their own machines, with tags
-    /// they hold.
+    /// Creates a single-use enrollment token. Administrators may enroll service agents (with any
+    /// tags) and anyone's machines; members only their own machines.
     pub fn create_enrollment(&self, who: &Principal, opts: EnrollmentOptions) -> Result<String, ErrorBody> {
         let tag_list = self.registered(&opts.tags)?;
         let spec = match who {
             _ if who.is_admin() => {
-                if let Some(owner) = &opts.owner_user_id
-                    && self.store.user(owner).map_err(internal)?.is_none()
-                {
-                    return Err(err(ErrorCode::NotFound, "no such user"));
+                if let Some(owner) = &opts.owner_user_id {
+                    if self.store.user(owner).map_err(internal)?.is_none() {
+                        return Err(err(ErrorCode::NotFound, "no such user"));
+                    }
+                    if !tag_list.is_empty() {
+                        return Err(invalid("a personal machine uses its owner's tags; tags are for service agents".into()));
+                    }
                 }
                 let has_users = self.store.has_users().map_err(internal)?;
                 EnrollmentSpec {
@@ -220,17 +253,17 @@ impl ControlPlane {
                     default_private: opts.default_private.unwrap_or(has_users),
                 }
             }
-            Principal::User { id, tags: held, .. } => {
+            Principal::User { id, .. } => {
                 if opts.owner_user_id.as_deref().is_some_and(|o| o != id) {
                     return Err(err(ErrorCode::Forbidden, "members enroll only their own machines"));
                 }
-                if let Some(t) = tag_list.iter().find(|t| !held.contains(t)) {
-                    return Err(err(ErrorCode::Forbidden, format!("you don't hold '{t}', so your machine can't have it")));
+                if !tag_list.is_empty() {
+                    return Err(invalid("your machine uses your tags; tags are for service agents".into()));
                 }
                 EnrollmentSpec {
                     created_by: Some(id.clone()),
                     owner_user_id: Some(id.clone()),
-                    tags: tag_list,
+                    tags: Vec::new(),
                     allow_public: self.cfg.users.members_can_publish && opts.allow_public.unwrap_or(true),
                     default_private: opts.default_private.unwrap_or(true),
                 }

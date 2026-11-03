@@ -189,7 +189,7 @@ Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgrad
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
   `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 3: 2 added the handshake and
-  answers to unknown messages, 3 visibility and access tags). A peer without the header is
+  answers to unknown messages, 3 visibility and tags). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,
@@ -267,7 +267,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   Agents reconnect with exponential backoff (0.5 s → 30 s, ±20% jitter).
 * **Tag edits in the UI** send the tags the page showed (`base`) and the tags wanted; the
   control plane applies only the difference to what is stored now (`change_user_tags`,
-  `change_agent_tags`), reading and writing under the state lock. Two administrators changing
+  `change_agent_tags`, service agents only), reading and writing under the state lock. Personal
+  tags never appear in the picker and survive every edit. Two administrators changing
   different tags of the same user at once both keep their change. The API's `PATCH … {tags}`
   still replaces the whole list. Tags an administrator makes up in the picker travel as
   `create` fields and are registered just before the change (`Submitted::create_missing`). The picker dialog (`mgmt/ui.js`) is an enhancement over a page
@@ -320,13 +321,18 @@ a connection to the public port that must arrive back at the agent (a warning, n
   The server can name a tunnel, never an address.
 * Hostname ownership: names are unique, tied to one agent, validated (DNS label rules, reserved
   names, management hostname). Another agent cannot register or query them.
-* Private HTTP tunnels admit their owner and users sharing one of their access tags (exact
-  match), after signing in; administrators manage them but don't get in through their role.
-  A tunnel's effective access is its requested tags limited to its agent's tags, and a personal
-  agent's tags are limited to its owner's, so nobody can widen access by tagging their own
-  machine. Visibility and access stored in a form that can't be read keep the tunnel private.
-  Members enroll only their own machines, with tags they hold; an owner may remove tags from
-  their machine but not add any.
+* Private HTTP tunnels admit users who share a tag with them that grants access (exact match),
+  after signing in, and nobody else: owners get in through their personal tag (`user:…`), which
+  the server puts on every tunnel of their machines; administrators manage tunnels but don't
+  get in through their role. Only administrators assign tags to people and service agents, and
+  a tunnel can carry only ordinary tags its publisher holds (its owner's, or a service agent's
+  own), checked on every registration that names tags, so nobody can widen access by tagging
+  their own tunnel, and turning a tag's access on opens nothing to a group the owner isn't in.
+  Anyone's personal tag may go on a tunnel, to share it with that person. Personal tags are
+  random (`user:k8p4x2m9qa`), held only by their user, always grant access, and go only with the
+  account. A tunnel's tags are its own: removing a tag from its owner doesn't unshare it. A tag the directory doesn't know grants nothing; a visibility stored in a form
+  that can't be read keeps the tunnel private. Members enroll only their own machines, which
+  have no tags of their own.
 * Port tunnels are open to anyone unless `--allow-cidr` is given (the CLI says so). The server
   enforces allow-lists on every connection, and an allow-list it cannot read keeps the tunnel
   unpublished (fail closed); behind a TCP proxy, only `proxy_protocol` with `trusted_proxies`

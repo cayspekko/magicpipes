@@ -167,10 +167,19 @@ administrator when they first sign in.
 * **Roles**: *administrators* manage tunnels, agents, users, tags, enrollment tokens and the
   audit log; *members* manage their own account (password, API tokens, sessions) and their own
   machines and tunnels. Design: [docs/USERS.md](docs/USERS.md).
-* **Access tags** (Tags page, e.g. `team:dev`): administrators create them and assign them to
-  users. Someone reaches a private tunnel when they share one of its access tags, or own it.
+* **Tags** (Tags page, e.g. `dev`): labels on people, service machines and tunnels.
+  Administrators create them, assign them to people, and decide per tag whether it **grants
+  access**. Someone can open a private tunnel when they and the tunnel share a tag that grants
+  access; that is the only rule. Every account also gets a **personal tag** (`user:k8p4x2m9qa`,
+  random; the UI shows the person), made with it and put on every tunnel of that person's
+  machines, which is how owners get into their own tunnels. No one else can hold it and its
+  access can't be turned off, but it can go on any tunnel to share that tunnel with one person
+  (`--tag user:k8p4x2m9qa`). Other tags on a tunnel must be ones its owner holds
+  (`magicpipes add 3000 --tag dev`), checked each time. A tunnel's tags are its own: taking `dev`
+  away from someone doesn't unshare the tunnels they already shared with `dev`. A tag that
+  doesn't grant access is just a label.
   Matching is exact; nobody can give themselves a tag. Deleting a tag takes it away from
-  everyone and everything at once. In the UI, **Edit** next to a user's or a machine's tags opens a
+  everyone and everything at once. In the UI, **Edit** next to a user's or a service agent's tags opens a
   picker: every tag as a pill grouped by key, a filter box (Enter picks the first match) and a
   tray of what will be added (green, `+`) or removed (red, `−`), with a warning when a removal
   closes private tunnels. Administrators can also type a tag that doesn't exist yet and create
@@ -251,14 +260,14 @@ magicpipes login --server https://example.com:8443
 ```
 
 The CLI prints a link and a code, and opens the server's page where you sign in, check that the
-code matches, and pick which of your access tags the machine gets. The machine then belongs to
-you: you manage it and its tunnels, and it never has more access tags than you hold. Without a
-terminal, add `--browser` to wait for the approval anyway.
+code matches. The machine then belongs to you: you manage it and its tunnels, and it publishes
+with your tags (it has none of its own). Without a terminal, add `--browser` to wait for the
+approval anyway.
 
 **With an enrollment token**: create a single-use token (valid 1 hour by default) on the server,
 or in the UI ("Enroll a machine"), or via `POST /api/v1/enrollments`. Administrators choose who
-the machine belongs to (nobody, for a *service agent*), its access tags, and whether
-its tunnels may be public:
+the machine belongs to (nobody, for a *service agent*, which then gets tags of its own), and
+whether its tunnels may be public:
 
 ```bash
 magicpipesd --config /etc/magicpipes/magicpipesd.toml enroll
@@ -295,15 +304,20 @@ is closed and its tunnels are deleted. Enroll it again with a new token to bring
 ### Public and private
 
 A **public** tunnel is reachable by anyone who has its address. A **private** one asks people to
-sign in to the management UI first, then lets in its owner and anyone who shares one of its
-access tags. Machines enrolled before the server had user accounts make public tunnels, as
-before; machines enrolled since make private ones unless asked otherwise.
+sign in to the management UI first, then lets in anyone who shares a tag with it that grants
+access: its owner through their personal tag, and others through the tags it was given.
+Machines enrolled before the server had user accounts make public tunnels; machines enrolled
+since make private ones unless asked otherwise.
 
 ```bash
-magicpipes add 3000 --private                 # the owner, plus everyone who shares the machine's tags
-magicpipes add 3000 --access team:dev         # narrower: only team:dev (the machine must have it)
+magicpipes add 3000 --private                 # only you (your personal tag)
+magicpipes add 3000 --tag dev                 # you, and everyone with dev (you must hold it)
+magicpipes add 3000 --tag user:k8p4x2m9qa     # you, and that one person (their personal tag)
 magicpipes add 3000 --public                  # anyone; refused if the enrollment doesn't allow it
 ```
+
+A private tunnel of a service agent carries only the tags given with `--tag` (from the agent's
+own): without one, nobody can open it.
 
 * Opening a private tunnel in a browser without being signed in shows the sign-in page, then
   comes back to the same address. Signed in without a shared tag: an "access denied" page. API
@@ -562,13 +576,14 @@ administrators answer `403 forbidden` to members.
 | DELETE | `/api/v1/tunnels/{id or name}` | 204; the owning agent is notified and stops serving it; 404 if absent |
 | GET | `/api/v1/agents` | Enrolled agents and connection state |
 | DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
-| POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "allow_public"?, "default_private"?}`. Members may enroll only their own machines, with tags they hold |
+| POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "allow_public"?, "default_private"?}`; `tags` only for a service agent (no owner). Members may enroll only their own machines |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
 | GET | `/api/v1/me` | `{"kind": "admin_token"}` or `{"kind": "user", "user": {...}}` |
 | GET | `/api/v1/shared` | Tunnels you can reach but don't manage (`name`, `public_url`, `kind`, `visibility`, `owner_email`) |
-| PATCH | `/api/v1/agents/{id}` | `{"tags"?}`; owners may only remove tags |
-| GET | `/api/v1/tags` | `{"tags": [{"name", "description", "created_at"}]}` (administrators) |
-| POST | `/api/v1/tags` | 201; body `{"name", "description"?}` |
+| PATCH | `/api/v1/agents/{id}` | `{"tags"?}`; a service agent's tags (administrators) |
+| GET | `/api/v1/tags` | `{"tags": [{"name", "description", "access", "created_at"}]}` (administrators; personal tags not listed) |
+| POST | `/api/v1/tags` | 201; body `{"name", "description"?, "access"?}` (`access` defaults to true; `user:` names are reserved) |
+| PATCH | `/api/v1/tags/{name}` | `{"access": bool}`: whether it grants access |
 | DELETE | `/api/v1/tags/{name}` | 204; removes it from every user, agent and tunnel |
 | POST | `/api/v1/device` | Starts a browser-approved `magicpipes login` (used by the CLI) |
 | POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`), `denied` or `expired` |
@@ -583,15 +598,15 @@ administrators answer `403 forbidden` to members.
 | GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 
-User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`, `tags`,
-`created_at`, `last_login_at`.
+User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`, `tags`
+(assigned), `personal_tag`, `created_at`, `last_login_at`.
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
-agent's protocol version), `owner_user_id`, `owner_email`, `tags` (in effect),
+agent's protocol version), `owner_user_id`, `owner_email`, `tags` (what it publishes with: its owner's, or a service agent's own),
 `allow_public`, `default_private`, `last_seen_at`, `tunnels`, `created_at`.
 
 Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `visibility`,
-`access` (private: the tags in effect), `status`
+`tags` (the owner's personal tag included), `access` (private: the tags that let people in), `status`
 (`connected` / `disconnected` / `error` = local app unreachable on the last request), `tls`
 (`ready` / `pending` / `failed`), `tls_error`, `created_at`, `requests`, `upstream_errors`,
 `last_request_at`. Errors: `{"error": {"code", "message"}}`.

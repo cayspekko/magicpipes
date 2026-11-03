@@ -76,12 +76,9 @@ struct TunnelRecord {
 }
 
 impl State {
-    /// The tunnel's effective access: its requested tags (all of the agent's when none were
-    /// asked for), limited to the tags the agent holds now. Requested tags that were deleted
-    /// since leave it narrower (owner-only when none are left), never wider.
+    /// What `authorize` needs about a tunnel: its tags that grant access, and its owner.
     fn tunnel_authz(&self, t: &TunnelRecord) -> TunnelAuthz {
-        let held = self.dir.agent_tags(&t.row.agent_id);
-        let access = if t.row.access_restricted { t.row.access.iter().filter(|a| held.contains(a)).cloned().collect() } else { held };
+        let access = t.row.tags.iter().filter(|tag| self.dir.grants_access(tag)).cloned().collect();
         TunnelAuthz {
             agent_id: t.row.agent_id.clone(),
             owner_user_id: self.dir.owner(&t.row.agent_id).map(str::to_string),

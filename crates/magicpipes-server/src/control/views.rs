@@ -26,7 +26,9 @@ pub struct TunnelView {
     pub target: String,
     pub agent_id: String,
     pub visibility: Visibility,
-    /// Private tunnels: the access tags in effect (limited to the agent's); empty = owner only.
+    /// Its tags, the owner's personal tag included.
+    pub tags: Vec<String>,
+    /// Private tunnels: the tags that let people in (those that grant access); empty = nobody.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
     /// `connected`, `disconnected` (agent offline) or `error` (local application unreachable,
@@ -63,7 +65,7 @@ pub struct AgentView {
     pub owner_user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    /// Access tags in effect (a personal agent's are limited to its owner's).
+    /// The tags it publishes with: its owner's for a personal agent, its own for a service agent.
     pub tags: Vec<String>,
     /// May its tunnels be public?
     pub allow_public: bool,
@@ -126,6 +128,7 @@ impl ControlPlane {
             target: t.row.target.clone(),
             agent_id: t.row.agent_id.clone(),
             visibility: t.row.visibility,
+            tags: t.row.tags.clone(),
             access: if t.row.visibility == Visibility::Private { st.tunnel_authz(t).access } else { Vec::new() },
             status,
             port_error,
@@ -205,8 +208,8 @@ impl ControlPlane {
             .collect()
     }
 
-    /// How many private tunnels `who` manages admit people through each access tag, over all
-    /// of them and per agent: what removing a tag would close.
+    /// How many private tunnels `who` manages admit people through each tag, over all of them
+    /// and per agent: what removing a tag would close.
     pub fn private_reach(&self, who: &Principal) -> PrivateReach {
         let st = self.state.lock().unwrap();
         let mut reach = PrivateReach::default();
@@ -217,6 +220,22 @@ impl ControlPlane {
             }
         }
         reach
+    }
+
+    /// Whose each personal tag is, for display: `you` for `who`'s own, and for administrators
+    /// everyone's email. Other personal tags are shown as they are.
+    pub fn people(&self, who: &Principal) -> HashMap<String, String> {
+        let st = self.state.lock().unwrap();
+        let mut map: HashMap<String, String> = HashMap::new();
+        if who.is_admin() {
+            map.extend(st.dir.personal_tags().map(|(tag, email)| (tag.to_string(), email.to_string())));
+        }
+        if let Principal::User { id, .. } = who
+            && let Some(tag) = st.dir.personal_tag(id)
+        {
+            map.insert(tag.to_string(), "you".into());
+        }
+        map
     }
 
     pub fn agent_name(&self, who: &Principal, agent_id: &str) -> Option<String> {

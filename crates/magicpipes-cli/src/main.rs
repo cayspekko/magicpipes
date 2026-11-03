@@ -98,17 +98,17 @@ enum Command {
         /// With --shell: the program (and its arguments) to run instead of your login shell.
         #[arg(last = true, value_name = "PROGRAM")]
         command: Vec<String>,
-        /// Only you and people who share one of its access tags can open it, after signing in.
-        /// Default for machines enrolled once the server has user accounts.
+        /// Only you, and people sharing a --tag with it, can open it, after signing in. Default
+        /// for machines enrolled once the server has user accounts.
         #[arg(long, conflicts_with_all = ["public", "tcp", "udp"])]
         private: bool,
         /// Anyone with the address can open it (if this machine's enrollment allows it).
-        #[arg(long, conflicts_with = "access")]
+        #[arg(long, conflicts_with = "tags")]
         public: bool,
-        /// With --private (implied): only these access tags may open it (repeatable or
-        /// comma-separated; default: all of this machine's tags).
-        #[arg(long, value_name = "TAG", value_parser = parse_tag, conflicts_with_all = ["tcp", "udp"])]
-        access: Vec<String>,
+        /// With --private (implied): share it with people holding this tag (repeatable or
+        /// comma-separated; only tags you hold).
+        #[arg(long = "tag", value_name = "TAG", value_parser = parse_tag, conflicts_with_all = ["tcp", "udp"])]
+        tags: Vec<String>,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
         name: Option<String>,
@@ -270,14 +270,14 @@ async fn dispatch(cmd: Command) -> ExitCode {
             command,
             private,
             public,
-            access,
+            tags,
             name,
             host,
             probe_path,
             timeout,
             out,
         } => {
-            let visibility = match (private || !access.is_empty(), public) {
+            let visibility = match (private || !tags.is_empty(), public) {
                 (true, _) => Some(Visibility::Private),
                 (_, true) => Some(Visibility::Public),
                 _ => None,
@@ -303,7 +303,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 probe_path,
                 timeout_secs: timeout,
                 visibility,
-                access,
+                tags,
             };
             (out, add(req, out).await)
         }
@@ -571,10 +571,24 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         let private = data["visibility"] == "private";
         match &shell {
             _ if private => {
-                let who = match data["access"].as_array().filter(|a| !a.is_empty()) {
-                    Some(tags) => format!("you and people with {}", tags.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join(" or ")),
-                    None => "you and people who share this machine's access tags".to_string(),
-                };
+                // `access`: the tags that let people in. `owner_tag` is the owner's personal tag;
+                // other `user:` tags share it with one person each.
+                let owner = data["owner_tag"].as_str();
+                let tags: Vec<&str> = data["access"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).collect();
+                let mut who: Vec<String> = Vec::new();
+                if owner.is_some_and(|o| tags.contains(&o)) {
+                    who.push("you".into());
+                }
+                match tags.iter().filter(|t| t.starts_with("user:") && Some(**t) != owner).count() {
+                    0 => {}
+                    1 => who.push("1 other person".into()),
+                    n => who.push(format!("{n} other people")),
+                }
+                let groups: Vec<&str> = tags.iter().copied().filter(|t| !t.starts_with("user:")).collect();
+                if !groups.is_empty() {
+                    who.push(format!("people with {}", groups.join(" or ")));
+                }
+                let who = if who.is_empty() { "nobody (give it a --tag)".to_string() } else { who.join(", ") };
                 println!("Tunnel active in background. Private: only {who} can open it, after signing in.");
             }
             Some((_, true, _)) => println!("Tunnel active in background. Anyone with this link can type into the terminal."),
@@ -634,7 +648,7 @@ async fn list(out: Output) -> Result<(), ErrorInfo> {
                     json!({ "id": t.id, "name": t.name, "kind": t.kind, "public_url": t.public_url, "target": t.describe(),
                             "share_url": t.share_url(), "status": "stopped", "error": null,
                             "created_at": magicpipes_core::rfc3339(t.created_at),
-                            "visibility": t.visibility, "access": t.access })
+                            "visibility": t.visibility, "tags": t.tags })
                 })
                 .collect();
             json!({ "agent_running": false, "connection": "stopped", "tunnels": tunnels })

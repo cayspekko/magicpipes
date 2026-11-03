@@ -84,7 +84,7 @@ fn http(name: &str) -> RegisterTunnel {
         remote_port: None,
         allow: vec![],
         visibility: None,
-        access: vec![],
+        tags: vec![],
     }
 }
 
@@ -164,59 +164,117 @@ async fn per_agent_tunnel_quota() {
 }
 
 #[tokio::test]
-async fn tags_limit_enrollments_and_personal_agents() {
-    use crate::authz::Role;
+async fn personal_tags_and_access() {
+    use magicpipes_core::proto::Visibility;
+
+    use crate::authz::{self, Action, Resource, Role};
     use crate::control::EnrollmentOptions;
     let f = fixture();
     let admin = Principal::AdminToken;
-    for t in ["team:dev", "team:ops"] {
-        f.cp.create_tag(&admin, t, "").unwrap();
-    }
-    assert!(f.cp.create_tag(&admin, "Not Valid!", "").unwrap_err().is(ErrorCode::InvalidRequest));
-    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
-    assert!(f.cp.set_user_tags(&admin, &ann.id, &["team:qa".into()]).unwrap_err().is(ErrorCode::TagUnknown));
-    f.cp.set_user_tags(&admin, &ann.id, &["team:dev".into()]).unwrap();
-    let who = Principal::User { id: ann.id.clone(), role: Role::Member, tags: vec!["team:dev".into()] };
-    assert!(f.cp.set_user_tags(&who, &ann.id, &["team:ops".into()]).unwrap_err().is(ErrorCode::Forbidden), "no self-assignment");
+    let s = |l: &[&str]| l.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    f.cp.create_tag(&admin, "dev", "", true).unwrap();
+    f.cp.create_tag(&admin, "prod", "", false).unwrap();
+    assert!(f.cp.create_tag(&admin, "Not Valid!", "", true).unwrap_err().is(ErrorCode::InvalidRequest));
+    assert!(f.cp.create_tag(&admin, "user:mallory", "", true).unwrap_err().is(ErrorCode::InvalidRequest), "user: is for personal tags");
 
-    // Members enroll only their own machines, and only with tags they hold.
-    let opts = |tags: &[&str]| EnrollmentOptions { tags: tags.iter().map(|s| s.to_string()).collect(), ..Default::default() };
-    assert!(f.cp.create_enrollment(&who, opts(&["team:ops"])).unwrap_err().is(ErrorCode::Forbidden));
-    let other = EnrollmentOptions { owner_user_id: Some("us_someone".into()), ..Default::default() };
-    assert!(f.cp.create_enrollment(&who, other).unwrap_err().is(ErrorCode::Forbidden));
-    let token = f.cp.create_enrollment(&who, opts(&["team:dev"])).unwrap();
+    // Every account gets a personal tag that nobody else can hold, and that can't be turned off
+    // or deleted. Its name says nothing about the person; the UI shows them instead.
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let (bob, _) = f.cp.create_user(&admin, "bob@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let (pa, pb) = (ann.personal_tag.clone().unwrap(), bob.personal_tag.clone().unwrap());
+    assert!(pa.starts_with("user:") && !pa.contains("ann") && ann.tags.is_empty(), "{pa}");
+    assert!(f.cp.tags(&admin).iter().all(|t| !t.name.starts_with("user:")), "the registry lists only ordinary tags");
+    assert!(f.cp.set_user_tags(&admin, &ann.id, &s(&["team:qa"])).unwrap_err().is(ErrorCode::TagUnknown));
+    assert!(f.cp.set_user_tags(&admin, &ann.id, std::slice::from_ref(&pb)).unwrap_err().is(ErrorCode::Forbidden));
+    assert!(!f.cp.delete_tag(&admin, &pa).unwrap() && !f.cp.set_tag_access(&admin, &pa, false).unwrap());
+    f.cp.set_user_tags(&admin, &ann.id, &s(&["dev", "prod"])).unwrap();
+    let ann_now = f.cp.user(&admin, &ann.id).unwrap();
+    assert_eq!((ann_now.tags, ann_now.personal_tag), (s(&["dev", "prod"]), Some(pa.clone())));
+    assert_eq!(f.cp.people(&admin)[&pa], "ann@example.com");
+    let ann_sees = f.cp.people(&Principal::User { id: ann.id.clone(), role: Role::Member, tags: vec![] });
+    assert_eq!((ann_sees.get(&pa).map(String::as_str), ann_sees.get(&pb)), (Some("you"), None), "members don't learn others' emails");
+    let who = |id: &str| Principal::User { id: id.into(), role: Role::Member, tags: f.cp.users(&admin).into_iter().find(|u| u.id == id).map(|u| {
+        let mut t = u.tags;
+        t.extend(u.personal_tag);
+        t.sort();
+        t
+    }).unwrap() };
+    assert!(f.cp.set_user_tags(&who(&ann.id), &ann.id, &s(&["dev"])).unwrap_err().is(ErrorCode::Forbidden), "no self-assignment");
+
+    // Members enroll only their own machines, which publish with their tags.
+    let tagged = EnrollmentOptions { tags: s(&["dev"]), ..Default::default() };
+    assert!(f.cp.create_enrollment(&who(&ann.id), tagged.clone()).unwrap_err().is(ErrorCode::InvalidRequest));
+    let other = EnrollmentOptions { owner_user_id: Some(bob.id.clone()), ..Default::default() };
+    assert!(f.cp.create_enrollment(&who(&ann.id), other).unwrap_err().is(ErrorCode::Forbidden));
+    let for_ann = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), tags: s(&["dev"]), ..Default::default() };
+    assert!(f.cp.create_enrollment(&admin, for_ann).unwrap_err().is(ErrorCode::InvalidRequest), "personal machines have no tags of their own");
+    let token = f.cp.create_enrollment(&who(&ann.id), Default::default()).unwrap();
     let laptop = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "laptop".into() }).unwrap().agent_id;
     let view = |id: &str| f.cp.agents(&admin).into_iter().find(|a| a.id == id).unwrap();
     let v = view(&laptop);
-    assert_eq!((v.owner_user_id.as_deref(), v.tags.clone(), v.default_private), (Some(ann.id.as_str()), vec!["team:dev".to_string()], true));
-    assert_eq!(f.cp.agents(&who).len(), 1, "owners see their own machines");
+    assert_eq!((v.owner_user_id.as_deref(), v.tags.clone(), v.default_private), (Some(ann.id.as_str()), s(&["dev", "prod", &pa]), true));
+    assert!(f.cp.set_agent_tags(&admin, &laptop, &s(&["dev"])).unwrap_err().is(ErrorCode::InvalidRequest));
 
-    // A personal agent never has more than its owner: removing the owner's tag removes it.
-    f.cp.set_user_tags(&admin, &ann.id, &[]).unwrap();
-    assert!(view(&laptop).tags.is_empty());
-    f.cp.set_user_tags(&admin, &ann.id, &["team:dev".into()]).unwrap();
-    assert_eq!(view(&laptop).tags, ["team:dev"]);
+    // A tunnel carries its owner's personal tag plus the tags asked for, from the owner's own.
+    let private = |name: &str, tags: &[&str]| RegisterTunnel { visibility: Some(Visibility::Private), tags: s(tags), ..http(name) };
+    let app = f.cp.register(&laptop, &private("app", &["dev"])).unwrap();
+    assert_eq!((app.tags.clone(), app.owner_tag.clone()), (s(&["dev", &pa]), Some(pa.clone())));
+    assert!(f.cp.register(&laptop, &private("x", &["ops"])).unwrap_err().is(ErrorCode::TagUnknown));
+    f.cp.create_tag(&admin, "ops", "", true).unwrap();
+    assert!(f.cp.register(&laptop, &private("x", &["ops"])).unwrap_err().is(ErrorCode::Forbidden), "ann doesn't hold ops");
+    let lbl = f.cp.register(&laptop, &private("lbl", &["prod"])).unwrap();
+    let access = |host: &str| f.data.lookup(host).unwrap().access.authz.access.clone();
+    assert_eq!(access(&lbl.hostname), std::slice::from_ref(&pa), "a tag that doesn't grant access is only a label");
+    assert_eq!(lbl.access, std::slice::from_ref(&pa));
+    let may = |id: &str, host: &str| authz::authorize(&who(id), Action::Connect, Resource::Tunnel(&f.data.lookup(host).unwrap().access.authz));
+    assert!(may(&ann.id, &app.hostname) && may(&ann.id, &lbl.hostname), "the owner gets in through the personal tag");
+    assert!(!may(&bob.id, &app.hostname));
+    f.cp.set_user_tags(&admin, &bob.id, &s(&["dev"])).unwrap();
+    assert!(may(&bob.id, &app.hostname) && !may(&bob.id, &lbl.hostname));
+    // Someone's personal tag on a tunnel shares it with that one person.
+    let mut shared = s(&["prod", &pa, &pb]);
+    shared.sort();
+    assert_eq!(f.cp.register(&laptop, &private("lbl", &["prod", &pb])).unwrap().tags, shared);
+    assert!(may(&bob.id, &lbl.hostname));
+    // Access is the tag's setting, applied at once.
+    f.cp.set_tag_access(&admin, "prod", true).unwrap();
+    assert_eq!(access(&lbl.hostname), shared);
+    f.cp.set_tag_access(&admin, "dev", false).unwrap();
+    assert_eq!(access(&app.hostname), std::slice::from_ref(&pa));
+    assert!(!may(&bob.id, &app.hostname));
+    // Re-registering without a visibility keeps the tags.
+    assert_eq!(f.cp.register(&laptop, &http("app")).unwrap().tags, s(&["dev", &pa]));
+    // Removing a tag from the owner doesn't unshare what she published (the tunnel keeps it),
+    // but every registration that names tags is checked against what she holds now.
+    f.cp.set_tag_access(&admin, "dev", true).unwrap();
+    f.cp.set_user_tags(&admin, &ann.id, &s(&["prod"])).unwrap();
+    assert_eq!(access(&app.hostname), s(&["dev", &pa]));
+    assert!(may(&bob.id, &app.hostname));
+    assert!(f.cp.register(&laptop, &private("app", &["dev"])).unwrap_err().is(ErrorCode::Forbidden), "no longer hers to give");
+    assert_eq!(f.cp.register(&laptop, &private("app", &[])).unwrap().tags, std::slice::from_ref(&pa), "naming tags replaces them");
+    f.cp.set_user_tags(&admin, &ann.id, &s(&["dev", "prod"])).unwrap();
 
-    // Owners may remove an agent's tags but not add them; administrators may.
-    assert!(f.cp.update_agent(&who, &laptop, Some(&["team:dev".into(), "team:ops".into()])).unwrap_err().is(ErrorCode::Forbidden));
-    f.cp.update_agent(&who, &laptop, Some(&[])).unwrap();
-    assert!(view(&laptop).tags.is_empty());
+    // A service agent has tags of its own, set by administrators; untagged, nobody gets in.
     let service = f.agent("ci");
-    f.cp.update_agent(&admin, &service, Some(&["team:ops".into()])).unwrap();
-    assert_eq!(view(&service).tags, ["team:ops"], "a service agent keeps what an administrator gave it");
-    assert!(f.cp.update_agent(&who, &service, Some(&[])).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
+    assert!(f.cp.set_agent_tags(&who(&ann.id), &service, &s(&["dev"])).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
+    assert!(f.cp.register(&service, &private("svc", &["dev"])).unwrap_err().is(ErrorCode::Forbidden));
+    f.cp.set_agent_tags(&admin, &service, &s(&["dev"])).unwrap();
+    let svc = f.cp.register(&service, &private("svc", &["dev"])).unwrap();
+    assert_eq!(svc.tags, s(&["dev"]));
+    let bare = f.cp.register(&service, &private("bare", &[])).unwrap();
+    assert!(access(&bare.hostname).is_empty(), "no tag, no access: not even for an administrator");
+
+    // Deleting a tag removes it everywhere.
+    f.cp.delete_tag(&admin, "dev").unwrap();
+    assert!(view(&service).tags.is_empty());
+    assert_eq!(f.cp.tunnel(&admin, "svc").unwrap().tags, Vec::<String>::new());
 
     // A disabled owner's agents can't connect and serve nothing.
-    f.cp.register(&laptop, &http("annsapp")).unwrap();
-    assert!(f.data.lookup("annsapp.t.example.test").is_some());
+    assert!(f.data.lookup(&app.hostname).is_some());
     f.cp.update_user(&admin, &ann.id, None, Some(true)).unwrap();
-    assert!(f.data.lookup("annsapp.t.example.test").is_none());
+    assert!(f.data.lookup(&app.hostname).is_none());
     let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
     assert!(f.cp.attach_session(&laptop, handle, "127.0.0.1:1".parse().unwrap(), 2).is_none());
-
-    // Deleting a tag revokes it everywhere.
-    f.cp.delete_tag(&admin, "team:ops").unwrap();
-    assert!(view(&service).tags.is_empty());
 }
 
 #[tokio::test]
@@ -227,7 +285,7 @@ async fn tag_changes_keep_other_edits() {
     let f = fixture();
     let admin = Principal::AdminToken;
     for t in ["team:dev", "team:ops", "env:prod"] {
-        f.cp.create_tag(&admin, t, "").unwrap();
+        f.cp.create_tag(&admin, t, "", true).unwrap();
     }
     let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
     let s = |l: &[&str]| l.iter().map(|t| t.to_string()).collect::<Vec<_>>();
@@ -237,14 +295,18 @@ async fn tag_changes_keep_other_edits() {
     f.cp.change_user_tags(&admin, &ann.id, &s(&["team:ops"]), &[]).unwrap();
     assert_eq!(f.cp.change_user_tags(&admin, &ann.id, &s(&["env:prod"]), &s(&["team:dev"])).unwrap(), s(&["env:prod", "team:ops"]));
     assert!(f.cp.change_user_tags(&admin, &ann.id, &s(&["team:qa"]), &[]).unwrap_err().is(ErrorCode::TagUnknown));
-    let who = Principal::User { id: ann.id.clone(), role: Role::Member, tags: s(&["team:ops"]) };
+    let pa = ann.personal_tag.clone().unwrap();
+    assert_eq!(f.cp.change_user_tags(&admin, &ann.id, &[], std::slice::from_ref(&pa)).unwrap(), s(&["env:prod", "team:ops"]));
+    assert_eq!(f.cp.user(&admin, &ann.id).unwrap().personal_tag, Some(pa.clone()), "removing the personal tag does nothing");
+    let who = Principal::User { id: ann.id.clone(), role: Role::Member, tags: s(&["team:ops", &pa]) };
     assert!(f.cp.change_user_tags(&who, &ann.id, &s(&["team:dev"]), &[]).unwrap_err().is(ErrorCode::Forbidden));
 
-    // Agents: administrators add and remove; an owner only removes.
+    // Service agents: administrators add and remove.
     let ci = f.agent("ci");
     f.cp.change_agent_tags(&admin, &ci, &s(&["team:dev", "team:ops"]), &[]).unwrap();
-    let t = f.cp.register(&ci, &RegisterTunnel { visibility: Some(Visibility::Private), access: s(&["team:dev"]), ..http("dev") }).unwrap();
-    f.cp.register(&ci, &RegisterTunnel { visibility: Some(Visibility::Private), ..http("both") }).unwrap();
+    let private = |name: &str, tags: &[&str]| RegisterTunnel { visibility: Some(Visibility::Private), tags: s(tags), ..http(name) };
+    let t = f.cp.register(&ci, &private("dev", &["team:dev"])).unwrap();
+    f.cp.register(&ci, &private("both", &["team:dev", "team:ops"])).unwrap();
     let web = f.agent("web");
     f.cp.change_agent_tags(&admin, &web, &s(&["team:ops"]), &[]).unwrap();
     f.cp.register(&web, &RegisterTunnel { visibility: Some(Visibility::Public), ..http("public") }).unwrap();
@@ -253,8 +315,10 @@ async fn tag_changes_keep_other_edits() {
     assert_eq!(reach.by_agent[&ci].get("team:dev"), Some(&2));
     assert!(f.cp.private_reach(&who).by_tag.is_empty(), "members count only their own tunnels");
 
+    // A tunnel's tags are what was stored: removing one from the agent changes what new
+    // tunnels may carry, not existing ones.
     f.cp.change_agent_tags(&admin, &ci, &[], &s(&["team:dev"])).unwrap();
-    assert!(f.data.lookup(&t.hostname).unwrap().access.authz.access.is_empty(), "the removal applies to the tunnel at once");
+    assert_eq!(f.data.lookup(&t.hostname).unwrap().access.authz.access, ["team:dev"]);
     assert!(f.cp.change_agent_tags(&who, &ci, &[], &s(&["team:ops"])).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
 }
 
@@ -268,34 +332,34 @@ async fn registration_respects_the_enrollment() {
     let admin = Principal::AdminToken;
     // Enrolled before the server had users: its tunnels stay public by default.
     let ci = f.agent("ci");
-    f.cp.create_tag(&admin, "team:dev", "").unwrap();
-    f.cp.create_tag(&admin, "team:ops", "").unwrap();
+    f.cp.create_tag(&admin, "team:dev", "", true).unwrap();
+    f.cp.create_tag(&admin, "team:ops", "", true).unwrap();
     let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
     f.cp.set_user_tags(&admin, &ann.id, &["team:dev".into()]).unwrap();
-    let opts = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), tags: vec!["team:dev".into()], allow_public: Some(false), ..Default::default() };
+    // An administrator enrolls ann's machine: ann owns it, so its tunnels carry her tag.
+    let opts = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), allow_public: Some(false), ..Default::default() };
     let token = f.cp.create_enrollment(&admin, opts).unwrap();
     let laptop = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "laptop".into() }).unwrap().agent_id;
-    let with = |name: &str, v: Option<Visibility>, access: &[&str]| RegisterTunnel {
-        visibility: v,
-        access: access.iter().map(|s| s.to_string()).collect(),
-        ..http(name)
-    };
+    let with = |name: &str, v: Option<Visibility>, tags: &[&str]| RegisterTunnel { visibility: v, tags: tags.iter().map(|s| s.to_string()).collect(), ..http(name) };
 
-    // An agent that sends no visibility (protocol 2) gets its enrollment's default: private.
+    // An agent that sends no visibility gets its enrollment's default: private, for its owner.
+    let pa = ann.personal_tag.clone().unwrap();
     let t = f.cp.register(&laptop, &http("old")).unwrap();
-    assert_eq!((t.visibility, t.access.len()), (Some(Visibility::Private), 0));
+    assert_eq!((t.visibility, t.tags.clone()), (Some(Visibility::Private), vec![pa.clone()]));
     let route = f.data.lookup(&t.hostname).unwrap();
     assert!(!route.access.authz.public);
-    assert_eq!(route.access.authz.access, ["team:dev"], "no tags asked for: all of the agent's");
+    assert_eq!(route.access.authz.access, std::slice::from_ref(&pa), "no tags asked for: the owner only, by their tag");
     // ...and re-registering without one keeps the tunnel as it is.
     f.cp.register(&laptop, &with("old", Some(Visibility::Private), &["team:dev"])).unwrap();
-    assert_eq!(f.cp.register(&laptop, &http("old")).unwrap().access, ["team:dev"]);
+    assert_eq!(f.cp.register(&laptop, &http("old")).unwrap().tags, ["team:dev".to_string(), pa.clone()]);
 
     assert!(f.cp.register(&laptop, &with("pub", Some(Visibility::Public), &[])).unwrap_err().is(ErrorCode::PublicNotAllowed));
     assert!(f.cp.register(&laptop, &with("ops", Some(Visibility::Private), &["team:ops"])).unwrap_err().is(ErrorCode::Forbidden));
     assert!(f.cp.register(&laptop, &with("qa", Some(Visibility::Private), &["team:qa"])).unwrap_err().is(ErrorCode::TagUnknown));
     let tcp = RegisterTunnel { kind: Kind::Tcp, ..with("db", Some(Visibility::Private), &[]) };
     assert!(f.cp.register(&laptop, &tcp).unwrap_err().is(ErrorCode::Unsupported) || f.cp.register(&laptop, &tcp).unwrap_err().is(ErrorCode::PortsDisabled));
+    let public = RegisterTunnel { visibility: Some(Visibility::Public), tags: vec!["team:dev".into()], ..http("site") };
+    assert!(f.cp.register(&ci, &public).unwrap_err().is(ErrorCode::InvalidRequest), "tags apply only to private tunnels");
 
     // The service agent from before users keeps making public tunnels; new ones default to private.
     let t = f.cp.register(&ci, &http("site")).unwrap();
@@ -313,26 +377,26 @@ async fn registration_respects_the_enrollment() {
 }
 
 #[tokio::test]
-async fn deleting_an_access_tag_narrows_tunnels() {
+async fn deleting_a_tag_closes_tunnels_shared_with_it() {
     use magicpipes_core::proto::Visibility;
 
     use crate::control::EnrollmentOptions;
     let f = fixture();
     let admin = Principal::AdminToken;
     for t in ["team:dev", "team:secret"] {
-        f.cp.create_tag(&admin, t, "").unwrap();
+        f.cp.create_tag(&admin, t, "", true).unwrap();
     }
     let opts = EnrollmentOptions { tags: vec!["team:dev".into(), "team:secret".into()], ..Default::default() };
     let token = f.cp.create_enrollment(&admin, opts).unwrap();
     let agent = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "box".into() }).unwrap().agent_id;
-    let req = RegisterTunnel { visibility: Some(Visibility::Private), access: vec!["team:secret".into()], ..http("db") };
+    let req = RegisterTunnel { visibility: Some(Visibility::Private), tags: vec!["team:secret".into()], ..http("db") };
     let t = f.cp.register(&agent, &req).unwrap();
     let access = || f.data.lookup(&t.hostname).unwrap().access.authz.access.clone();
     assert_eq!(access(), ["team:secret"]);
     assert!(f.cp.delete_tag(&admin, "team:secret").unwrap());
-    assert!(access().is_empty(), "owner-only, not all of the agent's tags");
-    // A new tag with the old name grants nothing until someone asks for it again.
-    f.cp.create_tag(&admin, "team:secret", "").unwrap();
+    assert!(access().is_empty(), "nobody, not every tag of the agent");
+    // A new tag with the old name grants nothing until someone puts it on the tunnel again.
+    f.cp.create_tag(&admin, "team:secret", "", true).unwrap();
     assert!(access().is_empty());
 }
 

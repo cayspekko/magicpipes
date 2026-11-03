@@ -112,8 +112,11 @@ pub struct UserView {
     pub role: Role,
     pub disabled: bool,
     pub must_change_password: bool,
-    /// Access tags assigned by administrators.
+    /// Tags assigned by administrators.
     pub tags: Vec<String>,
+    /// The tag the server made with the account and puts on the tunnels of their machines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personal_tag: Option<String>,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_login_at: Option<String>,
@@ -129,6 +132,7 @@ impl From<UserRow> for UserView {
             disabled: u.disabled,
             must_change_password: u.must_change_password,
             tags: Vec::new(),
+            personal_tag: None,
             created_at: rfc3339(u.created_at),
             last_login_at: u.last_login_at.map(rfc3339),
         }
@@ -284,8 +288,10 @@ impl ControlPlane {
     }
 
     fn user_view(&self, u: UserRow) -> UserView {
-        let tags = self.state.lock().unwrap().dir.user_tags(&u.id);
-        UserView { tags, ..u.into() }
+        let st = self.state.lock().unwrap();
+        let tags = st.dir.user_tags(&u.id).into_iter().filter(|t| !st.dir.is_personal(t)).collect();
+        let personal_tag = st.dir.personal_tag(&u.id).map(str::to_string);
+        UserView { tags, personal_tag, ..u.into() }
     }
 
     pub fn session(&self, cookie: &str) -> Option<UiSession> {

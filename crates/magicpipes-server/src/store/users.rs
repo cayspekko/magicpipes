@@ -80,6 +80,23 @@ pub struct AuditRow {
     pub detail: String,
 }
 
+/// A new personal tag name, `user:` and 10 random lowercase letters and digits. It says nothing
+/// about the person (the UI shows their email instead), so it never goes stale.
+fn personal_tag_name(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<String> {
+    loop {
+        let mut n = secret::random_u64();
+        let mut name = String::from("user:");
+        for _ in 0..10 {
+            name.push(char::from(b"0123456789abcdefghijklmnopqrstuvwxyz"[(n % 36) as usize]));
+            n /= 36;
+        }
+        let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE org_id = ?1 AND name = ?2)", params![DEFAULT_ORG, name], |r| r.get(0))?;
+        if !taken {
+            return Ok(name);
+        }
+    }
+}
+
 impl Store {
     // ---- users ----------------------------------------------------------------------------
 
@@ -105,6 +122,12 @@ impl Store {
             params![DEFAULT_ORG, id, role.as_str(), now],
         )?;
         tx.execute("INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, ?2, 1, ?3)", params![id, password_hash, now])?;
+        let tag = personal_tag_name(&tx)?;
+        tx.execute(
+            "INSERT INTO tags (org_id, name, access, user_id, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
+            params![DEFAULT_ORG, tag, id, now],
+        )?;
+        tx.execute("INSERT INTO user_tags (org_id, user_id, tag, created_at) VALUES (?1, ?2, ?3, ?4)", params![DEFAULT_ORG, id, tag, now])?;
         tx.commit()?;
         Ok(Some(id))
     }

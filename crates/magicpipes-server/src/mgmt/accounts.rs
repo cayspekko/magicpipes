@@ -221,9 +221,10 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
         let you = if me { r#"<span class="sub" style="display:inline;margin-right:8px">you</span>"# } else { "" };
         let actions = format!("{you}{}", row_menu(&u.email, &items));
         rows.push_str(&format!(
-            r#"<tr><td><span class="name">{name}</span><span class="sub">{email}</span></td><td>{role}</td><td>{tags}</td><td>{state}</td><td>{last}</td><td class="num">{actions}</td></tr>"#,
+            r#"<tr><td><span class="name">{name}</span><span class="sub">{email}{personal}</span></td><td>{role}</td><td>{tags}</td><td>{state}</td><td>{last}</td><td class="num">{actions}</td></tr>"#,
             name = esc(if u.display_name.is_empty() { &u.email } else { &u.display_name }),
             email = esc(&u.email),
+            personal = u.personal_tag.as_deref().map(|t| format!(" · <code>{}</code>", esc(t))).unwrap_or_default(),
             role = u.role.as_str(),
             last = u.last_login_at.as_deref().map(when).unwrap_or_else(|| "never".into()),
         ));
@@ -233,8 +234,8 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
     }
     let body = format!(
         r#"<div class="head"><div><div class="eyebrow">Administration</div><h1>Users</h1>
-<p class="lede">People sign in with their email and a password. A password you set here must be changed at first sign-in. Access tags decide which private tunnels they reach; create tags under <a href="/tags">Tags</a>.</p></div></div>
-{err}<div class="card scroll"><table><thead><tr><th>User</th><th>Role</th><th>Access tags</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+<p class="lede">People sign in with their email and a password. A password you set here must be changed at first sign-in. Their tags decide which private tunnels they reach, next to their own personal tag (<code>user:…</code>); create tags under <a href="/tags">Tags</a>.</p></div></div>
+{err}<div class="card scroll"><table><thead><tr><th>User</th><th>Role</th><th>Tags</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="section"><h2>Add a user</h2></div>
 <div class="card form"><form method="post" action="/users">{csrf}
 <label for="ue" style="margin-top:0">Email</label><input id="ue" type="email" name="email" required>
@@ -340,12 +341,12 @@ pub async fn user_tags_page(user: UiUser, State(app): State<AppState>, Path(id):
     };
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
     let boxes = if all.is_empty() {
-        r#"<p class="note">There are no access tags yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string()
+        r#"<p class="note">There are no tags yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string()
     } else {
-        picker::fieldset("Access tags", &all, &u.tags, None)
+        picker::fieldset("Tags", &all, &u.tags, None)
     };
     let body = format!(
-        r#"<a class="crumb" href="/users">← Users</a><div class="head"><div><div class="eyebrow">User</div><h1>Access tags of <em>{email}</em></h1></div></div>
+        r#"<a class="crumb" href="/users">← Users</a><div class="head"><div><div class="eyebrow">User</div><h1>Tags of <em>{email}</em></h1></div></div>
 <div class="card form"><form method="post" action="/users/{id}/tags">{csrf}<input type="hidden" name="base" value="{base}">
 {boxes}<button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
         email = esc(&u.email),
@@ -439,10 +440,10 @@ pub struct CodeQuery {
 
 /// The page `magicpipes login` opens: shows the waiting request and asks to approve it.
 pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Query(q): axum::extract::Query<CodeQuery>) -> Response {
-    let Some(me) = &user.user else {
+    if user.user.is_none() {
         let body = r#"<h1>Use your <em>account</em></h1><p class="lede">You are signed in with an admin token. Sign in with your user account to enroll your own machine, or create an enrollment token on the Tunnels page.</p>"#;
         return page("Approve a machine", Some(&user), body);
-    };
+    }
     let Some(req) = app.control.device_request(&q.code) else {
         let body = format!(
             r#"<h1>Code not found</h1><p class="lede">The login code <code>{}</code> is unknown, was already used, or has expired. Run <code>magicpipes login</code> again.</p>"#,
@@ -450,18 +451,12 @@ pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Qu
         );
         return (StatusCode::NOT_FOUND, page("Approve a machine", Some(&user), &body)).into_response();
     };
-    let held: Vec<(String, String)> = me.tags.iter().map(|t| (t.clone(), String::new())).collect();
-    let tags = if held.is_empty() {
-        r#"<p class="note">You hold no access tags, so this machine gets none: its private tunnels are for you alone.</p>"#.to_string()
-    } else {
-        picker::fieldset("Access tags for this machine", &held, &me.tags, Some(&req.agent_name))
-    };
     let body = format!(
         r#"<div class="auth"><div class="eyebrow">magicpipes login</div><h1>Approve <em>{name}</em>?</h1>
 <p class="lede">A machine asked to sign in as you {ago} seconds ago, from <code>{client}</code>. Compare the code with the one in its terminal.</p>
 <div class="card" style="margin-top:20px"><div class="stat"><div class="k">Code</div><div class="v sm"><code>{code}</code></div></div>
 <form method="post" action="/cli">{csrf}<input type="hidden" name="code" value="{code}">
-{tags}
+<p class="note">Its private tunnels are for you alone until it shares one with a tag you hold (<code>magicpipes add --tag</code>).</p>
 <div style="display:flex;gap:10px;margin-top:18px"><button class="btn primary" name="answer" value="approve">Approve</button><button class="btn danger" name="answer" value="deny">Deny</button></div></form></div>
 <p class="note">Only approve a request you just started yourself: an approved machine acts as you and can publish tunnels in your name.</p></div>"#,
         name = esc(&req.agent_name),
@@ -473,17 +468,21 @@ pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Qu
     page("Approve a machine", Some(&user), &body)
 }
 
-pub async fn answer_device(user: UiUser, State(app): State<AppState>, axum::extract::RawForm(raw): axum::extract::RawForm) -> Response {
-    // Repeated `tag` fields, so not a plain `Form` struct.
-    let fields: Vec<(String, String)> = form_urlencoded_pairs(&raw);
-    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str()).unwrap_or("");
-    if let Err(r) = user.check_csrf(get("csrf")) {
+#[derive(Deserialize)]
+pub struct DeviceAnswer {
+    csrf: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    answer: String,
+}
+
+pub async fn answer_device(user: UiUser, State(app): State<AppState>, Form(f): Form<DeviceAnswer>) -> Response {
+    if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    let code = get("code").to_string();
-    let approve = (get("answer") == "approve").then(|| fields.iter().filter(|(n, _)| n == "tag").map(|(_, v)| v.clone()).collect());
-    let approved = approve.is_some();
-    match app.control.answer_device_login(&user.who, &code, approve) {
+    let approved = f.answer == "approve";
+    match app.control.answer_device_login(&user.who, &f.code, approved) {
         Ok(()) => {
             let (title, lede) = if approved {
                 ("Approved", "Go back to the terminal: the machine finishes signing in by itself.")
@@ -533,8 +532,13 @@ pub(super) fn form_urlencoded_pairs(body: &[u8]) -> Vec<(String, String)> {
 fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
     let mut rows = String::new();
     for t in app.control.tags(&user.who) {
+        let (state, flip, label) = if t.access {
+            (r#"<span class="status ok">grants access</span>"#, "off", "Turn off")
+        } else {
+            (r#"<span class="sub">label only</span>"#, "on", "Turn on")
+        };
         rows.push_str(&format!(
-            r#"<tr><td><code>{name}</code></td><td>{description}</td><td>{created}</td><td class="num"><form method="post" action="/tags/delete">{csrf}<input type="hidden" name="name" value="{name}"><button class="btn danger small">Delete</button></form></td></tr>"#,
+            r#"<tr><td><code>{name}</code></td><td>{description}</td><td>{state} <form method="post" action="/tags/access" style="display:inline">{csrf}<input type="hidden" name="name" value="{name}"><input type="hidden" name="access" value="{flip}"><button class="btn small ghost">{label}</button></form></td><td>{created}</td><td class="num"><form method="post" action="/tags/delete">{csrf}<input type="hidden" name="name" value="{name}"><button class="btn danger small">Delete</button></form></td></tr>"#,
             name = esc(&t.name),
             description = esc(&t.description),
             created = when(&t.created_at),
@@ -542,23 +546,24 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
         ));
     }
     if rows.is_empty() {
-        rows = r#"<tr><td colspan="4" class="empty">No access tags yet.</td></tr>"#.into();
+        rows = r#"<tr><td colspan="5" class="empty">No tags yet.</td></tr>"#.into();
     }
     let body = format!(
-        r#"<div class="head"><div><div class="eyebrow">Administration</div><h1>Access tags</h1>
-<p class="lede">A person reaches a private tunnel when they share one of its access tags, or own it. Matching is exact. Deleting a tag removes it from everyone and everything at once.</p></div></div>
-{err}<div class="card scroll"><table><thead><tr><th>Tag</th><th>Description</th><th>Created</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+        r#"<div class="head"><div><div class="eyebrow">Administration</div><h1>Tags</h1>
+<p class="lede">Tags label people, machines and tunnels. A person can open a private tunnel when they share a tag with it that grants access; everyone holds a personal tag (<code>user:…</code>) that the server puts on the tunnels of their machines. Matching is exact. Deleting a tag removes it from everyone and everything at once.</p></div></div>
+{err}<div class="card scroll"><table><thead><tr><th>Tag</th><th>Description</th><th>Access</th><th>Created</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="section"><h2>Create a tag</h2></div>
 <div class="card form"><form method="post" action="/tags">{csrf}
 <label for="tn" style="margin-top:0">Name</label><input id="tn" name="name" placeholder="team:dev" maxlength="64" required>
 <label for="td">Description</label><input id="td" name="description" maxlength="200">
+<label><input type="checkbox" name="access" value="on" checked> Grants access: people and private tunnels sharing it connect</label>
 <button class="btn primary" style="margin-top:14px">Create tag</button></form>
-<p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>. Example tags: {examples}</p></div>"#,
+<p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>; <code>user:</code> is for personal tags. Example tags: {examples}</p></div>"#,
         err = alert(error),
         csrf = csrf(user),
         examples = chips(&["team:dev".into(), "contractor:acme".into()]),
     );
-    page("Access tags", Some(user), &body)
+    page("Tags", Some(user), &body)
 }
 
 pub async fn tags(user: UiUser, State(app): State<AppState>) -> Response {
@@ -574,13 +579,15 @@ pub struct TagForm {
     name: String,
     #[serde(default)]
     description: String,
+    /// `on` or absent (an unchecked box), or `off`.
+    access: Option<String>,
 }
 
 pub async fn create_tag(user: UiUser, State(app): State<AppState>, Form(f): Form<TagForm>) -> Response {
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    match app.control.create_tag(&user.who, &f.name, &f.description) {
+    match app.control.create_tag(&user.who, &f.name, &f.description, f.access.as_deref() == Some("on")) {
         Ok(_) => Redirect::to("/tags").into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, tags_page(&user, &app, Some(&e.message))).into_response(),
     }
@@ -592,6 +599,16 @@ pub async fn delete_tag(user: UiUser, State(app): State<AppState>, Form(f): Form
     }
     let _ = app.control.delete_tag(&user.who, &f.name);
     Redirect::to("/tags").into_response()
+}
+
+pub async fn tag_access(user: UiUser, State(app): State<AppState>, Form(f): Form<TagForm>) -> Response {
+    if let Err(r) = user.check_csrf(&f.csrf) {
+        return r;
+    }
+    match app.control.set_tag_access(&user.who, &f.name, f.access.as_deref() == Some("on")) {
+        Ok(_) => Redirect::to("/tags").into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, tags_page(&user, &app, Some(&e.message))).into_response(),
+    }
 }
 
 // ---- audit log -------------------------------------------------------------------------------

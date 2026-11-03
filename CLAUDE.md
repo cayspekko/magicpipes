@@ -84,9 +84,13 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   Refusals look like "not found" so callers learn nothing about other agents' tunnels. After
   any change to users, tags, roles or agents, call `ControlPlane::refresh` so the directory and
   the published routes (which private tunnels check per request) follow at once.
-- **Labels never grant access**: only registered access tags reach `authorize`. Members can't
-  give themselves or their machines tags they don't hold; a private tunnel never falls back to
-  public (the agent removes a tunnel the server didn't keep private).
+- **One access rule**: a private tunnel admits a user who shares a tag with it whose `access`
+  is on, and nobody else; owners get in through their personal tag, never through an owner
+  exception. Only administrators assign tags to people and service agents; a tunnel carries
+  only ordinary tags its publisher holds (checked on every registration that names tags) and
+  personal tags, which are held only by their own user and written to users only by the store. A
+  private tunnel never falls back to public (the agent removes a tunnel the server didn't keep
+  private).
 - **Isolation between agents**: an agent manages only its own tunnels (`authorize`'s Manage
   rule). Hostnames and public ports are unique and owned by one agent.
 - **Fail closed**: if a stored policy (allow-list, ownership, permission) cannot be read or

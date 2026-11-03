@@ -204,7 +204,7 @@ pub async fn create_user(Caller(who): Caller, State(app): State<AppState>, Json(
 pub struct UserChange {
     role: Option<String>,
     disabled: Option<bool>,
-    /// Replaces the user's access tags.
+    /// Replaces the user's tags (the personal tag stays).
     tags: Option<Vec<String>>,
 }
 
@@ -279,11 +279,31 @@ pub struct NewTag {
     name: String,
     #[serde(default)]
     description: String,
+    /// Default: it grants access.
+    access: Option<bool>,
 }
 
 pub async fn create_tag(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewTag>) -> Result<impl IntoResponse, ApiError> {
-    let tag = app.control.create_tag(&who, &req.name, &req.description).map_err(ApiError)?;
+    let tag = app.control.create_tag(&who, &req.name, &req.description, req.access.unwrap_or(true)).map_err(ApiError)?;
     Ok((StatusCode::CREATED, Json(tag)))
+}
+
+#[derive(Deserialize)]
+pub struct TagChange {
+    access: bool,
+}
+
+pub async fn update_tag(
+    Caller(who): Caller,
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TagChange>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !app.control.set_tag_access(&who, &name, req.access).map_err(ApiError)? {
+        return Err(api_err(ErrorCode::NotFound, "no such tag"));
+    }
+    let tag = app.control.tags(&who).into_iter().find(|t| t.name == name.trim().to_ascii_lowercase());
+    tag.map(Json).ok_or_else(|| api_err(ErrorCode::NotFound, "no such tag"))
 }
 
 pub async fn delete_tag(Caller(who): Caller, State(app): State<AppState>, Path(name): Path<String>) -> Result<StatusCode, ApiError> {
@@ -296,7 +316,7 @@ pub async fn delete_tag(Caller(who): Caller, State(app): State<AppState>, Path(n
 
 #[derive(Deserialize)]
 pub struct AgentChange {
-    /// Replaces the agent's access tags (owners may only remove).
+    /// Replaces a service agent's tags (administrators only).
     tags: Option<Vec<String>>,
 }
 
@@ -306,7 +326,9 @@ pub async fn update_agent(
     Path(id): Path<String>,
     Json(req): Json<AgentChange>,
 ) -> Result<impl IntoResponse, ApiError> {
-    app.control.update_agent(&who, &id, req.tags.as_deref()).map_err(ApiError)?;
+    if let Some(tags) = &req.tags {
+        app.control.set_agent_tags(&who, &id, tags).map_err(ApiError)?;
+    }
     let agent = app.control.agents(&who).into_iter().find(|a| a.id == id).ok_or_else(|| api_err(ErrorCode::NotFound, "no such agent"))?;
     Ok(Json(agent))
 }

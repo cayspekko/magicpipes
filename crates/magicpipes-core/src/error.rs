@@ -104,7 +104,7 @@ codes! {
     NameTaken = "name_taken", http 409, exit 6;
     /// Another account already logs in with this email.
     EmailTaken = "email_taken", http 409, exit 6;
-    /// Not a registered access tag.
+    /// Not a registered tag.
     TagUnknown = "tag_unknown", http 400, exit 6;
     /// This agent may not create public tunnels.
     PublicNotAllowed = "public_not_allowed", http 403, exit 6;

@@ -195,7 +195,7 @@ async fn http_websocket_and_lifecycle() {
     // The same fields as when the agent runs, from tunnels.json.
     let stopped = &list["tunnels"][0];
     assert_eq!((stopped["status"].as_str(), stopped["share_url"].as_str()), (Some("stopped"), stopped["public_url"].as_str()), "{stopped}");
-    assert!(stopped.get("visibility").is_some() && stopped["access"].is_array(), "{stopped}");
+    assert!(stopped.get("visibility").is_some() && stopped["tags"].is_array(), "{stopped}");
 
     env.cli_ok(&["agent", "start"]).await;
     let new_pid = env.agent_pid().unwrap();
@@ -1027,19 +1027,20 @@ async fn browser_login_enrolls_your_machine() {
     assert_eq!(elsewhere.location.as_deref(), Some("/"));
 
     let approval = env.ui(&link, Some(&cookie), None).await;
-    assert!(approval.status == 200 && approval.html.contains("laptop") && approval.html.contains("team:dev"), "{}", approval.html);
+    assert!(approval.status == 200 && approval.html.contains("laptop") && approval.html.contains("--tag"), "{}", approval.html);
     let code = link.split("code=").nth(1).unwrap().to_string();
-    let done = env.ui("/cli", Some(&cookie), Some(&[("csrf", &approval.csrf()), ("code", &code), ("answer", "approve"), ("tag", "team:dev")])).await;
+    let done = env.ui("/cli", Some(&cookie), Some(&[("csrf", &approval.csrf()), ("code", &code), ("answer", "approve")])).await;
     assert!(done.html.contains("Approved"), "{}", done.html);
     let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await.unwrap().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(env.ui(&link, Some(&cookie), None).await.status == StatusCode::NOT_FOUND, "a code works once");
 
-    // The machine belongs to Ann, with her tag, and its tunnels default to private.
+    // The machine belongs to Ann and publishes with her tags; its tunnels default to private.
     let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
     let laptop = v["agents"].as_array().unwrap().iter().find(|a| a["name"] == "laptop").unwrap().clone();
     assert_eq!(laptop["owner_email"], "ann@example.com");
-    assert_eq!(laptop["tags"], serde_json::json!(["team:dev"]));
+    let personal = env.api("GET", &format!("/api/v1/users/{ann}"), Some(&admin)).await.1["personal_tag"].as_str().unwrap().to_string();
+    assert_eq!(laptop["tags"], serde_json::json!(["team:dev", personal]));
     assert_eq!(laptop["default_private"], true);
     let mine = env.ui("/", Some(&cookie), None).await;
     assert!(mine.status == 200 && mine.html.contains("laptop"), "members see their own machines");
@@ -1080,12 +1081,19 @@ async fn tag_forms_apply_only_what_changed() {
         async move { env.api("GET", &format!("/api/v1/users/{id}"), Some(&admin)).await.1["tags"].clone() }
     };
     env.api_json("PATCH", &format!("/api/v1/users/{ann}"), Some(&admin), serde_json::json!({ "tags": ["team:dev"] })).await;
+    let personal_of = |id: String| {
+        let env = &env;
+        let admin = admin.clone();
+        async move { env.api("GET", &format!("/api/v1/users/{id}"), Some(&admin)).await.1["personal_tag"].as_str().unwrap().to_string() }
+    };
+    let (ann_tag, ad_tag) = (personal_of(ann.clone()).await, personal_of(ids[0].clone()).await);
     let cookie = sign_in(&env, "ad@example.com", "correct horse battery").await;
 
     // The users page carries the registry for the picker, with descriptions unable to end it.
     let users = env.ui("/users", Some(&cookie), None).await;
     assert!(users.html.contains(r#"id="mp-tags""#) && users.html.contains(&format!(r#"href="/users/{ann}/tags" aria-label="Edit tags of ann@example.com" data-tag-edit"#)), "{}", users.html);
     assert!(users.html.contains(r#"\u003c/script>\u003cb>ops"#) && !users.html.contains("</script><b>"), "{}", users.html);
+    assert!(users.html.contains(&format!("<code>{ann_tag}</code>")) && !users.html.contains(r#""n":"user:"#), "personal tags are shown, never offered: {}", users.html);
     // The row's other actions are in a menu; the irreversible ones ask first.
     assert!(users.html.contains(r#"aria-label="More actions for ann@example.com""#), "{}", users.html);
     assert!(users.html.contains(r#"data-confirm="Disable ann@example.com?"#), "{}", users.html);
@@ -1103,7 +1111,9 @@ async fn tag_forms_apply_only_what_changed() {
     env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "env:prod team:dev team:ops"), ("tag", "team:ops")])).await;
     assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["team:ops"]));
     let refused = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", ""), ("tags", "team:qa")])).await;
-    assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("not an access tag"), "{}", refused.html);
+    assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("is not a tag"), "{}", refused.html);
+    let personal = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", ""), ("tags", &ad_tag)])).await;
+    assert!(personal.status == StatusCode::BAD_REQUEST && personal.html.contains("personal tag"), "{}", personal.html);
     let forged = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", "wrong"), ("base", ""), ("tags", "env:prod")])).await;
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
     // The picker can make up a tag: it's created on save, then given.
@@ -1138,6 +1148,21 @@ async fn tag_forms_apply_only_what_changed() {
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
     let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "env:new"), ("create", "env:new")])).await;
     assert!(made.status == StatusCode::OK && made.html.contains("--token"), "{}", made.html);
+    let personal = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ann.as_str()), ("tag", "team:dev")])).await;
+    assert_eq!(personal.status, StatusCode::BAD_REQUEST, "a personal machine has no tags of its own");
+
+    // Whether a tag grants access is its own setting, on the Tags page and in the API.
+    let tags_page = env.ui("/tags", Some(&cookie), None).await;
+    assert!(tags_page.html.contains("grants access") && !tags_page.html.contains(&ann_tag) && !tags_page.html.contains(&ad_tag), "{}", tags_page.html);
+    env.ui("/tags/access", Some(&cookie), Some(&[("csrf", &csrf), ("name", "env:prod"), ("access", "off")])).await;
+    let access_of = |v: &Value, name: &str| v["tags"].as_array().unwrap().iter().find(|t| t["name"] == name).map(|t| t["access"].clone());
+    assert_eq!(access_of(&env.api("GET", "/api/v1/tags", Some(&admin)).await.1, "env:prod"), Some(Value::Bool(false)));
+    let (s, v) = env.api_json("PATCH", "/api/v1/tags/env:prod", Some(&admin), serde_json::json!({ "access": true })).await;
+    assert_eq!((s, v["access"].clone()), (StatusCode::OK, Value::Bool(true)));
+    let (s, _) = env.api_json("PATCH", &format!("/api/v1/tags/{ann_tag}"), Some(&admin), serde_json::json!({ "access": false })).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "personal tags can't be changed");
+    let (s, v) = env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "user:mallory" })).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")));
 }
 
 async fn sign_in(env: &Env, email: &str, password: &str) -> String {
@@ -1197,8 +1222,8 @@ async fn private_tunnels() {
         sign_in(&env, "cy@example.com", "correct horse battery").await,
     );
 
-    // Ann's machine, enrolled by an administrator with her tag; private only.
-    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"], "tags": ["team:dev"], "allow_public": false });
+    // Ann's machine, enrolled by an administrator; it publishes with her tags, private only.
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"], "allow_public": false });
     let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
     let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
     env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "anns-laptop"]).await;
@@ -1207,12 +1232,17 @@ async fn private_tunnels() {
     let out = env.cli(&["add", &port, "--public", "--json", "--timeout", "30"]).await;
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!((out.status.code(), v["error"]["code"].as_str()), (Some(6), Some("public_not_allowed")), "{v}");
-    let out = env.cli(&["add", &port, "--access", "team:ops", "--json", "--timeout", "30"]).await;
+    let out = env.cli(&["add", &port, "--tag", "team:ops", "--json", "--timeout", "30"]).await;
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["error"]["code"], "forbidden", "the machine doesn't hold team:ops: {v}");
-    let t = add_json(&env, &[&port, "--name", "wiki"]).await;
+    assert_eq!(v["error"]["code"], "forbidden", "Ann doesn't hold team:ops: {v}");
+    let t = add_json(&env, &[&port, "--name", "wiki", "--tag", "team:dev"]).await;
     assert_eq!(t["status"], "ready", "private tunnels are verified through the server: {t}");
-    assert_eq!((t["visibility"].as_str(), t["access"].clone()), (Some("private"), serde_json::json!([])), "{t}");
+    let personal = |email: &str| {
+        let (env, admin, id) = (&env, admin.clone(), ids[email].clone());
+        async move { env.api("GET", &format!("/api/v1/users/{id}"), Some(&admin)).await.1["personal_tag"].as_str().unwrap().to_string() }
+    };
+    let (ann_tag, bob_tag) = (personal("ann@example.com").await, personal("bob@example.com").await);
+    assert_eq!((t["visibility"].as_str(), t["tags"].clone(), t["owner_tag"].as_str()), (Some("private"), serde_json::json!(["team:dev", ann_tag]), Some(ann_tag.as_str())), "{t}");
     let host = hostname(t["public_url"].as_str().unwrap());
     let list = env.cli_json(&["list", "--json"]).await;
     assert_eq!(list["tunnels"][0]["visibility"], "private", "{list}");
@@ -1246,13 +1276,21 @@ async fn private_tunnels() {
     }
     // A cookie for one tunnel host is useless on another.
     let other = add_json(&env, &[&port, "--name", "other"]).await;
+    assert_eq!(other["tags"], serde_json::json!([ann_tag]), "without --tag, only its owner: {other}");
     let other_host = hostname(other["public_url"].as_str().unwrap());
     assert_eq!(env.tunnel_get(&other_host, "/whoami", &ann_cookie, false).await.status, StatusCode::UNAUTHORIZED);
+    assert!(open_private(&env, &other_host, "/", &ann).await.is_ok(), "the owner gets in through her personal tag");
 
     // Bob has no shared tag: the management host says so. Cy has team:ops, not team:dev.
     let refused = open_private(&env, &host, "/", &bob).await.unwrap_err();
     assert!(refused.status == StatusCode::FORBIDDEN && refused.html.contains("bob@example.com"), "{}", refused.html);
     assert!(open_private(&env, &host, "/", &cy).await.is_err());
+    // Bob's personal tag on a tunnel shares it with him alone.
+    let pair = add_json(&env, &[&port, "--name", "pair", "--tag", &bob_tag]).await;
+    let pair_host = hostname(pair["public_url"].as_str().unwrap());
+    assert!(open_private(&env, &pair_host, "/", &bob).await.is_ok() && open_private(&env, &pair_host, "/", &cy).await.is_err());
+    let index = env.ui("/", Some(&ann), None).await;
+    assert!(index.html.contains(&format!(r#"<code title="{ann_tag}">you</code>"#)), "{}", index.html);
     let (_, v) = env.api("GET", "/api/v1/shared", Some(&admin)).await;
     assert!(v["tunnels"].as_array().unwrap().is_empty(), "administrators don't discover private tunnels through their role");
 
@@ -1262,10 +1300,11 @@ async fn private_tunnels() {
     assert_eq!(env.tunnel_get(&host, "/", &cy_cookie, false).await.status, 200);
     let shared = env.ui("/", Some(&cy), None).await;
     assert!(shared.html.contains("Shared with you") && shared.html.contains(&host), "{}", shared.html);
+    assert!(open_private(&env, &other_host, "/", &cy).await.is_err(), "a tunnel with only Ann's personal tag stays hers");
 
     // A WebSocket to a private tunnel, opened with the tunnel cookie.
     let ws = common::ws_echo_app().await;
-    let live = add_json(&env, &[&ws.port.to_string(), "--name", "live"]).await;
+    let live = add_json(&env, &[&ws.port.to_string(), "--name", "live", "--tag", "team:dev"]).await;
     let live_host = hostname(live["public_url"].as_str().unwrap());
     let cy_live = open_private(&env, &live_host, "/", &cy).await.unwrap();
     let mut req = format!("wss://{live_host}/").into_client_request().unwrap();

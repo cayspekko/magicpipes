@@ -1,4 +1,4 @@
-//! Access tag syntax (docs/USERS.md, "Access tags").
+//! Tag syntax (docs/USERS.md, "Tags").
 //!
 //! A tag is `key` or `key:value`: lowercase ASCII letters, digits and `._-`, starting with a
 //! letter or digit; the value may also contain `@`. At most 64 bytes. Matching is exact string

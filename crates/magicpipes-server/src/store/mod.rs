@@ -7,7 +7,7 @@
 mod tags;
 mod users;
 
-pub use tags::{EnrollmentSpec, MAX_TAGS};
+pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
 pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
 
 use std::path::Path;
@@ -37,12 +37,8 @@ pub struct TunnelRow {
     /// Port tunnels: allowed client networks (canonical CIDRs); empty = anyone.
     pub allow: Vec<String>,
     pub visibility: Visibility,
-    /// Private tunnels: the requested access tags (the effective set is limited to the agent's
-    /// tags when routes are published); empty and not `access_restricted` = all of the agent's tags.
-    pub access: Vec<String>,
-    /// Tags were asked for. Deleting them (which removes their rows) leaves the tunnel owner-only,
-    /// never open to all of the agent's tags.
-    pub access_restricted: bool,
+    /// Its tags (sorted), including its owner's personal tag.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,50 +55,19 @@ pub struct AgentRow {
     pub default_private: bool,
 }
 
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS admin_tokens (
-    id          TEXT PRIMARY KEY,
-    token_hash  TEXT NOT NULL UNIQUE,
-    created_at  INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS agents (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    token_hash   TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    last_seen_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS enrollments (
-    token_hash  TEXT PRIMARY KEY,
-    created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL,
-    used_at     INTEGER,
-    agent_id    TEXT
-);
-CREATE TABLE IF NOT EXISTS tunnels (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    hostname    TEXT NOT NULL UNIQUE,
-    agent_id    TEXT NOT NULL REFERENCES agents(id),
-    target      TEXT NOT NULL,
-    created_at  INTEGER NOT NULL
-);
-"#;
-
-/// Schema changes after the initial schema, applied in order and tracked in `user_version`.
-/// Append only: a released migration never changes.
+/// The schema, applied in order and tracked in `user_version`. Append only: a released
+/// migration never changes. The list was restarted on 2026-11-03 (the tag model was replaced);
+/// databases written before then are refused and must be deleted.
 const MIGRATIONS: &[&str] = &[
-    // 1: port tunnels. Their hostname stays `<name>.<base_domain>` (names are unique across
-    // kinds) but is never routed or given a certificate.
+    // 1: the whole schema. One organization for now; account and tag rows name it so more can
+    // come without another rewrite. Every tag reference points at the registry, so deleting a tag
+    // removes it everywhere through the cascade.
     r#"
-    ALTER TABLE tunnels ADD COLUMN kind TEXT NOT NULL DEFAULT 'http';
-    ALTER TABLE tunnels ADD COLUMN public_port INTEGER;
-    ALTER TABLE tunnels ADD COLUMN allow TEXT NOT NULL DEFAULT '';
-    CREATE UNIQUE INDEX tunnels_public_port ON tunnels(kind, public_port) WHERE public_port IS NOT NULL;
-    "#,
-    // 2: users with passwords, UI sessions, API tokens and the audit log (docs/USERS.md). One
-    // organization for now; every row names it so more can come without another rewrite.
-    r#"
+    CREATE TABLE admin_tokens (
+        id          TEXT PRIMARY KEY,
+        token_hash  TEXT NOT NULL UNIQUE,
+        created_at  INTEGER NOT NULL
+    );
     CREATE TABLE orgs (
         id          TEXT PRIMARY KEY,
         name        TEXT NOT NULL,
@@ -169,15 +134,16 @@ const MIGRATIONS: &[&str] = &[
         detail      TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX audit_log_at ON audit_log(at);
-    "#,
-    // 3: access tags, agent ownership and private tunnels (docs/USERS.md). Every tag reference
-    // points at the registry, so deleting a tag revokes it everywhere through the cascade. The
-    // `labels` columns held free-form metadata, a feature since removed; nothing reads them.
-    r#"
+
+    -- Tags label users, agents and tunnels. A user and a tunnel sharing a tag with `access`
+    -- set is the only way into a private tunnel. A tag with `user_id` is that user's personal
+    -- tag: the server creates it with the account and puts it on the tunnels of their machines.
     CREATE TABLE tags (
         org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
         name        TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
+        access      INTEGER NOT NULL DEFAULT 1,
+        user_id     TEXT UNIQUE REFERENCES users(id) ON DELETE CASCADE,
         created_by  TEXT,
         created_at  INTEGER NOT NULL,
         PRIMARY KEY (org_id, name)
@@ -191,11 +157,20 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (org_id, user_id, tag),
         FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
     );
-    ALTER TABLE agents ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
-    ALTER TABLE agents ADD COLUMN owner_user_id TEXT REFERENCES users(id);
-    ALTER TABLE agents ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;
-    ALTER TABLE agents ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE agents ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+
+    -- A personal agent (`owner_user_id` set) acts with its owner's tags; only service agents
+    -- have tags of their own.
+    CREATE TABLE agents (
+        id              TEXT PRIMARY KEY,
+        name            TEXT NOT NULL,
+        token_hash      TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        last_seen_at    INTEGER,
+        org_id          TEXT NOT NULL DEFAULT 'org_default',
+        owner_user_id   TEXT REFERENCES users(id),
+        allow_public    INTEGER NOT NULL DEFAULT 1,
+        default_private INTEGER NOT NULL DEFAULT 0
+    );
     CREATE TABLE agent_tags (
         agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
         org_id      TEXT NOT NULL,
@@ -203,12 +178,18 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (agent_id, tag),
         FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
     );
-    ALTER TABLE enrollments ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
-    ALTER TABLE enrollments ADD COLUMN created_by TEXT;
-    ALTER TABLE enrollments ADD COLUMN owner_user_id TEXT;
-    ALTER TABLE enrollments ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;
-    ALTER TABLE enrollments ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE enrollments ADD COLUMN labels TEXT NOT NULL DEFAULT '';
+    CREATE TABLE enrollments (
+        token_hash      TEXT PRIMARY KEY,
+        created_at      INTEGER NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        used_at         INTEGER,
+        agent_id        TEXT,
+        org_id          TEXT NOT NULL DEFAULT 'org_default',
+        created_by      TEXT,
+        owner_user_id   TEXT,
+        allow_public    INTEGER NOT NULL DEFAULT 1,
+        default_private INTEGER NOT NULL DEFAULT 0
+    );
     CREATE TABLE enrollment_tags (
         token_hash  TEXT NOT NULL REFERENCES enrollments(token_hash) ON DELETE CASCADE,
         org_id      TEXT NOT NULL,
@@ -216,9 +197,23 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (token_hash, tag),
         FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
     );
-    ALTER TABLE tunnels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private'));
-    ALTER TABLE tunnels ADD COLUMN labels TEXT NOT NULL DEFAULT '';
-    CREATE TABLE tunnel_access (
+
+    -- Port tunnels keep a hostname `<name>.<base_domain>` (names are unique across kinds) that
+    -- is never routed or given a certificate.
+    CREATE TABLE tunnels (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        hostname    TEXT NOT NULL UNIQUE,
+        agent_id    TEXT NOT NULL REFERENCES agents(id),
+        target      TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'http',
+        public_port INTEGER,
+        allow       TEXT NOT NULL DEFAULT '',
+        visibility  TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('public', 'private'))
+    );
+    CREATE UNIQUE INDEX tunnels_public_port ON tunnels(kind, public_port) WHERE public_port IS NOT NULL;
+    CREATE TABLE tunnel_tags (
         tunnel_id   TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
         org_id      TEXT NOT NULL,
         tag         TEXT NOT NULL,
@@ -226,16 +221,17 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
     );
     "#,
-    // 4: remember that a tunnel asked for access tags, so that deleting them (which cascades to
-    // tunnel_access) can't turn "these tags" into "all of the agent's tags" on the next start.
-    r#"
-    ALTER TABLE tunnels ADD COLUMN access_restricted INTEGER NOT NULL DEFAULT 0;
-    UPDATE tunnels SET access_restricted = 1 WHERE id IN (SELECT tunnel_id FROM tunnel_access);
-    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+    if usize::try_from(version).map_or(true, |v| v > MIGRATIONS.len()) || (version == 0 && tables > 0) {
+        anyhow::bail!(
+            "the database has schema version {version}, which this magicpipesd doesn't know; databases from before 2026-11-03 \
+             can't be upgraded: delete it (and the -wal and -shm files next to it) to start over"
+        );
+    }
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(usize::try_from(version).unwrap_or(0)) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql).with_context(|| format!("database migration {}", i + 1))?;
@@ -247,7 +243,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
 }
 
 const TUNNEL_COLUMNS: &str =
-    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, access_restricted";
+    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility";
 
 fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
     let kind: String = r.get(6)?;
@@ -265,8 +261,7 @@ fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
         allow: allow.split_whitespace().map(str::to_string).collect(),
         // A visibility that can't be read keeps the tunnel private.
         visibility: Visibility::parse(&visibility).unwrap_or(Visibility::Private),
-        access: Vec::new(),
-        access_restricted: r.get(10)?,
+        tags: Vec::new(),
     })
 }
 
@@ -276,7 +271,6 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
         migrate(&mut conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
@@ -443,23 +437,23 @@ impl Store {
             let mut st = c.prepare(&format!("SELECT {TUNNEL_COLUMNS} FROM tunnels ORDER BY created_at"))?;
             st.query_map([], tunnel_row)?.collect()
         })?;
-        let access: Vec<(String, String)> = self.with(|c| {
-            let mut st = c.prepare("SELECT tunnel_id, tag FROM tunnel_access ORDER BY tag")?;
+        let tags: Vec<(String, String)> = self.with(|c| {
+            let mut st = c.prepare("SELECT tunnel_id, tag FROM tunnel_tags ORDER BY tag")?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
         })?;
-        for (id, tag) in access {
+        for (id, tag) in tags {
             if let Some(t) = rows.iter_mut().find(|t| t.id == id) {
-                t.access.push(tag);
+                t.tags.push(tag);
             }
         }
         Ok(rows)
     }
 
-    /// Replaces a tunnel's access rows (inside the caller's transaction).
-    fn write_access(tx: &rusqlite::Transaction<'_>, t: &TunnelRow) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM tunnel_access WHERE tunnel_id = ?1", [&t.id])?;
-        for tag in &t.access {
-            tx.execute("INSERT INTO tunnel_access (tunnel_id, org_id, tag) VALUES (?1, ?2, ?3)", params![t.id, users::DEFAULT_ORG, tag])?;
+    /// Replaces a tunnel's tags (inside the caller's transaction).
+    fn write_tags(tx: &rusqlite::Transaction<'_>, t: &TunnelRow) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM tunnel_tags WHERE tunnel_id = ?1", [&t.id])?;
+        for tag in &t.tags {
+            tx.execute("INSERT INTO tunnel_tags (tunnel_id, org_id, tag) VALUES (?1, ?2, ?3)", params![t.id, users::DEFAULT_ORG, tag])?;
         }
         Ok(())
     }
@@ -468,7 +462,7 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
             params![
                 t.id,
                 t.name,
@@ -479,11 +473,10 @@ impl Store {
                 t.kind.as_str(),
                 t.public_port,
                 t.allow.join(" "),
-                t.visibility.as_str(),
-                t.access_restricted
+                t.visibility.as_str()
             ],
         )?;
-        Self::write_access(&tx, t)?;
+        Self::write_tags(&tx, t)?;
         tx.commit()?;
         Ok(())
     }
@@ -493,10 +486,10 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, access_restricted = ?5 WHERE id = ?6",
-            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.access_restricted, t.id],
+            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4 WHERE id = ?5",
+            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.id],
         )?;
-        Self::write_access(&tx, t)?;
+        Self::write_tags(&tx, t)?;
         tx.commit()?;
         Ok(())
     }
@@ -553,9 +546,8 @@ mod tests {
                     public_port: None,
                     allow: vec![],
                     visibility: Visibility::Public,
-                    access: vec![],
-                    access_restricted: false,
-                        })
+                    tags: vec![],
+                })
                 .unwrap();
         }
         assert!(store.delete_agent(&id).unwrap());
@@ -568,82 +560,75 @@ mod tests {
     }
 
     #[test]
-    fn migrates_an_old_database_and_keeps_ports_unique() {
+    fn keeps_ports_unique_and_refuses_old_databases() {
         let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
-        {
-            // A database written before migrations existed, with one HTTP tunnel.
-            let c = Connection::open(&path).unwrap();
-            c.execute_batch(SCHEMA).unwrap();
-            c.execute_batch(
-                "INSERT INTO agents (id, name, token_hash, created_at) VALUES ('ag_1', 'a', 'h', 0);
-                 INSERT INTO tunnels (id, name, hostname, agent_id, target, created_at)
-                 VALUES ('tn_old', 'old', 'old.t.test', 'ag_1', 'http://127.0.0.1:1', 0);",
-            )
-            .unwrap();
-        }
         let store = Store::open(&path).unwrap();
-        let old = &store.tunnels().unwrap()[0];
-        assert_eq!((old.kind, old.public_port, old.allow.len()), (Kind::Http, None, 0));
-        assert_eq!(old.visibility, Visibility::Public, "tunnels from before private tunnels stay public");
+        let (agent, _) = store.enroll(&store.create_enrollment(60, &EnrollmentSpec::default()).unwrap(), "db").unwrap().unwrap();
         let row = |id: &str, kind, port| TunnelRow {
             id: id.into(),
             name: id.into(),
             hostname: format!("{id}.t.test"),
-            agent_id: "ag_1".into(),
+            agent_id: agent.clone(),
             target: "tcp://127.0.0.1:5432".into(),
             created_at: 1,
             kind,
             public_port: Some(port),
             allow: vec!["10.0.0.0/8".into(), "192.0.2.1/32".into()],
             visibility: Visibility::Public,
-            access: vec![],
-            access_restricted: false,
+            tags: vec![],
         };
         store.insert_tunnel(&row("tn_tcp", Kind::Tcp, 65500)).unwrap();
         store.insert_tunnel(&row("tn_udp", Kind::Udp, 65500)).unwrap();
         assert!(store.insert_tunnel(&row("tn_dup", Kind::Tcp, 65500)).is_err(), "a TCP port belongs to one tunnel");
         let tcp = store.tunnels().unwrap().into_iter().find(|t| t.id == "tn_tcp").unwrap();
         assert_eq!(tcp.allow, ["10.0.0.0/8", "192.0.2.1/32"]);
-        // Migration 2 added accounts, starting empty.
-        assert!(store.users().unwrap().is_empty());
         drop(store);
-        // Opening again does not re-run migrations.
-        assert_eq!(Store::open(&path).unwrap().tunnels().unwrap().len(), 3);
+        // Opening again does not re-run the schema.
+        assert_eq!(Store::open(&path).unwrap().tunnels().unwrap().len(), 2);
+
+        // A database from before the schema was restarted (version 4), or from before
+        // migrations (version 0 with tables), is refused rather than misread.
+        for (version, name) in [(4, "v4.sqlite"), (0, "v0.sqlite")] {
+            let old = dir.join(name);
+            let c = Connection::open(&old).unwrap();
+            c.execute_batch("CREATE TABLE agents (id TEXT PRIMARY KEY)").unwrap();
+            c.pragma_update(None, "user_version", version).unwrap();
+            drop(c);
+            let e = Store::open(&old).err().expect("refused");
+            assert!(format!("{e:#}").contains("delete it"), "{e:#}");
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn deleting_a_tunnels_access_tag_keeps_it_restricted() {
+    fn deleting_a_tag_removes_it_from_tunnels() {
         let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
         let store = Store::open(&path).unwrap();
         let (agent, _) = store.enroll(&store.create_enrollment(60, &EnrollmentSpec::default()).unwrap(), "laptop").unwrap().unwrap();
-        assert!(store.create_tag("team:secret", "", None).unwrap());
-        let row = |id: &str, access: Vec<String>| TunnelRow {
-            id: id.into(),
-            name: id.into(),
-            hostname: format!("{id}.t.test"),
-            agent_id: agent.clone(),
-            target: "http://127.0.0.1:1".into(),
-            created_at: 0,
-            kind: Kind::Http,
-            public_port: None,
-            allow: vec![],
-            visibility: Visibility::Private,
-            access_restricted: !access.is_empty(),
-            access,
-        };
-        store.insert_tunnel(&row("tn_narrow", vec!["team:secret".into()])).unwrap();
-        store.insert_tunnel(&row("tn_all", vec![])).unwrap();
-        assert!(store.delete_tag("team:secret").unwrap());
+        assert!(store.create_tag("secret", "", true, None).unwrap());
+        assert!(store.create_tag("dev", "", true, None).unwrap());
+        store
+            .insert_tunnel(&TunnelRow {
+                id: "tn_a".into(),
+                name: "a".into(),
+                hostname: "a.t.test".into(),
+                agent_id: agent,
+                target: "http://127.0.0.1:1".into(),
+                created_at: 0,
+                kind: Kind::Http,
+                public_port: None,
+                allow: vec![],
+                visibility: Visibility::Private,
+                tags: vec!["dev".into(), "secret".into()],
+            })
+            .unwrap();
+        assert!(store.delete_tag("secret").unwrap());
         drop(store);
-        let rows = Store::open(&path).unwrap().tunnels().unwrap();
-        let get = |id: &str| rows.iter().find(|t| t.id == id).map(|t| (t.access.len(), t.access_restricted)).unwrap();
-        assert_eq!(get("tn_narrow"), (0, true), "its only tag is gone: owner-only, not all of the agent's tags");
-        assert_eq!(get("tn_all"), (0, false));
+        assert_eq!(Store::open(&path).unwrap().tunnels().unwrap()[0].tags, ["dev"]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

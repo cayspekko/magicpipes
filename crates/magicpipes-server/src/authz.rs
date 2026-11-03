@@ -6,8 +6,9 @@
 //! connection without touching the registry or the database. Principals are the admin token,
 //! users (admins and members), agents and anonymous public clients.
 //!
-//! The access rule for private tunnels: the principal shares at least one access tag with the
-//! tunnel's effective access set, or owns the tunnel. Labels never reach this module.
+//! The access rule for private tunnels: the user shares a tag that grants access with the
+//! tunnel. Owners get in the same way, through the personal tag on each of their tunnels;
+//! ownership itself only decides who manages.
 
 /// Who is acting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,8 +87,8 @@ pub struct TunnelAuthz {
     pub owner_user_id: Option<String>,
     /// Anyone may connect (network allow-lists still apply first).
     pub public: bool,
-    /// Private tunnels: the effective access set (sorted), already limited to the agent's tags.
-    /// Empty: only the owner.
+    /// The tunnel's tags that grant access (sorted), its owner's personal tag among them.
+    /// Empty: nobody gets into a private tunnel.
     pub access: Vec<String>,
 }
 
@@ -144,10 +145,10 @@ pub fn authorize(who: &Principal, action: Action, what: Resource<'_>) -> bool {
         (Resource::Agent(_), Action::Connect) => false,
         // A tunnel is managed by its owners and by administrators.
         (Resource::Tunnel(t), Action::Manage) => tunnel_owner(t) || who.is_admin(),
-        // Discovering and connecting give the same answer: public, an owner, or a shared tag.
-        // Administrators manage private tunnels but don't reach them through their role.
+        // Discovering and connecting give the same answer: public, or a shared tag. Owners
+        // and administrators manage private tunnels but don't reach them through that.
         (Resource::Tunnel(t), Action::Discover | Action::Connect) => {
-            t.public || tunnel_owner(t) || matches!(who, Principal::User { tags, .. } if share_any(tags, &t.access))
+            t.public || matches!(who, Principal::User { tags, .. } if share_any(tags, &t.access))
         }
     }
 }
@@ -174,14 +175,14 @@ mod tests {
         let anon = Principal::Anonymous;
         let admin = Principal::AdminToken;
         let alice = user("us_alice", Role::Admin, &[]);
-        let bob = user("us_bob", Role::Member, &["team:dev"]);
+        let bob = user("us_bob", Role::Member, &["team:dev", "user:bob"]);
         let carol = user("us_carol", Role::Member, &["team:ops", "zzz"]);
         let a = Principal::Agent("ag_a".into());
         let b = Principal::Agent("ag_b".into());
         let public = tunnel("ag_a", None, true, &[]);
         let private = tunnel("ag_a", None, false, &[]);
         // Served by bob's laptop, shared with team:ops.
-        let bobs = tunnel("ag_bob", Some("us_bob"), false, &["team:ops"]);
+        let bobs = tunnel("ag_bob", Some("us_bob"), false, &["team:ops", "user:bob"]);
 
         // Public tunnels: anyone connects; only the owner and administrators manage.
         for p in [&anon, &admin, &a, &b, &bob] {
@@ -196,21 +197,23 @@ mod tests {
         assert!(!authorize(&anon, Discover, Resource::Tunnel(&public)));
         assert!(authorize(&bob, Discover, Resource::Tunnel(&public)));
 
-        // Private tunnels: owners and shared tags; administrators manage but don't connect.
-        assert!(authorize(&a, Connect, Resource::Tunnel(&private)));
-        for p in [&anon, &admin, &alice, &b, &bob] {
+        // Private tunnels: shared tags only, the owner's personal tag among them; owners and
+        // administrators manage, which doesn't let them in.
+        for p in [&anon, &admin, &alice, &a, &b, &bob] {
             assert!(!authorize(p, Connect, Resource::Tunnel(&private)), "{p:?}");
             assert!(!authorize(p, Discover, Resource::Tunnel(&private)), "{p:?}");
         }
+        assert!(authorize(&a, Manage, Resource::Tunnel(&private)));
         assert!(authorize(&admin, Manage, Resource::Tunnel(&private)));
-        assert!(authorize(&bob, Connect, Resource::Tunnel(&bobs)), "the owner, through the agent's user");
+        assert!(authorize(&bob, Connect, Resource::Tunnel(&bobs)), "the owner, through their personal tag");
         assert!(authorize(&bob, Manage, Resource::Tunnel(&bobs)));
         assert!(authorize(&carol, Connect, Resource::Tunnel(&bobs)), "a shared tag");
         assert!(authorize(&carol, Discover, Resource::Tunnel(&bobs)));
         assert!(!authorize(&carol, Manage, Resource::Tunnel(&bobs)), "sharing a tag doesn't make you an owner");
         assert!(!authorize(&user("us_dan", Role::Member, &["team:dev"]), Connect, Resource::Tunnel(&bobs)));
-        let owner_only = tunnel("ag_bob", Some("us_bob"), false, &[]);
-        assert!(!authorize(&carol, Connect, Resource::Tunnel(&owner_only)), "an empty access set is owner-only");
+        let untagged = tunnel("ag_bob", Some("us_bob"), false, &[]);
+        assert!(!authorize(&bob, Connect, Resource::Tunnel(&untagged)), "ownership alone doesn't let anyone in");
+        assert!(authorize(&bob, Manage, Resource::Tunnel(&untagged)));
 
         // Accounts: your own, or any for administrators.
         assert!(authorize(&bob, Manage, Resource::User("us_bob")));

@@ -1,4 +1,4 @@
-//! Editing access tags in the UI: the markup the tag picker in `ui.js` enhances, the plain pages
+//! Editing tags in the UI: the markup the tag picker in `ui.js` enhances, the plain pages
 //! it falls back to without scripts, and reading what those forms submit.
 //!
 //! A form says which tags were shown (`base`) and which are wanted (`tags`, or checkboxes named
@@ -162,7 +162,7 @@ impl Submitted {
         }
         let known = |n: &str| app.control.tags(who).iter().any(|t| t.name == n);
         for name in self.create.iter().filter(|n| !known(n)) {
-            if let Err(e) = app.control.create_tag(who, name, "")
+            if let Err(e) = app.control.create_tag(who, name, "", true)
                 && !known(name)
             {
                 return Err(e.message);

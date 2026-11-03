@@ -29,37 +29,72 @@ Non-goals for this phase:
 ## The model in one page
 
 ```text
-Org (workspace)                     every tag, user, agent and tunnel belongs to one org
- ├─ access tags: team:dev, team:ops  registered by an admin; the only tags authorize() reads
+Org (workspace)            every tag, user, agent and tunnel belongs to one org
+ ├─ tags: dev, prod, …      registered by an admin, each with `access` on or off
+ │        user:k8p4x2m9qa, … one personal tag per user, made with the account
  ├─ users ── tags ← admin assignment | rules (proxy or IdP group, IdP claim, verified email domain)
+ │                  + their personal tag
  ├─ agents ── owner (a user, or none for service agents)
- │            tags ← enrollment token (at most the owner's tags)
- └─ tunnels ── owner = its agent's owner
-               public, or private with access tags (default: the agent's tags)
+ │            personal agent: publishes with its owner's tags; service agent: tags of its own
+ └─ tunnels ── owner = its agent's owner (management only)
+               public, or private; tags = the owner's personal tag + those given with --tag
 ```
 
-**The rule:** a principal may connect to a private tunnel, and see it in lists, when the
-principal shares at least one access tag with the tunnel's effective access set, or owns the
-tunnel. That is the whole access rule. Everything else is about where the tags come from.
+**The rule:** a user may connect to a private tunnel, and see it in lists, when the user and
+the tunnel share a tag whose `access` is on. That is the whole access rule; there is no owner
+exception. An owner gets into their own tunnels the same way, through their personal tag, which
+the server puts on every tunnel of their machines. Ownership only decides who manages.
 
-### Access tags
+### Tags
 
-Access tags such as `team:dev` or `contractor:acme` are the only kind of tag. Org admins create
-them in the `tags` registry, and they attach to users, agents, enrollment tokens and tunnel
-access sets. The syntax is lowercase, `[a-z0-9][a-z0-9._-]*` with an optional `:value` made of
-`[a-z0-9._@-]`, at most 64 bytes. Names are normalized and validated on write, and matching is
-exact string equality.
+A tag such as `dev`, `team:ops` or `contractor:acme` is a label on users, service agents and
+tunnels. Admins create tags in the registry and turn `access` on or off per tag: a tag without
+access is only a label. The syntax is lowercase, `[a-z0-9][a-z0-9._-]*` with an optional
+`:value` made of `[a-z0-9._@-]`, at most 64 bytes. Names are normalized and validated on write,
+and matching is exact string equality.
 
-There is no second, descriptive kind. Free-form *labels* on agents and tunnels shipped briefly
-(2026-11-01 to 2026-11-03) and were removed because nothing used them; with no metadata tags
-at all, nothing can be mistaken for one that grants access.
+**Personal tags.** Creating an account also creates its personal tag, `user:` and 10 random
+characters (`user:k8p4x2m9qa`), tied to the account by `tags.user_id`. The name says nothing
+about the person, so it never collides or goes stale; the UI shows their email instead (to
+administrators; a member sees "you" for their own). A personal tag:
+- is created automatically, and no one can create a `user:` tag by hand;
+- is held by its user only: it can't be assigned to another user or to an agent;
+- always grants access: its access can't be turned off;
+- goes only with its account;
+- can go on any tunnel (`--tag user:k8p4x2m9qa`), to share that tunnel with that one person;
+- is put on every tunnel of its user's machines when they are registered.
+
+The last point is the registration's policy, not a rule of the model: the owner's personal tag
+is an ordinary `tunnel_tags` row, and `authorize` knows nothing about owners. Today every
+registration adds it, so nobody locks themselves out of their own tunnel; handing a tunnel over
+to someone else, and taking the original owner's access away, would be a change to that
+policy, not to the model.
+
+**Who attaches tags.**
+- Users: only admins (and, later, admin-written rules). Nobody gives themselves a tag.
+- Service agents: only admins, through the enrollment token or by editing the agent.
+- Tunnels: the agent that registers them, with ordinary tags its publisher holds (the owner's
+  tags for a personal agent, the agent's own for a service agent) and anyone's personal tag,
+  plus the owner's personal tag added by the server. A member therefore can't put a group tag
+  they don't hold on a tunnel, so turning a tag's access on never opens a tunnel to a group its
+  owner isn't in. This is checked on every registration that names tags, against what the
+  publisher holds at that moment, not only when the tags were first given: an older or
+  compromised agent can't bring back a tag its owner has lost.
+
+**A tunnel's tags belong to the tunnel.** They are stored (`tunnel_tags`) and apply as stored:
+nothing is inherited or recomputed from the agent or the owner later. So if Alice publishes five
+tunnels tagged `dev` and is then removed from `dev`, she loses her own access to other `dev`
+tunnels, but her five stay shared with `dev` until someone changes them (and she can no longer
+re-register them with `dev`). Disabling Alice withdraws every tunnel of her machines at once, and
+revoking a machine deletes its tunnels. The tag model was replaced on 2026-11-03 (before,
+tunnels inherited their agent's tags and owners had an exception of their own).
 
 ### Roles
 
 Each membership has one of two roles. Neither is a tag, and neither can be assigned by the
 holder.
 
-- **admin**: manages the org (users, access tags, rules, enrollment tokens, any agent or
+- **admin**: manages the org (users, tags, rules, enrollment tokens, any agent or
   tunnel). An admin doesn't automatically *connect* to private tunnels. Like anyone else, they
   need a shared tag or ownership. Admins can give themselves tags, so this is not a hard
   barrier. What it buys is that reaching someone's shell tunnel takes an explicit, audited
@@ -87,7 +122,7 @@ pub enum Principal {
 pub enum Action { Discover, Connect, Manage }
 
 pub enum Resource<'a> {
-    Tunnel(&'a TunnelAuthz),   // org, owner user, agent, public flag, effective access set
+    Tunnel(&'a TunnelAuthz),   // org, owner user, agent, public flag, tags that grant access
     Agent(&'a AgentAuthz),     // org, owner user
     Org(OrgId),                // users, tags, rules, enrollment tokens, audit log
 }
@@ -106,14 +141,13 @@ The decision table, evaluated in this order; the first matching row wins:
 | 5 | `Manage` a tunnel or agent: its owner user, the agent itself (for its own tunnels), an admin, the admin token | allow |
 | 6 | `Manage`: anyone else | deny |
 | 7 | `Discover` a public tunnel | allow |
-| 8 | `Connect` or `Discover` a private tunnel: its owner user, or its own agent | allow |
-| 9 | `Connect` or `Discover` a private tunnel: shares any access tag with the tunnel's effective access set | allow |
-| 10 | Anything else | deny |
+| 8 | `Connect` or `Discover` a private tunnel: the user shares a tag with it whose `access` is on | allow |
+| 9 | Anything else | deny |
 
 - **Enrollment tokens are a validation, not a decision row.** A member may create one only for
-  themselves, with tags they hold (see "Agents"); the handler checks that. It isn't a
+  their own machine, without tags (see "Agents"); the handler checks that. It isn't a
   permission on `Org`.
-- **Discovery equals connection.** Rows 8–9 give `Discover` and `Connect` the same answer for
+- **Discovery equals connection.** Row 8 gives `Discover` and `Connect` the same answer for
   private tunnels. If a separate "listed but not reachable" or "reachable but unlisted" mode
   is ever needed, it becomes an extra tunnel flag, not a second permission model.
 - **`authorize()` is a pure function** over precomputed views (`TagSet` is a sorted
@@ -150,7 +184,7 @@ An email counts as verified in these cases:
 
 An email typed in by an admin is not verified.
 
-- **How rules work.** A rule is `(provider, claim, value) → access tag`, created by an admin.
+- **How rules work.** A rule is `(provider, claim, value) → tag`, created by an admin.
   On every login the server re-evaluates every rule against the fresh claims (ID token, proxy
   assertion or GitHub API) and replaces that user's rows in `user_rule_matches`. A user's tags
   are their admin-assigned `user_tags` plus the tags of the rules they match. Deleting a rule
@@ -160,26 +194,22 @@ An email typed in by an admin is not verified.
 - **Revocation lag for rule-based tags.** It is bounded by the session's maximum age
   (`session_max_age_secs`, default 12 h): after that the user must log in again, which
   re-reads the IdP. Re-checking through the refresh token every hour is a later improvement.
-- **No self-assignment.** Only admins create access tags, assign them to users, and write
+- **No self-assignment.** Only admins create tags, assign them to users, and write
   rules. A member can't add a tag to themselves, and an IdP claim can only map to tags that an
   admin has wired up.
 
 ### Agents
 
-- **Agents get tags only through their enrollment token.** The token records who created it,
-  which org it belongs to, the owner the new agent will have, its access tags, and
-  whether its tunnels may be public.
-  - Admins may create tokens for any owner, including none (a service agent), with any
-    registered access tags.
-  - Members may create tokens only for themselves, and only with access tags they currently
-    hold. This is how `magicpipes login` works for a person: see "CLI".
-- **A personal agent can never have more access than its owner.** For an agent owned by a user,
-  the effective tags are its assigned tags intersected with the owner's current tags. If the
-  owner leaves `team:dev`, their agent loses it in the same publish. A service agent
-  (`owner_user_id IS NULL`) keeps exactly the tags an admin gave it.
-- **After enrollment**, only an admin changes a service agent's tags. The owner may *remove*
-  tags from their own agent but never add one; adding means enrolling again or asking an
-  admin.
+- **The enrollment token says who the agent belongs to.** It records who created it
+  (`created_by`), which org it belongs to, the owner the new agent will have (`owner_user_id`,
+  which may differ from the creator), and whether its tunnels may be public.
+  - Admins may create tokens for any owner, or none (a service agent). Only a service agent's
+    token carries tags.
+  - Members may create tokens only for themselves, without tags. This is how `magicpipes login`
+    works for a person: see "CLI".
+- **A personal agent has no tags of its own.** It publishes with its owner's current tags. A
+  service agent (`owner_user_id IS NULL`) has exactly the tags an admin gave it, changed only by
+  an admin.
 
 ### Tunnels
 
@@ -191,13 +221,12 @@ An email typed in by an admin is not verified.
     members_can_publish` is true (the default). The setting is also checked whenever a
     member's machine registers a tunnel, so turning it off applies to machines enrolled before;
     their existing public tunnels stay until removed.
-- **Access set.** A private tunnel's access set defaults to the agent's effective access tags.
-  The owner may narrow it (`--access team:dev`), but never widen it beyond the agent's tags:
-  `effective access = requested ∩ agent's effective tags`. An agent can't publish to an
-  audience it isn't part of.
-- **Empty access set.** A private tunnel whose effective access set is empty is reachable only
-  by its owner and its own agent. It is never treated as public. This is the fail-closed case,
-  for example after a tag is deleted.
+- **Tags.** A tunnel of a personal agent gets its owner's personal tag (the owner, not whoever
+  created the enrollment token), plus the tags given with `--tag`, each of which the publisher
+  must hold. Nothing else is added: `magicpipes add 3000` is for its owner alone.
+- **No tag that grants access.** A private tunnel without one (a service agent's tunnel with no
+  `--tag`, or after its only tag was deleted or had access turned off) is reachable by nobody.
+  It is never treated as public.
 
 ### Revocation summary
 
@@ -205,9 +234,10 @@ Every change below takes effect on the next request through the published snapsh
 
 | Change | Effect |
 |---|---|
-| Remove an access tag from a user | That user loses it; their personal agents lose it; tunnels whose effective access drops it shrink |
+| Remove a tag from a user | That user loses access through it, and their machines can't put it on a tunnel again. Tunnels they already published with it stay shared with it: a tunnel's tags are its own |
+| Turn a tag's access off | Everyone it let in loses that; it stays as a label |
 | Delete a rule | Every user who got a tag only through that rule loses it |
-| Delete an access tag | Cascades to every user, agent, enrollment token, rule and tunnel access row; tunnels left with an empty set become owner-only, also after a restart (`tunnels.access_restricted`, migration 4) |
+| Delete a tag | Cascades to every user, agent, enrollment token, rule and tunnel; a tunnel left without a tag that grants access is reachable by nobody |
 | Disable a user or remove their membership | Sessions, API tokens and tunnel cookies are rejected. Their personal agents can't connect, and their tunnels are unpublished |
 | "Log out everywhere" | Bumps `sessions_valid_after`; every session and tunnel cookie issued before it is rejected |
 | Revoke an agent | As today, plus its tunnels' access rows |
@@ -247,7 +277,7 @@ The methods ship in this order, each usable on its own.
 
 ### 1. Users with passwords
 
-- **Admins create users** in the UI or API: email, display name, role, access tags, and either
+- **Admins create users** in the UI or API: email, display name, role, tags, and either
   a password they choose or a generated one shown once. Either way the user must change it at
   first login.
   - Admins can also reset a password (same forced change) and disable a user.
@@ -357,7 +387,7 @@ and others.
 
 - **SMTP** is configured in `[smtp]` and sent with `lettre` (MIT/Apache-2.0), using its rustls
   transport.
-- **An admin invites an email** with a role and access tags. The recipient gets a link with a
+- **An admin invites an email** with a role and tags. The recipient gets a link with a
   single-use token: stored hashed, valid for 7 days, revocable, and possible to re-send.
 - **The invitation page** lets the recipient set a password or continue with any enabled SSO or
   social method. Accepting marks the email verified, which matters for email-domain rules.
@@ -470,8 +500,8 @@ everywhere", it bumps `sessions_valid_after`. A per-tunnel "sign out" link lives
 
 ```text
 magicpipes login --server https://mp.example.com   # opens the login screen in the browser
-magicpipes add 3000                                 # private, reachable by the agent's tags
-magicpipes add 3000 --access team:dev               # narrower audience
+magicpipes add 3000                                 # private, for you alone (your personal tag)
+magicpipes add 3000 --tag dev                       # you, and everyone holding dev
 magicpipes add 3000 --public                        # explicit; refused unless the enrollment allows it
 magicpipes ls --all                                 # tunnels you can discover in the org
 magicpipes whoami                                   # user, org, role, tags; agent tags
@@ -479,8 +509,8 @@ magicpipes whoami                                   # user, org, role, tags; age
 
 - **`magicpipes login` without an enrollment token** uses a device-style flow:
   1. The CLI shows a short code and opens `https://<management>/cli?code=…`.
-  2. The user logs in and approves the request. They pick the new agent's access tags from the
-     tags they hold; all of them are pre-selected.
+  2. The user logs in and approves the request. The machine publishes with their tags; it
+     has none of its own.
   3. The server creates a personal enrollment token for this machine and returns it to the
      waiting CLI.
 - **Today's `magicpipes login --server <url> --token <token>`** keeps working for admin-issued
@@ -500,21 +530,23 @@ magicpipes whoami                                   # user, org, role, tags; age
   - A session is allowed if `authorize(user, Connect, tunnel)` is.
   - The roadmap's "grants" table is no longer needed.
   - Writable shells additionally require ownership or an explicit `terminal:write`-style tag on
-    the tunnel's access set. Exactly which is decided in that phase.
+    the tunnel. Exactly which is decided in that phase.
 - **VPN.** Users' devices and agents are principals with tags, and reachable subnets or
-  services are resources with access sets. The rule doesn't change: share a tag, or own it.
+  services are resources with tags. The rule doesn't change: share a tag that grants access.
 
 ## Schema
 
-New entries are appended to `MIGRATIONS` in `store.rs`, one per implementation step:
-- **users** (step 2): orgs, users, identities, memberships, passwords, sessions, API tokens,
-  the audit log, and the agent and enrollment ownership columns;
-- **tags** (step 3): the tag registry, rules and access tables, plus the visibility columns
-  (and `labels` columns, unused since labels were removed);
+`MIGRATIONS` in `store.rs` was restarted on 2026-11-03, when the tag model was replaced:
+migration 1 is the whole schema, and databases from before then are refused (delete them).
+New entries are appended from there, one per implementation step:
+- **users and tags** (steps 2 and 3, migration 1): orgs, users, identities, memberships,
+  passwords, sessions, API tokens, the audit log, ownership columns, the tag registry and the
+  tag assignments;
+- **rules** (steps 4 and 5): tag rules and their matches;
 - **email** (step 7): email tokens.
 
-Existing tables only gain columns. The first migration creates the default org and assigns
-every existing agent to it. The whole target schema:
+Migration 1 creates the default org. The whole target schema (`tag_rules`,
+`user_rule_matches` and `email_tokens` come with later steps):
 
 ```sql
 CREATE TABLE orgs (
@@ -552,10 +584,12 @@ CREATE TABLE memberships (
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (org_id, user_id)
 );
-CREATE TABLE tags (                         -- the access tag registry
+CREATE TABLE tags (                         -- the tag registry
     org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    access      INTEGER NOT NULL DEFAULT 1, -- users and tunnels sharing it may connect
+    user_id     TEXT UNIQUE REFERENCES users(id) ON DELETE CASCADE,  -- set: that user's personal tag
     created_by  TEXT,                       -- user id; NULL for the admin token
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (org_id, name)
@@ -571,7 +605,7 @@ CREATE TABLE tag_rules (
     created_at  INTEGER NOT NULL,
     FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
 );
-CREATE TABLE user_tags (                    -- assigned by an admin
+CREATE TABLE user_tags (                    -- assigned by an admin, plus the personal tag
     org_id      TEXT NOT NULL,
     user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     tag         TEXT NOT NULL,
@@ -587,12 +621,18 @@ CREATE TABLE user_rule_matches (            -- rules the user matched at their l
     PRIMARY KEY (user_id, rule_id)
 );
 
-ALTER TABLE agents ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
-ALTER TABLE agents ADD COLUMN owner_user_id TEXT REFERENCES users(id);   -- NULL = service agent
-ALTER TABLE agents ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;   -- migrated agents: as today
-ALTER TABLE agents ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE agents ADD COLUMN labels TEXT NOT NULL DEFAULT '';        -- unused (labels were removed)
-CREATE TABLE agent_tags (
+CREATE TABLE agents (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    token_hash      TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    last_seen_at    INTEGER,
+    org_id          TEXT NOT NULL DEFAULT 'org_default',
+    owner_user_id   TEXT REFERENCES users(id),      -- NULL = service agent
+    allow_public    INTEGER NOT NULL DEFAULT 1,
+    default_private INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE agent_tags (                   -- service agents only
     agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     org_id      TEXT NOT NULL,
     tag         TEXT NOT NULL,
@@ -600,13 +640,19 @@ CREATE TABLE agent_tags (
     FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
 );
 
-ALTER TABLE enrollments ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
-ALTER TABLE enrollments ADD COLUMN created_by TEXT;                      -- NULL = admin token
-ALTER TABLE enrollments ADD COLUMN owner_user_id TEXT;
-ALTER TABLE enrollments ADD COLUMN allow_public INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE enrollments ADD COLUMN default_private INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE enrollments ADD COLUMN labels TEXT NOT NULL DEFAULT '';   -- unused
-CREATE TABLE enrollment_tags (
+CREATE TABLE enrollments (
+    token_hash      TEXT PRIMARY KEY,
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    used_at         INTEGER,
+    agent_id        TEXT,
+    org_id          TEXT NOT NULL DEFAULT 'org_default',
+    created_by      TEXT,                           -- NULL = admin token
+    owner_user_id   TEXT,                           -- the new agent's owner; may differ from created_by
+    allow_public    INTEGER NOT NULL DEFAULT 1,
+    default_private INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE enrollment_tags (              -- service agents' tokens only
     token_hash  TEXT NOT NULL REFERENCES enrollments(token_hash) ON DELETE CASCADE,
     org_id      TEXT NOT NULL,
     tag         TEXT NOT NULL,
@@ -614,10 +660,9 @@ CREATE TABLE enrollment_tags (
     FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
 );
 
-ALTER TABLE tunnels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'
-    CHECK (visibility IN ('public', 'private'));
-ALTER TABLE tunnels ADD COLUMN labels TEXT NOT NULL DEFAULT '';       -- unused
-CREATE TABLE tunnel_access (                -- the requested set; effective = this ∩ agent tags
+-- tunnels: as before, plus `kind`, `public_port`, `allow` and
+--   visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('public', 'private'))
+CREATE TABLE tunnel_tags (                  -- the owner's personal tag + those given with --tag
     tunnel_id   TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
     org_id      TEXT NOT NULL,
     tag         TEXT NOT NULL,
@@ -675,9 +720,10 @@ CREATE TABLE audit_log (
 
 Schema notes:
 
-- **Assignment tables only reference registered access tags** through their foreign key on
-  `tags`, so an unregistered string can't be assigned as an access tag. Deleting a tag cascades,
-  and the cascade is the revocation.
+- **Assignment tables only reference registered tags** through their foreign key on `tags`, so
+  an unregistered string can't be assigned. Deleting a tag cascades, and the cascade is the
+  revocation. The store never writes a personal tag into an assignment other than its own
+  user's `user_tags` row and the tunnels of that user's machines.
 - **A tunnel has no `org_id`.** It belongs to its agent, which belongs to an org.
 - **`users.email` is not unique.** Identity is `(issuer, subject)`, and an email can move
   between accounts at an IdP. The `local` identity's subject is unique, so two password
@@ -693,9 +739,11 @@ Schema notes:
 
 ## Wire protocol and compatibility
 
-- **`RegisterTunnel` and `TunnelInfo` gain optional fields.** `visibility` and `access`
-  (`Vec<String>`), each `#[serde(default)]` and skipped when empty. The first protocol 3
-  builds also sent `labels`; both sides now ignore it.
+- **`RegisterTunnel` and `TunnelInfo` gain optional fields.** `visibility` and `tags`
+  (`Vec<String>`), each `#[serde(default)]` and skipped when empty. Builds before 2026-11-03
+  called the field `access` (and briefly sent `labels`); the tag model changed then without
+  keeping compatibility, and such agents' tags are ignored (their private tunnels are for
+  their owner alone).
   - An old agent sends none of them. Its tunnel takes the agent's defaults, which for a migrated
     agent means public, exactly as today. An agent before protocol 3 enrolled with a private
     default gets `agent_outdated` instead: it couldn't check a private tunnel, and public isn't
@@ -705,7 +753,7 @@ Schema notes:
     (the agent's copy may name tags deleted since). It still checks that a private tunnel came
     back private.
   - The CLI asks a running agent for its `ipc_version` before an `add` with options an older
-    agent would silently drop (private, access, TCP/UDP, allow-lists, `--serve`,
+    agent would silently drop (private, tags, TCP/UDP, allow-lists, `--serve`,
     `--shell`), and stops with `agent_outdated` rather than get a public HTTPS tunnel.
   - A new agent that asked for `private` checks that `TunnelInfo` echoes it back. If an old
     server doesn't, the new agent removes the tunnel again and reports `server_outdated`. This
@@ -819,7 +867,8 @@ useful.
    - Tag rules (IdP groups, claims, email domains) arrive with the SSO steps.
    - The tag registry and admin assignment.
    - Agent tags from enrollment tokens, and the device-style `magicpipes login`.
-   - Tunnel visibility and access (labels shipped too, and were removed on 2026-11-03).
+   - Tunnel visibility and tags. On 2026-11-03 the tag model was replaced (personal tags, an
+     `access` setting per tag, no owner exception and no inheritance) and labels removed.
    - The tunnel cookie flow and the access-denied page.
    - Discovery filtering in the API, UI and `ls --all`.
 4. **Authenticating proxy** (method 2), with groups-header rules.

@@ -26,13 +26,15 @@ open.
    {"id":"tn_…","name":"bright-otter","public_url":"https://bright-otter.t.example.com","target":"http://127.0.0.1:5173","status":"ready","background":true,"created":true}
    ```
 
-4. Give the user `public_url`. If `visibility` is `"private"`, tell them they (and people who
-   share the tunnel's access tags) must sign in to open it; otherwise, that anyone with the link
-   can reach it.
+4. Give the user `public_url`. If `visibility` is `"private"`, tell them they (and people with
+   the tunnel's other `tags`; `user:…` tags are personal) must sign in to open it; otherwise,
+   that anyone with the link can reach it.
 
-Add `--private` to keep it to the user (and their team's access tags, `--access team:dev`), or
-`--public` for a link anyone can open; without either, the server applies the machine's
-default.
+Add `--private` to keep it to the user, `--tag dev` to share it with people holding `dev` too
+(only tags the user holds), `--tag user:…` to share it with one person (their personal tag, as
+the user gives it to you), or `--public` for a link anyone can open; without either, the server
+applies the machine's default. With `--json`, a private tunnel's `access` lists the tags that
+let people in and `owner_tag` is the user's own.
 
 Use `--name <label>` for a stable, readable hostname (`https://<label>.<base domain>`). Running
 the same `add` again is safe: it returns the existing tunnel (`"created": false`).
@@ -51,8 +53,8 @@ present a URL. Act on the code:
 | 6 | `name_conflict`, `name_taken`, `invalid_name` | Choose another `--name`, or `magicpipes remove <name>` first. |
 | 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. |
 | 6 | `public_not_allowed` | This machine may only publish private tunnels. Retry without `--public`. |
-| 6 | `tag_unknown` | The access tag doesn't exist. Ask the user which tag to use. |
-| 3 | `forbidden` | The machine doesn't hold that access tag. Retry without `--access`, or ask the user. |
+| 6 | `tag_unknown` | The tag doesn't exist. Ask the user which tag to use. |
+| 3 | `forbidden` | The user doesn't hold that tag (or it is someone's personal tag). Retry without `--tag`, or ask the user. |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
 
@@ -70,5 +72,5 @@ magicpipes status --json      # login/agent/connection state
   `server.allowedHosts: ['.t.example.com']`, or requests get rejected by the app itself.
 * WebSockets work at the same URL with `wss://`.
 * Do not pass secrets from the user into URLs. Public tunnels have no access control of their
-  own; private ones admit only signed-in users who own the machine or share one of its access
-  tags.
+  own; private ones admit only signed-in users who share a tag with them that grants access
+  (the owner through their personal tag).

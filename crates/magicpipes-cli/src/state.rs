@@ -122,9 +122,15 @@ pub struct LocalTunnel {
     /// server predates them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<magicpipes_core::proto::Visibility>,
-    /// Private tunnels: the access tags asked for (empty = all of the machine's tags).
+    /// The tunnel's tags as the server confirmed them, the owner's personal tag included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Those of `tags` that granted access when it was registered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
+    /// The owner's personal tag (absent on a service agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_tag: Option<String>,
 }
 
 impl LocalTunnel {
