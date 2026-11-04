@@ -34,6 +34,27 @@ pub struct Config {
     /// login rate limits and passed on to tunnels) and PROXY headers on port tunnels.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Sign-in with OpenID Connect providers; one button each on the sign-in page.
+    #[serde(default)]
+    pub oidc: Vec<OidcConfig>,
+}
+
+/// One OpenID Connect provider (`[[oidc]]`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// Lowercase letters, digits and dashes; part of the callback URL registered at the provider.
+    pub id: String,
+    /// The button says "Continue with <label>".
+    pub label: String,
+    /// The provider's issuer URL, exactly as it states it in its discovery document.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_file: PathBuf,
+    /// A first sign-in whose verified email matches an existing user signs in as that user.
+    /// Off by default: only for a provider that doesn't let people change or reuse an address.
+    #[serde(default)]
+    pub link_by_email: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,11 +200,22 @@ pub struct UsersConfig {
     pub audit_retention_days: u64,
     /// May members' machines create public tunnels?
     pub members_can_publish: bool,
+    /// Verified emails that get a new administrator account at their first single sign-on.
+    pub bootstrap_admins: Vec<String>,
+    /// Verified emails in these domains get a new member account at their first single sign-on.
+    /// Empty: nobody does.
+    pub allowed_email_domains: Vec<String>,
 }
 
 impl Default for UsersConfig {
     fn default() -> Self {
-        Self { session_max_age_secs: 12 * 3600, audit_retention_days: 90, members_can_publish: true }
+        Self {
+            session_max_age_secs: 12 * 3600,
+            audit_retention_days: 90,
+            members_can_publish: true,
+            bootstrap_admins: Vec::new(),
+            allowed_email_domains: Vec::new(),
+        }
     }
 }
 
@@ -271,6 +303,32 @@ impl Config {
     }
 
     pub(crate) fn validate(&mut self) -> anyhow::Result<()> {
+        for e in &mut self.users.bootstrap_admins {
+            *e = e.trim().to_lowercase();
+            if !e.contains('@') {
+                bail!("users.bootstrap_admins: '{e}' is not an email address");
+            }
+        }
+        for d in &mut self.users.allowed_email_domains {
+            *d = d.trim().to_lowercase();
+            if d.is_empty() || d.contains('@') || d.contains('*') {
+                bail!("users.allowed_email_domains: '{d}' is not a domain");
+            }
+        }
+        for (i, p) in self.oidc.iter().enumerate() {
+            if p.id.is_empty() || !p.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                bail!("oidc.id: '{}' may only use lowercase letters, digits and dashes", p.id);
+            }
+            if self.oidc[..i].iter().any(|o| o.id == p.id) {
+                bail!("oidc.id: '{}' is used twice", p.id);
+            }
+            if p.label.trim().is_empty() || p.client_id.trim().is_empty() {
+                bail!("oidc '{}': label and client_id are required", p.id);
+            }
+            if !crate::oidc::allowed_url(&p.issuer) {
+                bail!("oidc '{}': issuer must be an https:// URL", p.id);
+            }
+        }
         self.base_domain = self.base_domain.trim().trim_end_matches('.').to_ascii_lowercase();
         self.management.hostname = self.management.hostname.trim().to_ascii_lowercase();
         if self.base_domain.is_empty() || (!self.base_domain.contains('.') && self.base_domain != "localhost") {
@@ -346,5 +404,28 @@ mod tests {
         for bad in ["", "0-10", "10-5", "a-b", "1-70000"] {
             assert!(PortRange::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn single_sign_on_settings() {
+        let load = |extra: &str| {
+            let mut c: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n{extra}")).unwrap();
+            c.validate().map(|_| c)
+        };
+        let provider = |id: &str, issuer: &str| format!("[[oidc]]\nid = \"{id}\"\nlabel = \"L\"\nissuer = \"{issuer}\"\nclient_id = \"c\"\nclient_secret_file = \"/s\"\n");
+        let google = provider("google", "https://accounts.google.com");
+
+        let c = load(&format!("[users]\nbootstrap_admins = [\" Ann@Example.com \"]\nallowed_email_domains = [\"Example.COM\"]\n{google}")).unwrap();
+        assert_eq!(c.users.bootstrap_admins, ["ann@example.com"]);
+        assert_eq!(c.users.allowed_email_domains, ["example.com"]);
+        assert!(!c.oidc[0].link_by_email, "linking by email is off unless asked for");
+        assert!(load(&provider("local", "http://127.0.0.1:9000")).is_ok());
+
+        assert!(load(&provider("Has Space", "https://a.example.com")).is_err());
+        assert!(load(&provider("x", "http://idp.example.com")).is_err(), "not over plain HTTP");
+        assert!(load(&format!("{google}{google}")).is_err(), "the same id twice");
+        assert!(load("[users]\nbootstrap_admins = [\"nobody\"]").is_err());
+        assert!(load("[users]\nallowed_email_domains = [\"*.example.com\"]").is_err(), "no wildcards");
+        assert!(load("[users]\nallowed_email_domains = [\"a@example.com\"]").is_err());
     }
 }

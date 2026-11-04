@@ -44,4 +44,7 @@ portable-pty.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+ring.workspace = true
+base64.workspace = true
+sha2.workspace = true
 rcgen.workspace = true

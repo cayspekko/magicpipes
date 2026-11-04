@@ -3,8 +3,8 @@
 //! Authentication boundaries:
 //! * `/api/v1/*` (except enroll/agent connect): `Authorization: Bearer <admin token or a user's
 //!   API token>`.
-//! * UI pages: session cookie created by logging in with an email and password or an admin
-//!   token; state-changing forms carry a per-session CSRF token.
+//! * UI pages: session cookie created by logging in with an email and password, an OpenID Connect
+//!   provider or an admin token; state-changing forms carry a per-session CSRF token.
 //!
 //! What each caller may do is decided by `authz::authorize`, in the control plane.
 //! * `/api/v1/enroll`: a single-use enrollment token in the body.
@@ -12,6 +12,7 @@
 
 mod accounts;
 mod api;
+mod oidc;
 mod picker;
 mod ui;
 
@@ -119,6 +120,8 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/audit", get(accounts::audit))
         .route("/cli", get(accounts::device).post(accounts::answer_device))
         .route("/auth/tunnel", get(accounts::auth_tunnel))
+        .route("/auth/oidc/{id}", get(oidc::start))
+        .route("/auth/oidc/{id}/callback", get(oidc::callback))
         .route("/ui.js", get(ui::script))
 
         .route("/healthz", get(|| async { "ok" }))

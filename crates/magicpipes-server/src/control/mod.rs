@@ -8,6 +8,7 @@
 //! * `device` — `magicpipes login` approved in the browser;
 //! * `directory` — owners, tags and custom hostnames, kept in memory for access decisions;
 //! * `hostnames` — custom hostnames and who may serve them;
+//! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
@@ -17,6 +18,7 @@
 mod device;
 mod directory;
 mod hostnames;
+mod oidc;
 mod registry;
 mod sessions;
 mod tags;
@@ -28,6 +30,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use magicpipes_core::cidr;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::MuxHandle;
@@ -42,6 +45,7 @@ use crate::config::Config;
 use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
 pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
+pub use oidc::OidcError;
 pub use registry::TunnelSignIn;
 pub use tags::EnrollmentOptions;
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
@@ -58,6 +62,9 @@ pub struct ControlPlane {
     hashing: Semaphore,
     accounts: users::AccountLimiter,
     devices: device::DeviceLogins,
+    oidc: Vec<crate::oidc::Provider>,
+    /// Bounds code exchanges under way with providers.
+    oidc_exchanges: Semaphore,
 }
 
 #[derive(Default)]
@@ -129,6 +136,7 @@ impl ControlPlane {
             }
             state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default() });
         }
+        let oidc = cfg.oidc.iter().map(|p| crate::oidc::Provider::load(p).with_context(|| format!("oidc provider '{}'", p.id))).collect::<anyhow::Result<Vec<_>>>()?;
         let cp = Arc::new(Self {
             cfg,
             store,
@@ -139,6 +147,8 @@ impl ControlPlane {
             hashing: Semaphore::new(users::HASH_CONCURRENCY),
             accounts: users::AccountLimiter::default(),
             devices: device::DeviceLogins::default(),
+            oidc,
+            oidc_exchanges: Semaphore::new(oidc::MAX_EXCHANGES),
         });
         cp.publish(&cp.state.lock().unwrap());
         Ok(cp)

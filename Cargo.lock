@@ -996,6 +996,7 @@ name = "magicpipes-cli"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "flate2",
@@ -1010,10 +1011,12 @@ dependencies = [
  "mime_guess",
  "portable-pty",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "thiserror 2.0.21",
  "tokio",
@@ -1050,6 +1053,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "hmac",
@@ -1060,6 +1064,7 @@ dependencies = [
  "instant-acme",
  "magicpipes-core",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pki-types",
@@ -1076,6 +1081,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
  "x509-parser",
 ]
 

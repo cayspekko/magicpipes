@@ -193,13 +193,62 @@ administrator when they first sign in.
   (an IPv6 /64 counts as one) gets no password checked at all until it waits. A wrong password
   and an unknown email get the same answer. The sign-in form only accepts posts from its own
   page, so another site can't sign your browser into its account.
+* **Single sign-on**: see below.
 * **Sessions** last `[users] session_max_age_secs` (12 hours) and survive server restarts.
-  Changing your password, being disabled, or "Sign out everywhere" ends them.
+  Changing your password, being disabled, or "Sign out everywhere" ends them. Signing out here
+  doesn't sign you out at a single sign-on provider.
 * **API tokens** (Account page) act as their user with the user's current role:
   `Authorization: Bearer tok_…`. Disabling the user stops them.
 * **Audit log**: sign-ins (including failed ones), account changes, deletions, revocations and
   enrollment tokens, kept for `[users] audit_retention_days` (90).
 
+
+### Single sign-on
+
+People can sign in through any OpenID Connect provider: Google, Microsoft Entra (with a
+tenant-specific issuer), Okta, Authentik, Keycloak, Authelia, Dex and others. Each `[[oidc]]`
+section adds a "Continue with ..." button to the sign-in page, next to the password form:
+
+```toml
+[users]
+bootstrap_admins = ["you@example.com"]     # verified emails that get an administrator's account
+allowed_email_domains = ["example.com"]    # verified emails here get a member's account
+
+[[oidc]]
+id = "google"                              # part of the callback URL
+label = "Google"                           # "Continue with Google"
+issuer = "https://accounts.google.com"
+client_id = "1234.apps.googleusercontent.com"
+client_secret_file = "/etc/magicpipes/google-secret"
+# link_by_email = true
+```
+
+At the provider, register a web application with this redirect URI:
+`https://<management hostname>/auth/oidc/<id>/callback`, with the management port if it isn't
+443. The server reads the client secret when it starts, and contacts the provider at the first
+sign-in, so a provider that's down only affects its own button.
+
+**Who gets in.** Having an account at the provider isn't enough. Someone who has signed in here
+before is recognized by the provider's subject id, so changing their address there changes
+nothing here. A first sign-in needs an email the provider says it verified, and then one of:
+
+* the address is in `bootstrap_admins`: a new administrator's account;
+* the address's domain is in `allowed_email_domains` (exactly; no subdomains): a new member's
+  account;
+* an account with that address exists and the provider has `link_by_email = true`: it signs in
+  to that account, and only one identity per provider can do so.
+
+These settings apply to every provider, so only add a provider you trust to verify addresses.
+Anyone else is told their address can't sign in here. To let in one person with an address
+outside your domains, add them under **Users** and set `link_by_email`; turn it on only for a
+provider that doesn't let people choose or reuse addresses (Google and most company directories
+are fine; check first for a self-hosted one where people edit their own email). A provider that
+never states `email_verified` (Microsoft Entra, for one) can't create or link accounts yet.
+
+The temporary password an administrator set stops working once its owner has signed in with
+single sign-on, and no password change is asked for. A password the person chose keeps working.
+If a provider goes away, an administrator can give its users a password with "Reset password".
+The admin token works regardless.
 ### Docker
 
 The [`Dockerfile`](Dockerfile) builds static musl binaries in `rust:1.90-alpine` and copies
@@ -618,8 +667,9 @@ administrators answer `403 forbidden` to members.
 | GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 
-User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`, `tags`
-(assigned), `personal_tag`, `created_at`, `last_login_at`.
+User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`,
+`has_password` (false for someone who only signs in with single sign-on), `tags` (assigned),
+`personal_tag`, `created_at`, `last_login_at`.
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
 agent's protocol version), `owner_user_id`, `owner_email`, `tags` (what it publishes with: its owner's, or a service agent's own),

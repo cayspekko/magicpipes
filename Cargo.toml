@@ -38,6 +38,8 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sha2 = "0.11"
+ring = "0.17"
+base64 = "0.22"
 argon2 = "0.6"
 hmac = "0.13"
 getrandom = "0.4"

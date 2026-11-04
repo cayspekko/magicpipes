@@ -112,6 +112,8 @@ pub struct UserView {
     pub role: Role,
     pub disabled: bool,
     pub must_change_password: bool,
+    /// False for someone who only signs in with single sign-on.
+    pub has_password: bool,
     /// Tags assigned by administrators.
     pub tags: Vec<String>,
     /// The tag the server made with the account and puts on the tunnels of their machines.
@@ -131,6 +133,7 @@ impl From<UserRow> for UserView {
             role: u.role,
             disabled: u.disabled,
             must_change_password: u.must_change_password,
+            has_password: u.has_password,
             tags: Vec::new(),
             personal_tag: None,
             created_at: rfc3339(u.created_at),
@@ -198,7 +201,7 @@ fn check_password(password: &str, email: &str) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-fn clean_name(s: &str, max: usize) -> String {
+pub(super) fn clean_name(s: &str, max: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
 }
 

@@ -98,6 +98,18 @@ impl Signer {
         format!("{payload}~{mac}")
     }
 
+    /// `payload`, signed. It must start with its own kind and may not contain anything a cookie
+    /// can't hold.
+    pub fn seal(&self, payload: &str) -> String {
+        format!("{payload}~{}", self.mac(payload))
+    }
+
+    /// What [`Signer::seal`] was given, if the signature is good.
+    pub fn open<'a>(&self, sealed: &'a str) -> Option<&'a str> {
+        let (payload, mac) = sealed.rsplit_once('~')?;
+        secret::constant_time_eq(self.mac(payload).as_bytes(), mac.as_bytes()).then_some(payload)
+    }
+
     /// A one-time code for `host`, bound to the browser's state nonce.
     pub fn code(&self, user_id: &str, host: &str, nonce: &str) -> String {
         self.issue(Kind::Code, user_id, host, nonce, CODE_TTL_SECS)

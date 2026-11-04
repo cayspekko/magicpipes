@@ -237,6 +237,11 @@ const MIGRATIONS: &[&str] = &[
         CHECK ((owner_user_id IS NULL) != (agent_id IS NULL))
     );
     "#,
+    // 3: one account per email. Single sign-on creates accounts as well as administrators do, and
+    // a person must not end up with two.
+    r#"
+    CREATE UNIQUE INDEX users_email ON users(email);
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {

@@ -1461,6 +1461,254 @@ async fn browser_signs_in_to_private_tunnels() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// A browser going to the fake provider and back: the sign-in link, the provider, the callback.
+/// Returns the callback's answer.
+async fn oidc_sign_in(env: &Env, next: Option<&str>) -> common::UiResponse {
+    let at = next.map_or("/auth/oidc/fake".to_string(), |n| format!("/auth/oidc/fake?next={n}"));
+    let start = env.ui(&at, None, None).await;
+    assert_eq!(start.status, StatusCode::SEE_OTHER, "{}", start.html);
+    let attempt = start.cookie.clone().expect("attempt cookie");
+    let callback = follow_to_callback(env, &start).await;
+    env.ui(&callback, Some(&attempt), None).await
+}
+
+/// Follows the redirect to the provider, which answers at once; the path to come back to.
+async fn follow_to_callback(env: &Env, start: &common::UiResponse) -> String {
+    let at = start.location.clone().expect("sent to the provider");
+    let (status, location) = plain_get(&at).await;
+    assert_eq!(status, StatusCode::FOUND);
+    location.strip_prefix(&format!("https://localhost:{}", env.mgmt_port)).expect("back to the management host").to_string()
+}
+
+/// A GET over plain HTTP to the fake provider; the status and the redirect's target.
+async fn plain_get(url: &str) -> (StatusCode, String) {
+    use http_body_util::BodyExt;
+    let uri: http::Uri = url.parse().unwrap();
+    let stream = tokio::net::TcpStream::connect((uri.host().unwrap(), uri.port_u16().unwrap())).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let req = http::Request::builder()
+        .uri(uri.path_and_query().unwrap().as_str())
+        .header(http::header::HOST, uri.authority().unwrap().as_str())
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status();
+    let location = resp.headers().get(http::header::LOCATION).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+    resp.into_body().collect().await.unwrap();
+    (status, location)
+}
+
+fn session_of(resp: &common::UiResponse) -> String {
+    let cookie = resp.cookie.clone().unwrap_or_else(|| panic!("signed in: {} {}", resp.status, resp.html));
+    assert!(cookie.starts_with("__Host-mp_session="), "{cookie}");
+    cookie
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oidc_sign_in_admits_only_who_it_should() {
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-oidc-{}", std::process::id()));
+    let users = r#"bootstrap_admins = ["Boss@Example.com"]
+allowed_email_domains = ["team.example.com"]"#;
+    let env = Env::with_config(Tls::DevCa, &idp.config(&dir, users, true)).await;
+    let admin = env.admin_token();
+    let set = |p: common::OidcPerson| *idp.person.lock().unwrap() = p;
+
+    // The sign-in page offers the provider, and keeps the destination.
+    let login = env.ui("/login?next=/account", None, None).await;
+    assert!(login.html.contains(r#"href="/auth/oidc/fake?next=%2Faccount""#) && login.html.contains("Continue with Fake ID"), "{}", login.html);
+    assert!(!env.ui("/login?method=token", None, None).await.html.contains("Continue with"), "the admin token form is on its own");
+
+    // Nobody is admitted just for having an account at the provider.
+    set(common::OidcPerson::new("stranger", "stranger@example.org"));
+    let r = oidc_sign_in(&env, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.html);
+    assert!(r.html.contains("stranger@example.org can&#39;t sign in here") || r.html.contains("stranger@example.org can't sign in here"), "{}", r.html);
+    assert!(r.cookie.is_none());
+
+    // An address the provider didn't verify proves nothing, even a listed one.
+    let mut unverified = common::OidcPerson::new("boss-1", "boss@example.com");
+    unverified.verified = false;
+    set(unverified);
+    let r = oidc_sign_in(&env, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.html);
+    assert!(r.html.contains("didn"), "{}", r.html);
+
+    // A bootstrap administrator gets an account with the administrator's role and no password.
+    set(common::OidcPerson::new("boss-1", "boss@example.com"));
+    let r = oidc_sign_in(&env, None).await;
+    assert_eq!((r.status, r.location.as_deref()), (StatusCode::SEE_OTHER, Some("/")));
+    let boss = session_of(&r);
+    assert_eq!(env.ui("/users", Some(&boss), None).await.status, StatusCode::OK, "an administrator's page");
+    let account = env.ui("/account", Some(&boss), None).await;
+    assert!(!account.html.contains("Change password"), "no password to change");
+    let (_, list) = env.api("GET", "/api/v1/users", Some(&admin)).await;
+    let row = list["users"].as_array().unwrap().iter().find(|u| u["email"] == "boss@example.com").unwrap().clone();
+    assert_eq!((row["role"].as_str(), row["has_password"].as_bool(), row["display_name"].as_str()), (Some("admin"), Some(false), Some("Test Person")));
+    assert!(row["personal_tag"].as_str().unwrap().starts_with("user:"));
+
+    // An address in an allowed domain gets a member's account; its destination is kept.
+    set(common::OidcPerson::new("dev-1", "dev@team.example.com"));
+    let r = oidc_sign_in(&env, Some("/account")).await;
+    let dev = session_of(&r);
+    assert!(r.html.contains(r#"<a href="/account">"#), "continues to where it started: {}", r.html);
+    assert_eq!(env.ui("/users", Some(&dev), None).await.status, StatusCode::SEE_OTHER, "a member is sent away");
+    // Subdomains aren't the domain.
+    set(common::OidcPerson::new("sub-1", "dev@x.team.example.com"));
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+
+    // The email can come from UserInfo instead of the ID token.
+    let mut late = common::OidcPerson::new("dev-2", "second@team.example.com");
+    late.email_in_userinfo = true;
+    set(late);
+    session_of(&oidc_sign_in(&env, None).await);
+
+    // An identity is its subject: a changed address still signs in to the same account.
+    set(common::OidcPerson::new("dev-1", "renamed@elsewhere.example.org"));
+    session_of(&oidc_sign_in(&env, None).await);
+    let (_, list) = env.api("GET", "/api/v1/users", Some(&admin)).await;
+    assert_eq!(list["users"].as_array().unwrap().len(), 3, "no new account: {list}");
+
+    // An administrator's temporary password stops working when its owner signs in here. Linking
+    // needs the verified email to match, and only once per issuer.
+    let body = serde_json::json!({ "email": "pat@example.org", "password": "correct horse battery" });
+    let (status, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let pat = v["user"]["id"].as_str().unwrap().to_string();
+    set(common::OidcPerson::new("pat-1", "pat@example.org"));
+    let r = oidc_sign_in(&env, None).await;
+    let cookie = session_of(&r);
+    assert_eq!(r.location.as_deref(), Some("/"), "no forced password change");
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.status, StatusCode::OK);
+    let refused = env.ui("/login", None, Some(&[("email", "pat@example.org"), ("password", "correct horse battery")])).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "the temporary password is gone");
+    // Someone else who now has that address at the provider doesn't reach the account.
+    set(common::OidcPerson::new("pat-2", "pat@example.org"));
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+    // An administrator can still give them a password, for when the provider goes away.
+    let (status, v) = env.api("POST", &format!("/api/v1/users/{pat}/password"), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let again = v["password"].as_str().unwrap().to_string();
+    let signed_in = env.ui("/login", None, Some(&[("email", "pat@example.org"), ("password", &again)])).await;
+    assert!(signed_in.cookie.is_some(), "{}", signed_in.html);
+
+    // A disabled account stays out.
+    let (status, _) = env.api_json("PATCH", &format!("/api/v1/users/{pat}"), Some(&admin), serde_json::json!({ "disabled": true })).await;
+    assert_eq!(status, StatusCode::OK);
+    set(common::OidcPerson::new("pat-1", "pat@example.org"));
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+
+    // Tokens that fail their checks.
+    let mut forged = common::OidcPerson::new("boss-1", "boss@example.com");
+    forged.wrong_key = true;
+    set(forged);
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::UNAUTHORIZED);
+    let mut replayed = common::OidcPerson::new("boss-1", "boss@example.com");
+    replayed.wrong_nonce = true;
+    set(replayed);
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::UNAUTHORIZED);
+
+    // The way back only works in the browser that left. No request reaches the provider without
+    // the attempt that matches.
+    set(common::OidcPerson::new("boss-1", "boss@example.com"));
+    let start = env.ui("/auth/oidc/fake", None, None).await;
+    let attempt = start.cookie.clone().unwrap();
+    let callback = follow_to_callback(&env, &start).await;
+    let before = idp.token_requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(env.ui(&callback, None, None).await.status, StatusCode::BAD_REQUEST, "no cookie: another browser");
+    let other = env.ui("/auth/oidc/fake", None, None).await.cookie.unwrap();
+    assert_eq!(env.ui(&callback, Some(&other), None).await.status, StatusCode::BAD_REQUEST, "another attempt's cookie");
+    let (name, value) = attempt.split_once('=').unwrap();
+    let forged = format!("{name}={}", value.replacen('o', "p", 1));
+    assert_eq!(env.ui(&callback, Some(&forged), None).await.status, StatusCode::BAD_REQUEST, "a changed cookie");
+    assert_eq!(idp.token_requests.load(std::sync::atomic::Ordering::SeqCst), before);
+    // The real one still works, with a provider that says who it is; another name is refused.
+    let wrong_iss = format!("{}&iss=https://evil.example.com", callback.split("&iss=").next().unwrap());
+    assert_eq!(env.ui(&wrong_iss, Some(&attempt), None).await.status, StatusCode::UNAUTHORIZED);
+    session_of(&env.ui(&callback, Some(&attempt), None).await);
+    // A used code doesn't work twice.
+    assert_eq!(env.ui(&callback, Some(&attempt), None).await.status, StatusCode::UNAUTHORIZED);
+    // A provider's error, and a provider we don't have.
+    let state = callback.split("state=").nth(1).unwrap().split('&').next().unwrap();
+    let cancelled = env.ui(&format!("/auth/oidc/fake/callback?error=access_denied&state={state}"), Some(&attempt), None).await;
+    assert!(cancelled.status == StatusCode::BAD_REQUEST && cancelled.html.contains("cancelled"), "{}", cancelled.html);
+    assert_eq!(env.ui("/auth/oidc/other", None, None).await.status, StatusCode::NOT_FOUND);
+
+    idp.task.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A provider that is down shows a page, and the password form still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oidc_provider_down_leaves_other_sign_ins_alone() {
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-oidc-down-{}", std::process::id()));
+    let config = idp.config(&dir, "", false);
+    idp.task.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let env = Env::with_config(Tls::DevCa, &config).await;
+    let r = env.ui("/auth/oidc/fake?next=/account", None, None).await;
+    assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.html);
+    assert!(r.html.contains("Fake ID can&#39;t be reached") || r.html.contains("Fake ID can't be reached"), "{}", r.html);
+    assert!(r.html.contains(r#"action="/login""#), "the password form is still offered: {}", r.html);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same as `browser_signs_in_to_private_tunnels`, through an OpenID Connect provider: the
+/// private tunnel sends the browser to the sign-in page, its link to the provider, the provider
+/// back to the callback, and the callback on to the tunnel. Cookies have to survive coming back
+/// from another site, and nothing on the way may trip the CSP. Run it like that test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Chrome and Node"]
+async fn browser_signs_in_with_oidc() {
+    let chrome = std::env::var("MAGICPIPES_CHROME").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") { "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() } else { "google-chrome".into() }
+    });
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-oidc-browser-{}", std::process::id()));
+    let env = Env::with_config(Tls::DevCa, &idp.config(&dir, r#"allowed_email_domains = ["example.com"]"#, false)).await;
+    let admin = env.admin_token();
+
+    // Ann signs in once, which makes her account, and enrolls a machine that serves the tunnels.
+    let session = session_of(&oidc_sign_in(&env, None).await);
+    assert_eq!(env.ui("/account", Some(&session), None).await.status, StatusCode::OK);
+    let (_, list) = env.api("GET", "/api/v1/users", Some(&admin)).await;
+    let ann = list["users"][0]["id"].as_str().unwrap().to_string();
+    let body = serde_json::json!({ "owner_user_id": ann });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "laptop"]).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let first = add_json(&env, &[&app.port.to_string(), "--private", "--name", "one"]).await;
+    let second = add_json(&env, &[&app.port.to_string(), "--private", "--name", "two"]).await;
+
+    // A fresh browser, not signed in to anything.
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/browser-sign-in.mjs");
+    let profile = std::env::temp_dir().join(format!("mp-chrome-oidc-{}", std::process::id()));
+    let opts = serde_json::json!({
+        "chrome": chrome,
+        "first": format!("{}/", first["public_url"].as_str().unwrap()),
+        "second": format!("{}/", second["public_url"].as_str().unwrap()),
+        "management": url,
+        "sso": "Continue with Fake ID",
+        "resolve": format!("MAP *.{BASE} 127.0.0.1"),
+        "profile": profile,
+    });
+    let out = tokio::process::Command::new("node").arg(&script).arg(opts.to_string()).output().await.expect("run node");
+    std::fs::remove_dir_all(&profile).ok();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+
+    assert!(result["first"]["url"].as_str().unwrap_or("").starts_with(first["public_url"].as_str().unwrap()), "{result}");
+    assert_eq!(result["first"]["text"], "hello from app", "{result}");
+    assert!(result["second"]["url"].as_str().unwrap_or("").starts_with(second["public_url"].as_str().unwrap()), "{result}");
+    assert_eq!(result["second"]["text"], "hello from app", "{result}");
+    assert!(result["errors"].as_array().unwrap().is_empty(), "the browser reported errors: {result}");
+    env.cli_ok(&["agent", "stop"]).await;
+    idp.task.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Real ACME issuance against Pebble (https://github.com/letsencrypt/pebble), including real
 /// HTTP-01 validation of magicpipesd's challenge responder. Not run by default.
 ///

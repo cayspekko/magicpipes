@@ -82,6 +82,11 @@ pub struct Env {
 
 impl Env {
     pub async fn new(tls: Tls) -> Env {
+        Self::with_config(tls, "").await
+    }
+
+    /// `extra` is appended to the server's configuration.
+    pub async fn with_config(tls: Tls, extra: &str) -> Env {
         let root = std::env::temp_dir().join(format!("mpe2e-{}", magicpipes_core_rand()));
         std::fs::create_dir_all(root.join("home")).unwrap();
         let (https_port, mut http_port, mgmt_port) = (free_port(), free_port(), free_port());
@@ -145,6 +150,7 @@ range = "{first}-{last}"
 bind = "127.0.0.1"
 public_host = "localhost"
 udp_idle_timeout_secs = 5
+{extra}
 "#,
             data = root.join("server").display(),
             first = ports.0,
@@ -644,6 +650,181 @@ pub async fn udp_echo_app() -> App {
         }
     });
     App { port, task }
+}
+
+/// Who the fake OpenID Connect provider says is signing in, and how it misbehaves.
+#[derive(Clone)]
+pub struct OidcPerson {
+    pub sub: String,
+    pub email: String,
+    pub verified: bool,
+    /// Give the email only through the UserInfo endpoint.
+    pub email_in_userinfo: bool,
+    /// Sign the ID token with a key the provider doesn't publish.
+    pub wrong_key: bool,
+    /// Put this in the ID token instead of the nonce it was given.
+    pub wrong_nonce: bool,
+}
+
+impl OidcPerson {
+    pub fn new(sub: &str, email: &str) -> Self {
+        Self { sub: sub.into(), email: email.into(), verified: true, email_in_userinfo: false, wrong_key: false, wrong_nonce: false }
+    }
+}
+
+/// A small OpenID Connect provider on plain HTTP on this machine: discovery, keys, an
+/// authorization endpoint that signs in `person` at once, a token endpoint and UserInfo. It checks
+/// what a real provider checks: the client's credentials, one use of a code, the redirect URI and
+/// PKCE.
+pub struct FakeOidc {
+    pub issuer: String,
+    pub person: Arc<std::sync::Mutex<OidcPerson>>,
+    pub token_requests: Arc<std::sync::atomic::AtomicUsize>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+pub const OIDC_CLIENT: &str = "client-1";
+pub const OIDC_SECRET: &str = "secret/with+odd chars";
+
+impl FakeOidc {
+    pub async fn start() -> FakeOidc {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD as B64};
+        use ring::rand::SystemRandom;
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING as ALG, EcdsaKeyPair, KeyPair};
+        use sha2::Digest;
+
+        type Code = (String, OidcPerson, String, String);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let rng = SystemRandom::new();
+        let new_key = || EcdsaKeyPair::from_pkcs8(&ALG, EcdsaKeyPair::generate_pkcs8(&ALG, &rng).unwrap().as_ref(), &rng).unwrap();
+        let (key, other) = (Arc::new(new_key()), Arc::new(new_key()));
+        let person = Arc::new(std::sync::Mutex::new(OidcPerson::new("sub-1", "ann@example.com")));
+        let codes: Arc<std::sync::Mutex<std::collections::HashMap<String, Code>>> = Arc::default();
+        let token_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (iss, who, requests) = (issuer.clone(), person.clone(), token_requests.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let (iss, who, codes, key, other, requests) = (iss.clone(), who.clone(), codes.clone(), key.clone(), other.clone(), requests.clone());
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let (iss, who, codes, key, other, requests) = (iss.clone(), who.clone(), codes.clone(), key.clone(), other.clone(), requests.clone());
+                        async move {
+                            let path = req.uri().path().to_string();
+                            let query: std::collections::HashMap<String, String> = parse_form(req.uri().query().unwrap_or(""));
+                            let auth = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+                            let body = String::from_utf8_lossy(&req.into_body().collect().await.unwrap().to_bytes()).into_owned();
+                            let json = |status: StatusCode, v: Value| Response::builder().status(status).header(header::CONTENT_TYPE, "application/json").body(Full::new(Bytes::from(v.to_string()))).unwrap();
+                            let refuse = || json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "invalid_grant" }));
+                            let resp = match path.as_str() {
+                                "/.well-known/openid-configuration" => json(StatusCode::OK, serde_json::json!({
+                                    "issuer": iss,
+                                    "authorization_endpoint": format!("{iss}/authorize"),
+                                    "token_endpoint": format!("{iss}/token"),
+                                    "jwks_uri": format!("{iss}/keys"),
+                                    "userinfo_endpoint": format!("{iss}/userinfo"),
+                                })),
+                                "/keys" => {
+                                    let p = key.public_key().as_ref();
+                                    json(StatusCode::OK, serde_json::json!({ "keys": [{ "kty": "EC", "kid": "k1", "use": "sig", "crv": "P-256", "x": B64.encode(&p[1..33]), "y": B64.encode(&p[33..65]) }] }))
+                                }
+                                "/authorize" => {
+                                    let code = format!("code-{}", magicpipes_core_rand());
+                                    let entry = (query["nonce"].clone(), who.lock().unwrap().clone(), query["code_challenge"].clone(), query["redirect_uri"].clone());
+                                    assert_eq!(query["code_challenge_method"], "S256");
+                                    assert_eq!(query["client_id"], OIDC_CLIENT);
+                                    codes.lock().unwrap().insert(code.clone(), entry);
+                                    let to = format!("{}?code={code}&state={}&iss={}", query["redirect_uri"], query["state"], iss);
+                                    Response::builder().status(StatusCode::FOUND).header(header::LOCATION, to).body(Full::new(Bytes::new())).unwrap()
+                                }
+                                "/token" => {
+                                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    let form = parse_form(&body);
+                                    let enc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+                                    let basic = format!("Basic {}", STANDARD.encode(format!("{}:{}", enc(OIDC_CLIENT), enc(OIDC_SECRET))));
+                                    let entry = codes.lock().unwrap().remove(form.get("code").map_or("", |c| c.as_str()));
+                                    match entry {
+                                        Some((nonce, p, challenge, redirect))
+                                            if auth.as_deref() == Some(&basic)
+                                                && form.get("redirect_uri") == Some(&redirect)
+                                                && B64.encode(sha2::Sha256::digest(form["code_verifier"].as_bytes())) == challenge =>
+                                        {
+                                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                            let mut claims = serde_json::json!({
+                                                "iss": iss, "aud": OIDC_CLIENT, "sub": p.sub, "exp": now + 300, "iat": now,
+                                                "nonce": if p.wrong_nonce { "another".to_string() } else { nonce }, "name": "Test Person",
+                                            });
+                                            if !p.email_in_userinfo {
+                                                claims["email"] = p.email.clone().into();
+                                                claims["email_verified"] = p.verified.into();
+                                            }
+                                            let msg = format!("{}.{}", B64.encode(r#"{"alg":"ES256","kid":"k1"}"#), B64.encode(claims.to_string()));
+                                            let signer = if p.wrong_key { &other } else { &key };
+                                            let sig = signer.sign(&SystemRandom::new(), msg.as_bytes()).unwrap();
+                                            json(StatusCode::OK, serde_json::json!({ "id_token": format!("{msg}.{}", B64.encode(sig.as_ref())), "access_token": p.sub, "token_type": "Bearer" }))
+                                        }
+                                        _ => refuse(),
+                                    }
+                                }
+                                "/userinfo" => {
+                                    let p = who.lock().unwrap().clone();
+                                    if auth.as_deref() == Some(&format!("Bearer {}", p.sub)) {
+                                        json(StatusCode::OK, serde_json::json!({ "sub": p.sub, "email": p.email, "email_verified": p.verified }))
+                                    } else {
+                                        json(StatusCode::UNAUTHORIZED, Value::Null)
+                                    }
+                                }
+                                _ => json(StatusCode::NOT_FOUND, Value::Null),
+                            };
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+                });
+            }
+        });
+        FakeOidc { issuer, person, token_requests, task }
+    }
+
+    /// The configuration that uses this provider.
+    pub fn config(&self, root: &Path, users: &str, link_by_email: bool) -> String {
+        std::fs::create_dir_all(root).unwrap();
+        let secret = root.join("oidc-secret");
+        std::fs::write(&secret, format!("{OIDC_SECRET}\n")).unwrap();
+        format!(
+            "[users]\n{users}\n[[oidc]]\nid = \"fake\"\nlabel = \"Fake ID\"\nissuer = \"{}\"\nclient_id = \"{OIDC_CLIENT}\"\nclient_secret_file = \"{}\"\nlink_by_email = {link_by_email}\n",
+            self.issuer,
+            secret.display(),
+        )
+    }
+}
+
+fn parse_form(s: &str) -> std::collections::HashMap<String, String> {
+    let decode = |v: &str| {
+        let b = v.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'%' if i + 2 < b.len() => {
+                    out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap());
+                    i += 3;
+                }
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).unwrap()
+    };
+    s.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (decode(k), decode(v))).collect()
 }
 
 #[derive(Debug)]

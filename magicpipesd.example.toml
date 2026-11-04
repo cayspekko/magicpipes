@@ -61,6 +61,8 @@ acme_directory = "letsencrypt"
 # Accounts are created by administrators in the UI (Users) or the API; see the README.
 # session_max_age_secs = 43200         # how long a sign-in lasts
 # audit_retention_days = 90
+# bootstrap_admins = ["you@example.com"]  # verified emails that get an administrator's account at their first single sign-on
+# allowed_email_domains = ["example.com"] # verified emails here get a member's account at their first single sign-on (exact domain)
 # members_can_publish = true           # may members' machines create public tunnels? (checked on every new or changed one)
 
 [ports]
@@ -74,3 +76,13 @@ acme_directory = "letsencrypt"
 # max_connections = 10000              # open TCP connections across all port tunnels
 # udp_idle_timeout_secs = 60
 # udp_max_flows = 128                  # UDP clients tracked at once per tunnel; one address may hold an eighth
+
+# Single sign-on: one section per OpenID Connect provider, one button each on the sign-in page.
+# Register https://<management hostname>/auth/oidc/<id>/callback at the provider.
+# [[oidc]]
+# id = "google"                        # lowercase letters, digits, dashes; part of the callback URL
+# label = "Google"                     # the button says "Continue with Google"
+# issuer = "https://accounts.google.com"
+# client_id = "1234.apps.googleusercontent.com"
+# client_secret_file = "/etc/magicpipes/google-secret"
+# link_by_email = false                # a first sign-in with a verified email reaches the account with that email

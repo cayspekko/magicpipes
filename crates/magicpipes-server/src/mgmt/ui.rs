@@ -45,14 +45,17 @@ pub(super) fn esc(s: &str) -> String {
 }
 
 fn cookie_value(parts: &Parts) -> Option<String> {
-    parts
-        .headers
+    cookie_from(&parts.headers, SESSION_COOKIE)
+}
+
+pub(super) fn cookie_from(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == SESSION_COOKIE)
+        .find(|(k, _)| *k == name)
         .map(|(_, v)| v.to_string())
 }
 
@@ -591,9 +594,23 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
     page("Enrollment token", Some(&user), &body)
 }
 
-fn login_page(error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
+pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
     let err = error.map(|e| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(e))).unwrap_or_default();
     let next = safe_next(next);
+    let providers = app.control.oidc_providers();
+    // One link per provider, above the password form. They carry the destination too.
+    let sso = if admin_token || providers.is_empty() {
+        String::new()
+    } else {
+        let links: String = providers
+            .iter()
+            .map(|p| {
+                let q = next.map(|n| format!("?next={}", url_encode(n))).unwrap_or_default();
+                format!(r#"<a class="btn block" style="margin-bottom:10px;text-align:center" href="/auth/oidc/{}{q}">Continue with {}</a>"#, esc(&p.id), esc(&p.label))
+            })
+            .collect();
+        format!(r#"{links}<p class="note" style="text-align:center;margin:14px 0">or</p>"#)
+    };
     // Switching between the two forms keeps the destination.
     let nq = next.map(|n| format!("&amp;next={}", url_encode(n))).unwrap_or_default();
     let next = next.map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
@@ -610,7 +627,7 @@ fn login_page(error: Option<&str>, admin_token: bool, next: Option<&str>) -> Res
     page(
         "Sign in",
         None,
-        &format!(r#"<div class="auth"><div class="eyebrow">MagicPipes</div><h1>Sign <em>in</em></h1><div class="card" style="margin-top:28px">{err}{form}</div>"#, form = form.replace("{next}", &next).replace("{nq}", &nq)),
+        &format!(r#"<div class="auth"><div class="eyebrow">MagicPipes</div><h1>Sign <em>in</em></h1><div class="card" style="margin-top:28px">{err}{sso}{form}</div>"#, form = form.replace("{next}", &next).replace("{nq}", &nq)),
     )
 }
 
@@ -620,8 +637,8 @@ pub struct LoginQuery {
     next: Option<String>,
 }
 
-pub async fn login_form(axum::extract::Query(q): axum::extract::Query<LoginQuery>) -> Response {
-    login_page(None, q.method.as_deref() == Some("token"), q.next.as_deref())
+pub async fn login_form(State(app): State<AppState>, axum::extract::Query(q): axum::extract::Query<LoginQuery>) -> Response {
+    login_page(&app, None, q.method.as_deref() == Some("token"), q.next.as_deref())
 }
 
 #[derive(Deserialize)]
@@ -700,25 +717,25 @@ pub async fn login(
     // Login CSRF: another site's form would sign this browser into the attacker's account (and a
     // machine approved there would then be enrolled as theirs).
     if cross_site(&headers) {
-        return (StatusCode::FORBIDDEN, login_page(Some("Sign in from this page, not from another site."), f.token.is_some(), next)).into_response();
+        return (StatusCode::FORBIDDEN, login_page(&app, Some("Sign in from this page, not from another site."), f.token.is_some(), next)).into_response();
     }
     if let Some(token) = f.token {
         let checked = match app.control.login_admin_token(token.trim()) {
             Ok(found) => found.ok_or(()),
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, login_page(Some("Something went wrong. Try again."), true, next)).into_response(),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, login_page(&app, Some("Something went wrong. Try again."), true, next)).into_response(),
         };
         return match app.check_credential(checked, client) {
             Ok(login) => logged_in(&app, login, next),
             Err(Rejected::RateLimited) => {
-                (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."), true, next)).into_response()
+                (StatusCode::TOO_MANY_REQUESTS, login_page(&app, Some("Too many failed attempts. Try again later."), true, next)).into_response()
             }
             Err(Rejected::Invalid(())) => {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                (StatusCode::UNAUTHORIZED, login_page(Some("Invalid admin token."), true, next)).into_response()
+                (StatusCode::UNAUTHORIZED, login_page(&app, Some("Invalid admin token."), true, next)).into_response()
             }
         };
     }
-    let too_many = || (StatusCode::TOO_MANY_REQUESTS, login_page(Some("Too many failed attempts. Try again later."), false, next)).into_response();
+    let too_many = || (StatusCode::TOO_MANY_REQUESTS, login_page(&app, Some("Too many failed attempts. Try again later."), false, next)).into_response();
     // A password can be guessed, so a client over the limit isn't even checked (or hashed).
     if app.password_blocked(client) {
         return too_many();
@@ -729,16 +746,16 @@ pub async fn login(
         Err(LoginError::Invalid) => Err(()),
         Err(LoginError::Throttled) => {
             let msg = "Too many failed attempts for this account. Wait a few seconds and try again.";
-            return (StatusCode::TOO_MANY_REQUESTS, login_page(Some(msg), false, next)).into_response();
+            return (StatusCode::TOO_MANY_REQUESTS, login_page(&app, Some(msg), false, next)).into_response();
         }
         Err(LoginError::Internal) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, login_page(Some("Something went wrong. Try again."), false, next)).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, login_page(&app, Some("Something went wrong. Try again."), false, next)).into_response();
         }
     };
     match app.check_credential(checked, client) {
         Ok(login) => logged_in(&app, login, next),
         Err(Rejected::RateLimited) => too_many(),
-        Err(Rejected::Invalid(())) => (StatusCode::UNAUTHORIZED, login_page(Some("Email or password is incorrect."), false, next)).into_response(),
+        Err(Rejected::Invalid(())) => (StatusCode::UNAUTHORIZED, login_page(&app, Some("Email or password is incorrect."), false, next)).into_response(),
     }
 }
 

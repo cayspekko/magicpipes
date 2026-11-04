@@ -7,6 +7,9 @@
 //   node scripts/browser-sign-in.mjs '{"chrome": "...", "first": "https://…", "second": "https://…",
 //     "email": "…", "password": "…", "resolve": "MAP *.t.test 127.0.0.1", "profile": "/tmp/…"}'
 //
+// With "sso": "Continue with …" instead of an email and password, it follows that link on the
+// sign-in page, to a provider that answers at once and back (`browser_signs_in_with_oidc`).
+//
 // Prints one JSON document: {"first": {url, text}, "second": {url, text}, "errors": [...]}.
 // Needs Node 22 or newer (built-in fetch and WebSocket) and Chrome; nothing to install.
 
@@ -64,7 +67,9 @@ try {
   await page("Page.navigate", { url: opts.first });
   const mgmt = new URL(opts.management).origin;
   await settle(mgmt);
-  await evaluate(`(() => {
+  if (opts.sso) {
+    await evaluate(`[...document.querySelectorAll('a')].find((a) => a.textContent === ${JSON.stringify(opts.sso)})?.click()`);
+  } else await evaluate(`(() => {
     const f = document.querySelector('form[action="/login"]');
     if (!f) return false;
     f.querySelector('[name=email]').value = ${JSON.stringify(opts.email)};

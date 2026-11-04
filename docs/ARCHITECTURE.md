@@ -313,6 +313,19 @@ a connection to the public port that must arrive back at the agent (a warning, n
   * **user passwords**: Argon2id (19 MiB, 2 iterations, 1 lane), at most 4 hashed at once on
     the blocking pool; an unknown email is checked against a throwaway hash so it takes as long
     as a wrong password. Administrator-set passwords must be changed at first sign-in;
+  * **single sign-on** with OpenID Connect providers (`oidc.rs`, `control/oidc.rs`,
+    `mgmt/oidc.rs`): the authorization code flow with PKCE and an exact redirect URI. State,
+    nonce, verifier and destination travel in a signed 10-minute `__Host-mp_oidc` cookie, so
+    abandoned sign-ins cost the server nothing and a callback only works in the browser that
+    left. ID tokens are verified with `ring`, RS256 and ES256 only, against the issuer, audience
+    (`azp` too when there are several), expiry and nonce. Metadata is fetched on first use and
+    kept for an hour, at most once a minute while it's in hand (every 5 s while it isn't). Each
+    request to a provider has 4 s and 256 KiB, redirects aren't followed, at most 16 code
+    exchanges run at once, and a failed exchange counts against the client's failure limit, which
+    is checked before the next one. Providers must be HTTPS (plain HTTP to this machine only, for
+    tests). This is control-plane work; nothing here is on the data path. Who gets in is
+    described in the README: accounts are keyed by `(issuer, subject)`, and only a verified
+    email can create or link one;
   * **user API tokens** `tok_<id>.mpu_<secret>`, acting as their user with the user's current
     role, at most 20 per user, optional expiry;
   * **single-use enrollment tokens** with an expiry;

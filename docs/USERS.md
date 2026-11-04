@@ -1,14 +1,14 @@
 # Users, SSO and tag-based access (design)
 
-Status: proposal, not implemented. This is roadmap phase 4. It replaces the per-user "grants"
+Status: partly built; see "Implementation order" for what is done. The rest is a proposal. This is roadmap phase 4. It replaces the per-user "grants"
 in ROADMAP.md, and the SSH gateway, browser desktops and a future VPN use the same model.
 
 ## Goals
 
-- People log in with a password an admin set for them, through an authenticating proxy that is
-  already in front of the server, with SSO (OIDC), with a social account, or with an emailed
-  link. These ship in that order, and every method ends in the same kind of session. Agents
-  and tunnels belong to someone.
+- People log in with a password an admin set for them, with SSO (OIDC), through an
+  authenticating proxy that is already in front of the server, with a social account, or with an
+  emailed link. These ship in that order, and every method ends in the same kind of session.
+  Agents and tunnels belong to someone.
 - One access mechanism, **tags**, for users, agents, tunnels and later VPN connections. One
   function, `authorize(principal, action, resource)`, makes every decision, whether for HTTP,
   TCP/UDP, the management UI or the API.
@@ -352,22 +352,38 @@ Deployment notes:
 
 ### 3. SSO (OIDC)
 
-Any OpenID Connect provider: Google Workspace, Microsoft Entra, Okta, Authentik, Keycloak, Dex
-and others.
+*Built 2026-11-04, ahead of the proxy.* Any OpenID Connect provider: Google Workspace, Microsoft
+Entra, Okta, Authentik, Keycloak, Dex and others. The README says how to configure it and who
+gets in; `docs/ARCHITECTURE.md` lists its limits.
 
-- **Flow:** authorization code with PKCE (S256). State and nonce live in a 10-minute
-  `__Host-mp_oidc` cookie.
-- **Our own code over the existing hyper/rustls client** fetches the discovery document and
-  JWKS. They are cached and refetched when a key id is unknown, at most once a minute.
-- **ID token checks:** signature, `iss`, `aud`, `exp`, `nonce`. Signatures are verified with
-  `jsonwebtoken` (approved; see "Libraries"). The identity is `(iss, sub)`.
+- **Flow:** authorization code with PKCE (S256). State, nonce, verifier and destination live in
+  a signed 10-minute `__Host-mp_oidc` cookie.
+- **Our own code over hyper and rustls** fetches the discovery document and JWKS. They are
+  cached and refetched when a key id is unknown, at most once a minute.
+- **ID token checks:** signature, `iss`, `aud`, `azp`, `exp`, `iat`, `nonce`. Signatures are
+  verified with `ring` directly (RS256 and ES256): `jsonwebtoken` now offers only `aws-lc-rs` or
+  the RustCrypto `rsa` crate as backends, and `ring` is already in the tree. The identity is
+  `(iss, sub)`. An email missing from the ID token is read from the UserInfo endpoint.
 - **Linking to an existing local user.** A first SSO login whose verified email matches an
   existing local user links to that user only when the provider has `link_by_email = true`.
-  It is off by default, because some providers let users change the email claim (Entra's
-  `email`, for example). Otherwise the user must be invited, or match `allowed_email_domains`.
-- **The first admin.** `[users] bootstrap_admins` lists verified emails that become admin on
-  their first SSO login. Without it, the first user is created with the admin token.
-- **Groups and claims** feed tag rules (see "Users" under "Where tags come from").
+  It is off by default, because some providers let users change the email claim. An account has
+  at most one identity per issuer, so an address reused at the provider doesn't reach it.
+  Otherwise the address must match `bootstrap_admins` or `allowed_email_domains`.
+- **The first admin.** `[users] bootstrap_admins` lists verified emails that become admin when
+  their account is created at their first SSO login. It doesn't change an existing account's
+  role. Without it, the first user is created with the admin token.
+- **Temporary passwords.** A password an administrator set stops working when its owner signs
+  in with SSO, instead of forcing a change they have no use for.
+
+**Not built yet, on purpose:**
+- **Tag rules** (groups and claims becoming tags). Administrators assign tags, as with passwords.
+  Everything below that mentions rules, including `groups_claim` and the `tag_rules` table, is
+  still a proposal.
+- **`scopes`, `preset` and `auto_redirect` settings.** The scopes are `openid email profile`.
+  Google works by giving its issuer; there is no preset to fill it in.
+- **A setting to trust a provider that never sends `email_verified`,** such as Microsoft Entra.
+  Without it those people can't create or link an account.
+- **Signing out at the provider.** Signing out here ends the session here only.
 
 ### 4. Social login
 
@@ -797,8 +813,8 @@ label = "Company SSO"                     # button text
 issuer = "https://login.example.com"
 client_id = "…"
 client_secret_file = "/etc/magicpipes/company-oidc-secret"
-# groups_claim = "groups"
-# scopes = ["openid", "email", "profile"]
+# groups_claim = "groups"                 # not built yet
+# scopes = ["openid", "email", "profile"] # not built yet
 # link_by_email = false
 
 [[oidc]]
@@ -827,13 +843,13 @@ identity services, and every one goes through `cargo deny check`.
 | Need | Crate | License | Notes |
 |---|---|---|---|
 | Password hashing | `argon2` (RustCrypto) | MIT/Apache-2.0 | Argon2id, PHC strings |
-| JWT verification (proxy assertions, ID tokens) | `jsonwebtoken` | MIT | Approved. At implementation, pick a version whose crypto backend is `ring`. If only `aws-lc-rs` or the RustCrypto `rsa` crate (which has an open timing advisory) are offered, verify RS256/ES256 with `ring::signature` directly instead: `ring` is already in the tree, and it is about 50 lines. |
+| JWT verification (proxy assertions, ID tokens) | `ring`, directly | ISC-style, already in the tree | RS256 and ES256 with `ring::signature`. `jsonwebtoken` was approved, but its current versions offer only `aws-lc-rs` or the RustCrypto `rsa` crate (which has an open timing advisory) as backends. |
 | HMAC for tunnel cookies and codes | `hmac` (RustCrypto) | MIT/Apache-2.0 | Approved; uses the existing `sha2` |
 | SMTP | `lettre` | MIT/Apache-2.0 | rustls transport; confirm it can use the `ring` provider, per the TLS rule in CLAUDE.md |
 | TOTP (later) | `totp-rs` | MIT | not in this phase |
 
 **Not used:**
-- **`openidconnect` / `oauth2`.** They bring a second HTTP client and the `rsa` crate. The
+- **`jsonwebtoken`, `openidconnect` / `oauth2`.** They bring a second HTTP client or the `rsa` crate. The
   code flow we need is small and goes through the existing hyper/rustls client.
 - **Hosted identity services** (Auth0, Clerk and the like).
 
@@ -871,8 +887,11 @@ useful.
      `access` setting per tag, no owner exception and no inheritance) and labels removed.
    - The tunnel cookie flow and the access-denied page.
    - Discovery filtering in the API, UI and `ls --all`.
-4. **Authenticating proxy** (method 2), with groups-header rules.
-5. **SSO (OIDC)** (method 3), with claim, group and email-domain rules.
+4. **SSO (OIDC)** (method 3). *Done;* claim, group and email-domain rules aren't built (see
+   method 3).
+5. **Authenticating proxy** (method 2), with groups-header rules. It moved behind OIDC on
+   2026-11-04: it needs TLS terminated in front of the management host, which a TLS-passthrough
+   deployment can't do, and its signed-assertion mode reuses OIDC's token checks.
 6. **Social login** (method 4): presets, plus GitHub's OAuth flow.
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
    (method 6).
@@ -920,8 +939,8 @@ End-to-end tests, at minimum:
    disable or regenerate it come later.
 2. **Login methods ship in this order:**
    1. admin-created users with passwords;
-   2. authenticating proxy;
-   3. OIDC SSO;
+   2. OIDC SSO;
+   3. authenticating proxy;
    4. social login;
    5. email invitations;
    6. emailed sign-in links.

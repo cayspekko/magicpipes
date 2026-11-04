@@ -232,7 +232,7 @@ Today the management UI has a single admin token. Desktops and SSH terminals in 
 need real accounts, which also own the SSH gateway keys (the agent shell manages with its
 secret link until then):
 
-- `users` table with web login (password + TOTP; OIDC later);
+- `users` table with web login (password, OIDC; TOTP later);
 - per-user SSH keys and grants (which agents/tunnels, and whether terminal/desktop is allowed);
 - an audit log of who opened which session and when; optional terminal session recording
   (asciinema format).
@@ -258,7 +258,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | `kind` done (with phase 3); Unix sockets planned |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
-| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags and private tunnels done) |
+| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels and OIDC sign-in done) |
 | 5 | SSH gateway + SSH web terminal | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | done (with phase 3) |

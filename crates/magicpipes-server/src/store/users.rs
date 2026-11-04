@@ -14,6 +14,9 @@ pub const LOCAL_ISSUER: &str = "local";
 const MAX_SESSIONS_PER_USER: i64 = 20;
 /// API tokens one user may hold.
 pub const MAX_API_TOKENS_PER_USER: i64 = 20;
+/// Single sign-on stops creating accounts at this many: a provider that admits too many people
+/// must not be able to grow the database without limit.
+pub const MAX_USERS: i64 = 10_000;
 /// The audit log never grows beyond this many entries, whatever the retention.
 const MAX_AUDIT_ROWS: i64 = 100_000;
 
@@ -29,10 +32,13 @@ pub struct UserRow {
     pub sessions_valid_after: i64,
     pub created_at: i64,
     pub last_login_at: Option<i64>,
+    /// False for someone who only signs in with single sign-on.
+    pub has_password: bool,
 }
 
 const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
-    u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id)
+    u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id),
+    p.user_id IS NOT NULL
     FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = 'org_default'
     LEFT JOIN passwords p ON p.user_id = u.id";
 
@@ -51,6 +57,7 @@ fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         sessions_valid_after: r.get(6)?,
         created_at: r.get(7)?,
         last_login_at: r.get(8)?,
+        has_password: r.get(9)?,
     })
 }
 
@@ -80,6 +87,19 @@ pub struct AuditRow {
     pub detail: String,
 }
 
+/// The rows every account has: the user, their membership, and their personal tag, which they
+/// hold from the start.
+fn insert_user(tx: &rusqlite::Transaction<'_>, email: &str, display_name: &str, role: Role) -> rusqlite::Result<String> {
+    let id = secret::new_id("us");
+    let now = unix_now();
+    tx.execute("INSERT INTO users (id, email, display_name, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, email, display_name, now])?;
+    tx.execute("INSERT INTO memberships (org_id, user_id, role, created_at) VALUES (?1, ?2, ?3, ?4)", params![DEFAULT_ORG, id, role.as_str(), now])?;
+    let tag = personal_tag_name(tx)?;
+    tx.execute("INSERT INTO tags (org_id, name, access, user_id, created_at) VALUES (?1, ?2, 1, ?3, ?4)", params![DEFAULT_ORG, tag, id, now])?;
+    tx.execute("INSERT INTO user_tags (org_id, user_id, tag, created_at) VALUES (?1, ?2, ?3, ?4)", params![DEFAULT_ORG, id, tag, now])?;
+    Ok(id)
+}
+
 /// A new personal tag name, `user:` and 10 random lowercase letters and digits. It says nothing
 /// about the person (the UI shows their email instead), so it never goes stale.
 fn personal_tag_name(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<String> {
@@ -100,36 +120,80 @@ fn personal_tag_name(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<String>
 impl Store {
     // ---- users ----------------------------------------------------------------------------
 
-    /// Creates a password account. Returns `None` if another account already logs in with this
-    /// email.
+    /// Creates a password account. Returns `None` if the email already has an account.
     pub fn create_user(&self, email: &str, display_name: &str, role: Role, password_hash: &str) -> anyhow::Result<Option<String>> {
-        let id = secret::new_id("us");
-        let now = unix_now();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE email = ?1)", [email], |r| r.get(0))?;
+        if taken {
+            return Ok(None);
+        }
+        let id = insert_user(&tx, email, display_name, role)?;
+        tx.execute("INSERT INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![LOCAL_ISSUER, email, id])?;
+        tx.execute("INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, ?2, 1, ?3)", params![id, password_hash, unix_now()])?;
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
+    /// Creates an account that signs in with an outside identity. Returns `None` if the email
+    /// already has an account, the identity already belongs to one, or there are [`MAX_USERS`].
+    pub fn create_sso_user(&self, email: &str, display_name: &str, role: Role, issuer: &str, subject: &str) -> anyhow::Result<Option<String>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let taken: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM identities WHERE issuer = ?1 AND subject = ?2)",
-            params![LOCAL_ISSUER, email],
+            "SELECT EXISTS(SELECT 1 FROM users WHERE email = ?1) OR EXISTS(SELECT 1 FROM identities WHERE issuer = ?2 AND subject = ?3)
+             OR (SELECT COUNT(*) FROM users) >= ?4",
+            params![email, issuer, subject, MAX_USERS],
             |r| r.get(0),
         )?;
         if taken {
             return Ok(None);
         }
-        tx.execute("INSERT INTO users (id, email, display_name, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, email, display_name, now])?;
-        tx.execute("INSERT INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![LOCAL_ISSUER, email, id])?;
-        tx.execute(
-            "INSERT INTO memberships (org_id, user_id, role, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![DEFAULT_ORG, id, role.as_str(), now],
-        )?;
-        tx.execute("INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, ?2, 1, ?3)", params![id, password_hash, now])?;
-        let tag = personal_tag_name(&tx)?;
-        tx.execute(
-            "INSERT INTO tags (org_id, name, access, user_id, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
-            params![DEFAULT_ORG, tag, id, now],
-        )?;
-        tx.execute("INSERT INTO user_tags (org_id, user_id, tag, created_at) VALUES (?1, ?2, ?3, ?4)", params![DEFAULT_ORG, id, tag, now])?;
+        let id = insert_user(&tx, email, display_name, role)?;
+        tx.execute("INSERT INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![issuer, subject, id])?;
         tx.commit()?;
         Ok(Some(id))
+    }
+
+    /// The account an outside identity signs in to.
+    pub fn identity_user(&self, issuer: &str, subject: &str) -> anyhow::Result<Option<UserRow>> {
+        let id: Option<String> = self.with(|c| {
+            c.query_row("SELECT user_id FROM identities WHERE issuer = ?1 AND subject = ?2", params![issuer, subject], |r| r.get(0)).optional()
+        })?;
+        match id {
+            Some(id) => self.user(&id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn user_by_email(&self, email: &str) -> anyhow::Result<Option<UserRow>> {
+        self.with(|c| c.query_row(&format!("{USER_SELECT} WHERE u.email = ?1"), [email], user_row).optional())
+    }
+
+    /// Adds an outside identity to an account. `false` if the account already has an identity
+    /// from this issuer: a reused address must not reach an account that signs in as someone
+    /// else there.
+    pub fn link_identity(&self, user_id: &str, issuer: &str, subject: &str) -> anyhow::Result<bool> {
+        let n = self.with(|c| {
+            c.execute(
+                "INSERT INTO identities (issuer, subject, user_id) SELECT ?1, ?2, ?3
+                 WHERE NOT EXISTS (SELECT 1 FROM identities WHERE issuer = ?1 AND user_id = ?3)
+                 ON CONFLICT (issuer, subject) DO NOTHING",
+                params![issuer, subject, user_id],
+            )
+        })?;
+        Ok(n == 1)
+    }
+
+    /// Records a single sign-on. A temporary password an administrator set stops working here:
+    /// its owner no longer needs it, and nobody else should keep a way in.
+    pub fn finish_sso_login(&self, user_id: &str, issuer: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE identities SET last_login_at = ?1 WHERE user_id = ?2 AND issuer = ?3", params![unix_now(), user_id, issuer])?;
+        tx.execute("DELETE FROM passwords WHERE user_id = ?1 AND must_change = 1", [user_id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn users(&self) -> anyhow::Result<Vec<UserRow>> {
@@ -163,14 +227,20 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the password of an existing account, which may not have had one (single sign-on).
     pub fn set_password(&self, user_id: &str, hash: &str, must_change: bool) -> anyhow::Result<bool> {
-        let n = self.with(|c| {
-            c.execute(
-                "UPDATE passwords SET hash = ?1, must_change = ?2, updated_at = ?3 WHERE user_id = ?4",
-                params![hash, must_change as i64, unix_now(), user_id],
-            )
-        })?;
-        Ok(n == 1)
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        let email: Option<String> = tx.query_row("SELECT email FROM users WHERE id = ?1", [user_id], |r| r.get(0)).optional()?;
+        let Some(email) = email else { return Ok(false) };
+        tx.execute(
+            "INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (user_id) DO UPDATE SET hash = excluded.hash, must_change = excluded.must_change, updated_at = excluded.updated_at",
+            params![user_id, hash, must_change as i64, unix_now()],
+        )?;
+        tx.execute("INSERT OR IGNORE INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![LOCAL_ISSUER, email, user_id])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn set_role(&self, user_id: &str, role: Role) -> anyhow::Result<bool> {
@@ -341,6 +411,60 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
         (Store::open(&dir.join("db.sqlite")).unwrap(), dir)
+    }
+
+    #[test]
+    fn single_sign_on_accounts() {
+        let dir = std::env::temp_dir().join(format!("mp-sso-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        // A database from before the migration keeps its accounts.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            for m in &super::super::MIGRATIONS[..2] {
+                c.execute_batch(m).unwrap();
+            }
+            c.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let (iss, other) = ("https://idp.example.com", "https://other.example.com");
+        let pat = s.create_user("pat@example.com", "Pat", Role::Member, "hash").unwrap().unwrap();
+
+        let ann = s.create_sso_user("ann@example.com", "Ann", Role::Admin, iss, "sub-ann").unwrap().unwrap();
+        let row = s.identity_user(iss, "sub-ann").unwrap().unwrap();
+        assert_eq!((row.id.as_str(), row.role, row.has_password), (ann.as_str(), Role::Admin, false));
+        assert!(s.identity_user(other, "sub-ann").unwrap().is_none(), "a subject means something only at its issuer");
+        // Every account has its personal tag.
+        assert_eq!(s.tags().unwrap().iter().filter(|t| t.user_id.is_some()).count(), 2);
+        // One account per email and per identity, however the first one was made.
+        assert!(s.create_sso_user("ann@example.com", "", Role::Member, iss, "sub-2").unwrap().is_none());
+        assert!(s.create_sso_user("pat@example.com", "", Role::Member, iss, "sub-2").unwrap().is_none());
+        assert!(s.create_sso_user("new@example.com", "", Role::Member, iss, "sub-ann").unwrap().is_none());
+        assert!(s.create_user("ann@example.com", "", Role::Member, "hash").unwrap().is_none());
+        assert_eq!(s.user_by_email("ann@example.com").unwrap().unwrap().id, ann);
+
+        // Linking: once per issuer, and a taken subject stays with its owner.
+        assert!(!s.link_identity(&pat, iss, "sub-ann").unwrap());
+        assert!(s.link_identity(&pat, iss, "sub-pat").unwrap());
+        assert!(!s.link_identity(&pat, iss, "sub-reused").unwrap());
+        assert!(s.link_identity(&pat, other, "sub-pat").unwrap());
+        assert_eq!(s.identity_user(iss, "sub-pat").unwrap().unwrap().id, pat);
+
+        // Signing in ends a temporary password, not one its owner chose.
+        assert!(s.user(&pat).unwrap().unwrap().must_change_password);
+        s.finish_sso_login(&pat, iss).unwrap();
+        let row = s.user(&pat).unwrap().unwrap();
+        assert!(!row.has_password && !row.must_change_password && row.last_login_at.is_some());
+        assert!(s.password_login("pat@example.com").unwrap().is_none());
+        assert!(s.set_password(&pat, "chosen", false).unwrap());
+        s.finish_sso_login(&pat, iss).unwrap();
+        assert_eq!(s.password_login("pat@example.com").unwrap().unwrap().1, "chosen");
+
+        // An administrator can give an account that never had a password one.
+        assert!(s.set_password(&ann, "temporary", true).unwrap());
+        assert_eq!(s.password_login("ann@example.com").unwrap().unwrap().1, "temporary");
+        assert!(!s.set_password("us_nobody", "x", true).unwrap());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

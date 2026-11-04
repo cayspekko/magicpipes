@@ -10,6 +10,7 @@ mod gateway;
 mod listen;
 mod proxy_header;
 mod mgmt;
+mod oidc;
 mod store;
 mod tunnel_auth;
 

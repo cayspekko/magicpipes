@@ -121,7 +121,7 @@ pub async fn account(user: UiUser, State(app): State<AppState>) -> Response {
     }
     let body = format!(
         r#"<div class="eyebrow">Account</div><h1>{name}</h1><p class="lede">{email} · {role}</p>
-<div class="card panel" style="margin-top:20px"><div><h3>Password</h3><p>Changing it signs you out on other devices.</p></div><a class="btn" href="/password">Change password</a></div>
+{password}
 <div class="section"><h2>API tokens</h2></div>
 <div class="card scroll"><table><thead><tr><th>Token</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="card form" style="margin-top:12px"><form method="post" action="/account/tokens">{csrf}
@@ -135,6 +135,12 @@ pub async fn account(user: UiUser, State(app): State<AppState>) -> Response {
         email = esc(&me.email),
         role = me.role.as_str(),
         csrf = csrf(&user),
+        // Someone who only signs in with single sign-on has no password to change.
+        password = if me.has_password {
+            r#"<div class="card panel" style="margin-top:20px"><div><h3>Password</h3><p>Changing it signs you out on other devices.</p></div><a class="btn" href="/password">Change password</a></div>"#
+        } else {
+            ""
+        },
     );
     page("Account", Some(&user), &body)
 }
@@ -234,7 +240,7 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
     }
     let body = format!(
         r#"<div class="head"><div><div class="eyebrow">Administration</div><h1>Users</h1>
-<p class="lede">People sign in with their email and a password. A password you set here must be changed at first sign-in. Their tags decide which private tunnels they reach, next to their own personal tag (<code>user:…</code>); create tags under <a href="/tags">Tags</a>.</p></div></div>
+<p class="lede">People sign in with their email and a password, or with a single sign-on provider if the server has one. A password you set here must be changed at first sign-in. Their tags decide which private tunnels they reach, next to their own personal tag (<code>user:…</code>); create tags under <a href="/tags">Tags</a>.</p></div></div>
 {err}<div class="card scroll"><table><thead><tr><th>User</th><th>Role</th><th>Tags</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="section"><h2>Add a user</h2></div>
 <div class="card form"><form method="post" action="/users">{csrf}
