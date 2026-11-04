@@ -11,6 +11,7 @@
 //! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
+//! * `settings` — sign-in settings made on the Settings page, and the generated configuration;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
 //! * `users` — accounts, logins, UI sessions, API tokens and the audit log;
 //! * `views` — what the API and the UI show.
@@ -21,13 +22,14 @@ mod hostnames;
 mod oidc;
 mod registry;
 mod sessions;
+mod settings;
 mod tags;
 mod users;
 mod views;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -47,6 +49,7 @@ use crate::store::{Store, TunnelRow};
 pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
 pub use oidc::OidcError;
 pub use registry::TunnelSignIn;
+pub use settings::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 pub use tags::EnrollmentOptions;
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
@@ -62,7 +65,12 @@ pub struct ControlPlane {
     hashing: Semaphore,
     accounts: users::AccountLimiter,
     devices: device::DeviceLogins,
-    oidc: Vec<crate::oidc::Provider>,
+    /// The configuration file's providers, read once.
+    file_providers: Vec<Arc<crate::oidc::Provider>>,
+    /// Providers and sign-in rules in effect; replaced whole when settings change.
+    sign_in: RwLock<Arc<settings::SignIn>>,
+    /// Puts settings changes in effect one at a time, so the last one holds.
+    settings_lock: Mutex<()>,
     /// Bounds code exchanges under way with providers.
     oidc_exchanges: Semaphore,
 }
@@ -136,7 +144,14 @@ impl ControlPlane {
             }
             state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default() });
         }
-        let oidc = cfg.oidc.iter().map(|p| crate::oidc::Provider::load(p).with_context(|| format!("oidc provider '{}'", p.id))).collect::<anyhow::Result<Vec<_>>>()?;
+        let file_providers = cfg
+            .oidc
+            .iter()
+            .map(|p| crate::oidc::Provider::load(p).map(Arc::new).with_context(|| format!("oidc provider '{}'", p.id)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let effective = settings::effective_config(&cfg, &store)?;
+        let sign_in = RwLock::new(Arc::new(settings::SignIn::new(&effective, &file_providers)));
+        settings::write_generated(&effective);
         let cp = Arc::new(Self {
             cfg,
             store,
@@ -147,7 +162,9 @@ impl ControlPlane {
             hashing: Semaphore::new(users::HASH_CONCURRENCY),
             accounts: users::AccountLimiter::default(),
             devices: device::DeviceLogins::default(),
-            oidc,
+            file_providers,
+            sign_in,
+            settings_lock: Mutex::new(()),
             oidc_exchanges: Semaphore::new(oidc::MAX_EXCHANGES),
         });
         cp.publish(&cp.state.lock().unwrap());

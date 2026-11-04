@@ -14,6 +14,7 @@ mod accounts;
 mod api;
 mod oidc;
 mod picker;
+mod settings;
 mod ui;
 
 use std::collections::HashMap;
@@ -118,6 +119,12 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/users/{id}", post(accounts::update_user))
         .route("/users/{id}/tags", get(accounts::user_tags_page).post(accounts::user_tags))
         .route("/audit", get(accounts::audit))
+        .route("/settings", get(settings::settings))
+        .route("/settings/export", get(settings::export))
+        .route("/settings/sign-in", post(settings::save_rules))
+        .route("/settings/providers/new", get(settings::new_provider).post(settings::create_provider))
+        .route("/settings/providers/{id}", get(settings::edit_provider).post(settings::update_provider))
+        .route("/settings/providers/{id}/delete", post(settings::delete_provider))
         .route("/cli", get(accounts::device).post(accounts::answer_device))
         .route("/auth/tunnel", get(accounts::auth_tunnel))
         .route("/auth/oidc/{id}", get(oidc::start))

@@ -118,6 +118,45 @@ The agent is split the same way: `agent/session.rs` (control: connect, authentic
 reconnect, RPCs, restoring registrations) and `agent/forward.rs` (data: stream header, connect
 to local target, bidirectional copy). `agent/ops.rs` sits on top of both.
 
+## Settings: the file, the database and the generated copy
+
+Settings have two homes, because neither can hold everything:
+
+* **The configuration file** holds what's needed before the database opens, or what could lock an
+  administrator out of the page that would fix it: listeners, domains, TLS, `data_dir`, trusted
+  proxies. It's read once and never written; in Docker it's a read-only mount in a read-only
+  container.
+* **The database** holds what the Settings page changes: OpenID Connect providers and the two
+  lists of who a first sign-in may create an account for (`control/settings.rs`). A change is
+  validated, saved and audited like any other, then the providers and lists in effect are replaced
+  whole. There's no restart, and a sign-in under way keeps the provider it started with. This is
+  management-side only: the data plane never sees any of it.
+
+What's in effect is the two together. A file's provider wins over a saved one of the same id and is
+locked on the page; lists are combined. The file can't be overruled, so someone who manages servers
+declaratively stays in charge, and a generated file can start another server.
+
+**`<data_dir>/magicpipesd.generated.toml`** is a copy of the settings in effect, written (0600,
+atomically) at startup and after every change. It's output only: nothing reads it back, so it can't
+disagree with what the server does, and a failed write is only logged. A round-trip test holds it to
+parsing back to the same settings. The file name differs from the usual one so it can't overwrite a
+configuration file kept in `data_dir`.
+
+**Client secrets** must be readable, so they can't be digests. They're files under
+`<data_dir>/oidc-secrets/` (0600 in 0700), like `session-key` and the file's own `client_secret_file`,
+named by the provider's validated id. They're never shown again, and aren't in the database or the
+generated copy. A saved provider whose secret can't be read is left out with an error in the log,
+and the page says so; a file's provider with a missing secret stops startup, as a configuration
+mistake.
+
+**Bounds:** 32 saved providers, 500 entries per list, and the request limits of the management
+listener. Adding a provider asks it about itself first: at most two requests of 4 s and 256 KiB,
+sharing the limit of 16 exchanges with sign-ins. Only administrators can trigger this, and the only
+thing shown from the answer is the issuer it states, escaped and at most 2 KiB.
+
+Provider ids and issuers can't be edited: the callback URL depends on the id, and identities on the
+issuer, which is unique among saved providers for the same reason.
+
 ## Static file tunnels (`add --serve`)
 
 A tunnel's local target is a TCP service, a directory or a program in a terminal
@@ -325,7 +364,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
     is checked before the next one. Providers must be HTTPS (plain HTTP to this machine only, for
     tests). This is control-plane work; nothing here is on the data path. Who gets in is
     described in the README: accounts are keyed by `(issuer, subject)`, and only a verified
-    email can create or link one;
+    email (any address, on a provider an administrator marked `trust_email`) can create or link
+    one;
   * **user API tokens** `tok_<id>.mpu_<secret>`, acting as their user with the user's current
     role, at most 20 per user, optional expiry;
   * **single-use enrollment tokens** with an expiry;

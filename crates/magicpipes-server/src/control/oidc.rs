@@ -2,11 +2,13 @@
 //! [`crate::oidc`]; here a verified person becomes an account, or doesn't.
 //!
 //! An identity is `(issuer, subject)`, so an address changing at the provider changes nothing
-//! here. A first sign-in reaches an account only through a verified email, in one of three ways:
-//! an existing account with that email on a provider with `link_by_email`, or a new account for
-//! an address in `bootstrap_admins` (an administrator) or `allowed_email_domains` (a member).
-//! Anyone else is refused.
+//! here. A first sign-in reaches an account only through a verified email (any address, on a
+//! provider with `trust_email`), in one of three ways: an existing account with that email on a
+//! provider with `link_by_email`, or a new account for an address in `bootstrap_admins` (an
+//! administrator) or `allowed_email_domains` (a member). Anyone else is refused. Those lists are
+//! the configuration file's plus the Settings page's (`settings`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use magicpipes_core::secret;
@@ -37,12 +39,12 @@ pub enum OidcError {
 }
 
 impl ControlPlane {
-    pub fn oidc_providers(&self) -> &[Provider] {
-        &self.oidc
+    pub fn oidc_providers(&self) -> Vec<Arc<Provider>> {
+        self.sign_in().providers.clone()
     }
 
-    pub fn oidc_provider(&self, id: &str) -> Option<&Provider> {
-        self.oidc.iter().find(|p| p.id == id)
+    pub fn oidc_provider(&self, id: &str) -> Option<Arc<Provider>> {
+        self.sign_in().providers.iter().find(|p| p.id == id).cloned()
     }
 
     /// Starts a sign-in: where to send the browser, and the cookie to set for the way back.
@@ -113,10 +115,10 @@ impl ControlPlane {
             self.refresh();
             return Ok(user);
         }
-        let users = &self.cfg.users;
-        let role = if users.bootstrap_admins.iter().any(|a| a == address) {
+        let rules = self.sign_in();
+        let role = if rules.bootstrap_admins.iter().any(|a| a == address) {
             Role::Admin
-        } else if address.rsplit_once('@').is_some_and(|(_, domain)| users.allowed_email_domains.iter().any(|d| d == domain)) {
+        } else if address.rsplit_once('@').is_some_and(|(_, domain)| rules.allowed_email_domains.iter().any(|d| d == domain)) {
             Role::Member
         } else {
             return Err(refused());

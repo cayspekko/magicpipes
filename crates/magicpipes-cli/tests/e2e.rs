@@ -1464,7 +1464,11 @@ async fn browser_signs_in_to_private_tunnels() {
 /// A browser going to the fake provider and back: the sign-in link, the provider, the callback.
 /// Returns the callback's answer.
 async fn oidc_sign_in(env: &Env, next: Option<&str>) -> common::UiResponse {
-    let at = next.map_or("/auth/oidc/fake".to_string(), |n| format!("/auth/oidc/fake?next={n}"));
+    oidc_sign_in_at(env, "fake", next).await
+}
+
+async fn oidc_sign_in_at(env: &Env, provider: &str, next: Option<&str>) -> common::UiResponse {
+    let at = next.map_or(format!("/auth/oidc/{provider}"), |n| format!("/auth/oidc/{provider}?next={n}"));
     let start = env.ui(&at, None, None).await;
     assert_eq!(start.status, StatusCode::SEE_OTHER, "{}", start.html);
     let attempt = start.cookie.clone().expect("attempt cookie");
@@ -1653,6 +1657,206 @@ async fn oidc_provider_down_leaves_other_sign_ins_alone() {
     assert!(r.html.contains("Fake ID can&#39;t be reached") || r.html.contains("Fake ID can't be reached"), "{}", r.html);
     assert!(r.html.contains(r#"action="/login""#), "the password form is still offered: {}", r.html);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An administrator's session, signed in with the admin token.
+async fn admin_session(env: &Env) -> String {
+    let token = env.admin_token();
+    env.ui("/login", None, Some(&[("token", token.as_str())])).await.cookie.expect("signed in")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_page_adds_providers_without_a_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let idp = common::FakeOidc::start().await;
+    let mut env = Env::new(Tls::DevCa).await;
+    let admin = admin_session(&env).await;
+    let set = |p: common::OidcPerson| *idp.person.lock().unwrap() = p;
+    let page = env.ui("/settings", Some(&admin), None).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.html.contains("None yet") && page.html.contains(r#"href="/settings"#), "{}", page.html);
+    let csrf = page.csrf();
+
+    // The generated configuration is there from the start.
+    let generated = env.root.join("server/magicpipesd.generated.toml");
+    let on_disk = || std::fs::read_to_string(&generated).unwrap();
+    assert!(on_disk().contains("base_domain = "), "{}", on_disk());
+
+    // The page says what to register, for the id it's going to use.
+    let form = env.ui("/settings/providers/new?type=oidc", Some(&admin), None).await;
+    assert!(form.html.contains(&format!("https://localhost:{}/auth/oidc/oidc/callback", env.mgmt_port)), "{}", form.html);
+    assert!(form.html.contains(r#"name="id" value="oidc""#), "{}", form.html);
+    let add = |url: &str, label: &str, csrf: &str| -> Vec<(String, String)> {
+        [("csrf", csrf), ("type", "oidc"), ("id", "oidc"), ("url", url), ("label", label), ("client_id", common::OIDC_CLIENT), ("client_secret", common::OIDC_SECRET)]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .to_vec()
+    };
+    let post = |fields: &[(String, String)]| fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>();
+    let send = async |at: &str, fields: Vec<(String, String)>| {
+        let pairs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        env.ui(at, Some(&admin), Some(&pairs)).await
+    };
+
+    // Without the session's CSRF token nothing happens.
+    let r = send("/settings/providers/new", post(&add(&idp.issuer, "Fake ID", "wrong"))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    // A provider that can't be used is refused, with the reason, and what was typed comes back,
+    // except the secret.
+    let mut no_keys = common::OidcPerson::new("sub-1", "ann@example.com");
+    no_keys.no_signing_keys = true;
+    set(no_keys);
+    let r = send("/settings/providers/new", post(&add(&idp.issuer, "Fake ID", &csrf))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.html);
+    assert!(r.html.contains("no RS256 or ES256 signing key") && r.html.contains("Signing Key"), "{}", r.html);
+    assert!(r.html.contains(r#"value="Fake ID""#) && !r.html.contains("secret/with"), "{}", r.html);
+    set(common::OidcPerson::new("sub-1", "ann@example.com"));
+    let r = send("/settings/providers/new", post(&add("http://idp.example.com", "Fake ID", &csrf))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.html);
+    assert!(r.html.contains("https://"), "{}", r.html);
+    assert!(!env.ui("/login", None, None).await.html.contains("Continue with"), "nothing was added");
+
+    // A discovery URL does as well as the issuer, and the button is there at once.
+    let r = send("/settings/providers/new", post(&add(&format!("{}/.well-known/openid-configuration", idp.issuer), "Fake ID", &csrf))).await;
+    assert_eq!((r.status, r.location.as_deref()), (StatusCode::SEE_OTHER, Some("/settings")), "{}", r.html);
+    assert!(env.ui("/login", None, None).await.html.contains(r#"href="/auth/oidc/oidc""#));
+    let r = send("/settings/providers/new", post(&add(&idp.issuer, "Again", &csrf))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "the same id and issuer again: {}", r.html);
+    let r = env.ui("/settings/providers/new?type=oidc", Some(&admin), None).await;
+    assert!(r.html.contains(r#"name="id" value="oidc-2""#), "the next one gets another id: {}", r.html);
+
+    // The secret is a private file, and in neither the generated file nor the page.
+    let secret_file = env.root.join("server/oidc-secrets/oidc");
+    assert_eq!(std::fs::read_to_string(&secret_file).unwrap().trim(), common::OIDC_SECRET);
+    assert_eq!(std::fs::metadata(&secret_file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(secret_file.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(&generated).unwrap().permissions().mode() & 0o777, 0o600);
+    let text = on_disk();
+    assert!(text.contains(&format!("issuer = \"{}\"", idp.issuer)) && text.contains("client_secret_file = ") && !text.contains("secret/with"), "{text}");
+    let page = env.ui("/settings", Some(&admin), None).await;
+    assert!(page.html.contains("Fake ID") && !page.html.contains("secret/with"), "{}", page.html);
+    let export = env.ui("/settings/export", Some(&admin), None).await;
+    assert_eq!((export.status, export.html.as_str()), (StatusCode::OK, text.as_str()));
+
+    // Having an account at the provider still isn't enough, until the rules say so; no restart.
+    set(common::OidcPerson::new("boss-1", "boss@example.com"));
+    assert_eq!(oidc_sign_in_at(&env, "oidc", None).await.status, StatusCode::FORBIDDEN);
+    let rules = |admins: &str, domains: &str| [("csrf", csrf.as_str()), ("bootstrap_admins", admins), ("email_domains", domains)].map(|(k, v)| (k.to_string(), v.to_string())).to_vec();
+    let r = send("/settings/sign-in", rules("nobody", "")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.html);
+    assert!(r.html.contains("not an email address") && r.html.contains(">nobody</textarea>"), "{}", r.html);
+    let r = send("/settings/sign-in", rules("Boss@Example.com", "team.example.com\nexample.org")).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.html);
+    let boss = session_of(&oidc_sign_in_at(&env, "oidc", None).await);
+    assert_eq!(env.ui("/settings", Some(&boss), None).await.status, StatusCode::OK, "a new administrator");
+    assert!(on_disk().contains("boss@example.com") && on_disk().contains("team.example.com"), "{}", on_disk());
+
+    // A member gets none of this.
+    set(common::OidcPerson::new("dev-1", "dev@team.example.com"));
+    let dev = session_of(&oidc_sign_in_at(&env, "oidc", None).await);
+    for at in ["/settings", "/settings/export", "/settings/providers/new?type=google", "/settings/providers/oidc"] {
+        let r = env.ui(at, Some(&dev), None).await;
+        assert_eq!((r.status, r.location.as_deref()), (StatusCode::SEE_OTHER, Some("/account")), "{at}");
+    }
+    let member_page = env.ui("/account", Some(&dev), None).await;
+    let member_csrf = member_page.csrf();
+    let r = env.ui("/settings/providers/oidc/delete", Some(&dev), Some(&[("csrf", member_csrf.as_str())])).await;
+    assert_eq!(r.location.as_deref(), Some("/account"));
+    let r = env.ui("/settings/sign-in", Some(&dev), Some(&[("csrf", member_csrf.as_str()), ("bootstrap_admins", "dev@team.example.com")])).await;
+    assert_eq!(r.location.as_deref(), Some("/account"));
+    assert!(env.ui("/login", None, None).await.html.contains(r#"href="/auth/oidc/oidc""#), "still there");
+    assert!(on_disk().contains("boss@example.com") && !on_disk().contains("dev@team.example.com"), "{}", on_disk());
+    let (_, list) = env.api("GET", "/api/v1/users", Some(&env.admin_token())).await;
+    assert_eq!(list["users"].as_array().unwrap().iter().find(|u| u["email"] == "dev@team.example.com").unwrap()["role"], "member");
+
+    // An address the provider won't vouch for gets in only once the provider is trusted. Saving
+    // without a new secret keeps the old one, or this sign-in would fail at the token endpoint.
+    let mut unverified = common::OidcPerson::new("auth-1", "new@team.example.com");
+    unverified.verified = false;
+    set(unverified.clone());
+    assert_eq!(oidc_sign_in_at(&env, "oidc", None).await.status, StatusCode::FORBIDDEN);
+    let edit = env.ui("/settings/providers/oidc", Some(&admin), None).await;
+    assert!(edit.html.contains(&idp.issuer) && !edit.html.contains("secret/with"), "{}", edit.html);
+    let change = |extra: &[(&str, &str)]| {
+        let mut f = vec![("csrf", csrf.as_str()), ("label", "Renamed"), ("client_id", common::OIDC_CLIENT), ("client_secret", "")];
+        f.extend_from_slice(extra);
+        f.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>()
+    };
+    let r = send("/settings/providers/oidc", change(&[("trust_email", "on")])).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.html);
+    assert!(env.ui("/login", None, None).await.html.contains("Continue with Renamed"));
+    assert!(on_disk().contains("trust_email = true"), "{}", on_disk());
+    session_of(&oidc_sign_in_at(&env, "oidc", None).await);
+    assert!(std::fs::read_to_string(env.root.join("server/oidc-secrets/oidc")).unwrap().contains("secret/with"), "kept");
+
+    // It all survives a restart.
+    env.stop_server().await;
+    env.start_server().await;
+    assert!(env.ui("/login", None, None).await.html.contains("Continue with Renamed"));
+    set(common::OidcPerson::new("boss-1", "boss@example.com"));
+    let boss = session_of(&oidc_sign_in_at(&env, "oidc", None).await);
+    assert_eq!(env.ui("/settings", Some(&boss), None).await.status, StatusCode::OK);
+
+    // Losing the secret turns off that provider only, and the page says so.
+    let secret_file = env.root.join("server/oidc-secrets/oidc");
+    let kept = std::fs::read(&secret_file).unwrap();
+    std::fs::remove_file(&secret_file).unwrap();
+    env.stop_server().await;
+    env.start_server().await;
+    let login = env.ui("/login", None, None).await;
+    assert!(login.status == StatusCode::OK && !login.html.contains("Continue with"), "{}", login.html);
+    let admin = admin_session(&env).await;
+    let page = env.ui("/settings", Some(&admin), None).await;
+    assert!(page.html.contains("Client secret can't be read"), "{}", page.html);
+    let csrf = page.csrf();
+    std::fs::write(&secret_file, kept).unwrap();
+
+    // Removing it takes the button and the secret, and leaves the accounts.
+    assert!(page.html.contains(r#"data-confirm="Remove Renamed?"#), "{}", page.html);
+    let r = env.ui("/settings/providers/oidc/delete", Some(&admin), Some(&[("csrf", csrf.as_str())])).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.html);
+    assert!(!secret_file.exists());
+    assert!(!on_disk().contains("[[oidc]]"), "{}", on_disk());
+    assert_eq!(env.ui("/auth/oidc/oidc", None, None).await.status, StatusCode::NOT_FOUND);
+    let (_, list) = env.api("GET", "/api/v1/users", Some(&env.admin_token())).await;
+    assert_eq!(list["users"].as_array().unwrap().len(), 3, "{list}");
+    let audit = env.ui("/audit", Some(&admin), None).await;
+    assert!(audit.html.contains("settings.oidc.create") && audit.html.contains("settings.oidc.delete") && audit.html.contains("settings.sign_in"), "{}", audit.html);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn providers_in_the_configuration_file_are_locked_on_the_settings_page() {
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-oidc-locked-{}", std::process::id()));
+    let env = Env::with_config(Tls::DevCa, &idp.config(&dir, r#"bootstrap_admins = ["boss@example.com"]"#, false)).await;
+    let admin = admin_session(&env).await;
+    let page = env.ui("/settings", Some(&admin), None).await;
+    assert!(page.html.contains("in the configuration file") && !page.html.contains(r#"href="/settings/providers/fake""#), "{}", page.html);
+    assert!(page.html.contains("from the configuration file: boss@example.com"), "{}", page.html);
+    let csrf = page.csrf();
+
+    // It can't be changed, removed or added again under another id.
+    assert_eq!(env.ui("/settings/providers/fake", Some(&admin), None).await.location.as_deref(), Some("/settings"));
+    let r = env.ui("/settings/providers/fake", Some(&admin), Some(&[("csrf", csrf.as_str()), ("label", "Changed"), ("client_id", "c")])).await;
+    assert_eq!(r.location.as_deref(), Some("/settings"));
+    env.ui("/settings/providers/fake/delete", Some(&admin), Some(&[("csrf", csrf.as_str())])).await;
+    let again = [("csrf", csrf.as_str()), ("type", "oidc"), ("id", "other"), ("url", idp.issuer.as_str()), ("label", "Other"), ("client_id", "c"), ("client_secret", "s")];
+    assert_eq!(env.ui("/settings/providers/new", Some(&admin), Some(&again)).await.status, StatusCode::BAD_REQUEST);
+    assert!(env.ui("/login", None, None).await.html.contains("Continue with Fake ID"));
+    assert!(dir.join("oidc-secret").exists());
+
+    // Saved rules add to the file's; they don't replace them.
+    env.ui("/settings/sign-in", Some(&admin), Some(&[("csrf", csrf.as_str()), ("email_domains", "team.example.com")])).await;
+    let text = env.ui("/settings/export", Some(&admin), None).await.html;
+    assert!(text.contains("boss@example.com") && text.contains("team.example.com") && text.contains("id = \"fake\""), "{text}");
+    set_and_sign_in(&idp, &env, "boss-1", "boss@example.com").await;
+    set_and_sign_in(&idp, &env, "dev-1", "dev@team.example.com").await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+async fn set_and_sign_in(idp: &common::FakeOidc, env: &Env, sub: &str, email: &str) {
+    *idp.person.lock().unwrap() = common::OidcPerson::new(sub, email);
+    session_of(&oidc_sign_in(env, None).await);
 }
 
 /// The same as `browser_signs_in_to_private_tunnels`, through an OpenID Connect provider: the

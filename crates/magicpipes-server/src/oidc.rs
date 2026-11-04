@@ -68,6 +68,7 @@ struct Discovery {
     jwks_uri: String,
     userinfo_endpoint: Option<String>,
     token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    id_token_signing_alg_values_supported: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +108,8 @@ pub struct Provider {
     pub issuer: String,
     pub link_by_email: bool,
     client_id: String,
+    /// Take this provider's addresses without its word that they're verified.
+    trust_email: bool,
     client_secret: String,
     cache: Mutex<Cache>,
     /// One fetch at a time.
@@ -178,9 +181,9 @@ struct RawClaims {
 }
 
 impl RawClaims {
-    fn into_person(self) -> Person {
+    fn into_person(self, trust_email: bool) -> Person {
         // Some providers send the string "true".
-        let verified = matches!(&self.email_verified, Some(serde_json::Value::Bool(true))) || self.email_verified.as_ref().and_then(|v| v.as_str()) == Some("true");
+        let verified = trust_email || matches!(&self.email_verified, Some(serde_json::Value::Bool(true))) || self.email_verified.as_ref().and_then(|v| v.as_str()) == Some("true");
         Person { subject: self.sub, verified_email: self.email.filter(|_| verified), name: self.name.unwrap_or_default() }
     }
 }
@@ -218,6 +221,7 @@ impl Provider {
             issuer: cfg.issuer.clone(),
             link_by_email: cfg.link_by_email,
             client_id: cfg.client_id.clone(),
+            trust_email: cfg.trust_email,
             client_secret,
             cache: Mutex::default(),
             refreshing: tokio::sync::Mutex::new(()),
@@ -225,20 +229,12 @@ impl Provider {
     }
 
     async fn fetch_metadata(&self) -> anyhow::Result<Metadata> {
-        let url = format!("{}/.well-known/openid-configuration", self.issuer.trim_end_matches('/'));
-        let discovery: Discovery = get_json(&url, None).await.context("discovery")?;
+        let discovery = fetch_discovery(&self.issuer).await?;
         if discovery.issuer != self.issuer {
             bail!("the provider calls itself {}, not {}", discovery.issuer, self.issuer);
         }
-        let endpoints = [&discovery.authorization_endpoint, &discovery.token_endpoint, &discovery.jwks_uri];
-        if let Some(bad) = endpoints.into_iter().chain(discovery.userinfo_endpoint.as_ref()).find(|u| !allowed_url(u)) {
-            bail!("the provider's endpoint {bad} isn't HTTPS");
-        }
-        let set: JwkSet = get_json(&discovery.jwks_uri, None).await.context("keys")?;
-        if set.keys.len() > MAX_KEYS {
-            bail!("the provider publishes {} keys", set.keys.len());
-        }
-        Ok(Metadata { discovery, keys: set.keys, fetched: Instant::now() })
+        let keys = fetch_keys(&discovery).await?;
+        Ok(Metadata { discovery, keys, fetched: Instant::now() })
     }
 
     /// The cached metadata, fetched if it's missing, old, or `refresh` asks for newer keys.
@@ -322,7 +318,7 @@ impl Provider {
             }
             other => other,
         };
-        let mut person = claims.map_err(|e| anyhow!("ID token refused: {e:?}"))?.into_person();
+        let mut person = claims.map_err(|e| anyhow!("ID token refused: {e:?}"))?.into_person(self.trust_email);
 
         // Providers may keep the email for the UserInfo endpoint (OpenID Connect Core 5.3).
         if person.verified_email.is_none()
@@ -332,7 +328,7 @@ impl Provider {
             if info.sub != person.subject {
                 bail!("UserInfo describes someone else");
             }
-            let info = info.into_person();
+            let info = info.into_person(self.trust_email);
             person.verified_email = info.verified_email;
             if person.name.is_empty() {
                 person.name = info.name;
@@ -340,6 +336,63 @@ impl Provider {
         }
         Ok(person)
     }
+}
+
+async fn fetch_discovery(issuer: &str) -> anyhow::Result<Discovery> {
+    let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
+    let discovery: Discovery = get_json(&url, None).await.context("discovery")?;
+    let endpoints = [&discovery.authorization_endpoint, &discovery.token_endpoint, &discovery.jwks_uri];
+    if let Some(bad) = endpoints.into_iter().chain(discovery.userinfo_endpoint.as_ref()).find(|u| !allowed_url(u)) {
+        bail!("the provider's endpoint {bad} isn't HTTPS");
+    }
+    Ok(discovery)
+}
+
+async fn fetch_keys(discovery: &Discovery) -> anyhow::Result<Vec<Jwk>> {
+    let set: JwkSet = get_json(&discovery.jwks_uri, None).await.context("keys")?;
+    if set.keys.len() > MAX_KEYS {
+        bail!("the provider publishes {} keys", set.keys.len());
+    }
+    Ok(set.keys)
+}
+
+/// Can tokens signed by this provider be checked here? Only RS256 and ES256 can.
+fn signs_usably(discovery: &Discovery, keys: &[Jwk]) -> bool {
+    let usable_alg = |a: &str| matches!(a, "RS256" | "ES256");
+    let offered = discovery.id_token_signing_alg_values_supported.as_ref().is_none_or(|l| l.iter().any(|a| usable_alg(a)));
+    offered
+        && keys.iter().any(|k| {
+            k.usage.as_deref().is_none_or(|u| u == "sig")
+                && k.alg.as_deref().is_none_or(usable_alg)
+                && ((k.kty == "RSA" && k.n.is_some() && k.e.is_some()) || (k.kty == "EC" && k.crv.as_deref() == Some("P-256") && k.x.is_some() && k.y.is_some()))
+        })
+}
+
+/// What an administrator typed for a provider, without a trailing slash or the discovery path.
+fn entered_issuer(entered: &str) -> &str {
+    let entered = entered.trim().trim_end_matches('/');
+    entered.strip_suffix("/.well-known/openid-configuration").unwrap_or(entered).trim_end_matches('/')
+}
+
+/// Asks a provider about itself before an administrator adds it, and says what's wrong if it
+/// can't be used. Returns its issuer exactly as it states it, which tokens must then match.
+pub async fn discover(entered: &str) -> anyhow::Result<String> {
+    let entered = entered_issuer(entered);
+    if !allowed_url(entered) {
+        bail!("the address must be an https:// URL");
+    }
+    let discovery = fetch_discovery(entered).await?;
+    if discovery.issuer.trim_end_matches('/') != entered {
+        if discovery.issuer.len() > 2048 {
+            bail!("the provider calls itself something else");
+        }
+        bail!("the provider calls itself {}. Enter that address", discovery.issuer);
+    }
+    let keys = fetch_keys(&discovery).await?;
+    if !signs_usably(&discovery, &keys) {
+        bail!("the provider publishes no RS256 or ES256 signing key. In authentik, choose a Signing Key on the provider: without one it signs with the client secret, which isn't accepted here");
+    }
+    Ok(discovery.issuer)
 }
 
 /// Checks an ID token's signature and claims.
@@ -604,7 +657,7 @@ mod tests {
     fn id_tokens_are_checked() {
         let key = Key::new();
         let keys = [key.jwk("k1")];
-        let good = verify(&key.token(&claims()), &keys).unwrap().into_person();
+        let good = verify(&key.token(&claims()), &keys).unwrap().into_person(false);
         assert_eq!(good.subject, "subject-1");
         assert_eq!(good.verified_email.as_deref(), Some("Ann@Example.com"));
 
@@ -699,6 +752,53 @@ mod tests {
         assert!(Attempt::open(&signer, &signer.cookie("us_x", "h.t", 60)).is_none());
         let expired = signer.seal("o~1~google~s~n~v~");
         assert!(Attempt::open(&signer, &expired).is_none());
+    }
+
+    #[test]
+    fn trusting_a_provider_takes_addresses_it_does_not_vouch_for() {
+        let raw = |verified: serde_json::Value| -> RawClaims { serde_json::from_value(serde_json::json!({ "sub": "s", "email": "a@example.com", "email_verified": verified })).unwrap() };
+        assert_eq!(raw(false.into()).into_person(false).verified_email, None);
+        assert_eq!(raw(serde_json::Value::Null).into_person(false).verified_email, None);
+        assert_eq!(raw(true.into()).into_person(false).verified_email.as_deref(), Some("a@example.com"));
+        assert_eq!(raw("true".into()).into_person(false).verified_email.as_deref(), Some("a@example.com"));
+        assert_eq!(raw(false.into()).into_person(true).verified_email.as_deref(), Some("a@example.com"));
+        assert_eq!(raw(serde_json::Value::Null).into_person(true).verified_email.as_deref(), Some("a@example.com"));
+        let none: RawClaims = serde_json::from_value(serde_json::json!({ "sub": "s" })).unwrap();
+        assert_eq!(none.into_person(true).verified_email, None, "no address to trust");
+    }
+
+    #[test]
+    fn what_was_typed_becomes_a_provider_address() {
+        for typed in ["https://a.example.com/o/x", "https://a.example.com/o/x/", " https://a.example.com/o/x/.well-known/openid-configuration ", "https://a.example.com/o/x/.well-known/openid-configuration/"] {
+            assert_eq!(entered_issuer(typed), "https://a.example.com/o/x", "{typed}");
+        }
+    }
+
+    #[test]
+    fn only_keys_that_can_be_checked_here_count() {
+        let discovery = |algs: Option<&[&str]>| Discovery {
+            issuer: ISS.into(),
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            jwks_uri: String::new(),
+            userinfo_endpoint: None,
+            token_endpoint_auth_methods_supported: None,
+            id_token_signing_alg_values_supported: algs.map(|l| l.iter().map(|a| a.to_string()).collect()),
+        };
+        let key = |v: serde_json::Value| -> Jwk { serde_json::from_value(v).unwrap() };
+        let rsa = key(serde_json::json!({ "kty": "RSA", "alg": "RS256", "use": "sig", "n": "AQAB", "e": "AQAB" }));
+        let p256 = key(serde_json::json!({ "kty": "EC", "crv": "P-256", "x": "AA", "y": "AA" }));
+        let p384 = key(serde_json::json!({ "kty": "EC", "crv": "P-384", "alg": "ES384", "x": "AA", "y": "AA" }));
+        let encryption = key(serde_json::json!({ "kty": "RSA", "use": "enc", "n": "AQAB", "e": "AQAB" }));
+
+        assert!(signs_usably(&discovery(None), std::slice::from_ref(&rsa)));
+        assert!(signs_usably(&discovery(Some(&["RS256"])), std::slice::from_ref(&rsa)));
+        assert!(signs_usably(&discovery(Some(&["ES256", "ES384"])), &[p384.clone(), p256]));
+        // authentik without a signing key: HS256, and nothing published.
+        assert!(!signs_usably(&discovery(Some(&["HS256"])), &[]));
+        assert!(!signs_usably(&discovery(None), &[]));
+        assert!(!signs_usably(&discovery(Some(&["HS256"])), &[rsa]), "keys it doesn't sign tokens with");
+        assert!(!signs_usably(&discovery(None), &[p384, encryption]));
     }
 
     #[test]

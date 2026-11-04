@@ -127,7 +127,7 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     let logout = user
         .map(|u| {
             let links: &[(&str, &str)] = if u.who.is_admin() {
-                &[("/", "Tunnels"), ("/users", "Users"), ("/tags", "Tags"), ("/hostnames", "Hostnames"), ("/audit", "Audit log"), ("/account", "Account")]
+                &[("/", "Tunnels"), ("/users", "Users"), ("/tags", "Tags"), ("/hostnames", "Hostnames"), ("/audit", "Audit log"), ("/settings", "Settings"), ("/account", "Account")]
             } else {
                 &[("/", "Machines"), ("/account", "Account")]
             };
@@ -395,7 +395,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
 
 #[derive(Deserialize)]
 pub struct CsrfForm {
-    csrf: String,
+    pub(super) csrf: String,
 }
 
 impl CsrfForm {

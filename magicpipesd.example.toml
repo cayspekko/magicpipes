@@ -78,7 +78,9 @@ acme_directory = "letsencrypt"
 # udp_max_flows = 128                  # UDP clients tracked at once per tunnel; one address may hold an eighth
 
 # Single sign-on: one section per OpenID Connect provider, one button each on the sign-in page.
-# Register https://<management hostname>/auth/oidc/<id>/callback at the provider.
+# Register https://<management hostname>/auth/oidc/<id>/callback at the provider. Administrators can
+# also add providers, and the two [users] lists above, on the Settings page; those are kept in the
+# database. <data_dir>/magicpipesd.generated.toml always shows the settings in effect.
 # [[oidc]]
 # id = "google"                        # lowercase letters, digits, dashes; part of the callback URL
 # label = "Google"                     # the button says "Continue with Google"
@@ -86,3 +88,4 @@ acme_directory = "letsencrypt"
 # client_id = "1234.apps.googleusercontent.com"
 # client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = false                # a first sign-in with a verified email reaches the account with that email
+# trust_email = false                  # accept addresses it doesn't say it verified: anyone who can choose theirs there can use an address listed above

@@ -13,12 +13,12 @@ use super::ui::{CsrfForm, UiUser, badge, chips, esc, logged_in, menu_post, page,
 use crate::authz::{Principal, Role};
 use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
 
-fn alert(msg: Option<&str>) -> String {
+pub(super) fn alert(msg: Option<&str>) -> String {
     msg.map(|m| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(m))).unwrap_or_default()
 }
 
 /// A hidden CSRF field for a form.
-fn csrf(user: &UiUser) -> String {
+pub(super) fn csrf(user: &UiUser) -> String {
     format!(r#"<input type="hidden" name="csrf" value="{}">"#, esc(&user.csrf))
 }
 
@@ -257,7 +257,7 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
     page("Users", Some(user), &body)
 }
 
-fn admins_only(user: &UiUser) -> Option<Response> {
+pub(super) fn admins_only(user: &UiUser) -> Option<Response> {
     (!user.who.is_admin()).then(|| Redirect::to("/account").into_response())
 }
 

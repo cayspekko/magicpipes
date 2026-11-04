@@ -374,15 +374,22 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
   role. Without it, the first user is created with the admin token.
 - **Temporary passwords.** A password an administrator set stops working when its owner signs
   in with SSO, instead of forcing a change they have no use for.
+- **Providers that don't verify addresses.** `trust_email` accepts a provider's addresses without
+  `email_verified`, for Microsoft Entra (never sends it) and authentik (`false` by default since
+  2025.10). Off by default. Anyone who can choose their address at that provider could use an
+  address in `bootstrap_admins` or `allowed_email_domains`, so the page says so beside the option.
+  It only moves a decision that a custom claim mapping at the provider would otherwise make
+  out of sight.
+- **The Settings page.** Administrators add providers and edit the two lists without a restart.
+  Presets (Google, Microsoft, authentik, Keycloak, GitLab, any other) only build the issuer URL and
+  say what to do at the provider; discovery does the rest. See "Settings" in
+  `docs/ARCHITECTURE.md` for where these settings live.
 
 **Not built yet, on purpose:**
 - **Tag rules** (groups and claims becoming tags). Administrators assign tags, as with passwords.
   Everything below that mentions rules, including `groups_claim` and the `tag_rules` table, is
   still a proposal.
-- **`scopes`, `preset` and `auto_redirect` settings.** The scopes are `openid email profile`.
-  Google works by giving its issuer; there is no preset to fill it in.
-- **A setting to trust a provider that never sends `email_verified`,** such as Microsoft Entra.
-  Without it those people can't create or link an account.
+- **`scopes` and `auto_redirect` settings.** The scopes are `openid email profile`.
 - **Signing out at the provider.** Signing out here ends the session here only.
 
 ### 4. Social login

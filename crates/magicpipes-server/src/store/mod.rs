@@ -5,10 +5,12 @@
 //! statement or transaction. Users, sessions, API tokens and the audit log are in [`users`].
 
 mod hostnames;
+mod settings;
 mod tags;
 mod users;
 
 pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
+pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
 pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
 
@@ -242,12 +244,35 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE UNIQUE INDEX users_email ON users(email);
     "#,
+    // 4: sign-in settings made on the Settings page. Client secrets stay out of the database, in
+    // `<data_dir>/oidc-secrets/`. The issuer is unique because identities are `(issuer, subject)`.
+    r#"
+    CREATE TABLE oidc_providers (
+        id            TEXT PRIMARY KEY,
+        org_id        TEXT NOT NULL DEFAULT 'org_default',
+        label         TEXT NOT NULL,
+        issuer        TEXT NOT NULL UNIQUE,
+        client_id     TEXT NOT NULL,
+        link_by_email INTEGER NOT NULL DEFAULT 0,
+        trust_email   INTEGER NOT NULL DEFAULT 0,
+        created_at    INTEGER NOT NULL
+    );
+    CREATE TABLE sign_in_rules (
+        org_id TEXT NOT NULL DEFAULT 'org_default',
+        kind   TEXT NOT NULL CHECK (kind IN ('bootstrap_admin', 'email_domain')),
+        value  TEXT NOT NULL,
+        PRIMARY KEY (org_id, kind, value)
+    );
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
-    if usize::try_from(version).map_or(true, |v| v > MIGRATIONS.len()) || (version == 0 && tables > 0) {
+    // The schema restarted on 2026-11-03, reusing version numbers: its first migration is what
+    // tells an older database at the same version apart.
+    let restarted: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tunnel_tags'", [], |r| r.get(0))?;
+    if usize::try_from(version).map_or(true, |v| v > MIGRATIONS.len()) || (version == 0 && tables > 0) || (version > 0 && restarted == 0) {
         anyhow::bail!(
             "the database has schema version {version}, which this magicpipesd doesn't know; databases from before 2026-11-03 \
              can't be upgraded: delete it (and the -wal and -shm files next to it) to start over"
@@ -609,9 +634,10 @@ mod tests {
         // Opening again does not re-run the schema.
         assert_eq!(Store::open(&path).unwrap().tunnels().unwrap().len(), 2);
 
-        // A database from before the schema was restarted (version 4), or from before
-        // migrations (version 0 with tables), is refused rather than misread.
-        for (version, name) in [(4, "v4.sqlite"), (0, "v0.sqlite")] {
+        // A database from before the schema was restarted (which used versions 1 to 4 too), from
+        // before migrations (version 0 with tables) or from a newer server is refused rather
+        // than misread.
+        for (version, name) in [(1, "v1.sqlite"), (4, "v4.sqlite"), (0, "v0.sqlite"), (999, "v999.sqlite")] {
             let old = dir.join(name);
             let c = Connection::open(&old).unwrap();
             c.execute_batch("CREATE TABLE agents (id TEXT PRIMARY KEY)").unwrap();

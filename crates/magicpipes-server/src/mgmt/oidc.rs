@@ -18,7 +18,7 @@ fn attempt_cookie(value: &str, max_age: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("{ATTEMPT_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}")).expect("cookie is ASCII")
 }
 
-fn redirect_uri(app: &AppState, id: &str) -> String {
+pub(super) fn redirect_uri(app: &AppState, id: &str) -> String {
     format!("{}/auth/oidc/{id}/callback", server_url(app))
 }
 
@@ -34,7 +34,7 @@ pub async fn start(State(app): State<AppState>, Path(id): Path<String>, Query(q)
     let Some(provider) = app.control.oidc_provider(&id) else {
         return (StatusCode::NOT_FOUND, login_page(&app, Some("That sign-in method doesn't exist."), false, next)).into_response();
     };
-    match app.control.oidc_start(provider, next, &redirect_uri(&app, &id)).await {
+    match app.control.oidc_start(&provider, next, &redirect_uri(&app, &id)).await {
         Ok((url, cookie)) => {
             let mut resp = Redirect::to(&url).into_response();
             resp.headers_mut().insert(header::SET_COOKIE, attempt_cookie(&cookie, ATTEMPT_COOKIE_MAX_AGE));
@@ -72,7 +72,7 @@ async fn finish(app: &AppState, id: &str, client: Option<std::net::IpAddr>, head
     let page = |status: StatusCode, msg: &str, next: Option<&str>| (status, login_page(app, Some(msg), false, next)).into_response();
     let expired = "That sign-in has expired. Try again.";
     let Some(provider) = app.control.oidc_provider(id) else { return page(StatusCode::NOT_FOUND, "That sign-in method doesn't exist.", None) };
-    let attempt = cookie_from(headers, ATTEMPT_COOKIE).and_then(|c| app.control.oidc_attempt(provider, &c));
+    let attempt = cookie_from(headers, ATTEMPT_COOKIE).and_then(|c| app.control.oidc_attempt(&provider, &c));
     let Some(attempt) = attempt else { return page(StatusCode::BAD_REQUEST, expired, None) };
     let next = safe_next(attempt.next.as_deref());
     let Some(state) = q.state.as_deref() else { return page(StatusCode::BAD_REQUEST, expired, next) };
@@ -86,7 +86,7 @@ async fn finish(app: &AppState, id: &str, client: Option<std::net::IpAddr>, head
     if app.password_blocked(client) {
         return page(StatusCode::TOO_MANY_REQUESTS, too_many, next);
     }
-    match app.control.oidc_finish(provider, &attempt, state, code, q.iss.as_deref(), &redirect_uri(app, id)).await {
+    match app.control.oidc_finish(&provider, &attempt, state, code, q.iss.as_deref(), &redirect_uri(app, id)).await {
         Ok(login) => logged_in(app, login, next),
         Err(OidcError::Expired) => page(StatusCode::BAD_REQUEST, expired, next),
         Err(OidcError::Refused) => {

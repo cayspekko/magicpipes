@@ -193,7 +193,7 @@ administrator when they first sign in.
   (an IPv6 /64 counts as one) gets no password checked at all until it waits. A wrong password
   and an unknown email get the same answer. The sign-in form only accepts posts from its own
   page, so another site can't sign your browser into its account.
-* **Single sign-on**: see below.
+* **Single sign-on**: see below, or the **Settings** page.
 * **Sessions** last `[users] session_max_age_secs` (12 hours) and survive server restarts.
   Changing your password, being disabled, or "Sign out everywhere" ends them. Signing out here
   doesn't sign you out at a single sign-on provider.
@@ -205,50 +205,84 @@ administrator when they first sign in.
 
 ### Single sign-on
 
-People can sign in through any OpenID Connect provider: Google, Microsoft Entra (with a
-tenant-specific issuer), Okta, Authentik, Keycloak, Authelia, Dex and others. Each `[[oidc]]`
-section adds a "Continue with ..." button to the sign-in page, next to the password form:
+People can sign in through any OpenID Connect provider: Google, Microsoft Entra, GitLab, Okta,
+authentik, Keycloak, Authelia, Dex and others. Each provider adds a "Continue with ..." button
+to the sign-in page, next to the password form. GitHub isn't OpenID Connect and isn't supported
+yet.
 
-```toml
-[users]
-bootstrap_admins = ["you@example.com"]     # verified emails that get an administrator's account
-allowed_email_domains = ["example.com"]    # verified emails here get a member's account
+**On the Settings page** (administrators), choose **Add** and a kind of provider. The page says
+what to do at the provider and shows the redirect URI to register:
+`https://<management hostname>/auth/oidc/<id>/callback`, with the management port if it isn't 443.
+Paste the client ID and secret, plus whatever else that kind of provider needs, such as authentik's
+address and application slug. Everything else comes from the provider's discovery document.
+**Check and add** asks the provider about itself first and says what's wrong, such as a wrong
+address or no usable signing key (authentik needs a **Signing Key** chosen; RS256 and ES256 are
+accepted). It takes effect at once, without a restart. A wrong client ID or secret only shows at
+the first sign-in, so try it from a private window.
 
-[[oidc]]
-id = "google"                              # part of the callback URL
-label = "Google"                           # "Continue with Google"
-issuer = "https://accounts.google.com"
-client_id = "1234.apps.googleusercontent.com"
-client_secret_file = "/etc/magicpipes/google-secret"
-# link_by_email = true
-```
-
-At the provider, register a web application with this redirect URI:
-`https://<management hostname>/auth/oidc/<id>/callback`, with the management port if it isn't
-443. The server reads the client secret when it starts, and contacts the provider at the first
-sign-in, so a provider that's down only affects its own button.
+The issuer can't be edited, because accounts are tied to it. To change it, remove the provider and
+add it again. Removing a provider keeps its people's accounts; the page warns if any of them would
+lose their only way in.
 
 **Who gets in.** Having an account at the provider isn't enough. Someone who has signed in here
 before is recognized by the provider's subject id, so changing their address there changes
 nothing here. A first sign-in needs an email the provider says it verified, and then one of:
 
-* the address is in `bootstrap_admins`: a new administrator's account;
-* the address's domain is in `allowed_email_domains` (exactly; no subdomains): a new member's
+* the address is listed under **New administrators**: a new administrator's account;
+* the address's domain is listed under **New members** (exactly; no subdomains): a new member's
   account;
-* an account with that address exists and the provider has `link_by_email = true`: it signs in
-  to that account, and only one identity per provider can do so.
+* an account with that address exists and the provider has "Let a first sign-in use an existing
+  account" on: it signs in to that account, and only one identity per provider can do so.
 
-These settings apply to every provider, so only add a provider you trust to verify addresses.
-Anyone else is told their address can't sign in here. To let in one person with an address
-outside your domains, add them under **Users** and set `link_by_email`; turn it on only for a
-provider that doesn't let people choose or reuse addresses (Google and most company directories
-are fine; check first for a self-hosted one where people edit their own email). A provider that
-never states `email_verified` (Microsoft Entra, for one) can't create or link accounts yet.
+These lists apply to every provider, so only add a provider you trust. Anyone else is told their
+address can't sign in here. To let in one person with an address outside your domains, add them
+under **Users** and turn on that linking option; only do so for a provider that doesn't let people
+choose or reuse addresses (Google and most company directories are fine; check first for a
+self-hosted one where people edit their own email).
+
+**Providers that don't verify addresses.** Microsoft Entra never states `email_verified`, and
+authentik since 2025.10 says `false` by default, so new people can't get in until you turn on
+**Trust this provider's email addresses** for that provider. With it on, **anyone who can choose
+their address at the provider could use an address on your lists**, including one that gets an
+administrator's account. Stop people changing their address there first (in authentik, turn off
+**Allow users to change email**).
 
 The temporary password an administrator set stops working once its owner has signed in with
 single sign-on, and no password change is asked for. A password the person chose keeps working.
 If a provider goes away, an administrator can give its users a password with "Reset password".
 The admin token works regardless.
+
+**In the configuration file.** The same settings can go in `magicpipesd.toml`. They show on the
+Settings page as locked, and a provider there wins over one of the same id on the page. Lists from
+the file and the page are combined. A missing `client_secret_file` stops the server from starting.
+
+```toml
+[users]
+bootstrap_admins = ["you@example.com"]
+allowed_email_domains = ["example.com"]
+
+[[oidc]]
+id = "google"                              # part of the callback URL
+label = "Google"                           # "Continue with Google"
+issuer = "https://accounts.google.com"     # exactly as the provider states it
+client_id = "1234.apps.googleusercontent.com"
+client_secret_file = "/etc/magicpipes/google-secret"
+# link_by_email = true
+# trust_email = true
+```
+
+### Settings and the generated configuration
+
+Listeners, domains, TLS and other startup settings stay in your configuration file. Sign-in
+providers and the lists above can also be set on the Settings page, which keeps them in the
+database and their client secrets in `<data_dir>/oidc-secrets/` (mode 0600).
+
+The settings in effect, from both places, are always on disk at
+`<data_dir>/magicpipesd.generated.toml`, rewritten at startup and after every change. The Settings
+page shows it and offers it as a download. It holds no secrets, only the paths of secret files, and
+editing it does nothing. To start another server from it, copy it elsewhere, along with the secret
+files, and pass it with `--config`; its providers are then locked on that server's Settings page.
+
 ### Docker
 
 The [`Dockerfile`](Dockerfile) builds static musl binaries in `rust:1.90-alpine` and copies

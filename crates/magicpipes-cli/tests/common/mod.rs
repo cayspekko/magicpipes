@@ -664,11 +664,13 @@ pub struct OidcPerson {
     pub wrong_key: bool,
     /// Put this in the ID token instead of the nonce it was given.
     pub wrong_nonce: bool,
+    /// Publish no signing keys, like authentik without a Signing Key.
+    pub no_signing_keys: bool,
 }
 
 impl OidcPerson {
     pub fn new(sub: &str, email: &str) -> Self {
-        Self { sub: sub.into(), email: email.into(), verified: true, email_in_userinfo: false, wrong_key: false, wrong_nonce: false }
+        Self { sub: sub.into(), email: email.into(), verified: true, email_in_userinfo: false, wrong_key: false, wrong_nonce: false, no_signing_keys: false }
     }
 }
 
@@ -726,6 +728,7 @@ impl FakeOidc {
                                     "jwks_uri": format!("{iss}/keys"),
                                     "userinfo_endpoint": format!("{iss}/userinfo"),
                                 })),
+                                "/keys" if who.lock().unwrap().no_signing_keys => json(StatusCode::OK, serde_json::json!({ "keys": [] })),
                                 "/keys" => {
                                     let p = key.public_key().as_ref();
                                     json(StatusCode::OK, serde_json::json!({ "keys": [{ "kty": "EC", "kid": "k1", "use": "sig", "crv": "P-256", "x": B64.encode(&p[1..33]), "y": B64.encode(&p[33..65]) }] }))

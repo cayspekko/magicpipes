@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use magicpipes_core::cidr;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::forwarded::TrustedProxies;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Tunnels are served as `<name>.<base_domain>`; `*.<base_domain>` must resolve to this host.
@@ -40,7 +40,7 @@ pub struct Config {
 }
 
 /// One OpenID Connect provider (`[[oidc]]`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// Lowercase letters, digits and dashes; part of the callback URL registered at the provider.
@@ -55,9 +55,50 @@ pub struct OidcConfig {
     /// Off by default: only for a provider that doesn't let people change or reuse an address.
     #[serde(default)]
     pub link_by_email: bool,
+    /// Accept this provider's email addresses even when it doesn't say it verified them. Off by
+    /// default: anyone who can choose their address there could then claim one here.
+    #[serde(default)]
+    pub trust_email: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl OidcConfig {
+    /// The checks every provider passes, from the configuration file or the Settings page.
+    pub fn check(&self) -> Result<(), String> {
+        if self.id.is_empty() || self.id.len() > 40 || !self.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return Err(format!("the id '{}' may only use lowercase letters, digits and dashes, at most 40", self.id));
+        }
+        if self.label.trim().is_empty() || self.label.len() > 60 {
+            return Err("the label is required, at most 60 characters".into());
+        }
+        if self.client_id.trim().is_empty() || self.client_id.len() > 512 {
+            return Err("the client ID is required, at most 512 characters".into());
+        }
+        if self.issuer.len() > 2048 || !crate::oidc::allowed_url(&self.issuer) {
+            return Err("the issuer must be an https:// URL".into());
+        }
+        Ok(())
+    }
+}
+
+/// An address in `bootstrap_admins`, lowercased.
+pub fn clean_bootstrap_admin(raw: &str) -> Result<String, String> {
+    let e = raw.trim().to_lowercase();
+    if e.len() > 254 || !e.contains('@') {
+        return Err(format!("'{e}' is not an email address"));
+    }
+    Ok(e)
+}
+
+/// A domain in `allowed_email_domains`, lowercased.
+pub fn clean_email_domain(raw: &str) -> Result<String, String> {
+    let d = raw.trim().to_lowercase();
+    if d.is_empty() || d.len() > 253 || d.contains('@') || d.contains('*') {
+        return Err(format!("'{d}' is not a domain"));
+    }
+    Ok(d)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PublicConfig {
     pub https_listen: SocketAddr,
@@ -95,7 +136,7 @@ impl Default for PublicConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementConfig {
     #[serde(default = "default_mgmt_listen")]
@@ -110,7 +151,7 @@ pub struct ManagementConfig {
     pub proxy_protocol: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsMode {
     /// Per-hostname certificates from an ACME CA (HTTP-01 challenge on `http_listen`).
@@ -121,7 +162,7 @@ pub enum TlsMode {
     DevCa,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TlsConfig {
     pub mode: TlsMode,
@@ -163,7 +204,7 @@ impl TlsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AgentsConfig {
     /// Sessions without a ping for this long are dropped.
@@ -191,7 +232,7 @@ impl Default for AgentsConfig {
 }
 
 /// User accounts (docs/USERS.md). Administrators create them in the UI or API.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UsersConfig {
     /// How long a UI login lasts.
@@ -220,7 +261,7 @@ impl Default for UsersConfig {
 }
 
 /// Raw TCP and UDP port tunnels (`magicpipes add 5432 --tcp`). Off unless `range` is set.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PortsConfig {
     /// Ports handed out to tunnels, e.g. `"65500-65535"`. Each is used for TCP and for UDP.
@@ -304,29 +345,15 @@ impl Config {
 
     pub(crate) fn validate(&mut self) -> anyhow::Result<()> {
         for e in &mut self.users.bootstrap_admins {
-            *e = e.trim().to_lowercase();
-            if !e.contains('@') {
-                bail!("users.bootstrap_admins: '{e}' is not an email address");
-            }
+            *e = clean_bootstrap_admin(e).map_err(|m| anyhow::anyhow!("users.bootstrap_admins: {m}"))?;
         }
         for d in &mut self.users.allowed_email_domains {
-            *d = d.trim().to_lowercase();
-            if d.is_empty() || d.contains('@') || d.contains('*') {
-                bail!("users.allowed_email_domains: '{d}' is not a domain");
-            }
+            *d = clean_email_domain(d).map_err(|m| anyhow::anyhow!("users.allowed_email_domains: {m}"))?;
         }
         for (i, p) in self.oidc.iter().enumerate() {
-            if p.id.is_empty() || !p.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
-                bail!("oidc.id: '{}' may only use lowercase letters, digits and dashes", p.id);
-            }
+            p.check().map_err(|m| anyhow::anyhow!("oidc '{}': {m}", p.id))?;
             if self.oidc[..i].iter().any(|o| o.id == p.id) {
                 bail!("oidc.id: '{}' is used twice", p.id);
-            }
-            if p.label.trim().is_empty() || p.client_id.trim().is_empty() {
-                bail!("oidc '{}': label and client_id are required", p.id);
-            }
-            if !crate::oidc::allowed_url(&p.issuer) {
-                bail!("oidc '{}': issuer must be an https:// URL", p.id);
             }
         }
         self.base_domain = self.base_domain.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -352,6 +379,11 @@ impl Config {
             bail!("proxy_protocol requires trusted_proxies (the load balancer's addresses)");
         }
         Ok(())
+    }
+
+    /// This configuration as a file `load` reads back.
+    pub fn to_toml(&self) -> anyhow::Result<String> {
+        toml::to_string_pretty(self).context("writing the configuration as TOML")
     }
 
     pub fn trusted_proxies(&self) -> TrustedProxies {
@@ -427,5 +459,48 @@ mod tests {
         assert!(load("[users]\nbootstrap_admins = [\"nobody\"]").is_err());
         assert!(load("[users]\nallowed_email_domains = [\"*.example.com\"]").is_err(), "no wildcards");
         assert!(load("[users]\nallowed_email_domains = [\"a@example.com\"]").is_err());
+        assert!(!c.oidc[0].trust_email, "trusting addresses is off unless asked for");
+    }
+
+    #[test]
+    fn a_written_configuration_reads_back_the_same() {
+        let full = r#"base_domain = "t.example.com"
+data_dir = "/data"
+trusted_proxies = ["172.23.0.0/16"]
+[public]
+https_listen = "0.0.0.0:8443"
+url_port = 443
+proxy_protocol = true
+[management]
+listen = "0.0.0.0:443"
+hostname = "example.com"
+proxy_protocol = true
+[tls]
+mode = "dev-ca"
+[ports]
+range = "65500-65535"
+[users]
+bootstrap_admins = ["ann@example.com"]
+allowed_email_domains = ["example.com"]
+[[oidc]]
+id = "authentik"
+label = "authentik"
+issuer = "https://auth.example.com/application/o/mp/"
+client_id = "c"
+client_secret_file = "/data/oidc-secrets/authentik"
+trust_email = true
+"#;
+        for text in [full, "base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n"] {
+            let mut first: Config = toml::from_str(text).unwrap();
+            first.validate().unwrap();
+            let written = first.to_toml().unwrap();
+            let mut second: Config = toml::from_str(&written).unwrap_or_else(|e| panic!("{e}\n{written}"));
+            second.validate().unwrap();
+            assert_eq!(second.to_toml().unwrap(), written);
+        }
+        let mut c: Config = toml::from_str(full).unwrap();
+        c.validate().unwrap();
+        let written = c.to_toml().unwrap();
+        assert!(written.contains("client_secret_file = \"/data/oidc-secrets/authentik\"") && written.contains("trust_email = true"), "{written}");
     }
 }

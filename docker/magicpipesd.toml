@@ -27,7 +27,8 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # bootstrap_admins = ["you@example.com"]
 # allowed_email_domains = ["example.com"]
 
-# Single sign-on with an OpenID Connect provider; mount the secret into the container.
+# Single sign-on with an OpenID Connect provider; mount the secret into the container. Or add
+# providers on the Settings page, which keeps their secrets in the data volume.
 # Register https://<management hostname>/auth/oidc/google/callback at the provider.
 # [[oidc]]
 # id = "google"
@@ -36,6 +37,7 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # client_id = "1234.apps.googleusercontent.com"
 # client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = false
+# trust_email = false
 
 # TCP/UDP port tunnels (`magicpipes add 5432 --tcp`). Also publish the range in
 # docker-compose.yml.
