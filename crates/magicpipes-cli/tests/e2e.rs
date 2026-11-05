@@ -1356,6 +1356,10 @@ async fn private_tunnels() {
     assert!(open_private(&env, &pair_host, "/", &bob).await.is_ok() && open_private(&env, &pair_host, "/", &cy).await.is_err());
     let index = env.ui("/", Some(&ann), None).await;
     assert!(index.html.contains(&format!(r#"<code title="{ann_tag}">you</code>"#)), "{}", index.html);
+    // Icons go with the words, which are still there for anyone who can't see them.
+    assert!(index.html.contains(r#"<span class="kind" title="Web app"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true">"#), "{}", index.html);
+    assert!(index.html.contains(r#"<span class="status ok iconic"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true">"#) && index.html.contains("</svg>private</span>"), "{}", index.html);
+    assert!(index.html.contains(r#"aria-label="More actions for"#) || !index.html.contains("details class=\"menu\""), "{}", index.html);
     let (_, v) = env.api("GET", "/api/v1/shared", Some(&admin)).await;
     assert!(v["tunnels"].as_array().unwrap().is_empty(), "administrators don't discover private tunnels through their role");
 

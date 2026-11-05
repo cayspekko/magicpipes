@@ -8,14 +8,11 @@ use http::StatusCode;
 use serde::Deserialize;
 
 use super::AppState;
+use super::icons::BACK;
 use super::picker::{self, Holder, Submitted};
-use super::ui::{CsrfForm, UiUser, badge, chips, esc, logged_in, menu_post, page, row_menu, safe_next, when};
+use super::ui::{CsrfForm, UiUser, alert, badge, chips, esc, logged_in, menu_post, page, row_menu, safe_next, when};
 use crate::authz::{Principal, Role};
 use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
-
-pub(super) fn alert(msg: Option<&str>) -> String {
-    msg.map(|m| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(m))).unwrap_or_default()
-}
 
 /// A hidden CSRF field for a form.
 pub(super) fn csrf(user: &UiUser) -> String {
@@ -25,7 +22,7 @@ pub(super) fn csrf(user: &UiUser) -> String {
 /// A page that shows a secret once, with a way back.
 fn shown_once(user: &UiUser, title: &str, lede: &str, secret: &str, back: &str) -> Response {
     let body = format!(
-        r#"<a class="crumb" href="{back}">← Back</a><div class="eyebrow" style="margin-top:22px">Shown once</div><h1>{title}</h1>
+        r#"<a class="crumb" href="{back}">{BACK}Back</a><div class="eyebrow" style="margin-top:22px">Shown once</div><h1>{title}</h1>
 <p class="lede">{lede}</p><pre class="term">{secret}</pre>"#,
         back = esc(back),
         title = esc(title),
@@ -166,7 +163,7 @@ pub async fn create_token(user: UiUser, State(app): State<AppState>, Form(f): Fo
             &secret,
             "/account",
         ),
-        Err(e) => (StatusCode::BAD_REQUEST, page("API token", Some(&user), &format!(r#"<a class="crumb" href="/account">← Account</a>{}"#, alert(Some(&e.message)))))
+        Err(e) => (StatusCode::BAD_REQUEST, page("API token", Some(&user), &format!(r#"<a class="crumb" href="/account">{BACK}Account</a>{}"#, alert(Some(&e.message)))))
             .into_response(),
     }
 }
@@ -343,7 +340,7 @@ pub async fn user_tags_page(user: UiUser, State(app): State<AppState>, Path(id):
         return r;
     }
     let Some(u) = app.control.user(&user.who, &id) else {
-        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), r#"<a class="crumb" href="/users">← Users</a><h1>Not found</h1>"#)).into_response();
+        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), &format!(r#"<a class="crumb" href="/users">{BACK}Users</a><h1>Not found</h1>"#))).into_response();
     };
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
     let boxes = if all.is_empty() {
@@ -352,7 +349,7 @@ pub async fn user_tags_page(user: UiUser, State(app): State<AppState>, Path(id):
         picker::fieldset("Tags", &all, &u.tags, None)
     };
     let body = format!(
-        r#"<a class="crumb" href="/users">← Users</a><div class="head"><div><div class="eyebrow">User</div><h1>Tags of <em>{email}</em></h1></div></div>
+        r#"<a class="crumb" href="/users">{BACK}Users</a><div class="head"><div><div class="eyebrow">User</div><h1>Tags of <em>{email}</em></h1></div></div>
 <div class="card form"><form method="post" action="/users/{id}/tags">{csrf}<input type="hidden" name="base" value="{base}">
 {boxes}<button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
         email = esc(&u.email),

@@ -12,6 +12,7 @@
 
 mod accounts;
 mod api;
+mod icons;
 mod oidc;
 mod picker;
 mod settings;

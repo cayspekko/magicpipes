@@ -12,6 +12,7 @@ use magicpipes_core::proto::Visibility;
 use magicpipes_core::theme::{GLYPH, STYLE};
 use serde::Deserialize;
 
+use super::icons::{self, BACK, GLOBE, LOCK, MORE, OPENS_ELSEWHERE, WARNING};
 use super::picker::{self, Holder, Submitted};
 use super::{AppState, ClientIp, Rejected, SESSION_COOKIE};
 use crate::authz::Principal;
@@ -143,14 +144,20 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title>
-<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{picker}{MENU_STYLE}</style><script src="/ui.js" defer></script></head><body>
+<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{icon_style}{picker}{MENU_STYLE}</style><script src="/ui.js" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{logout}</div></header>
 <main>{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),
+        icon_style = icons::STYLE,
         picker = super::picker::STYLE,
         version = esc(magicpipes_core::VERSION),
     ))
     .into_response()
+}
+
+/// An error message, if there is one.
+pub(super) fn alert(msg: Option<&str>) -> String {
+    msg.map(|m| format!(r#"<div class="alert with-ic" role="alert">{WARNING}<span>{}</span></div>"#, esc(m))).unwrap_or_default()
 }
 
 /// A status dot plus its label. The tone comes from the state, the text stays the raw state name.
@@ -181,7 +188,7 @@ fn display_url(url: &str) -> &str {
 fn public_address(t: &TunnelView, class: &str) -> String {
     if t.kind.is_http() {
         format!(
-            r#"<a class="{class}" href="{url}" target="_blank" rel="noopener noreferrer">{shown} ↗</a>"#,
+            r#"<a class="{class}" href="{url}" target="_blank" rel="noopener noreferrer">{shown} {OPENS_ELSEWHERE}</a>"#,
             url = esc(&t.public_url),
             shown = esc(display_url(&t.public_url)),
         )
@@ -213,7 +220,7 @@ details.menu.float .menu-list{position:fixed;z-index:20;margin:0;box-shadow:0 10
 /// to the button.
 pub(super) fn row_menu(subject: &str, items: &[String]) -> String {
     format!(
-        r#"<details class="menu"><summary class="btn small ghost" aria-label="More actions for {}" title="More actions">⋯</summary><div class="menu-list">{}</div></details>"#,
+        r#"<details class="menu"><summary class="btn small ghost" aria-label="More actions for {}" title="More actions">{MORE}</summary><div class="menu-list">{}</div></details>"#,
         esc(subject),
         items.concat()
     )
@@ -249,8 +256,9 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     let people = app.control.people(&user.who);
     let mut rows = String::new();
     for t in &tunnels {
+        let (kind_icon, kind_name) = icons::tunnel_kind(t.kind, &t.target);
         rows.push_str(&format!(
-            r#"<tr><td><a class="name" href="/tunnels/{id}">{name}</a>{address}</td><td><code>{target}</code></td><td>{access}</td><td>{agent}</td><td>{status}</td><td>{tls}</td><td class="num">{requests}</td></tr>"#,
+            r#"<tr><td><div class="with-ic"><span class="kind" title="{kind_name}">{kind_icon}</span><div><a class="name" href="/tunnels/{id}">{name}</a>{address}</div></div></td><td><code>{target}</code></td><td>{access}</td><td>{agent}</td><td>{status}</td><td>{tls}</td><td class="num">{requests}</td></tr>"#,
             id = esc(&t.id),
             name = esc(&t.name),
             address = public_address(t, "sub"),
@@ -339,8 +347,8 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
 
 pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(t) = app.control.tunnel(&user.who, &id) else {
-        let body = r#"<a class="crumb" href="/">← Tunnels</a><h1>Not found</h1><p class="lede">There is no tunnel with that id or name. It may have been deleted.</p>"#;
-        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), body)).into_response();
+        let body = format!(r#"<a class="crumb" href="/">{BACK}Tunnels</a><h1>Not found</h1><p class="lede">There is no tunnel with that id or name. It may have been deleted.</p>"#);
+        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), &body)).into_response();
     };
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
@@ -369,7 +377,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     dl.push_str(&field("Created", &when(&t.created_at)));
     let last = t.last_request_at.as_deref().map(when).unwrap_or_else(|| "never".into());
     format!(
-        r#"<a class="crumb" href="/">← Tunnels</a>
+        r#"<a class="crumb" href="/">{BACK}Tunnels</a>
 <div class="head"><div><h1>{name}</h1><p class="lede">{address}</p></div>
 <a class="btn" href="/tunnels/{id}">Refresh</a></div>
 <div class="stats">
@@ -415,19 +423,19 @@ pub async fn delete_tunnel(user: UiUser, State(app): State<AppState>, Path(id): 
 /// Without scripts, an agent's Edit link opens this page of checkboxes.
 pub async fn agent_tags_page(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(agent) = app.control.agents(&user.who).into_iter().find(|a| a.id == id) else {
-        let body = r#"<a class="crumb" href="/">← Tunnels</a><h1>Not found</h1><p class="lede">There is no agent with that id.</p>"#;
-        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), body)).into_response();
+        let body = format!(r#"<a class="crumb" href="/">{BACK}Tunnels</a><h1>Not found</h1><p class="lede">There is no agent with that id.</p>"#);
+        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), &body)).into_response();
     };
     if agent.owner_user_id.is_some() || !user.who.is_admin() {
         let body = format!(
-            r#"<a class="crumb" href="/">← Tunnels</a><h1>Tags of <em>{}</em></h1><p class="lede">A personal machine publishes with its owner's tags. Only service agents have tags of their own, which administrators set.</p>"#,
+            r#"<a class="crumb" href="/">{BACK}Tunnels</a><h1>Tags of <em>{}</em></h1><p class="lede">A personal machine publishes with its owner's tags. Only service agents have tags of their own, which administrators set.</p>"#,
             esc(&agent.name)
         );
         return page("Agent tags", Some(&user), &body);
     }
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
     let body = format!(
-        r#"<a class="crumb" href="/">← Tunnels</a><div class="head"><div><div class="eyebrow">Service agent</div><h1>Tags of <em>{name}</em></h1></div></div>
+        r#"<a class="crumb" href="/">{BACK}Tunnels</a><div class="head"><div><div class="eyebrow">Service agent</div><h1>Tags of <em>{name}</em></h1></div></div>
 <div class="card form"><form method="post" action="/agents/{id}/tags"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="base" value="{base}">
 {boxes}<p class="note">Its tunnels can carry only these tags.</p><button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
         name = esc(&agent.name),
@@ -441,7 +449,7 @@ pub async fn agent_tags_page(user: UiUser, State(app): State<AppState>, Path(id)
 
 pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, RawForm(raw): RawForm) -> Response {
     let failed = |message: &str| {
-        let body = format!(r#"<a class="crumb" href="/">← Tunnels</a><div class="alert" role="alert">{}</div>"#, esc(message));
+        let body = format!(r#"<a class="crumb" href="/">{BACK}Tunnels</a>{}"#, alert(Some(message)));
         (StatusCode::BAD_REQUEST, page("Agent", Some(&user), &body)).into_response()
     };
     let form = match Submitted::parse(&raw) {
@@ -476,8 +484,8 @@ pub async fn revoke_agent(user: UiUser, State(app): State<AppState>, Path(id): P
 /// person where `people` knows them.
 fn access_cell(t: &TunnelView, people: &HashMap<String, String>) -> String {
     match t.visibility {
-        Visibility::Public => r#"<span class="status warn">anyone</span>"#.into(),
-        Visibility::Private if t.access.is_empty() => r#"<span class="status ok">private</span> <span class="sub">nobody: it has no tag that grants access</span>"#.into(),
+        Visibility::Public => format!(r#"<span class="status warn iconic">{GLOBE}anyone</span>"#),
+        Visibility::Private if t.access.is_empty() => format!(r#"<span class="status ok iconic">{LOCK}private</span> <span class="sub">nobody: it has no tag that grants access</span>"#),
         Visibility::Private => {
             let tags: Vec<String> = t
                 .access
@@ -487,7 +495,7 @@ fn access_cell(t: &TunnelView, people: &HashMap<String, String>) -> String {
                     None => format!("<code>{}</code>", esc(tag)),
                 })
                 .collect();
-            format!(r#"<span class="status ok">private</span> {}"#, tags.join(" "))
+            format!(r#"<span class="status ok iconic">{LOCK}private</span> {}"#, tags.join(" "))
         }
     }
 }
@@ -502,7 +510,7 @@ fn shared_section(app: &AppState, user: &UiUser) -> String {
         .iter()
         .map(|t| {
             let link = if t.kind.is_http() {
-                format!(r#"<a class="name" href="{0}" target="_blank" rel="noopener noreferrer">{1} ↗</a>"#, esc(&t.public_url), esc(display_url(&t.public_url)))
+                format!(r#"<a class="name" href="{0}" target="_blank" rel="noopener noreferrer">{1} {OPENS_ELSEWHERE}</a>"#, esc(&t.public_url), esc(display_url(&t.public_url)))
             } else {
                 format!("<code>{}</code>", esc(&t.public_url))
             };
@@ -554,7 +562,7 @@ fn member_enroll_hint(app: &AppState) -> String {
 
 pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawForm(raw): RawForm) -> Response {
     let failed = |message: &str| {
-        let body = format!(r#"<a class="crumb" href="/">← Tunnels</a><div class="alert" role="alert">{}</div>"#, esc(message));
+        let body = format!(r#"<a class="crumb" href="/">{BACK}Tunnels</a>{}"#, alert(Some(message)));
         (StatusCode::BAD_REQUEST, page("Enrollment token", Some(&user), &body)).into_response()
     };
     // Checkboxes named `tag`, or a `tags` field from an older page.
@@ -582,7 +590,7 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
     let cfg = app.control.config();
     let server = server_url(&app);
     let body = format!(
-        r#"<a class="crumb" href="/">← Tunnels</a>
+        r#"<a class="crumb" href="/">{BACK}Tunnels</a>
 <div class="eyebrow" style="margin-top:22px">Enrollment token</div><h1>Enroll a <em>machine</em></h1>
 <p class="lede">Run this on the machine you want to enroll. The token works once, expires in {mins} minutes, and is not shown again.</p>
 <pre class="term"><span class="p">$ </span>magicpipes login --server {server} --token {token}</pre>
@@ -595,7 +603,7 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
 }
 
 pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
-    let err = error.map(|e| format!(r#"<div class="alert" role="alert">{}</div>"#, esc(e))).unwrap_or_default();
+    let err = alert(error);
     let next = safe_next(next);
     let providers = app.control.oidc_providers();
     // One link per provider, above the password form. They carry the destination too.

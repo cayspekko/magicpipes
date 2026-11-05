@@ -8,9 +8,10 @@ use http::{HeaderValue, StatusCode, header};
 use serde::Deserialize;
 
 use super::AppState;
-use super::accounts::{admins_only, alert, csrf};
+use super::accounts::{admins_only, csrf};
+use super::icons::{BACK, DOWNLOAD};
 use super::oidc::redirect_uri;
-use super::ui::{CsrfForm, UiUser, badge, esc, page};
+use super::ui::{CsrfForm, UiUser, alert, badge, esc, page};
 use crate::control::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 
 /// A kind of provider: all an administrator needs to know to add one. Only `issuer` matters to
@@ -182,7 +183,7 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
 {locked_domains}<p class="note">One domain per line, exact, no subdomains. Empty: nobody gets an account just for being at a provider.</p>
 <button class="btn primary" style="margin-top:14px">Save</button></form></div>
 <div class="section"><h2>Configuration in effect</h2></div>
-<p class="note">Always current, at <code>{path}</code> in the data directory. It holds no secrets. <a href="/settings/export">Download it</a>.</p>
+<p class="note">Always current, at <code>{path}</code> in the data directory. It holds no secrets. <a href="/settings/export">{DOWNLOAD} Download it</a>.</p>
 <details><summary class="btn small">Show it</summary><pre class="term">{config}</pre></details>"#,
         err = alert(error),
         csrf = csrf(user),
@@ -290,7 +291,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
         format!(r#"<label for="pp">{label}</label><input id="pp" name="part" placeholder="{placeholder}" value="{}" maxlength="200" required>"#, esc(typed.map_or("", |f| &f.part)))
     });
     let body = format!(
-        r#"<a class="crumb" href="/settings">← Settings</a><div class="eyebrow" style="margin-top:22px">Sign-in providers</div><h1>Add {name}</h1>
+        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow" style="margin-top:22px">Sign-in providers</div><h1>Add {name}</h1>
 {err}<div class="section"><h2>1. Register this server there</h2></div>
 <div class="card form"><p style="margin-top:0">{steps}</p><label>Redirect URI</label><pre class="term">{redirect}</pre></div>
 <div class="section"><h2>2. Enter what it gave you</h2></div>
@@ -359,7 +360,7 @@ pub async fn create_provider(user: UiUser, State(app): State<AppState>, Form(f):
 
 fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, error: Option<&str>) -> Response {
     let body = format!(
-        r#"<a class="crumb" href="/settings">← Settings</a><div class="eyebrow" style="margin-top:22px">Sign-in providers</div><h1>{label}</h1>
+        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow" style="margin-top:22px">Sign-in providers</div><h1>{label}</h1>
 {err}<div class="card form"><label style="margin-top:0">Issuer</label><p><code>{issuer}</code></p><p class="note">To change it, remove this provider and add it again. People's accounts are tied to the issuer, so with a different one they sign in as new people.</p>
 <label>Redirect URI</label><pre class="term">{redirect}</pre></div>
 <div class="section"><h2>Change</h2></div>
