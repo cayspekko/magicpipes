@@ -1663,6 +1663,195 @@ async fn oidc_provider_down_leaves_other_sign_ins_alone() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Opens a connection and asks for `req`; the connection if the listener answered at all.
+async fn served<S>(mut conn: S, req: &str) -> Option<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    conn.write_all(req.as_bytes()).await.ok()?;
+    let mut head = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut head)).await.ok()?.ok()?;
+    (&head == b"HTTP/1.1").then_some(conn)
+}
+
+/// Every listener limits how many connections one address can hold. Public HTTPS has always done
+/// so; the management and plain HTTP listeners used to let them go right after the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_address_cannot_hold_every_connection() {
+    const PER_CLIENT: usize = 64;
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    add_json(&env, &[&app.port.to_string(), "--name", "app"]).await;
+    // Earlier connections have gone; the agent's session is still up, and must not count.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let healthz = format!("GET /healthz HTTP/1.1\r\nHost: localhost:{}\r\n\r\n", env.mgmt_port);
+    let mut held = Vec::new();
+    for i in 0..PER_CLIENT {
+        let tls = env.connect("localhost", env.mgmt_port).await;
+        held.push(served(tls, &healthz).await.unwrap_or_else(|| panic!("management connection {i} was refused")));
+    }
+    let refused = match env.try_connect("localhost", env.mgmt_port).await {
+        Ok(tls) => served(tls, &healthz).await.is_none(),
+        Err(_) => true,
+    };
+    assert!(refused, "management accepted more than {PER_CLIENT} connections from one address");
+    // Those limits are per listener: tunnels go on working.
+    assert_eq!(env.send(&format!("app.{BASE}"), env.https_port, Request::get("/").header(header::HOST, format!("app.{BASE}")).body(Full::new(Bytes::new())).unwrap()).await.status(), StatusCode::OK);
+    drop(held);
+    env.eventually("a management connection is served again", Duration::from_secs(5), || async {
+        match env.try_connect("localhost", env.mgmt_port).await {
+            Ok(tls) => served(tls, &healthz).await.is_some(),
+            Err(_) => false,
+        }
+    })
+    .await;
+
+    let plain = "GET /x HTTP/1.1\r\nHost: app.example.test\r\n\r\n";
+    let tcp = || tokio::net::TcpStream::connect(("127.0.0.1", env.http_port));
+    let mut held = Vec::new();
+    for i in 0..PER_CLIENT {
+        held.push(served(tcp().await.unwrap(), plain).await.unwrap_or_else(|| panic!("plain connection {i} was refused")));
+    }
+    assert!(served(tcp().await.unwrap(), plain).await.is_none(), "plain HTTP accepted more than {PER_CLIENT} connections from one address");
+    drop(held);
+    env.eventually("a plain connection is served again", Duration::from_secs(5), || async { served(tcp().await.unwrap(), plain).await.is_some() }).await;
+}
+
+/// MagicPipes' cookies don't reach a public tunnel's application: a tunnel's name can pass to
+/// someone else, while a browser keeps sending what it was given for that hostname.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_applications_never_get_our_cookies() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string(), "--name", "open"]).await;
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let r = env.tunnel_get(&host, "/whoami", "a=1; __Host-mp_tunnel=c~us_x~h~-~1~2~mac; __Host-mp_state_n=1; b=2", false).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("cookie=a=1; b=2") && !r.body.contains("mp_"), "{}", r.body);
+    let r = env.tunnel_get(&host, "/whoami", "only=theirs", false).await;
+    assert!(r.body.contains("cookie=only=theirs"), "{}", r.body);
+}
+
+/// Waits for a WebSocket to be closed by the other side.
+async fn closes_soon<S>(sock: &mut tokio_tungstenite::WebSocketStream<S>) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sock.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A WebSocket opened while a tunnel was public doesn't outlast its being made private or removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_websockets_close_when_access_changes() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let ws = common::ws_echo_app().await;
+    let port = ws.port.to_string();
+    let t = add_json(&env, &[&port, "--name", "open", "--public", "--probe-path", "/"]).await;
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let connect = || async {
+        let (mut sock, _) = tokio_tungstenite::client_async(format!("wss://{host}/"), env.connect(&host, env.https_port).await).await.expect("websocket handshake");
+        sock.send(Message::text("ping")).await.unwrap();
+        assert_eq!(sock.next().await.unwrap().unwrap(), Message::text("ping"));
+        sock
+    };
+
+    // Going private: the anonymous connection ends, though nothing changed at the agent.
+    let mut sock = connect().await;
+    env.cli_ok(&["add", &port, "--name", "open", "--private", "--no-verify"]).await;
+    assert!(closes_soon(&mut sock).await, "the WebSocket stayed open after the tunnel went private");
+
+    // A change that keeps it public leaves connections alone.
+    env.cli_ok(&["add", &port, "--name", "open", "--public", "--probe-path", "/"]).await;
+    let mut sock = connect().await;
+    env.cli_ok(&["add", &port, "--name", "open", "--public", "--probe-path", "/"]).await;
+    sock.send(Message::text("still here")).await.unwrap();
+    assert_eq!(sock.next().await.unwrap().unwrap(), Message::text("still here"));
+
+    // Removing it ends them too.
+    env.cli_ok(&["remove", "open"]).await;
+    assert!(closes_soon(&mut sock).await, "the WebSocket stayed open after the tunnel was removed");
+}
+
+/// Anonymous visitors of a terminal learn the program's name, never its arguments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_that_cannot_start_keeps_its_arguments_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let program = env.root.join("console-tool");
+    std::fs::write(&program, "#!/bin/sh\nread line\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.cli_ok(&["add", "--shell", "--name", "gone", "--", program.to_str().unwrap(), "postgres://u:hunter2@db"]).await;
+    std::fs::remove_file(&program).unwrap();
+
+    let (_, answer) = terminal(&env, &format!("gone.{BASE}"), None).await;
+    assert_eq!((answer["type"].as_str(), answer["code"].as_str()), (Some("error"), Some("spawn_failed")), "{answer}");
+    let message = answer["message"].as_str().unwrap();
+    assert!(message.contains("console-tool") && !message.contains("hunter2") && !message.contains(env.root.to_str().unwrap()), "{message}");
+}
+
+/// Taking an account back also takes back its API tokens, which outlive its sessions otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_tokens_can_be_revoked() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    let body = serde_json::json!({ "email": "ann@example.com", "password": "correct horse battery" });
+    let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    let ann = v["user"]["id"].as_str().unwrap().to_string();
+    let first = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", "correct horse battery")])).await;
+    let cookie = first.cookie.clone().unwrap();
+    let form = env.ui("/password", Some(&cookie), None).await;
+    let new = "another correct horse battery";
+    let changed = env.ui("/password", Some(&cookie), Some(&[("csrf", &form.csrf()), ("current", "correct horse battery"), ("new", new), ("repeat", new)])).await;
+    let cookie = changed.cookie.clone().unwrap();
+    let new_token = async |csrf: &str| shown_secret(&env.ui("/account/tokens", Some(&cookie), Some(&[("csrf", csrf), ("name", "ci")])).await.html);
+    let account = env.ui("/account", Some(&cookie), None).await;
+    let csrf = account.csrf();
+    let works = async |token: &str| env.api("GET", "/api/v1/me", Some(token)).await.0 == StatusCode::OK;
+
+    // A typo in the expiry is refused, instead of making a token that never expires.
+    let typo = env.ui("/account/tokens", Some(&cookie), Some(&[("csrf", &csrf), ("name", "typo"), ("expires_in_days", "abc")])).await;
+    assert_eq!(typo.status, StatusCode::BAD_REQUEST, "{}", typo.html);
+    assert!(typo.html.contains("whole number of days"), "{}", typo.html);
+    let token = new_token(&csrf).await;
+    assert_eq!(env.api("GET", "/api/v1/tokens", Some(&token)).await.1["tokens"].as_array().unwrap().len(), 1, "the typo made no token");
+
+    // Through the API.
+    let path = format!("/api/v1/users/{ann}/tokens");
+    let (s, v) = env.api("DELETE", &path, Some(&admin)).await;
+    assert_eq!((s, v["revoked"].as_u64()), (StatusCode::OK, Some(1)));
+    assert!(!works(&token).await);
+
+    // From the Users page.
+    let token = new_token(&csrf).await;
+    let session = admin_session(&env).await;
+    let users = env.ui("/users", Some(&session), None).await;
+    assert!(users.html.contains("Revoke API tokens"), "{}", users.html);
+    let r = env.ui(&format!("/users/{ann}"), Some(&session), Some(&[("csrf", &users.csrf()), ("action", "revoke-tokens")])).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.html);
+    assert!(!works(&token).await);
+
+    // A password reset takes them too.
+    let token = new_token(&csrf).await;
+    assert!(works(&token).await);
+    assert_eq!(env.api("POST", &format!("/api/v1/users/{ann}/password"), Some(&admin)).await.0, StatusCode::OK);
+    assert!(!works(&token).await);
+}
+
 /// An administrator's session, signed in with the admin token.
 async fn admin_session(env: &Env) -> String {
     let token = env.admin_token();

@@ -154,7 +154,17 @@ pub async fn create_token(user: UiUser, State(app): State<AppState>, Form(f): Fo
     if let Err(r) = user.check_csrf(&f.csrf) {
         return r;
     }
-    let days = f.expires_in_days.trim().parse::<u32>().ok();
+    let failed = |message: &str| {
+        (StatusCode::BAD_REQUEST, page("API token", Some(&user), &format!(r#"<a class="crumb" href="/account">{BACK}Account</a>{}"#, alert(Some(message))))).into_response()
+    };
+    let days = match f.expires_in_days.trim() {
+        "" => None,
+        days => match days.parse::<u32>() {
+            Ok(d) if d > 0 => Some(d),
+            // Never a token that lasts forever because of a typo.
+            _ => return failed("The expiry must be a whole number of days, or empty for a token that never expires."),
+        },
+    };
     match app.control.create_token(&user.who, &f.name, days) {
         Ok((t, secret)) => shown_once(
             &user,
@@ -163,8 +173,7 @@ pub async fn create_token(user: UiUser, State(app): State<AppState>, Form(f): Fo
             &secret,
             "/account",
         ),
-        Err(e) => (StatusCode::BAD_REQUEST, page("API token", Some(&user), &format!(r#"<a class="crumb" href="/account">{BACK}Account</a>{}"#, alert(Some(&e.message)))))
-            .into_response(),
+        Err(e) => failed(&e.message),
     }
 }
 
@@ -212,8 +221,10 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>) -> Response {
         let mut items = vec![edit.link(user, "menu-item", "Edit tags", &format!("Edit tags of {}", u.email))];
         if !me {
             items.push(if u.role == Role::Admin { post("member", "Make member", false, None) } else { post("admin", "Make admin", false, None) });
-            let reset = format!("Reset the password of {}? Their sessions end, and they must replace the new password when they next sign in.", u.email);
+            let reset = format!("Reset the password of {}? Their sessions end, their API tokens are revoked, and they must replace the new password when they next sign in.", u.email);
             items.push(post("reset", "Reset password", false, Some(reset)));
+            let revoke = format!("Revoke every API token of {}? Anything using them stops working.", u.email);
+            items.push(post("revoke-tokens", "Revoke API tokens", false, Some(revoke)));
             items.push("<hr>".into());
             items.push(if u.disabled {
                 post("enable", "Enable", false, None)
@@ -314,13 +325,14 @@ pub async fn update_user(user: UiUser, State(app): State<AppState>, Path(id): Pa
                 return shown_once(
                     &user,
                     &format!("New password for {email}"),
-                    "Their sessions have ended. They must replace this password when they next sign in.",
+                    "Their sessions have ended and their API tokens are revoked. They must replace this password when they next sign in.",
                     &password,
                     "/users",
                 );
             }
             Err(e) => Err(e),
         },
+        "revoke-tokens" => app.control.revoke_tokens(&user.who, &id).map(drop),
         "tags" => app.control.set_user_tags(&user.who, &id, &[f.tags]).map(drop),
         "admin" => app.control.update_user(&user.who, &id, Some(Role::Admin), None).map(drop),
         "member" => app.control.update_user(&user.who, &id, Some(Role::Member), None).map(drop),

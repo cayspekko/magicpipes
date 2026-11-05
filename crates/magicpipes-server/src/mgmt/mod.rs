@@ -148,6 +148,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/users", get(api::list_users).post(api::create_user))
         .route("/api/v1/users/{id}", get(api::get_user).patch(api::update_user))
         .route("/api/v1/users/{id}/password", post(api::reset_password))
+        .route("/api/v1/users/{id}/tokens", axum::routing::delete(api::revoke_user_tokens))
         .route("/api/v1/tokens", get(api::list_tokens).post(api::create_token))
         .route("/api/v1/tokens/{id}", axum::routing::delete(api::delete_token))
         .route("/api/v1/audit", get(api::audit))

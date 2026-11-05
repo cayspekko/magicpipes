@@ -110,7 +110,36 @@ fn open_store(cfg: &Config) -> anyhow::Result<Store> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
     dir.create(&cfg.data_dir).with_context(|| format!("creating data_dir {}", cfg.data_dir.display()))?;
-    Store::open(&cfg.data_dir.join("magicpipes.db"))
+    let path = cfg.data_dir.join("magicpipes.db");
+    #[cfg(unix)]
+    keep_private(&cfg.data_dir, &path)?;
+    Store::open(&path)
+}
+
+/// Password hashes, session data and keys live here, in a directory that may have been made by
+/// someone else (a Docker volume starts out 0755). SQLite gives its -wal and -shm files the
+/// database's permissions, so the database must exist with the right ones before it is opened.
+#[cfg(unix)]
+fn keep_private(data_dir: &Path, db: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let tighten = |path: &Path, mode: u32| {
+        let Ok(meta) = std::fs::metadata(path) else { return };
+        if meta.permissions().mode() & 0o077 != 0 {
+            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+                Ok(()) => tracing::info!(path = %path.display(), "tightened permissions so other local users can't read it"),
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "other local users may be able to read this; could not change its permissions"),
+            }
+        }
+    };
+    tighten(data_dir, 0o700);
+    std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(db).with_context(|| format!("opening {}", db.display()))?;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        tighten(Path::new(&name), 0o600);
+    }
+    Ok(())
 }
 
 /// On first start, creates an admin token and writes it to `<data_dir>/admin-token` (mode 0600).
@@ -254,5 +283,43 @@ async fn wait_for_signal() {
 async fn interrupt() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn the_database_is_private_even_in_a_directory_someone_else_made() {
+        let dir = std::env::temp_dir().join(format!("mp-main-{}", magicpipes_core::secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let set = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        set(&dir, 0o755);
+        let cfg: Config = toml::from_str(&format!(
+            "base_domain = \"t.test\"\ndata_dir = \"{}\"\n[management]\nhostname = \"m.t.test\"\n[tls]\nmode = \"dev-ca\"",
+            dir.display()
+        ))
+        .unwrap();
+
+        // A new database.
+        drop(open_store(&cfg).unwrap());
+        assert_eq!(mode(&dir), 0o700);
+        let db = dir.join("magicpipes.db");
+        assert_eq!(mode(&db), 0o600);
+
+        // One an older version left readable, with its journal files.
+        set(&dir, 0o755);
+        set(&db, 0o644);
+        let wal = dir.join("magicpipes.db-wal");
+        std::fs::write(&wal, b"").unwrap();
+        set(&wal, 0o644);
+        let store = open_store(&cfg).unwrap();
+        assert_eq!((mode(&dir), mode(&db), mode(&wal)), (0o700, 0o600, 0o600));
+        assert!(store.admin_token_count().is_ok(), "it still opens");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

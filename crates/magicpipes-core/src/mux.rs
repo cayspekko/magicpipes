@@ -156,6 +156,12 @@ impl MuxHandle {
         self.data.acquire(false, Some(client)).map(ClientUse)
     }
 
+    /// Whether all of the session's data streams are in use, so another client's stream has to
+    /// wait for one to be given back. Idle pooled connections can give theirs back at once.
+    pub fn data_streams_full(&self) -> bool {
+        self.data.0.lock().unwrap().0 >= MAX_DATA_STREAMS
+    }
+
     /// Whether both handles belong to the same session.
     pub fn same_session(&self, other: &MuxHandle) -> bool {
         Arc::ptr_eq(&self.data, &other.data)

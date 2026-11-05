@@ -7,8 +7,9 @@
 //! unbinds the listeners of port tunnels ([`ports`]) to match the table.
 //!
 //! Route removal lifecycle: once a new table without a hostname is published, *new* requests
-//! for it get 404. Requests and WebSockets already in flight keep their own stream and run to
-//! completion; they end early only if the agent session itself closes.
+//! for it get 404. Requests already in flight keep their own stream and run to completion.
+//! WebSockets and port connections are long-lived, so they are checked again on every publish, and
+//! closed once the tunnel is gone or no longer admits them.
 
 mod gate;
 pub mod ingress;
@@ -24,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use magicpipes_core::cidr::{self, Cidr};
-use magicpipes_core::mux::MuxHandle;
+use magicpipes_core::mux::{MuxHandle, MuxStream};
 use magicpipes_core::proto::Kind;
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
@@ -244,6 +245,27 @@ impl DataPlane {
         codes.insert(nonce.to_string(), std::time::Instant::now()).is_none()
     }
 
+    /// Opens a stream with `open`. When the session's data streams are used up, idle pooled
+    /// connections on it are closed to make room; a closed connection gives its stream back once
+    /// its task notices, so this waits a moment between tries. A client over its own share gets
+    /// no such help, and closes nothing.
+    async fn with_room<F, Fut>(&self, session: &MuxHandle, open: F) -> std::io::Result<MuxStream>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = std::io::Result<MuxStream>>,
+    {
+        let mut tries = 0;
+        loop {
+            match open().await {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries < 3 && session.data_streams_full() && self.pool.evict(session) => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Atomically replaces the routing table (called by the control plane only), then binds the
     /// listeners of new port routes and closes those of removed ones.
     pub fn publish(&self, table: RouteTable) {
@@ -296,5 +318,57 @@ impl DataPlane {
         listeners.insert((kind, port), stop);
         tracing::info!(%kind, port, "port open");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+    use magicpipes_core::mux::{self, MAX_DATA_STREAMS, MAX_DATA_STREAMS_PER_CLIENT, Mode};
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn idle_connections_make_room_for_new_streams() {
+        let cfg: Config = toml::from_str("base_domain = \"t.test\"\n[management]\nhostname = \"m.t.test\"\n[tls]\nmode = \"dev-ca\"").unwrap();
+        let dp = DataPlane::new(ProxySettings::from_config(&cfg, Signer::for_tests()), CancellationToken::new());
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (session, _rpcs) = mux::spawn(a, Mode::Server);
+        let (_agent, mut inbound) = mux::spawn(b, Mode::Client);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(s) = inbound.recv().await {
+                held.push(s);
+            }
+        });
+        let idle = || async {
+            let stream = session.open_shared(WAIT).await.unwrap();
+            let (sender, conn) = hyper::client::conn::http1::handshake::<_, proxy::Progress<Incoming>>(TokioIo::new(stream)).await.unwrap();
+            tokio::spawn(conn);
+            dp.pool.put("tn_a", session.clone(), 0, sender);
+        };
+        idle().await;
+
+        // A client over its own share closes nobody's idle connections.
+        let busy: IpAddr = "203.0.113.1".parse().unwrap();
+        let uses: Vec<_> = (0..MAX_DATA_STREAMS_PER_CLIENT).map(|_| session.client_use(busy).unwrap()).collect();
+        assert_eq!(dp.with_room(&session, || session.open_data(WAIT, busy)).await.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(dp.pool.len(), 1);
+        drop(uses);
+
+        // Idle connections filling the budget don't stop a WebSocket or a port connection.
+        for _ in 1..MAX_DATA_STREAMS {
+            idle().await;
+        }
+        assert!(session.data_streams_full());
+        let client: IpAddr = "203.0.113.2".parse().unwrap();
+        assert_eq!(session.open_data(WAIT, client).await.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(dp.with_room(&session, || session.open_data(WAIT, client)).await.is_ok());
+        assert!(dp.pool.len() < MAX_DATA_STREAMS);
     }
 }

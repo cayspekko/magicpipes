@@ -393,6 +393,17 @@ impl ControlPlane {
         Ok((row.into(), token))
     }
 
+    /// Revokes all of a user's API tokens: your own, or anyone's for an administrator. Returns
+    /// how many there were. Someone else's account looks like one that doesn't exist.
+    pub fn revoke_tokens(&self, who: &Principal, id: &str) -> Result<usize, ErrorBody> {
+        if !authz::authorize(who, Action::Manage, Resource::User(id)) || self.store.user(id).map_err(internal)?.is_none() {
+            return Err(err(ErrorCode::NotFound, "no such user"));
+        }
+        let revoked = self.store.delete_api_tokens(id).map_err(internal)?;
+        self.audit(who, "token.revoke_all", id, &revoked.to_string());
+        Ok(revoked)
+    }
+
     pub fn delete_token(&self, who: &Principal, token_id: &str) -> Result<bool, ErrorBody> {
         let Principal::User { id, .. } = who else { return Ok(false) };
         let deleted = self.store.delete_api_token(id, token_id).map_err(internal)?;
@@ -469,6 +480,8 @@ impl ControlPlane {
         if let Some(role) = role {
             self.store.set_role(id, role).map_err(internal)?;
             self.audit(who, "user.role", id, role.as_str());
+            // What their machines may publish follows their role.
+            self.refresh();
         }
         if let Some(disabled) = disabled {
             self.store.set_disabled(id, disabled).map_err(internal)?;
@@ -480,8 +493,8 @@ impl ControlPlane {
         Ok(self.user_view(user))
     }
 
-    /// Sets a new generated password (shown once) that the user must change, and ends the
-    /// user's sessions.
+    /// Sets a new generated password (shown once) that the user must change, ends the user's
+    /// sessions and revokes their API tokens: this is how an account is taken back.
     pub async fn reset_password(&self, who: &Principal, id: &str) -> Result<String, ErrorBody> {
         if !authz::authorize(who, Action::Manage, Resource::Org) {
             return Err(denied(who));
@@ -493,9 +506,10 @@ impl ControlPlane {
         let hash = self.hash_password(password.clone()).await?;
         self.store.set_password(id, &hash, true).map_err(internal)?;
         self.store.end_sessions(id).map_err(internal)?;
+        let revoked = self.store.delete_api_tokens(id).map_err(internal)?;
         // Tunnel cookies issued before now stop working too.
         self.refresh();
-        self.audit(who, "user.password_reset", id, "");
+        self.audit(who, "user.password_reset", id, &format!("{revoked} API tokens revoked"));
         Ok(password)
     }
 

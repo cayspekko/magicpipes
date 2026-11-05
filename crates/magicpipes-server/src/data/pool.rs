@@ -8,19 +8,22 @@
 //!
 //! Bounded: at most [`MAX_IDLE_PER_TUNNEL`] per tunnel and [`MAX_IDLE`] in total, each for at
 //! most [`IDLE_TIMEOUT`]. Idle connections hold a place in their session's stream budget (not a
-//! client's), and give it up when a session needs a stream ([`Pool::evict`]).
+//! client's), and give it up when a session needs a stream ([`Pool::evict`], through
+//! `DataPlane::with_room`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hyper::client::conn::http1::SendRequest;
-use magicpipes_core::mux::MuxHandle;
+use magicpipes_core::mux::{MAX_DATA_STREAMS, MuxHandle};
 
 /// How long an idle connection is kept. Shorter than most applications' own keep-alive (often
 /// 5 s or more), so an application rarely closes one just as it is reused.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
-pub const MAX_IDLE_PER_TUNNEL: usize = 32;
+/// As many as can be in flight. With fewer, a busy tunnel closes connections only to open them
+/// again for the next request, until the agent runs out of local ports.
+pub const MAX_IDLE_PER_TUNNEL: usize = MAX_DATA_STREAMS;
 pub const MAX_IDLE: usize = 4096;
 
 struct Idle<B> {

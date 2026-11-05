@@ -119,7 +119,8 @@ async fn revoked(dp: &DataPlane, kind: Kind, port: u16, peer: IpAddr, tunnel_id:
 /// Opens a data stream to the agent for `client` and waits for its status byte.
 async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
     let timeout = dp.settings.stream_open_timeout;
-    let mut stream = match session.open_data(timeout, client_key(client)).await {
+    let key = client_key(client);
+    let mut stream = match dp.with_room(session, || session.open_data(timeout, key)).await {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
             tracing::debug!(tunnel = %route.tunnel_id, %client, "agent stream budget used up; refusing");

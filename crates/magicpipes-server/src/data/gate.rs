@@ -8,6 +8,8 @@
 
 #![allow(clippy::result_large_err)] // responses are returned by value, as in `proxy`
 
+use std::net::IpAddr;
+
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
@@ -19,7 +21,7 @@ use magicpipes_core::{secret, unix_now};
 
 use super::proxy::{ProxyBody, error_page};
 use super::{DataPlane, Route, RouteTable, TunnelUser};
-use crate::authz::{self, Action, Resource};
+use crate::authz::{self, Action, Principal, Resource};
 use crate::tunnel_auth::{CALLBACK_PATH, CALLBACK_SCRIPT_PATH, LOGOUT_PATH, RESERVED_PREFIX, STATE_COOKIE, TUNNEL_COOKIE, token_safe};
 
 /// Largest body the code exchange accepts.
@@ -44,20 +46,22 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-/// Removes MagicPipes' own cookies before a request reaches the tunnel's application.
+/// Removes MagicPipes' own cookies before a request reaches the tunnel's application. A request
+/// without any keeps its headers as they came. Works on bytes: another cookie that isn't valid
+/// text must not hide ours.
 pub(super) fn strip_cookies(headers: &mut HeaderMap) {
-    let kept: Vec<String> = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .map(str::trim)
-        .filter(|kv| !kv.is_empty() && !kv.starts_with(&format!("{TUNNEL_COOKIE}=")) && !kv.starts_with(STATE_COOKIE))
-        .map(str::to_string)
-        .collect();
+    let ours = |kv: &[u8]| (kv.starts_with(TUNNEL_COOKIE.as_bytes()) && kv.get(TUNNEL_COOKIE.len()) == Some(&b'=')) || kv.starts_with(STATE_COOKIE.as_bytes());
+    let cookies = |h: &HeaderMap| -> Vec<Vec<u8>> {
+        h.get_all(header::COOKIE).iter().flat_map(|v| v.as_bytes().split(|b| *b == b';')).map(|kv| kv.trim_ascii().to_vec()).collect()
+    };
+    let all = cookies(headers);
+    if !all.iter().any(|kv| ours(kv)) {
+        return;
+    }
+    let kept: Vec<Vec<u8>> = all.into_iter().filter(|kv| !kv.is_empty() && !ours(kv)).collect();
     headers.remove(header::COOKIE);
     if !kept.is_empty()
-        && let Ok(v) = HeaderValue::from_str(&kept.join("; "))
+        && let Ok(v) = HeaderValue::from_bytes(&kept.join(&b"; "[..]))
     {
         headers.insert(header::COOKIE, v);
     }
@@ -142,12 +146,13 @@ fn may_connect(route: &Route, user: &TunnelUser) -> bool {
     authz::authorize(&user.principal, Action::Connect, Resource::Tunnel(&route.access.authz))
 }
 
-/// Whether an admitted user may still use the tunnel at `host` in the current table (for
-/// long-lived connections after a change).
-pub(super) fn still_admitted(table: &RouteTable, host: &str, user_id: &str, issued_at: i64) -> bool {
-    match (table.by_host.get(host), table.users.get(user_id)) {
-        (Some(route), Some(user)) => issued_at >= user.valid_after && may_connect(route, user),
-        _ => false,
+/// Whether a long-lived connection to `tunnel` may go on in the current table: `who` is the user
+/// admitted to it, or `None` for an anonymous client of a public tunnel.
+pub(super) fn still_admitted(table: &RouteTable, host: &str, tunnel: &str, who: Option<&Admitted>, client: IpAddr) -> bool {
+    let Some(route) = table.by_host.get(host).filter(|r| r.tunnel_id == tunnel) else { return false };
+    match who {
+        None => route.access.admits(&Principal::Anonymous, client),
+        Some(a) => table.users.get(&a.user_id).is_some_and(|user| a.issued_at >= user.valid_after && may_connect(route, user)),
     }
 }
 
@@ -315,6 +320,17 @@ mod tests {
         only_ours.insert(header::COOKIE, HeaderValue::from_static("__Host-mp_tunnel=x"));
         strip_cookies(&mut only_ours);
         assert!(only_ours.get(header::COOKIE).is_none());
+        // Another cookie that isn't valid text doesn't hide ours, and stays as it was.
+        let mut odd = HeaderMap::new();
+        odd.insert(header::COOKIE, HeaderValue::from_bytes(b"caf\xc3\xa9=1; __Host-mp_tunnel=secret").unwrap());
+        strip_cookies(&mut odd);
+        assert_eq!(odd.get(header::COOKIE).unwrap().as_bytes(), b"caf\xc3\xa9=1");
+        // Without any of ours, a request's cookies are left exactly as they came.
+        let mut theirs = HeaderMap::new();
+        theirs.append(header::COOKIE, HeaderValue::from_static("a=1"));
+        theirs.append(header::COOKIE, HeaderValue::from_static("__Host-mp_tunnel_x=2;b=3"));
+        strip_cookies(&mut theirs);
+        assert_eq!(theirs.get_all(header::COOKIE).iter().count(), 2);
 
         assert_eq!(safe_return(Some("/a?b=c".into())), "/a?b=c");
         for bad in ["//evil.example/", "https://evil.example/", "/\\evil", "", "a"] {

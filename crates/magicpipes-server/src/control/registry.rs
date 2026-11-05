@@ -362,12 +362,14 @@ impl ControlPlane {
         Ok(true)
     }
 
-    /// Certificate readiness for a hostname owned by `agent_id`.
+    /// Certificate readiness for an HTTP tunnel's hostname owned by `agent_id`. Waiting can start
+    /// an order, and only HTTP registrations count toward the agent's daily limit, so a port
+    /// tunnel's hostname never gets here.
     pub async fn cert_status(&self, agent_id: &str, hostname: &str, wait: Duration) -> Result<CertState, ErrorBody> {
         let who = Principal::Agent(agent_id.to_string());
         let owned = {
             let st = self.state.lock().unwrap();
-            st.tunnels.values().any(|t| t.row.hostname == hostname && st.may(&who, Action::Manage, t))
+            st.tunnels.values().any(|t| t.row.kind.is_http() && t.row.hostname == hostname && st.may(&who, Action::Manage, t))
         };
         if !owned {
             return Err(err(ErrorCode::NotFound, "unknown tunnel hostname"));

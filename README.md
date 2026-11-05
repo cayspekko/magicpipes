@@ -198,7 +198,8 @@ administrator when they first sign in.
   Changing your password, being disabled, or "Sign out everywhere" ends them. Signing out here
   doesn't sign you out at a single sign-on provider.
 * **API tokens** (Account page) act as their user with the user's current role:
-  `Authorization: Bearer tok_…`. Disabling the user stops them.
+  `Authorization: Bearer tok_…`. Disabling the user stops them. "Reset password" revokes them, and
+  so does "Revoke API tokens" on the Users page; signing out everywhere doesn't.
 * **Audit log**: sign-ins (including failed ones), account changes, deletions, revocations and
   enrollment tokens, kept for `[users] audit_retention_days` (90).
 
@@ -249,7 +250,8 @@ administrator's account. Stop people changing their address there first (in auth
 
 The temporary password an administrator set stops working once its owner has signed in with
 single sign-on, and no password change is asked for. A password the person chose keeps working.
-If a provider goes away, an administrator can give its users a password with "Reset password".
+If a provider goes away, an administrator can give its users a password with "Reset password",
+which also revokes their API tokens.
 The admin token works regardless.
 
 **In the configuration file.** The same settings can go in `magicpipesd.toml`. They show on the
@@ -694,7 +696,8 @@ administrators answer `403 forbidden` to members.
 | POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
 | GET | `/api/v1/users/{id}` | One user |
 | PATCH | `/api/v1/users/{id}` | `{"role"?: "admin" \| "member", "disabled"?: bool, "tags"?: [...]}`; role and status not for your own account |
-| POST | `/api/v1/users/{id}/password` | `{"password"}`: a new generated password the user must change; ends their sessions |
+| POST | `/api/v1/users/{id}/password` | `{"password"}`: a new generated password the user must change; ends their sessions and revokes their API tokens |
+| DELETE | `/api/v1/users/{id}/tokens` | `{"revoked": n}`: revokes all of a user's API tokens (your own, or anyone's for an administrator) |
 | GET | `/api/v1/tokens` | Your API tokens (never their secrets) |
 | POST | `/api/v1/tokens` | 201 `{"api_token", "token"}`; body `{"name", "expires_in_days"?}`; the secret is returned once; at most 20 per user |
 | DELETE | `/api/v1/tokens/{id}` | 204 |

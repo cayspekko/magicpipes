@@ -230,6 +230,12 @@ pub async fn reset_password(Caller(who): Caller, State(app): State<AppState>, Pa
     Ok(Json(json!({ "password": password })))
 }
 
+/// Revokes all of a user's API tokens.
+pub async fn revoke_user_tokens(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
+    let revoked = app.control.revoke_tokens(&who, &id).map_err(ApiError)?;
+    Ok(Json(json!({ "revoked": revoked })))
+}
+
 pub async fn list_tokens(Caller(who): Caller, State(app): State<AppState>) -> impl IntoResponse {
     Json(json!({ "tokens": app.control.tokens(&who) }))
 }

@@ -351,6 +351,11 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Deletes all of a user's API tokens; returns how many there were.
+    pub fn delete_api_tokens(&self, user_id: &str) -> anyhow::Result<usize> {
+        self.with(|c| c.execute("DELETE FROM api_tokens WHERE user_id = ?1", [user_id]))
+    }
+
     /// Verifies an unexpired API token and returns its user's id.
     pub fn verify_api_token(&self, token: &str) -> anyhow::Result<Option<String>> {
         let Some((id, _)) = token.split_once('.') else { return Ok(None) };

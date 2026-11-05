@@ -70,11 +70,13 @@ connections:
   an upgrade keeps its stream, and the probe checks that the agent opened a stream for it.
 * Requests from different visitors take turns on a connection, as behind any reverse proxy, so
   applications must not tie authentication to the TCP connection (NTLM-style).
-* Bounds: at most 32 idle connections per tunnel and 4096 in total, each idle for at most 4 s
-  (shorter than most applications' keep-alive), swept every 2 s. Idle connections count toward
-  the session's 224 data streams but not toward any client's 64; a request holds its client's
-  place until its response body is done. When a session's streams are used up, idle connections
-  on it are closed to make room.
+* Bounds: at most 224 idle connections per tunnel (as many as can be in flight, or a busy tunnel
+  closes connections only to reopen them, until the agent runs out of local ports) and 4096 in
+  total, each idle for at most 4 s (shorter than most applications' keep-alive), swept every 2 s.
+  Idle connections count toward the session's 224 data streams but not toward any client's 64; a
+  request holds its client's place until its response body is done. When a session's streams are
+  used up, idle connections on it are closed to make room, for pooled requests, WebSockets and
+  port connections alike.
 
 ## Data plane vs control plane
 
@@ -321,8 +323,11 @@ a connection to the public port that must arrive back at the agent (a warning, n
 ## Lifecycle policies
 
 * **Route removal** (agent `remove`, admin delete): new requests get 404 immediately. In-flight
-  requests and WebSockets on that tunnel run to completion; the agent also stops accepting new
-  streams for it.
+  requests on that tunnel run to completion; the agent also stops accepting new streams for it.
+* **Long-lived connections** (WebSockets, port connections) are checked again on every publish,
+  public tunnels' included, and closed once the tunnel no longer admits them, for example when it
+  turns private, or is removed. A removed tunnel's WebSockets get 2 s for the agent to end them
+  first, so a web terminal can tell its viewers. Requests are short, and aren't interrupted.
 * **Agent revocation** (admin): the agent row and its tunnels are deleted in one transaction,
   the routes are unpublished (404) and the live session is closed. The agent's reconnect gets
   401 and it reports `unauthorized`. `attach_session` re-checks the agent under the registry
@@ -430,7 +435,9 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * No open proxy: `CONNECT` is refused, absolute-form URIs must match `Host`, and the TLS SNI must
   equal the `Host` header (421 otherwise). Unknown hostnames get no certificate at all, since
   certificates are never issued on demand from SNI.
-* Bounded resources: connection semaphores per listener and per client address, header read
+* Bounded resources: connection semaphores per listener and per client address (held by the
+  connection's task on every listener, and by a proxied WebSocket for as long as it lasts; an
+  agent's authenticated session gives its place back once upgraded), header read
   and TLS handshake timeouts, a 15 s deadline and 64 KiB body limit for management requests,
   64 KiB control frames and IPC lines (5 s to send one), ≤256 concurrent streams per agent
   session of which public traffic may use 224 (64 streams or in-flight requests per client;

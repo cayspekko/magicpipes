@@ -487,3 +487,77 @@ async fn members_can_publish_applies_to_enrolled_machines() {
     let private = RegisterTunnel { visibility: Some(Visibility::Private), ..http("after") };
     assert_eq!(f.cp.register(&laptop, &private).unwrap().visibility, Some(Visibility::Private));
 }
+
+#[tokio::test]
+async fn only_http_tunnels_ask_for_certificates() {
+    use magicpipes_core::proto::Kind;
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let ports = format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\"");
+    let f = fixture_in(fixture().stop(), &ports);
+    let agent = f.agent("a");
+    let web = f.cp.register(&agent, &http("web")).unwrap();
+    assert!(f.cp.cert_status(&agent, &web.hostname, Duration::ZERO).await.is_ok());
+    // Asking about a port tunnel's hostname would order a certificate past the daily limit.
+    let db = f.cp.register(&agent, &RegisterTunnel { kind: Kind::Tcp, target: "tcp://127.0.0.1:5432".into(), ..http("db") }).unwrap();
+    assert!(f.cp.cert_status(&agent, &db.hostname, Duration::ZERO).await.unwrap_err().is(ErrorCode::NotFound));
+}
+
+#[tokio::test]
+async fn a_changed_role_takes_effect_at_once() {
+    use magicpipes_core::proto::Visibility;
+
+    use crate::authz::Role;
+    use crate::control::EnrollmentOptions;
+    let dir = std::env::temp_dir().join(format!("mp-control-{}", secret::random_string(8)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = fixture_in(dir, "[users]\nmembers_can_publish = false");
+    let admin = Principal::AdminToken;
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Admin, Some("correct horse battery")).await.unwrap();
+    let opts = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), allow_public: Some(true), ..Default::default() };
+    let token = f.cp.create_enrollment(&admin, opts).unwrap();
+    let laptop = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "laptop".into() }).unwrap().agent_id;
+    let public = |name: &str| RegisterTunnel { visibility: Some(Visibility::Public), ..http(name) };
+    f.cp.register(&laptop, &public("before")).unwrap();
+    f.cp.update_user(&admin, &ann.id, Some(Role::Member), None).unwrap();
+    assert!(f.cp.register(&laptop, &public("after")).unwrap_err().is(ErrorCode::PublicNotAllowed));
+    f.cp.update_user(&admin, &ann.id, Some(Role::Admin), None).unwrap();
+    assert!(f.cp.register(&laptop, &public("after")).is_ok());
+}
+
+#[tokio::test]
+async fn api_tokens_end_when_an_account_is_taken_back() {
+    use crate::authz::Role;
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let (bob, _) = f.cp.create_user(&admin, "bob@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let as_ann = Principal::User { id: ann.id.clone(), role: Role::Member, tags: Vec::new() };
+    let as_bob = Principal::User { id: bob.id.clone(), role: Role::Member, tags: Vec::new() };
+    let works = |t: &str| f.cp.bearer(t).is_some();
+
+    let (_, one) = f.cp.create_token(&as_ann, "one", None).unwrap();
+    let (_, two) = f.cp.create_token(&as_ann, "two", None).unwrap();
+    assert!(works(&one) && works(&two));
+
+    // Someone else's account looks like one that doesn't exist.
+    assert!(f.cp.revoke_tokens(&as_bob, &ann.id).unwrap_err().is(ErrorCode::NotFound));
+    assert!(f.cp.revoke_tokens(&admin, "us_nobody").unwrap_err().is(ErrorCode::NotFound));
+    assert!(works(&one));
+
+    // An administrator can revoke them, and so can their owner.
+    assert_eq!(f.cp.revoke_tokens(&admin, &ann.id).unwrap(), 2);
+    assert!(!works(&one) && !works(&two));
+    let (_, three) = f.cp.create_token(&as_ann, "three", None).unwrap();
+    assert_eq!(f.cp.revoke_tokens(&as_ann, &ann.id).unwrap(), 1);
+    assert!(!works(&three));
+
+    // A password reset takes them too, and leaves other people's alone.
+    let (_, four) = f.cp.create_token(&as_ann, "four", None).unwrap();
+    let (_, bobs) = f.cp.create_token(&as_bob, "bobs", None).unwrap();
+    f.cp.reset_password(&admin, &ann.id).await.unwrap();
+    assert!(!works(&four) && works(&bobs));
+}

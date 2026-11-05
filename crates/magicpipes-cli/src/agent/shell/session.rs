@@ -84,7 +84,8 @@ where
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "web terminal could not start the program");
-            let message = format!("Could not start {}: {e:#}", crate::state::command_line(&term.command));
+            // Visitors are anonymous, and a command's arguments can hold secrets.
+            let message = format!("Could not start {}.", crate::state::program_name(&term.command));
             return finish(ws, json!({ "type": "error", "code": ErrorCode::SpawnFailed.as_str(), "message": message })).await;
         }
     };

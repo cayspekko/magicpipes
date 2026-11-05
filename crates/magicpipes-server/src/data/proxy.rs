@@ -36,6 +36,9 @@ use crate::listen::ConnInfo;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
+/// How long a removed tunnel's WebSockets may stay open for the agent to end them.
+const REMOVAL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 const HOP_BY_HOP: &[HeaderName] = &[
     header::CONNECTION,
     header::PROXY_AUTHENTICATE,
@@ -101,10 +104,12 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     let upgrade = is_upgrade(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
     prepare_request(&mut req, &host, conn.peer, upgrade, &dp.settings.trusted_proxies)?;
+    // MagicPipes' own cookies are never the application's, public or private: a name can pass to
+    // someone else, and a browser still sends what it was given for it.
+    gate::strip_cookies(req.headers_mut());
     if let Some(a) = &admitted {
-        // The application learns who is asking, never the tunnel cookie. Clients can't forge
-        // these: `prepare_request` dropped every client-sent x-magicpipes-* header.
-        gate::strip_cookies(req.headers_mut());
+        // The application learns who is asking. Clients can't forge these: `prepare_request`
+        // dropped every client-sent x-magicpipes-* header.
         let h = req.headers_mut();
         if let (Ok(email), Ok(id)) = (HeaderValue::from_str(&a.user.email), HeaderValue::from_str(&a.user_id)) {
             h.insert("x-magicpipes-user", email);
@@ -160,21 +165,14 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         let upstream_upgrade = hyper::upgrade::on(&mut resp);
         let idle = dp.settings.websocket_idle_timeout;
         let stop = CancellationToken::new();
-        if let Some(a) = admitted {
-            // Recheck on every change to routes, users or tags; close once access is gone.
-            let (dp, stop, host) = (dp.clone(), stop.clone(), host.clone());
-            let mut changes = dp.generation.subscribe();
+        // Recheck on every change to routes, users or tags, for everyone: a public tunnel can turn
+        // private. Close once access is gone.
+        {
+            let (dp, stop, host, tunnel) = (dp.clone(), stop.clone(), host.clone(), route.tunnel_id.clone());
             tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = stop.cancelled() => return,
-                        changed = changes.changed() => {
-                            if changed.is_err() || !gate::still_admitted(&dp.table(), &host, &a.user_id, a.issued_at) {
-                                stop.cancel();
-                                return;
-                            }
-                        }
-                    }
+                tokio::select! {
+                    _ = stop.cancelled() => {}
+                    _ = revoked(&dp, &host, &tunnel, admitted.as_ref(), client_ip) => stop.cancel(),
                 }
             });
         }
@@ -196,6 +194,25 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
             resp.headers_mut().insert(PROBE_ACK_HEADER, v);
         }
     Ok(resp)
+}
+
+/// Returns once a long-lived connection may no longer use the tunnel it was opened to: at once if
+/// its access is gone. A removed tunnel's agent ends the connection itself, with a last word for
+/// the visitor if it has one (a web terminal's), so that gets a moment first.
+async fn revoked(dp: &DataPlane, host: &str, tunnel: &str, who: Option<&gate::Admitted>, client: IpAddr) {
+    let mut changes = dp.generation.subscribe();
+    loop {
+        let table = dp.table();
+        if !gate::still_admitted(&table, host, tunnel, who, client) {
+            if table.by_host.get(host).is_none_or(|r| r.tunnel_id != tunnel) {
+                tokio::time::sleep(REMOVAL_GRACE).await;
+            }
+            return;
+        }
+        if changes.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 type Sent = Option<Result<Response<Incoming>, hyper::Error>>;
@@ -255,18 +272,10 @@ async fn connect_shared(dp: &DataPlane, route: &Route, session: &MuxHandle) -> R
         error_page(ErrorCode::AgentUnavailable, "Could not open a stream to the MagicPipes agent.")
     };
     let open = dp.settings.stream_open_timeout;
-    let mut tries = 0;
-    let mut stream = loop {
-        match session.open_shared(open).await {
-            Ok(s) => break s,
-            // A closed connection gives its stream back once its task notices, so wait a moment.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && tries < 3 && dp.pool.evict(session) => {
-                tries += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
-            Err(_) => return Err(fail()),
-        }
+    let mut stream = match dp.with_room(session, || session.open_shared(open)).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+        Err(_) => return Err(fail()),
     };
     proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })
         .await
@@ -375,7 +384,8 @@ async fn open_upstream(
         route.stats.record(Outcome::AgentOffline);
         error_page(ErrorCode::AgentUnavailable, "Could not open a stream to the MagicPipes agent.")
     };
-    let mut stream = match session.open_data(dp.settings.stream_open_timeout, client).await {
+    let timeout = dp.settings.stream_open_timeout;
+    let mut stream = match dp.with_room(session, || session.open_data(timeout, client)).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
         Err(_) => return Err(fail()),

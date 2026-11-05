@@ -68,8 +68,10 @@ impl Drop for ClientSlot {
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connection's share of the listener's limits: its permit and its per-client slot, released
-/// when the last holder drops it. The connection task holds it, and so must anything that
-/// outlives the HTTP connection (an upgraded WebSocket), so the limits keep counting it.
+/// when the last holder drops it. The connection task holds it for as long as the HTTP connection
+/// lasts, on every listener. Anything that outlives the HTTP connection and should go on counting
+/// keeps a clone (a proxied WebSocket); an agent's session doesn't, so an authenticated session
+/// gives its place back once it has upgraded.
 pub struct ConnLimits {
     _permit: OwnedSemaphorePermit,
     _slot: Option<ClientSlot>,
@@ -153,13 +155,13 @@ pub async fn serve<F, S, B>(
                 Some(acceptor) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
                     Ok(Ok(stream)) => {
                         let sni = stream.get_ref().1.server_name().map(str::to_ascii_lowercase);
-                        let svc = make_service(ConnInfo { peer, sni, limits });
+                        let svc = make_service(ConnInfo { peer, sni, limits: limits.clone() });
                         serve_conn(stream, svc, header_timeout, shutdown).await
                     }
                     Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
                     Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
                 },
-                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits }), header_timeout, shutdown).await,
+                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, shutdown).await,
             }
         });
     }
@@ -207,18 +209,66 @@ mod tests {
         buf[..n].starts_with(b"HTTP/1.1 101").then_some(s)
     }
 
+    fn opts(max_per_client: usize) -> ListenOpts {
+        ListenOpts {
+            name: "test",
+            max_connections: 10,
+            max_per_client,
+            header_read_timeout: Duration::from_secs(5),
+            trusted_proxies: TrustedProxies::default(),
+            proxy_protocol: false,
+        }
+    }
+
+    /// A service that keeps nothing of the connection's: the listener still counts it.
+    #[tokio::test]
+    async fn every_connection_counts_until_it_ends() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let make = |_: ConnInfo| hyper::service::service_fn(|_: Request<Incoming>| async { Ok::<_, Infallible>(Response::new(Empty::<bytes::Bytes>::new())) });
+        tokio::spawn(serve(listener, None, opts(1), CancellationToken::new(), TaskTracker::new(), make));
+        let request = |addr| async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
+            s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n").await.ok()?;
+            let mut buf = [0u8; 12];
+            let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await.ok()?.ok()?;
+            buf[..n].starts_with(b"HTTP/1.1 200").then_some(s)
+        };
+        let first = request(addr).await.expect("first connection is served");
+        assert!(request(addr).await.is_none(), "the kept-alive connection still uses the client's only slot");
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(request(addr).await.is_some(), "its slot is free once it closes");
+    }
+
+    /// Like an agent's session: once upgraded, it no longer uses the listener's limits.
+    #[tokio::test]
+    async fn upgrades_that_keep_no_limits_give_their_slot_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let make = |_: ConnInfo| {
+            hyper::service::service_fn(|mut req: Request<Incoming>| async move {
+                let on = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                    if let Ok(io) = on.await {
+                        let _ = TokioIo::new(io).read(&mut [0u8; 1]).await;
+                    }
+                });
+                let resp = Response::builder().status(101).header("connection", "upgrade").header("upgrade", "test");
+                Ok::<_, Infallible>(resp.body(Empty::<bytes::Bytes>::new()).unwrap())
+            })
+        };
+        tokio::spawn(serve(listener, None, opts(1), CancellationToken::new(), TaskTracker::new(), make));
+        let first = upgrade(addr).await.expect("first connection upgrades");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(upgrade(addr).await.is_some(), "the upgraded connection gave its slot back");
+        drop(first);
+    }
+
     #[tokio::test]
     async fn upgraded_connections_keep_their_slot() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let opts = ListenOpts {
-            name: "test",
-            max_connections: 10,
-            max_per_client: 1,
-            header_read_timeout: Duration::from_secs(5),
-            trusted_proxies: TrustedProxies::default(),
-            proxy_protocol: false,
-        };
         let make = |info: ConnInfo| {
             hyper::service::service_fn(move |mut req: Request<Incoming>| {
                 let limits = info.limits.clone();
@@ -238,7 +288,7 @@ mod tests {
                 }
             })
         };
-        tokio::spawn(serve(listener, None, opts, CancellationToken::new(), TaskTracker::new(), make));
+        tokio::spawn(serve(listener, None, opts(1), CancellationToken::new(), TaskTracker::new(), make));
         let first = upgrade(addr).await.expect("first connection upgrades");
         assert!(upgrade(addr).await.is_none(), "the upgraded connection still uses the client's only slot");
         drop(first);
