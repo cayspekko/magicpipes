@@ -51,6 +51,7 @@ pub async fn serve_http(
         header_read_timeout: Duration::from_secs(10),
         trusted_proxies: TrustedProxies::default(),
         proxy_protocol: false,
+        idle_timeout: None,
     };
     serve(listener, None, opts, shutdown, tracker, move |_conn| {
         let challenges = challenges.clone();

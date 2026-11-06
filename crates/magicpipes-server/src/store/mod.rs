@@ -264,6 +264,11 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (org_id, kind, value)
     );
     "#,
+    // 5: an address a trusted provider didn't verify reaches administrators' accounts only if
+    // this says so.
+    r#"
+    ALTER TABLE oidc_providers ADD COLUMN allow_unverified_admin INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -366,6 +371,19 @@ impl Store {
 
     /// Creates a single-use enrollment token; the agent enrolled with it gets `spec`'s owner,
     /// tags and visibility settings.
+    /// A user's machines, counting enrollment tokens that could still become one.
+    pub fn machines_of(&self, user_id: &str) -> anyhow::Result<usize> {
+        let n: i64 = self.with(|c| {
+            c.query_row(
+                "SELECT (SELECT COUNT(*) FROM agents WHERE owner_user_id = ?1)
+                      + (SELECT COUNT(*) FROM enrollments WHERE owner_user_id = ?1 AND used_at IS NULL AND expires_at >= ?2)",
+                params![user_id, unix_now()],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n as usize)
+    }
+
     pub fn create_enrollment(&self, ttl_secs: u64, spec: &EnrollmentSpec) -> anyhow::Result<String> {
         let token = secret::new_token("mpenr");
         let hash = secret::sha256_hex(&token);

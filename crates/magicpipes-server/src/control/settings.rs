@@ -68,6 +68,7 @@ fn row_config(cfg: &Config, row: &OidcProviderRow) -> OidcConfig {
         client_secret_file: secret_path(cfg, &row.id),
         link_by_email: row.link_by_email,
         trust_email: row.trust_email,
+        allow_unverified_admin: row.allow_unverified_admin,
     }
 }
 
@@ -134,6 +135,7 @@ pub struct ProviderView {
     pub client_id: String,
     pub link_by_email: bool,
     pub trust_email: bool,
+    pub allow_unverified_admin: bool,
     /// In the configuration file: it can't be changed on the page.
     pub from_file: bool,
     /// Its button is on the sign-in page. If not, its client secret can't be read.
@@ -158,6 +160,7 @@ pub struct NewProvider<'a> {
     pub client_secret: &'a str,
     pub link_by_email: bool,
     pub trust_email: bool,
+    pub allow_unverified_admin: bool,
 }
 
 pub struct ProviderChanges<'a> {
@@ -167,6 +170,7 @@ pub struct ProviderChanges<'a> {
     pub client_secret: &'a str,
     pub link_by_email: bool,
     pub trust_email: bool,
+    pub allow_unverified_admin: bool,
 }
 
 impl ControlPlane {
@@ -203,6 +207,7 @@ impl ControlPlane {
                     client_id: p.client_id.clone(),
                     link_by_email: p.link_by_email,
                     trust_email: p.trust_email,
+                    allow_unverified_admin: p.allow_unverified_admin,
                     from_file: self.cfg.oidc.iter().any(|f| f.id == p.id),
                     available: sign_in.providers.iter().any(|l| l.id == p.id),
                     only_way_in: self.store.users_only_through(&p.issuer).map_err(internal)?,
@@ -250,6 +255,7 @@ impl ControlPlane {
             client_id: new.client_id.trim().to_string(),
             link_by_email: new.link_by_email,
             trust_email: new.trust_email,
+            allow_unverified_admin: new.allow_unverified_admin,
         };
         // The Settings page's own routes take this one.
         if row.id == "new" {
@@ -286,12 +292,12 @@ impl ControlPlane {
         let label = clean_name(changes.label, 60);
         let client_id = changes.client_id.trim();
         let secret = clean_secret(changes.client_secret)?;
-        let new = OidcProviderRow { label, client_id: client_id.to_string(), link_by_email: changes.link_by_email, trust_email: changes.trust_email, ..row.clone() };
+        let new = OidcProviderRow { label, client_id: client_id.to_string(), link_by_email: changes.link_by_email, trust_email: changes.trust_email, allow_unverified_admin: changes.allow_unverified_admin, ..row.clone() };
         row_config(&self.cfg, &new).check().map_err(|m| err(ErrorCode::InvalidRequest, m))?;
         if !secret.is_empty() {
             write_secret(&self.cfg, id, secret).map_err(internal)?;
         }
-        if !self.store.update_oidc_provider(id, &new.label, &new.client_id, new.link_by_email, new.trust_email).map_err(internal)? {
+        if !self.store.update_oidc_provider(&new).map_err(internal)? {
             return Err(err(ErrorCode::NotFound, "no such provider"));
         }
         let what = if secret.is_empty() { "" } else { "new client secret" };

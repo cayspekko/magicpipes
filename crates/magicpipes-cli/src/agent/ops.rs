@@ -207,12 +207,31 @@ impl Agent {
             });
             *key = old.or_else(|| Some(magicpipes_core::secret::random_string(32)));
         }
-        // Settings follow the latest `add`: re-adding without --allow-cidr opens the port to anyone.
-        let allow: Vec<String> = cidr::parse_list(&req.allow)
+        // Re-running a command must not widen access: what a re-add doesn't mention stays as it was.
+        if req.keep_list
+            && let (Target::Static { list, .. }, Some(Target::Static { list: kept, .. })) = (&mut target, existing.as_ref().map(|t| &t.target))
+        {
+            *list = *kept;
+        }
+        let asked: Vec<String> = cidr::parse_list(&req.allow)
             .map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?
             .iter()
             .map(ToString::to_string)
             .collect();
+        let allow = match &existing {
+            _ if !asked.is_empty() || req.allow_any || req.kind.is_http() => asked,
+            Some(t) => t.allow.clone(),
+            // A raw port has nothing in front of it but the service itself, so this is asked for.
+            None => {
+                return Err(ErrorInfo::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "this would open a {} port to the whole internet. Say who may connect with --allow-cidr <network>, or use --allow-any if anyone should",
+                        req.kind
+                    ),
+                ));
+            }
+        };
         // Without --private/--public a re-add keeps the tunnel's access as the server has it (our
         // copy may name tags deleted since); a new one gets the machine's default from the server.
         // If the server lost the tunnel, it is registered again with our copy, less the personal
@@ -540,7 +559,7 @@ async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
     }
     cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?;
     match (&req.serve, req.port) {
-        (Some(dir), _) => Ok(Target::Static { serve: serve::check_root(dir).await?, list: req.list }),
+        (Some(dir), _) => Ok(Target::Static { serve: serve::check_root(dir, req.allow_sensitive_root).await?, list: req.list, site: req.site }),
         // A UDP service cannot be probed: anything may or may not answer a datagram.
         (None, Some(port)) if req.kind == Kind::Udp => {
             let host = req.host.clone().unwrap_or_else(|| "127.0.0.1".into());

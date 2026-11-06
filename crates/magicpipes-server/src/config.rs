@@ -55,6 +55,11 @@ pub struct OidcConfig {
     /// Off by default: only for a provider that doesn't let people change or reuse an address.
     #[serde(default)]
     pub link_by_email: bool,
+    /// With `trust_email`: let an address the provider didn't verify reach an administrator's
+    /// account, through `bootstrap_admins` or `link_by_email`. Off by default, so that trusting a
+    /// provider's addresses can't hand out administrators.
+    #[serde(default)]
+    pub allow_unverified_admin: bool,
     /// Accept this provider's email addresses even when it doesn't say it verified them. Off by
     /// default: anyone who can choose their address there could then claim one here.
     #[serde(default)]
@@ -75,6 +80,9 @@ impl OidcConfig {
         }
         if self.issuer.len() > 2048 || !crate::oidc::allowed_url(&self.issuer) {
             return Err("the issuer must be an https:// URL".into());
+        }
+        if self.allow_unverified_admin && !self.trust_email {
+            return Err("unverified addresses can only reach administrators' accounts on a provider whose addresses are trusted".into());
         }
         Ok(())
     }
@@ -118,6 +126,14 @@ pub struct PublicConfig {
     /// Connections from `trusted_proxies` start with a PROXY protocol header (a TCP load
     /// balancer passing TLS through, such as HAProxy with `send-proxy-v2`).
     pub proxy_protocol: bool,
+    /// Close a connection after this long with no byte moving in either direction, so stalled
+    /// uploads and downloads give their place back. Off by default: an application that holds a
+    /// response open without sending anything (long polling, server-sent events) would be cut off.
+    pub body_idle_timeout_secs: Option<u64>,
+    /// Let applications set cookies for the whole base domain. Off by default: such a cookie goes
+    /// to every other tunnel and the management host, so one tunnel could log visitors in to
+    /// another as someone else, or lock them out with oversized headers.
+    pub allow_cookie_domain: bool,
 }
 
 impl Default for PublicConfig {
@@ -127,11 +143,13 @@ impl Default for PublicConfig {
             http_listen: Some("0.0.0.0:80".parse().unwrap()),
             url_port: None,
             max_connections: 10_000,
-            max_connections_per_client: 256,
+            max_connections_per_client: 64,
             header_read_timeout_secs: 30,
             upstream_response_timeout_secs: 60,
             websocket_idle_timeout_secs: 600,
             proxy_protocol: false,
+            body_idle_timeout_secs: None,
+            allow_cookie_domain: false,
         }
     }
 }
@@ -149,6 +167,13 @@ pub struct ManagementConfig {
     /// Like `public.proxy_protocol`, for the management listener.
     #[serde(default)]
     pub proxy_protocol: bool,
+    /// Open connections, while they are HTTP: an agent's session gives its place back once it has
+    /// authenticated and upgraded.
+    #[serde(default = "default_mgmt_max_connections")]
+    pub max_connections: usize,
+    /// Open connections per client address (per /64 for IPv6). Trusted proxies are exempt.
+    #[serde(default = "default_mgmt_max_per_client")]
+    pub max_connections_per_client: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,6 +271,9 @@ pub struct UsersConfig {
     /// Verified emails in these domains get a new member account at their first single sign-on.
     /// Empty: nobody does.
     pub allowed_email_domains: Vec<String>,
+    /// Machines a member may enroll for themself, counting tokens not used yet, since limits per
+    /// agent would otherwise multiply with every machine. 0: no limit. Administrators aren't limited.
+    pub max_agents_per_user: usize,
 }
 
 impl Default for UsersConfig {
@@ -256,6 +284,7 @@ impl Default for UsersConfig {
             members_can_publish: true,
             bootstrap_admins: Vec::new(),
             allowed_email_domains: Vec::new(),
+            max_agents_per_user: 25,
         }
     }
 }
@@ -275,6 +304,9 @@ pub struct PortsConfig {
     pub proxy_protocol: bool,
     /// Open TCP connections across all port tunnels.
     pub max_connections: usize,
+    /// Close a TCP connection after this long with no byte moving in either direction. Off by
+    /// default: plenty of protocols keep a quiet connection open on purpose.
+    pub tcp_idle_timeout_secs: Option<u64>,
     /// A UDP client is forgotten after this long without datagrams in either direction.
     pub udp_idle_timeout_secs: u64,
     /// UDP clients tracked at once per tunnel; datagrams from further clients are dropped.
@@ -289,6 +321,7 @@ impl Default for PortsConfig {
             public_host: None,
             proxy_protocol: false,
             max_connections: 10_000,
+            tcp_idle_timeout_secs: None,
             udp_idle_timeout_secs: 60,
             udp_max_flows: 128,
         }
@@ -327,6 +360,19 @@ fn default_data_dir() -> PathBuf {
 
 fn default_mgmt_listen() -> SocketAddr {
     "0.0.0.0:8443".parse().unwrap()
+}
+
+fn default_mgmt_max_connections() -> usize {
+    1024
+}
+
+fn default_mgmt_max_per_client() -> usize {
+    64
+}
+
+/// An optional timeout in seconds, for which 0 also means off.
+pub fn optional_secs(secs: Option<u64>) -> Option<Duration> {
+    secs.filter(|s| *s > 0).map(Duration::from_secs)
 }
 
 impl Config {
@@ -447,6 +493,11 @@ mod tests {
         let provider = |id: &str, issuer: &str| format!("[[oidc]]\nid = \"{id}\"\nlabel = \"L\"\nissuer = \"{issuer}\"\nclient_id = \"c\"\nclient_secret_file = \"/s\"\n");
         let google = provider("google", "https://accounts.google.com");
 
+        // Trusting addresses has to come first; the rest can't be switched on by accident.
+        let unverified = |extra: &str| load(&format!("{google}{extra}allow_unverified_admin = true\n"));
+        assert!(unverified("").is_err());
+        assert!(unverified("trust_email = true\n").is_ok());
+
         let c = load(&format!("[users]\nbootstrap_admins = [\" Ann@Example.com \"]\nallowed_email_domains = [\"Example.COM\"]\n{google}")).unwrap();
         assert_eq!(c.users.bootstrap_admins, ["ann@example.com"]);
         assert_eq!(c.users.allowed_email_domains, ["example.com"]);
@@ -459,7 +510,7 @@ mod tests {
         assert!(load("[users]\nbootstrap_admins = [\"nobody\"]").is_err());
         assert!(load("[users]\nallowed_email_domains = [\"*.example.com\"]").is_err(), "no wildcards");
         assert!(load("[users]\nallowed_email_domains = [\"a@example.com\"]").is_err());
-        assert!(!c.oidc[0].trust_email, "trusting addresses is off unless asked for");
+        assert!(!c.oidc[0].trust_email && !c.oidc[0].allow_unverified_admin, "trusting addresses is off unless asked for");
     }
 
     #[test]
@@ -471,17 +522,23 @@ trusted_proxies = ["172.23.0.0/16"]
 https_listen = "0.0.0.0:8443"
 url_port = 443
 proxy_protocol = true
+body_idle_timeout_secs = 90
+allow_cookie_domain = true
 [management]
 listen = "0.0.0.0:443"
 hostname = "example.com"
 proxy_protocol = true
+max_connections = 100
+max_connections_per_client = 10
 [tls]
 mode = "dev-ca"
 [ports]
 range = "65500-65535"
+tcp_idle_timeout_secs = 600
 [users]
 bootstrap_admins = ["ann@example.com"]
 allowed_email_domains = ["example.com"]
+max_agents_per_user = 3
 [[oidc]]
 id = "authentik"
 label = "authentik"
@@ -489,6 +546,7 @@ issuer = "https://auth.example.com/application/o/mp/"
 client_id = "c"
 client_secret_file = "/data/oidc-secrets/authentik"
 trust_email = true
+allow_unverified_admin = true
 "#;
         for text in [full, "base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n"] {
             let mut first: Config = toml::from_str(text).unwrap();
@@ -501,6 +559,8 @@ trust_email = true
         let mut c: Config = toml::from_str(full).unwrap();
         c.validate().unwrap();
         let written = c.to_toml().unwrap();
-        assert!(written.contains("client_secret_file = \"/data/oidc-secrets/authentik\"") && written.contains("trust_email = true"), "{written}");
+        for line in ["client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3"] {
+            assert!(written.contains(line), "{line} in {written}");
+        }
     }
 }

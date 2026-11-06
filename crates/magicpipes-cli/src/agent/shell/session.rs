@@ -10,9 +10,9 @@
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use magicpipes_core::error::ErrorCode;
@@ -35,6 +35,10 @@ const DRAIN: Duration = Duration::from_millis(300);
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Output is coalesced into WebSocket messages of at most this size.
 const MAX_CHUNK: usize = 64 * 1024;
+/// Programs one tunnel may start per minute. Each visit runs the program and its login scripts,
+/// and read-only visitors are anonymous, so `--max-clients` alone isn't enough: someone can open
+/// and close sessions in a loop without ever holding many at once.
+const MAX_SPAWNS_PER_MINUTE: u32 = 60;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -76,10 +80,14 @@ where
             return finish(ws, json!({ "type": "error", "code": "key", "message": message })).await;
         }
     };
-    let Some(_slot) = Slot::take(&term.sessions, term.max_clients) else {
+    let Some(slot) = Slot::take(&term.sessions, term.max_clients) else {
         let message = format!("This terminal already has {} open sessions. Try again later.", term.max_clients);
         return finish(ws, json!({ "type": "error", "code": ErrorCode::Busy.as_str(), "message": message })).await;
     };
+    if !term.spawns.allow(Instant::now()) {
+        let message = "This terminal has started too many sessions in the last minute. Try again shortly.";
+        return finish(ws, json!({ "type": "error", "code": ErrorCode::Busy.as_str(), "message": message })).await;
+    }
     let mut pty = match Pty::spawn(&term, size(cols, rows)) {
         Ok(p) => p,
         Err(e) => {
@@ -105,7 +113,7 @@ where
         Outcome::ClientGone => None,
     };
     log("ended");
-    pty.stop();
+    pty.stop(slot);
     if let Some(msg) = last {
         finish(ws, msg).await;
     }
@@ -155,8 +163,10 @@ where
                             Err(_) => break,
                         }
                     }
-                    if ws.send(Message::Binary(data.into())).await.is_err() {
-                        return Outcome::ClientGone;
+                    // A viewer that stopped reading pauses the output, but not the end of the tunnel.
+                    tokio::select! {
+                        sent = ws.send(Message::Binary(data.into())) => if sent.is_err() { return Outcome::ClientGone },
+                        _ = term.ended.cancelled() => return Outcome::Ended,
                     }
                 }
                 // Every holder of the pty is gone: the program has exited (or is about to).
@@ -185,8 +195,9 @@ where
                 return Outcome::Exited(exited.take().unwrap_or_else(|| ExitStatus::with_exit_code(1)));
             }
             _ = ping.tick() => {
-                if ws.send(Message::Ping(Default::default())).await.is_err() {
-                    return Outcome::ClientGone;
+                tokio::select! {
+                    sent = ws.send(Message::Ping(Default::default())) => if sent.is_err() { return Outcome::ClientGone },
+                    _ = term.ended.cancelled() => return Outcome::Ended,
                 }
             }
         }
@@ -216,7 +227,28 @@ where
     .await;
 }
 
-/// A counted place among a tunnel's `max_clients` sessions, released on drop.
+/// Counts the programs a tunnel started in the current minute.
+#[derive(Default)]
+pub struct SpawnRate(Mutex<Option<(Instant, u32)>>);
+
+impl SpawnRate {
+    fn allow(&self, now: Instant) -> bool {
+        let mut minute = self.0.lock().unwrap();
+        match &mut *minute {
+            Some((start, started)) if now.duration_since(*start) < Duration::from_secs(60) => {
+                *started += 1;
+                *started <= MAX_SPAWNS_PER_MINUTE
+            }
+            _ => {
+                *minute = Some((now, 1));
+                true
+            }
+        }
+    }
+}
+
+/// A counted place among a tunnel's `max_clients` sessions, released on drop. Held until the
+/// program has really gone, so `max_clients` bounds programs, not just connections.
 struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
@@ -291,15 +323,16 @@ impl Pty {
 
     /// Ends the program: SIGHUP (as when a terminal closes), then SIGKILL if it is still running
     /// after a grace period. On Windows the kill is immediate. Dropping the master afterwards
-    /// closes the pty.
-    fn stop(self) {
-        let Pty { master, mut killer, pid, exit, reaped, .. } = self;
+    /// closes the pty, and `slot` is given back once the program has gone.
+    fn stop(self, slot: Slot) {
+        let Pty { master, mut killer, pid, mut exit, reaped, .. } = self;
         if reaped {
             return;
         }
         let _ = killer.kill();
         tokio::spawn(async move {
-            if tokio::time::timeout(KILL_GRACE, exit).await.is_err() {
+            let _slot = slot;
+            if tokio::time::timeout(KILL_GRACE, &mut exit).await.is_err() {
                 #[cfg(unix)]
                 if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
                     // SAFETY: plain syscalls on a pid we spawned and have not reaped (the wait
@@ -313,8 +346,61 @@ impl Pty {
                 }
                 #[cfg(not(unix))]
                 let _ = pid;
+                // Bounded: a process stuck in the kernel doesn't hold its place forever.
+                let _ = tokio::time::timeout(KILL_GRACE, exit).await;
             }
             drop(master);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn programs_start_at_a_bounded_rate() {
+        let rate = SpawnRate::default();
+        let start = Instant::now();
+        for _ in 0..MAX_SPAWNS_PER_MINUTE {
+            assert!(rate.allow(start));
+        }
+        assert!(!rate.allow(start + Duration::from_secs(59)), "over the limit for the rest of the minute");
+        assert!(rate.allow(start + Duration::from_secs(60)), "a new minute");
+    }
+
+    /// A viewer that never reads again can't keep a removed tunnel's program running.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_viewer_does_not_outlive_the_tunnel() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_util::sync::CancellationToken;
+
+        let term = Arc::new(Terminal {
+            command: ["/bin/sh", "-c", "yes"].map(String::from).to_vec(),
+            cwd: std::env::temp_dir(),
+            key: None,
+            max_clients: 1,
+            sessions: Arc::default(),
+            spawns: Arc::default(),
+            ended: CancellationToken::new(),
+        });
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let session = tokio::spawn(run(WebSocketStream::from_raw_socket(theirs, Role::Server, None).await, term.clone(), "test".into()));
+        let mut viewer = WebSocketStream::from_raw_socket(ours, Role::Client, None).await;
+        viewer.send(Message::text(json!({ "type": "hello", "cols": 80, "rows": 24 }).to_string())).await.unwrap();
+        assert!(matches!(viewer.next().await, Some(Ok(Message::Text(_)))), "ready");
+
+        // Output fills the small buffer, so the session is stuck sending when the tunnel ends.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        term.ended.cancel();
+        tokio::time::timeout(Duration::from_secs(10), session).await.expect("the session ended").unwrap();
+        tokio::time::timeout(KILL_GRACE * 3, async {
+            while term.sessions.load(Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("its place was given back once the program had gone");
     }
 }

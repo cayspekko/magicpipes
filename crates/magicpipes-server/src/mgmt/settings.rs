@@ -44,7 +44,7 @@ const PRESETS: [Preset; 6] = [
         issuer: "https://login.microsoftonline.com/{part}/v2.0",
         url: None,
         part: Some(("Directory (tenant) ID", "00000000-0000-0000-0000-000000000000")),
-        steps: "In the Microsoft Entra admin center, open <b>App registrations</b> and add one, with the redirect URI below under <b>Web</b>. Create a secret under <b>Certificates &amp; secrets</b> and copy its value, along with the <b>Application (client) ID</b>. Add the <b>email</b> claim under <b>Token configuration</b>. Entra never says an address is verified, so new people can only get in with <b>Trust this provider's email addresses</b> on; check first who can change addresses in your directory.",
+        steps: "In the Microsoft Entra admin center, open <b>App registrations</b> and add one, with the redirect URI below under <b>Web</b>. Create a secret under <b>Certificates &amp; secrets</b> and copy its value, along with the <b>Application (client) ID</b>. Add the <b>email</b> claim under <b>Token configuration</b>. Entra never says an address is verified, so new people can only get in with <b>Trust this provider's email addresses</b> on, and new administrators also need the option below it; check first who can change addresses in your directory.",
     },
     Preset {
         key: "authentik",
@@ -52,7 +52,7 @@ const PRESETS: [Preset; 6] = [
         issuer: "{url}/application/o/{part}/",
         url: Some(("authentik address", "https://auth.example.com", "")),
         part: Some(("Application slug", "magicpipes")),
-        steps: "In the admin interface, open <b>Applications → Applications</b> and use <b>Create with provider</b>, choosing <b>OAuth2/OpenID Connect</b>. Set the client type to <b>Confidential</b>, add the redirect URI below as <b>Strict</b>, and <b>choose a Signing Key</b>: without one, authentik signs with the client secret, which isn't accepted here. Since 2025.10 authentik says addresses aren't verified, so new people can only get in with <b>Trust this provider's email addresses</b> on (or a custom email scope mapping). Turn off <b>Allow users to change email</b> in its system settings first.",
+        steps: "In the admin interface, open <b>Applications → Applications</b> and use <b>Create with provider</b>, choosing <b>OAuth2/OpenID Connect</b>. Set the client type to <b>Confidential</b>, add the redirect URI below as <b>Strict</b>, and <b>choose a Signing Key</b>: without one, authentik signs with the client secret, which isn't accepted here. Since 2025.10 authentik says addresses aren't verified, so new people can only get in with <b>Trust this provider's email addresses</b> on (or a custom email scope mapping), and new administrators also need the option below it. Turn off <b>Allow users to change email</b> in its system settings first.",
     },
     Preset {
         key: "keycloak",
@@ -113,6 +113,9 @@ fn option_chips(p: &ProviderView) -> String {
     let mut on = Vec::new();
     if p.trust_email {
         on.push("trusts addresses");
+    }
+    if p.allow_unverified_admin {
+        on.push("unverified admins");
     }
     if p.link_by_email {
         on.push("links by address");
@@ -242,14 +245,17 @@ pub async fn save_rules(user: UiUser, State(app): State<AppState>, Form(f): Form
     }
 }
 
-fn toggles(trust_email: bool, link_by_email: bool) -> String {
+fn toggles(trust_email: bool, allow_unverified_admin: bool, link_by_email: bool) -> String {
     let on = |b: bool| if b { " checked" } else { "" };
     format!(
         r#"<label><input type="checkbox" name="trust_email"{trust}> Trust this provider's email addresses</label>
-<p class="note">Accept an address even if the provider doesn't say it verified it. Leave this off if you can. <b>Anyone who can choose their address at the provider could use an address listed under Who can sign in</b>, including one that gets an administrator's account.</p>
+<p class="note">Accept an address even if the provider doesn't say it verified it. Leave this off if you can. <b>Anyone who can choose their address at the provider could use an address listed under New members, or an existing member's.</b></p>
+<label><input type="checkbox" name="allow_unverified_admin"{admin}> Let those addresses reach administrators' accounts too</label>
+<p class="note">Needs the option above. Off: an address the provider didn't verify can't become or take over an administrator. <b>On: anyone who can choose their address there can become one.</b> Only for a provider where you control every address.</p>
 <label><input type="checkbox" name="link_by_email"{link}> Let a first sign-in use an existing account with the same address</label>
 <p class="note">Off: someone who already has an account here is refused. Only turn this on for a provider that doesn't let people choose or reuse addresses, because it hands over the existing account.</p>"#,
         trust = on(trust_email),
+        admin = on(allow_unverified_admin),
         link = on(link_by_email),
     )
 }
@@ -278,6 +284,7 @@ pub struct ProviderForm {
     #[serde(default)]
     client_secret: String,
     trust_email: Option<String>,
+    allow_unverified_admin: Option<String>,
     link_by_email: Option<String>,
 }
 
@@ -313,7 +320,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
         id = esc(id),
         label = esc(typed.map_or(p.label(), |f| &f.label)),
         client_id = esc(typed.map_or("", |f| &f.client_id)),
-        toggles = toggles(typed.is_some_and(|f| f.trust_email.is_some()), typed.is_some_and(|f| f.link_by_email.is_some())),
+        toggles = toggles(typed.is_some_and(|f| f.trust_email.is_some()), typed.is_some_and(|f| f.allow_unverified_admin.is_some()), typed.is_some_and(|f| f.link_by_email.is_some())),
     );
     page(&format!("Add {}", p.name), Some(user), &body)
 }
@@ -347,6 +354,7 @@ pub async fn create_provider(user: UiUser, State(app): State<AppState>, Form(f):
                 client_secret: &f.client_secret,
                 link_by_email: f.link_by_email.is_some(),
                 trust_email: f.trust_email.is_some(),
+                allow_unverified_admin: f.allow_unverified_admin.is_some(),
             };
             app.control.add_oidc_provider(&user.who, new).await.map_err(|e| e.message)
         }
@@ -378,7 +386,7 @@ fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, error: Op
         id = esc(&p.id),
         csrf = csrf(user),
         client_id = esc(&p.client_id),
-        toggles = toggles(p.trust_email, p.link_by_email),
+        toggles = toggles(p.trust_email, p.allow_unverified_admin, p.link_by_email),
     );
     page(&p.label, Some(user), &body)
 }
@@ -405,7 +413,7 @@ pub async fn update_provider(user: UiUser, State(app): State<AppState>, Path(id)
     if let Some(r) = admins_only(&user) {
         return r;
     }
-    let changes = ProviderChanges { label: &f.label, client_id: &f.client_id, client_secret: &f.client_secret, link_by_email: f.link_by_email.is_some(), trust_email: f.trust_email.is_some() };
+    let changes = ProviderChanges { label: &f.label, client_id: &f.client_id, client_secret: &f.client_secret, link_by_email: f.link_by_email.is_some(), trust_email: f.trust_email.is_some(), allow_unverified_admin: f.allow_unverified_admin.is_some() };
     match app.control.update_oidc_provider(&user.who, &id, changes) {
         Ok(()) => Redirect::to("/settings").into_response(),
         Err(e) => match editable(&user, &app, &id) {

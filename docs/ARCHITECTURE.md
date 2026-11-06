@@ -173,6 +173,23 @@ NUL, and the canonical path must stay inside the canonical root (so symlinks lea
 are refused and not listed). Trailing-slash redirects are built from the validated segments, so
 a `//host` path cannot become an open redirect. The readiness probe works unchanged.
 
+The check can't be separated from the read. `open_servable` resolves the path, then opens the real
+path one component at a time from a descriptor of the root, with `O_NOFOLLOW` and `O_NONBLOCK`
+(`platform::open_beneath`): a component swapped for a symlink since the check makes the open fail,
+and a FIFO can't block it. Everything after that goes through the open handle. `ServeFile` and
+`read_dir` only take paths, so they get one that reaches the handle (`platform::handle_path`:
+`/proc/self/fd/N` on Linux, `/dev/fd/N` on macOS). Windows has no such path and no relative open
+in std, so there only the last component is protected (symlinks need privileges there). An archive
+entry is exactly the size in its header (`archive::exactly`): bytes appended while it's being read
+would otherwise be read as further entries.
+
+HTML, SVG and XML get `Content-Security-Policy: sandbox` without `allow-scripts` unless the tunnel
+has `--site`, so a file in a shared folder can't read the rest of it with a visitor's session. It
+keeps `allow-same-origin`, which with scripts off only means that a page's own styles and images
+load with the session cookie, as a private tunnel needs. A `tunnels.json` from before `--site`
+reads as `site: true`, so an upgrade doesn't break a site being served. `check_root` refuses folders
+nobody usually means to publish whole unless `--allow-sensitive-root` is given.
+
 `serve/kinds.rs` maps names to a kind (icon, open-in-browser or download) and a `Content-Type`;
 text and source files are served as `text/plain; charset=utf-8` so browsers display them. The
 listing (`serve/listing.rs`) uses the shared theme from `magicpipes-core::theme`, the same
@@ -202,15 +219,17 @@ channel: a slow viewer pauses the program's output rather than growing a buffer,
 dropped (not queued) if the program stops reading. Access is decided in the agent, never in the
 page: read-only sessions have their input discarded; on writable tunnels a session without the
 key (constant-time comparison) is refused before anything is spawned; `Origin` must match
-`Host`; `max_clients` bounds concurrent sessions. Pings every 30 s keep idle sessions under the
-server's WebSocket idle timeout.
+`Host`; `max_clients` bounds the programs running at once, since a session's place is given back
+only once its program has gone, and a tunnel starts at most 60 programs a minute, because each
+visit runs the program and its login scripts and read-only visitors are anonymous. Pings every
+30 s keep idle sessions under the server's WebSocket idle timeout.
 
 A session ends when the browser goes away, the program exits (output still in flight is
 forwarded for 300 ms, since a background process may hold the pty open, and ConPTY reports no
 EOF), or the tunnel is removed or re-added with other settings: every tunnel has a cancellation
-token that `Tunnels::upsert`/`remove` cancel when its target changes. Ending sends SIGHUP (as
-when a terminal closes; the kernel then hangs up the foreground job), then SIGKILL after 2 s;
-on Windows the process is terminated.
+token that `Tunnels::upsert`/`remove` cancel when its target changes, which a viewer that stopped
+reading can't hold up. Ending sends SIGHUP (as when a terminal closes; the kernel then hangs up the
+foreground job), then SIGKILL after 2 s; on Windows the process is terminated.
 
 ## Port tunnels (`add --tcp`, `--udp`)
 
@@ -427,7 +446,9 @@ a connection to the public port that must arrive back at the agent (a warning, n
   account. A tunnel's tags are its own: removing a tag from its owner doesn't unshare it. A tag the directory doesn't know grants nothing; a visibility stored in a form
   that can't be read keeps the tunnel private. Members enroll only their own machines, which
   have no tags of their own.
-* Port tunnels are open to anyone unless `--allow-cidr` is given (the CLI says so). The server
+* A new port tunnel needs `--allow-cidr` or `--allow-any`, and re-adding keeps its list (the CLI
+  decides this, so a modified one can still ask for an open port: it's a safeguard for its user, not
+  a limit on them). UDP allow-lists aren't authentication, since a source address can be forged. The server
   enforces allow-lists on every connection, and an allow-list it cannot read keeps the tunnel
   unpublished (fail closed); behind a TCP proxy, only `proxy_protocol` with `trusted_proxies`
   makes the checked address the client's. Raw ports are bounded by `[ports] max_connections`
@@ -461,7 +482,15 @@ a connection to the public port that must arrive back at the agent (a warning, n
   page shows the program name only. The write key moves from the link's fragment into the
   tab's `sessionStorage` and out of the address bar.
 * The server terminates TLS, so its operator can see tunnel traffic, including a web terminal's
-  write key. Run writable terminals only through a server you trust.
+  write key, and could use it, or add a script to the terminal's page. So `--write` means trusting
+  the server with a shell as you, which the agent's other rules otherwise never do, and the CLI
+  says so. Only end-to-end encryption would change that. Run writable terminals only through a
+  server you trust.
+* Cookies don't cross tunnels: `Domain` is taken off an application's cookie when it would reach
+  the base domain or the management host (`public.allow_cookie_domain` turns this off), since one
+  tunnel could otherwise log visitors in to another as someone else, or lock them out of the
+  management UI with oversized headers. A Public Suffix List entry for a shared base domain makes
+  browsers enforce the same thing.
 * `tls.mode = "dev-ca"` creates a CA name-constrained to `base_domain` and the management
   hostname, so trusting it cannot vouch for other sites (CAs created before this was added are
   unconstrained; delete `data_dir/dev-ca` to replace one).
@@ -496,7 +525,10 @@ a connection to the public port that must arrive back at the agent (a warning, n
   Upgraded (WebSocket) connections have an idle timeout.
 * UI sessions live in memory; restarting the server logs administrators out.
 * Read-only web terminals are anonymous: anyone with the link can hold one of its
-  `--max-clients` sessions for as long as they keep the page open.
+  `--max-clients` sessions for as long as they keep the page open, and start up to 60 programs a
+  minute.
+* Four client addresses (or /64s) can hold all of an agent's 224 data streams, which
+  `body_idle_timeout_secs` and `tcp_idle_timeout_secs` can only shorten.
 * Each agent session may buffer up to 128 MiB of yamux receive window, and UDP flow queues are
   bounded by datagram count (64 per flow), not bytes.
 * Windows IPC relies on `first_pipe_instance` and the default pipe ACL. Another local user who

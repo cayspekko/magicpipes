@@ -621,7 +621,15 @@ async fn port_tunnels() {
     let (first, last) = env.ports;
 
     // --- TCP: an echo service through a public port -------------------------------------------
-    let out = env.cli_ok(&["add", &echo.port.to_string(), "--tcp", "--name", "echo"]).await;
+    // A new port says who may connect: it isn't opened to the internet by default.
+    let out = env.cli(&["add", &echo.port.to_string(), "--tcp", "--name", "echo", "--json"]).await;
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_request");
+    assert!(v["error"]["message"].as_str().unwrap().contains("--allow-any"), "{v}");
+    assert_eq!(env.cli(&["add", "8080", "--allow-any"]).await.status.code(), Some(2), "only for raw ports");
+
+    let out = env.cli_ok(&["add", &echo.port.to_string(), "--tcp", "--allow-any", "--name", "echo"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Checking tunnel...") && stderr.contains("Verifying public endpoint...  ✓"), "{stderr}");
     assert!(stderr.contains("--allow-cidr"), "warns that the port is open to anyone: {stderr}");
@@ -649,20 +657,20 @@ async fn port_tunnels() {
     // --- --remote-port --------------------------------------------------------------------------
     let echo2 = common::tcp_echo_app().await;
     let wanted = if port == last { first } else { last };
-    let t2 = add_json(&env, &[&echo2.port.to_string(), "--tcp", "--remote-port", &wanted.to_string()]).await;
+    let t2 = add_json(&env, &[&echo2.port.to_string(), "--tcp", "--allow-any", "--remote-port", &wanted.to_string()]).await;
     assert_eq!(t2["public_port"].as_u64(), Some(wanted as u64));
     assert_eq!(tcp_roundtrip(wanted, b"second").await, b"second");
     let echo3 = common::tcp_echo_app().await;
-    let out = env.cli(&["add", &echo3.port.to_string(), "--tcp", "--json", "--remote-port", &wanted.to_string()]).await;
+    let out = env.cli(&["add", &echo3.port.to_string(), "--tcp", "--allow-any", "--json", "--remote-port", &wanted.to_string()]).await;
     assert_eq!(out.status.code(), Some(6), "{}", String::from_utf8_lossy(&out.stdout));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "port_unavailable");
-    let out = env.cli(&["add", &echo3.port.to_string(), "--tcp", "--json", "--remote-port", "80"]).await;
+    let out = env.cli(&["add", &echo3.port.to_string(), "--tcp", "--allow-any", "--json", "--remote-port", "80"]).await;
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "port_unavailable", "outside the range: {v}");
 
     // --- --allow-cidr ---------------------------------------------------------------------------
-    // Re-adding replaces the settings; 127.0.0.1 is not in 10.0.0.0/8, so even this machine's
+    // A new list replaces the old one; 127.0.0.1 is not in 10.0.0.0/8, so even this machine's
     // own check of the public port is refused (a warning, not a failure).
     let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-cidr", "10.0.0.0/8"]).await;
     assert_eq!((t["public_port"].as_u64(), t["reachable"].as_bool()), (Some(port as u64), Some(false)));
@@ -682,7 +690,12 @@ async fn port_tunnels() {
         let read = tokio::time::timeout(Duration::from_secs(5), open.read(&mut got)).await;
         assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the open connection was closed: {read:?}");
     }
-    add_json(&env, &[&echo.port.to_string(), "--tcp"]).await;
+    // Running the command again without the flag doesn't open it up; saying so does.
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp"]).await;
+    assert_eq!(t["allow"], serde_json::json!(["10.0.0.0/8"]), "re-adding keeps the list");
+    assert!(tcp_roundtrip(port, b"blocked").await.is_empty());
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any"]).await;
+    assert_eq!(t["allow"], serde_json::json!([]));
 
     // --- the local service stops, the agent goes away, the server restarts ---------------------
     echo2.stop();
@@ -700,7 +713,7 @@ async fn port_tunnels() {
 
     // --- UDP --------------------------------------------------------------------------------------
     let dns = common::udp_echo_app().await;
-    let out = env.cli_ok(&["add", &dns.port.to_string(), "--udp", "--name", "dns"]).await;
+    let out = env.cli_ok(&["add", &dns.port.to_string(), "--udp", "--allow-any", "--name", "dns"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("UDP cannot be verified"), "{stderr}");
     let u = add_json(&env, &[&dns.port.to_string(), "--udp"]).await;
@@ -1734,6 +1747,189 @@ async fn public_applications_never_get_our_cookies() {
     assert!(r.body.contains("cookie=a=1; b=2") && !r.body.contains("mp_"), "{}", r.body);
     let r = env.tunnel_get(&host, "/whoami", "only=theirs", false).await;
     assert!(r.body.contains("cookie=only=theirs"), "{}", r.body);
+
+    // And an application's cookies stay on its tunnel: `Domain` can't reach the others, or the
+    // management host. Its own hostname is fine.
+    let req = Request::get("/cookies").header(header::HOST, &host).body(Full::new(Bytes::new())).unwrap();
+    let resp = env.send(&host, env.https_port, req).await;
+    let cookies: Vec<&str> = resp.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+    assert_eq!(cookies, ["shared=1; Path=/".to_string(), format!("own=2; Domain=open.{BASE}")], "{cookies:?}");
+}
+
+/// Files in a shared folder can't run scripts on the tunnel's origin unless the tunnel is a site.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn served_pages_run_scripts_only_with_site() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let site = env.root.join("site");
+    std::fs::create_dir_all(site.join("sub")).unwrap();
+    std::fs::write(site.join("index.html"), "<h1>home</h1>").unwrap();
+    std::fs::write(site.join("logo.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+    std::fs::write(site.join("notes.txt"), "0123456789").unwrap();
+    std::fs::write(site.join("sub/file.txt"), "inside").unwrap();
+    let dir = site.to_str().unwrap();
+    let host = format!("files.{BASE}");
+    let get = async |path: &str| {
+        let req = Request::get(path).header(header::HOST, &host).body(Full::new(Bytes::new())).unwrap();
+        env.send(&host, env.https_port, req).await
+    };
+    let csp = async |path: &str| get(path).await.headers().get(header::CONTENT_SECURITY_POLICY).map(|v| v.to_str().unwrap().to_string());
+
+    let out = env.cli_ok(&["add", "--serve", dir, "--name", "files"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--site"), "says how to turn scripts on: {stderr}");
+    for page in ["/", "/index.html", "/logo.svg"] {
+        let policy = csp(page).await.unwrap_or_else(|| panic!("{page} has no policy"));
+        assert!(policy.starts_with("sandbox") && !policy.contains("allow-scripts"), "{page}: {policy}");
+    }
+    assert_eq!(csp("/notes.txt").await, None, "a text file can't run anything");
+    assert_eq!(get("/").await.into_body().collect().await.unwrap().to_bytes(), "<h1>home</h1>");
+
+    // Files are served from what was opened: Range requests and conditional ones still work.
+    let req = Request::get("/notes.txt").header(header::HOST, &host).header(header::RANGE, "bytes=2-4").body(Full::new(Bytes::new())).unwrap();
+    let resp = env.send(&host, env.https_port, req).await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "234");
+    let modified = get("/notes.txt").await.headers()[header::LAST_MODIFIED].clone();
+    let req = Request::get("/notes.txt").header(header::HOST, &host).header(header::IF_MODIFIED_SINCE, modified).body(Full::new(Bytes::new())).unwrap();
+    assert_eq!(env.send(&host, env.https_port, req).await.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(get("/sub/").await.status(), StatusCode::OK, "a listing is read through what was opened too");
+
+    // --site is for a web app you trust.
+    let out = env.cli_ok(&["add", "--serve", dir, "--name", "files", "--site"]).await;
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("--site"));
+    assert_eq!(csp("/").await, None);
+    assert_eq!(csp("/logo.svg").await, None);
+
+    // Re-running a command doesn't turn listings back on; asking for them does.
+    add_json(&env, &["--serve", dir, "--name", "files", "--no-list"]).await;
+    assert_eq!(get("/sub/").await.status(), StatusCode::NOT_FOUND);
+    add_json(&env, &["--serve", dir, "--name", "files"]).await;
+    assert_eq!(get("/sub/").await.status(), StatusCode::NOT_FOUND, "re-adding keeps --no-list");
+    add_json(&env, &["--serve", dir, "--name", "files", "--list"]).await;
+    assert_eq!(get("/sub/").await.status(), StatusCode::OK);
+    assert_eq!(env.cli(&["add", "--serve", dir, "--list", "--no-list"]).await.status.code(), Some(2));
+    assert_eq!(env.cli(&["add", "8080", "--site"]).await.status.code(), Some(2));
+
+    // Archives are read through what was opened as well.
+    assert_eq!(get("/sub/?archive").await.status(), StatusCode::OK);
+    env.cli_ok(&["remove", "files"]).await;
+
+    // A folder holding more than anyone means to share takes an explicit flag.
+    let home = env.home();
+    for dir in ["/", home.to_str().unwrap()] {
+        let out = env.cli(&["add", "--serve", dir, "--json"]).await;
+        assert_eq!(out.status.code(), Some(4), "{dir}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["error"]["code"], "invalid_directory");
+        assert!(v["error"]["message"].as_str().unwrap().contains("--allow-sensitive-root"), "{v}");
+    }
+    add_json(&env, &["--serve", home.to_str().unwrap(), "--allow-sensitive-root", "--name", "mine"]).await;
+}
+
+/// A terminal's place is held until its program has really gone, so --max-clients bounds programs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_place_is_held_until_its_program_has_gone() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let pidfile = env.root.join("pid");
+    // Ignores the hangup that ends most programs right away.
+    let cmd = format!("trap '' HUP; echo $$ > {}; echo STARTED; exec sleep 60", pidfile.display());
+    add_json(&env, &["--shell", "--max-clients", "1", "--name", "stubborn", "--", "/bin/sh", "-c", &cmd]).await;
+    let host = format!("stubborn.{BASE}");
+    let (mut first, ready) = terminal(&env, &host, None).await;
+    assert_eq!(ready["type"], "ready");
+    read_terminal(&mut first, "STARTED", Duration::from_secs(10)).await;
+    let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+    let _ = first.close(None).await;
+    drop(first);
+
+    // Closing the page doesn't make room while the program is still running.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(process_alive(&pid));
+    let (_, busy) = terminal(&env, &host, None).await;
+    assert_eq!(busy["code"], "busy", "{busy}");
+
+    // The kill comes after a grace period, and only then is there room.
+    env.eventually("the program is killed", Duration::from_secs(10), || async { !process_alive(&pid) }).await;
+    env.eventually("the place is given back", Duration::from_secs(5), || async { terminal(&env, &host, None).await.1["type"] == "ready" }).await;
+}
+
+/// `ports.tcp_idle_timeout_secs` closes quiet connections to raw ports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiet_port_connections_can_be_closed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = Env::with_config(Tls::DevCa, "tcp_idle_timeout_secs = 1").await;
+    env.login().await;
+    let echo = common::tcp_echo_app().await;
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any"]).await;
+    let port = t["public_port"].as_u64().unwrap() as u16;
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    conn.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    conn.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"ping");
+    let read = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut got)).await;
+    assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the quiet connection was closed: {read:?}");
+}
+
+/// Anyone who can choose their address at a trusted provider can use any address, so that alone
+/// doesn't reach an administrator's account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unverified_addresses_do_not_reach_administrators() {
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-oidc-trust-{}", std::process::id()));
+    let users = r#"bootstrap_admins = ["boss@example.com"]
+allowed_email_domains = ["team.example.com"]"#;
+    let config = format!("{}trust_email = true\n", idp.config(&dir, users, true));
+    let env = Env::with_config(Tls::DevCa, &config).await;
+    let admin = env.admin_token();
+    let unverified = |sub: &str, email: &str| {
+        let mut p = common::OidcPerson::new(sub, email);
+        p.verified = false;
+        *idp.person.lock().unwrap() = p;
+    };
+    let accounts = async || env.api("GET", "/api/v1/users", Some(&admin)).await.1["users"].as_array().unwrap().clone();
+
+    // That's what trusting a provider is for: members.
+    unverified("dev-1", "dev@team.example.com");
+    session_of(&oidc_sign_in(&env, None).await);
+
+    // A bootstrap address isn't enough without the provider's word, and isn't made a member either.
+    unverified("mallory", "boss@example.com");
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(accounts().await.len(), 1, "no account for it");
+    let audit = env.api("GET", "/api/v1/audit", Some(&admin)).await.1;
+    assert!(audit.to_string().contains("unverified address"), "the audit log says how the first one got in: {audit}");
+
+    // An existing administrator's address doesn't reach their account; a member's does, which is
+    // what link_by_email and trust_email together ask for.
+    let (s, _) = env.api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": "carol@example.org", "role": "admin" })).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = env.api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": "pat@example.org" })).await;
+    assert_eq!(s, StatusCode::CREATED);
+    unverified("mallory", "carol@example.org");
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+    unverified("pat-1", "pat@example.org");
+    session_of(&oidc_sign_in(&env, None).await);
+
+    // The provider's own word still counts.
+    *idp.person.lock().unwrap() = common::OidcPerson::new("boss-1", "boss@example.com");
+    let boss = session_of(&oidc_sign_in(&env, None).await);
+    assert_eq!(env.ui("/users", Some(&boss), None).await.status, StatusCode::OK, "an administrator");
+    std::fs::remove_dir_all(&dir).ok();
+
+    // And so does the operator's, explicitly.
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-oidc-trust2-{}", std::process::id()));
+    let config = format!("{}trust_email = true\nallow_unverified_admin = true\n", idp.config(&dir, users, false));
+    let env = Env::with_config(Tls::DevCa, &config).await;
+    let mut p = common::OidcPerson::new("boss-1", "boss@example.com");
+    p.verified = false;
+    *idp.person.lock().unwrap() = p;
+    let boss = session_of(&oidc_sign_in(&env, None).await);
+    assert_eq!(env.ui("/users", Some(&boss), None).await.status, StatusCode::OK, "an administrator");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Waits for a WebSocket to be closed by the other side.
@@ -1975,6 +2171,9 @@ async fn settings_page_adds_providers_without_a_restart() {
         f.extend_from_slice(extra);
         f.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>()
     };
+    // Unverified administrators only follow from trusting the provider's addresses.
+    let r = send("/settings/providers/oidc", change(&[("allow_unverified_admin", "on")])).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.html);
     let r = send("/settings/providers/oidc", change(&[("trust_email", "on")])).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.html);
     assert!(env.ui("/login", None, None).await.html.contains("Continue with Renamed"));

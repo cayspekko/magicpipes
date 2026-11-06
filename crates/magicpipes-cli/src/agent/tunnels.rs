@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use magicpipes_core::proto::Kind;
 
+use super::shell::SpawnRate;
 use crate::state::{self, LocalTunnel, Target};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -33,6 +34,7 @@ struct Entry {
     ended: CancellationToken,
     /// Open web terminal sessions.
     sessions: Arc<AtomicUsize>,
+    spawns: Arc<SpawnRate>,
     /// The agent refuses to serve what the server made of this tunnel (see [`Tunnels::withdraw`]).
     withdrawn: bool,
 }
@@ -46,6 +48,7 @@ impl Entry {
             streams_ok: Arc::default(),
             ended: CancellationToken::new(),
             sessions: Arc::default(),
+            spawns: Arc::default(),
             withdrawn: false,
         }
     }
@@ -58,6 +61,7 @@ pub struct Route {
     pub streams_ok: Arc<AtomicU64>,
     pub ended: CancellationToken,
     pub sessions: Arc<AtomicUsize>,
+    pub spawns: Arc<SpawnRate>,
 }
 
 #[derive(Default)]
@@ -189,6 +193,7 @@ impl Tunnels {
             streams_ok: e.streams_ok.clone(),
             ended: e.ended.clone(),
             sessions: e.sessions.clone(),
+            spawns: e.spawns.clone(),
         })
     }
 

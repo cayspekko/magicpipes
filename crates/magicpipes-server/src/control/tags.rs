@@ -260,6 +260,10 @@ impl ControlPlane {
                 if !tag_list.is_empty() {
                     return Err(invalid("your machine uses your tags; tags are for service agents".into()));
                 }
+                let max = self.cfg.users.max_agents_per_user;
+                if max > 0 && self.store.machines_of(id).map_err(internal)? >= max {
+                    return Err(err(ErrorCode::LimitReached, format!("you may have at most {max} machines on this server, counting enrollment tokens not used yet; revoke one you no longer use")));
+                }
                 EnrollmentSpec {
                     created_by: Some(id.clone()),
                     owner_user_id: Some(id.clone()),

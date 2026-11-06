@@ -270,11 +270,11 @@ PYEOF
 "$PY" ports.py serve "$ECHO_TCP" "$ECHO_UDP" > echo.log 2>&1 < /dev/null &
 ECHOPID=$!
 sleep 1
-run "$MP" add "$ECHO_TCP" --tcp --name ptcp --json --timeout 60
+run "$MP" add "$ECHO_TCP" --tcp --allow-any --name ptcp --json --timeout 60
 grep -q '"reachable": true' cmd.out
 PTCP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
 run "$PY" ports.py tcp "$PTCP" "smoke over tcp"
-run "$MP" add "$ECHO_UDP" --udp --name pudp --json --timeout 60
+run "$MP" add "$ECHO_UDP" --udp --allow-any --name pudp --json --timeout 60
 PUDP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
 run "$PY" ports.py udp "$PUDP" "smoke over udp"
 

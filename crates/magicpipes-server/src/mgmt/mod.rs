@@ -220,11 +220,13 @@ pub async fn serve_mgmt(
     let trusted = cfg.trusted_proxies();
     let opts = ListenOpts {
         name: "management",
-        max_connections: 1024,
-        max_per_client: 64,
+        max_connections: cfg.management.max_connections.max(1),
+        max_per_client: cfg.management.max_connections_per_client.max(1),
         header_read_timeout: Duration::from_secs(30),
         trusted_proxies: trusted.clone(),
         proxy_protocol: cfg.management.proxy_protocol,
+        // Requests here have their own deadline, and an agent's session stops being HTTP.
+        idle_timeout: None,
     };
     let app = router(control);
     serve(listener, Some(acceptor), opts, shutdown, tracker, move |conn| {

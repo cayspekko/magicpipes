@@ -7,9 +7,9 @@
 //!   pipe ACL: the creating user, SYSTEM and Administrators); the agent is started as a
 //!   detached process without a console.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Open options for files that only the current user may read (mode 0600 on Unix; files under
@@ -33,6 +33,64 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(dir)
+}
+
+/// Opens `relative` beneath `root`, one component at a time and following no symlink, so a path
+/// checked a moment ago can't be swapped for one that leads somewhere else: the open fails
+/// instead. A FIFO doesn't block the open.
+///
+/// On Windows only the last component is checked this way (symlinks there need privileges, and
+/// std has no `NtCreateFile`-relative open).
+#[cfg(unix)]
+pub fn open_beneath(root: &Path, relative: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut at = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(root)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a plain relative path"));
+        };
+        let name = CString::new(name.as_bytes())?;
+        // SAFETY: `at` is an open descriptor and `name` is NUL-terminated.
+        let fd = unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat just returned this descriptor, and nothing else owns it.
+        at = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(at)
+}
+
+#[cfg(windows)]
+pub fn open_beneath(root: &Path, relative: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Directories can only be opened with BACKUP_SEMANTICS; OPEN_REPARSE_POINT doesn't follow a
+    // link in the last component, which is then refused below.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(root.join(relative))?;
+    if !relative.as_os_str().is_empty() && file.metadata()?.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a link"));
+    }
+    Ok(file)
+}
+
+/// A path that reaches the file `file` has open, whatever has happened to its name since, for
+/// libraries that only take paths. `None` where there is no such path.
+pub fn handle_path(file: &File) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    return Some(PathBuf::from(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(file))));
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return Some(PathBuf::from(format!("/dev/fd/{}", std::os::fd::AsRawFd::as_raw_fd(file))));
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
 }
 
 /// Makes `cmd` start detached from the caller's terminal/console, so it survives the CLI, and

@@ -14,8 +14,9 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// Bumped when [`AddRequest`] gains fields that an older agent would silently ignore (it parses
 /// the request and drops what it doesn't know). Agents report it in `status` as
 /// `agent.ipc_version`; one that doesn't is older than 2. 3: `access` became `tags`. 4:
-/// `hostname` and `no_verify`, and the step state `skipped`.
-pub const IPC_VERSION: u32 = 4;
+/// `hostname` and `no_verify`, and the step state `skipped`. 5: `keep_list`, `site`,
+/// `allow_sensitive_root` and `allow_any`.
+pub const IPC_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -38,6 +39,16 @@ pub struct AddRequest {
     /// With `serve`: list directory contents.
     #[serde(default)]
     pub list: bool,
+    /// With `serve`: neither `--list` nor `--no-list` was given, so an existing tunnel keeps its
+    /// setting.
+    #[serde(default)]
+    pub keep_list: bool,
+    /// With `serve`: pages may run scripts.
+    #[serde(default)]
+    pub site: bool,
+    /// With `serve`: publish even a folder nobody usually means to, such as a home folder.
+    #[serde(default)]
+    pub allow_sensitive_root: bool,
     /// Web terminal: the command to run (argv, never empty; the CLI fills in the login shell).
     #[serde(default)]
     pub shell: Option<Vec<String>>,
@@ -56,9 +67,13 @@ pub struct AddRequest {
     /// Port tunnels: a specific public port.
     #[serde(default)]
     pub remote_port: Option<u16>,
-    /// Port tunnels: client networks allowed to connect.
+    /// Port tunnels: client networks allowed to connect. Without any, an existing tunnel keeps
+    /// its list and a new one is refused, unless `allow_any`.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Port tunnels: open to the whole internet, on purpose.
+    #[serde(default)]
+    pub allow_any: bool,
     pub host: Option<String>,
     pub name: Option<String>,
     pub probe_path: String,

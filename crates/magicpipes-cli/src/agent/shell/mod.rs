@@ -22,7 +22,7 @@
 mod page;
 mod session;
 
-pub use session::KILL_GRACE;
+pub use session::{KILL_GRACE, SpawnRate};
 
 use std::convert::Infallible;
 use std::io::Write as _;
@@ -91,6 +91,8 @@ pub struct Terminal {
     pub max_clients: u16,
     /// Open sessions of this tunnel.
     pub sessions: Arc<AtomicUsize>,
+    /// Programs this tunnel started recently.
+    pub spawns: Arc<session::SpawnRate>,
     /// Cancelled when the tunnel is removed or re-added with other settings.
     pub ended: CancellationToken,
 }
@@ -330,6 +332,7 @@ mod tests {
             key: None,
             max_clients: 1,
             sessions: Arc::default(),
+            spawns: Arc::default(),
             ended: CancellationToken::new(),
         };
         assert_eq!(term(&["/bin/zsh", "-l"]).program(), "zsh");

@@ -3,14 +3,17 @@
 use std::convert::Infallible;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use http::{Request, Response};
 use hyper::body::{Body, Incoming};
 use hyper::service::Service;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
@@ -31,6 +34,73 @@ pub struct ListenOpts {
     pub trusted_proxies: TrustedProxies,
     /// Connections from `trusted_proxies` start with a PROXY header naming the client.
     pub proxy_protocol: bool,
+    /// Close a connection after this long with no byte moving in either direction.
+    pub idle_timeout: Option<Duration>,
+}
+
+/// When any of a connection's streams last moved a byte, in either direction.
+#[derive(Clone)]
+pub struct Activity {
+    last: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl Activity {
+    pub fn new() -> Self {
+        Self { last: Arc::default(), epoch: Instant::now() }
+    }
+
+    pub fn track<S>(&self, inner: S) -> Tracked<S> {
+        Tracked { inner, activity: self.clone() }
+    }
+
+    fn moved(&self) {
+        self.last.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Returns once `limit` has passed with no byte moving.
+    pub async fn stalled(&self, limit: Duration) {
+        let mut tick = tokio::time::interval((limit / 4).clamp(Duration::from_millis(100), Duration::from_secs(30)));
+        loop {
+            tick.tick().await;
+            if self.epoch.elapsed().saturating_sub(Duration::from_millis(self.last.load(Ordering::Relaxed))) >= limit {
+                return;
+            }
+        }
+    }
+}
+
+/// A stream that reports every byte it moves to its [`Activity`].
+pub struct Tracked<S> {
+    inner: S,
+    activity: Activity,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Tracked<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(res, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.activity.moved();
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(res, Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.moved();
+        }
+        res
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Open connections per client key.
@@ -130,7 +200,7 @@ pub async fn serve<F, S, B>(
         let make_service = make_service.clone();
         let tls = tls.clone();
         let shutdown = shutdown.clone();
-        let header_timeout = opts.header_read_timeout;
+        let (header_timeout, idle_timeout) = (opts.header_read_timeout, opts.idle_timeout);
         let opts = opts.clone();
         let per_client = per_client.clone();
         tracker.spawn(async move {
@@ -156,18 +226,18 @@ pub async fn serve<F, S, B>(
                     Ok(Ok(stream)) => {
                         let sni = stream.get_ref().1.server_name().map(str::to_ascii_lowercase);
                         let svc = make_service(ConnInfo { peer, sni, limits: limits.clone() });
-                        serve_conn(stream, svc, header_timeout, shutdown).await
+                        serve_conn(stream, svc, header_timeout, idle_timeout, shutdown).await
                     }
                     Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
                     Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
                 },
-                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, shutdown).await,
+                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, idle_timeout, shutdown).await,
             }
         });
     }
 }
 
-async fn serve_conn<I, S, B>(io: I, svc: S, header_timeout: Duration, shutdown: CancellationToken)
+async fn serve_conn<I, S, B>(io: I, svc: S, header_timeout: Duration, idle_timeout: Option<Duration>, shutdown: CancellationToken)
 where
     I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     S: Service<Request<Incoming>, Response = Response<B>, Error = Infallible> + Send + 'static,
@@ -178,14 +248,23 @@ where
 {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.timer(TokioTimer::new()).header_read_timeout(header_timeout).keep_alive(true);
-    let conn = builder.serve_connection(TokioIo::new(io), svc).with_upgrades();
+    let activity = Activity::new();
+    let conn = builder.serve_connection(TokioIo::new(activity.track(io)), svc).with_upgrades();
     tokio::pin!(conn);
+    let stalled = async {
+        match idle_timeout {
+            Some(limit) => activity.stalled(limit).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         res = conn.as_mut() => {
             if let Err(e) = res {
                 tracing::debug!(error = %e, "connection error");
             }
         }
+        // Dropping the connection closes it, and ends the request it was in the middle of.
+        _ = stalled => tracing::debug!("closing a stalled connection"),
         _ = shutdown.cancelled() => {
             conn.as_mut().graceful_shutdown();
             let _ = tokio::time::timeout(Duration::from_secs(10), conn).await;
@@ -217,7 +296,37 @@ mod tests {
             header_read_timeout: Duration::from_secs(5),
             trusted_proxies: TrustedProxies::default(),
             proxy_protocol: false,
+            idle_timeout: None,
         }
+    }
+
+    /// With an idle timeout, a request that stops moving ends; one that keeps moving doesn't.
+    #[tokio::test]
+    async fn stalled_connections_are_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let make = |_: ConnInfo| {
+            hyper::service::service_fn(|req: Request<Incoming>| async move {
+                let _ = http_body_util::BodyExt::collect(req.into_body()).await;
+                Ok::<_, Infallible>(Response::new(Empty::<bytes::Bytes>::new()))
+            })
+        };
+        let opts = ListenOpts { idle_timeout: Some(Duration::from_millis(400)), ..opts(4) };
+        tokio::spawn(serve(listener, None, opts, CancellationToken::new(), TaskTracker::new(), make));
+        let head = b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n";
+
+        // An upload that keeps moving outlives the timeout.
+        let mut moving = tokio::net::TcpStream::connect(addr).await.unwrap();
+        moving.write_all(head).await.unwrap();
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            moving.write_all(b"x").await.unwrap();
+        }
+
+        // One that stops is closed.
+        let mut buf = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(3), moving.read(&mut buf)).await;
+        assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))), "{closed:?}");
     }
 
     /// A service that keeps nothing of the connection's: the listener still counts it.

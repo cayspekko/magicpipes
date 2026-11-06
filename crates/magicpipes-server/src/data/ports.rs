@@ -38,6 +38,7 @@ pub struct PortSettings {
     pub bind: IpAddr,
     pub proxy_protocol: bool,
     pub max_connections: usize,
+    pub tcp_idle_timeout: Option<Duration>,
     pub udp_idle_timeout: Duration,
     pub udp_max_flows: usize,
 }
@@ -48,6 +49,7 @@ impl PortSettings {
             bind: cfg.bind,
             proxy_protocol: cfg.proxy_protocol,
             max_connections: cfg.max_connections.max(1),
+            tcp_idle_timeout: crate::config::optional_secs(cfg.tcp_idle_timeout_secs),
             udp_idle_timeout: Duration::from_secs(cfg.udp_idle_timeout_secs.max(1)),
             udp_max_flows: cfg.udp_max_flows.max(1),
         }
@@ -188,13 +190,9 @@ async fn tcp_connection(dp: &DataPlane, port: u16, mut tcp: TcpStream, mut peer:
     }
     let Some((route, session)) = admit(dp, Kind::Tcp, port, peer) else { return };
     let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
-    let Some(mut stream) = open(dp, &route, &session, peer.ip(), header).await else { return };
+    let Some(stream) = open(dp, &route, &session, peer.ip(), header).await else { return };
     tokio::select! {
-        r = tokio::io::copy_bidirectional(&mut tcp, &mut stream) => {
-            if let Err(e) = r {
-                tracing::debug!(port, %peer, error = %e, "port connection ended");
-            }
-        }
+        _ = super::io::bridge(tcp, stream, dp.settings.ports.tcp_idle_timeout, CancellationToken::new()) => {}
         _ = revoked(dp, Kind::Tcp, port, peer.ip(), &route.tunnel_id) => {
             tracing::debug!(port, %peer, "closing a port connection the tunnel no longer admits");
         }

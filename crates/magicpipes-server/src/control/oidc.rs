@@ -7,6 +7,10 @@
 //! provider with `link_by_email`, or a new account for an address in `bootstrap_admins` (an
 //! administrator) or `allowed_email_domains` (a member). Anyone else is refused. Those lists are
 //! the configuration file's plus the Settings page's (`settings`).
+//!
+//! Anyone who can choose their address at a `trust_email` provider can use any address, so one the
+//! provider didn't vouch for doesn't reach an administrator's account, new or existing, unless the
+//! provider also has `allow_unverified_admin`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,19 +108,30 @@ impl ControlPlane {
             return if user.disabled { Err(refused()) } else { Ok(user) };
         }
         let Some(address) = email.as_deref() else { return Err(refused()) };
+        let may_be_admin = person.vouched_for || provider.allow_unverified_admin;
+        let unverified = if person.vouched_for { "" } else { " unverified address" };
         if let Some(user) = self.store.user_by_email(address).map_err(|_| OidcError::Internal)? {
             if !provider.link_by_email || user.disabled {
+                return Err(refused());
+            }
+            if user.role == Role::Admin && !may_be_admin {
+                tracing::warn!(provider = %provider.id, "refused a sign-in: an unverified address can't take over an administrator's account without allow_unverified_admin");
                 return Err(refused());
             }
             if !self.store.link_identity(&user.id, &provider.issuer, &person.subject).map_err(|_| OidcError::Internal)? {
                 return Err(refused());
             }
-            self.audit(&Principal::Anonymous, "user.link", &user.id, &format!("oidc:{}", provider.id));
+            self.audit(&Principal::Anonymous, "user.link", &user.id, &format!("oidc:{}{unverified}", provider.id));
             self.refresh();
             return Ok(user);
         }
         let rules = self.sign_in();
         let role = if rules.bootstrap_admins.iter().any(|a| a == address) {
+            // Refused rather than made a member, or the real administrator could never sign in.
+            if !may_be_admin {
+                tracing::warn!(provider = %provider.id, "refused a sign-in: an unverified address can't become an administrator without allow_unverified_admin");
+                return Err(refused());
+            }
             Role::Admin
         } else if address.rsplit_once('@').is_some_and(|(_, domain)| rules.allowed_email_domains.iter().any(|d| d == domain)) {
             Role::Member
@@ -125,7 +140,7 @@ impl ControlPlane {
         };
         let name = clean_name(&person.name, 100);
         let id = self.store.create_sso_user(address, &name, role, &provider.issuer, &person.subject).map_err(|_| OidcError::Internal)?.ok_or_else(refused)?;
-        self.audit(&Principal::Anonymous, "user.create", &id, &format!("oidc:{} {}", provider.id, role.as_str()));
+        self.audit(&Principal::Anonymous, "user.create", &id, &format!("oidc:{} {}{unverified}", provider.id, role.as_str()));
         self.refresh();
         self.store.user(&id).map_err(|_| OidcError::Internal)?.ok_or(OidcError::Internal)
     }

@@ -2,13 +2,13 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use magicpipes_core::proto::StreamStatus;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::listen::Activity;
 
 /// Error surfaced when the agent reports that it could not serve a data stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,71 +99,30 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatusPrefixed<S> {
     }
 }
 
-/// Records the time of the last successful read in a shared clock.
-struct Tracked<S> {
-    inner: S,
-    last: Arc<AtomicU64>,
-    epoch: Instant,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for Tracked<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(res, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.last.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-        }
-        res
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// Copies bytes in both directions until both sides finish or no data flows for `idle`.
-/// Backpressure is inherent: each direction only reads when the previous write completed.
-/// Copies both ways until either side closes, the connection idles for `idle`, or `stop` is
-/// cancelled (access was revoked).
-pub async fn bridge<A, B>(a: A, b: B, idle: Duration, stop: tokio_util::sync::CancellationToken)
+/// Copies bytes in both directions until either side closes, no byte moves for `idle` (if set), or
+/// `stop` is cancelled (access was revoked). Backpressure is inherent: each direction only reads
+/// when the previous write completed.
+pub async fn bridge<A, B>(a: A, b: B, idle: Option<Duration>, stop: tokio_util::sync::CancellationToken)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let last = Arc::new(AtomicU64::new(0));
-    let epoch = Instant::now();
-    let mut a = Tracked { inner: a, last: last.clone(), epoch };
-    let mut b = Tracked { inner: b, last: last.clone(), epoch };
-    let copy = tokio::io::copy_bidirectional(&mut a, &mut b);
-    tokio::pin!(copy);
-    let mut tick = tokio::time::interval((idle / 4).clamp(Duration::from_millis(100), Duration::from_secs(30)));
-    loop {
-        tokio::select! {
-            res = &mut copy => {
-                if let Err(e) = res {
-                    tracing::debug!(error = %e, "upgraded connection ended");
-                }
-                return;
-            }
-            _ = stop.cancelled() => {
-                tracing::debug!("closing upgraded connection: access revoked");
-                return;
-            }
-            _ = tick.tick() => {
-                let idle_for = epoch.elapsed().saturating_sub(Duration::from_millis(last.load(Ordering::Relaxed)));
-                if idle_for >= idle {
-                    tracing::debug!(?idle, "closing idle upgraded connection");
-                    return;
-                }
+    let activity = Activity::new();
+    let (mut a, mut b) = (activity.track(a), activity.track(b));
+    let stalled = async {
+        match idle {
+            Some(limit) => activity.stalled(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        res = tokio::io::copy_bidirectional(&mut a, &mut b) => {
+            if let Err(e) = res {
+                tracing::debug!(error = %e, "bridged connection ended");
             }
         }
+        _ = stop.cancelled() => tracing::debug!("closing a bridged connection: access revoked"),
+        _ = stalled => tracing::debug!(?idle, "closing an idle bridged connection"),
     }
 }
+

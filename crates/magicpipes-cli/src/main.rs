@@ -76,15 +76,31 @@ enum Command {
         #[arg(long, value_name = "PORT")]
         remote_port: Option<u16>,
         /// With --tcp/--udp: only let clients from this network connect (CIDR or address;
-        /// repeatable). Default: anyone.
+        /// repeatable). A new port needs this or --allow-any; re-adding without either keeps the list.
         #[arg(long = "allow-cidr", value_name = "CIDR", value_parser = parse_cidr)]
         allow_cidr: Vec<String>,
+        /// With --tcp/--udp: open the port to the whole internet, with only your service's own
+        /// authentication in front of it.
+        #[arg(long, conflicts_with = "allow_cidr")]
+        allow_any: bool,
         /// Serve the files in DIR with the built-in web server instead of forwarding to a port.
         #[arg(long, value_name = "DIR", conflicts_with_all = ["port", "host", "shell"])]
         serve: Option<PathBuf>,
         /// With --serve: don't list directory contents (a directory's index.html is still served).
-        #[arg(long, requires = "serve")]
+        /// Re-adding without --list or --no-list keeps the tunnel's setting.
+        #[arg(long, conflicts_with = "list")]
         no_list: bool,
+        /// With --serve: list directory contents (the default for a new tunnel).
+        #[arg(long)]
+        list: bool,
+        /// With --serve: let pages run scripts, for a web app or site you trust. Without it, HTML and
+        /// SVG files open with scripts turned off.
+        #[arg(long)]
+        site: bool,
+        /// With --serve: publish a folder that holds more than people usually mean to share: the
+        /// filesystem root, your home folder, a hidden folder in it, or this agent's own files.
+        #[arg(long)]
+        allow_sensitive_root: bool,
         /// Share a terminal in the browser: your login shell, or the program given after `--`.
         /// Each visitor gets their own copy; read-only unless --write.
         #[arg(long, conflicts_with_all = ["port", "host"])]
@@ -209,7 +225,8 @@ fn main() -> ExitCode {
 fn check_add_args(cmd: &Command) {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
-    let Command::Add { port, tcp, udp, remote_port, allow_cidr, serve, shell, write, max_clients, command, .. } = cmd else {
+    let Command::Add { port, tcp, udp, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
+    else {
         return;
     };
     let fail = |kind, msg: &str| Cli::command().find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit();
@@ -219,8 +236,12 @@ fn check_add_args(cmd: &Command) {
     if !shell && (*write || max_clients.is_some() || !command.is_empty()) {
         fail(ErrorKind::ArgumentConflict, "--write, --max-clients and a `-- <PROGRAM>` can only be used with --shell");
     }
-    if !tcp && !udp && (remote_port.is_some() || !allow_cidr.is_empty()) {
-        fail(ErrorKind::ArgumentConflict, "--remote-port and --allow-cidr can only be used with --tcp or --udp");
+    // Not clap's `requires`: it doesn't fire when the required flag conflicts with one that's given.
+    if serve.is_none() && (*no_list || *list || *site || *allow_sensitive_root) {
+        fail(ErrorKind::ArgumentConflict, "--no-list, --list, --site and --allow-sensitive-root can only be used with --serve");
+    }
+    if !tcp && !udp && (remote_port.is_some() || !allow_cidr.is_empty() || *allow_any) {
+        fail(ErrorKind::ArgumentConflict, "--remote-port, --allow-cidr and --allow-any can only be used with --tcp or --udp");
     }
     if remote_port == &Some(0) {
         fail(ErrorKind::InvalidValue, "--remote-port must be between 1 and 65535");
@@ -270,8 +291,12 @@ async fn dispatch(cmd: Command) -> ExitCode {
             udp,
             remote_port,
             allow_cidr,
+            allow_any,
             serve,
             no_list,
+            list,
+            site,
+            allow_sensitive_root,
             shell,
             write,
             max_clients,
@@ -302,8 +327,12 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 kind,
                 remote_port,
                 allow: allow_cidr,
+                allow_any,
                 serve,
                 list: !no_list,
+                keep_list: !no_list && !list,
+                site,
+                allow_sensitive_root,
                 shell: shell.then(|| if command.is_empty() { login_shell() } else { command }),
                 cwd: None,
                 writable: write,
@@ -539,9 +568,10 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         req.cwd = Some(cwd.map_err(|e| ErrorInfo::new(ErrorCode::InvalidCommand, format!("cannot use the current directory: {e}")))?);
     }
     let kind = req.kind;
-    let open_to_anyone = req.allow.is_empty();
     let serving = req.serve.clone();
     let listing = serving.is_some() && req.list;
+    // Only worth a word if it's about a page people will actually open.
+    let pages_without_scripts = !req.site && serving.as_ref().is_some_and(|dir| dir.join("index.html").is_file());
     let shell = req.shell.as_ref().map(|argv| (state::command_line(argv), req.writable, req.cwd.clone().unwrap_or_default()));
     let spawned = client::ensure_agent().await?;
     if !spawned {
@@ -566,6 +596,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             return Err(e);
         }
     };
+    let open_to_anyone = data["allow"].as_array().is_some_and(|a| a.is_empty());
     if out.json {
         print_json(&data);
     } else {
@@ -624,6 +655,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         if *writable {
             eprintln!("The link above runs `{cmd}` on this machine as you, with full control. Share it like a password;");
             eprintln!("re-running this command prints the same link, and `magicpipes remove` revokes it.");
+            eprintln!("Whoever runs the MagicPipes server can see it too, so only use --write through a server you trust.");
         } else {
             eprintln!("Visitors only watch: their keystrokes are ignored. Use --write to let people type.");
         }
@@ -650,6 +682,10 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         eprintln!();
         eprintln!("Directory listing is on: anyone with the URL can browse every non-hidden file in this directory.");
         eprintln!("Use --no-list to serve only files by exact path (and index.html).");
+    }
+    if pages_without_scripts && !out.quiet {
+        eprintln!();
+        eprintln!("Pages here open with scripts turned off. If this is a web app or a site you trust, add --site.");
     }
     Ok(())
 }

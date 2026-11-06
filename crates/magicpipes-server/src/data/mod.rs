@@ -133,6 +133,9 @@ pub struct ProxySettings {
     pub management_url: String,
     /// How long a private tunnel's cookie lasts.
     pub tunnel_cookie_ttl_secs: i64,
+    /// Hostnames an application's cookies may not reach (`public.allow_cookie_domain`): everything
+    /// under the base domain, and the management host.
+    pub shared_domains: Vec<String>,
     pub signer: Signer,
 }
 
@@ -145,6 +148,7 @@ impl ProxySettings {
         Self {
             management_url,
             tunnel_cookie_ttl_secs: cfg.users.session_max_age_secs as i64,
+            shared_domains: if cfg.public.allow_cookie_domain { Vec::new() } else { vec![cfg.base_domain.clone(), cfg.management.hostname.clone()] },
             signer,
             upstream_response_timeout: Duration::from_secs(cfg.public.upstream_response_timeout_secs),
             websocket_idle_timeout: Duration::from_secs(cfg.public.websocket_idle_timeout_secs),

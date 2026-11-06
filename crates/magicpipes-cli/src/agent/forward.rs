@@ -62,14 +62,14 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
         },
         ServerOpen::Data { tunnel_id, peer } => {
             let route = tunnels.route(&tunnel_id).filter(|r| r.kind != Kind::Udp);
-            let Some(Route { kind, target, streams_ok: counter, ended, sessions }) = route else {
+            let Some(Route { kind, target, streams_ok: counter, ended, sessions, spawns }) = route else {
                 let _ = StreamStatus::UnknownTunnel.write(&mut stream).await;
                 let _ = stream.shutdown().await;
                 return;
             };
             let (host, port) = match target {
                 Target::Port { host, port } => (host, port),
-                Target::Static { serve: root, list } => {
+                Target::Static { serve: root, list, site } => {
                     if StreamStatus::Ok.write(&mut stream).await.is_err() {
                         return;
                     }
@@ -77,7 +77,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                     // The server keeps HTTP connections for later requests: end this one when the
                     // tunnel's settings change, so it never serves the old ones.
                     tokio::select! {
-                        _ = serve::serve(stream, Arc::new(Site { root, list })) => {}
+                        _ = serve::serve(stream, Arc::new(Site { root, list, scripts: site })) => {}
                         _ = ended.cancelled() => {}
                     }
                     return;
@@ -88,7 +88,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
                     let key = key.filter(|_| writable);
-                    shell::serve(stream, Arc::new(Terminal { command, cwd, key, max_clients, sessions, ended })).await;
+                    shell::serve(stream, Arc::new(Terminal { command, cwd, key, max_clients, sessions, spawns, ended })).await;
                     return;
                 }
             };

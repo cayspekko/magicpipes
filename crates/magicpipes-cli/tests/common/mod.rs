@@ -186,6 +186,11 @@ udp_idle_timeout_secs = 5
                 assert!(start.elapsed() < Duration::from_secs(5));
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // The listener is up a moment before its certificate is.
+            while self.try_connect("localhost", self.mgmt_port).await.is_err() {
+                assert!(start.elapsed() < Duration::from_secs(10), "management never answered TLS");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
     }
 
@@ -568,6 +573,11 @@ pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
                                 Response::new(http_body_util::StreamBody::new(stream).boxed())
                             }
                             ("GET", "/status/401") => Response::builder().status(401).body(full("nope")).unwrap(),
+                            ("GET", "/cookies") => Response::builder()
+                                .header(header::SET_COOKIE, format!("shared=1; Path=/; Domain={BASE}"))
+                                .header(header::SET_COOKIE, format!("own=2; Domain=open.{BASE}"))
+                                .body(full("cookies"))
+                                .unwrap(),
                             _ => Response::builder().status(404).body(full("app 404")).unwrap(),
                         };
                         Ok::<_, std::convert::Infallible>(resp)

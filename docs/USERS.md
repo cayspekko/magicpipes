@@ -369,6 +369,9 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
   It is off by default, because some providers let users change the email claim. An account has
   at most one identity per issuer, so an address reused at the provider doesn't reach it.
   Otherwise the address must match `bootstrap_admins` or `allowed_email_domains`.
+- **Machines per member.** `[users] max_agents_per_user` (25) bounds the machines a member enrolls
+  themself, counting tokens not used yet, since limits per agent would otherwise multiply with
+  every machine. Administrators aren't limited, for themselves or on someone's behalf.
 - **The first admin.** `[users] bootstrap_admins` lists verified emails that become admin when
   their account is created at their first SSO login. It doesn't change an existing account's
   role. Without it, the first user is created with the admin token.
@@ -377,9 +380,11 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
 - **Providers that don't verify addresses.** `trust_email` accepts a provider's addresses without
   `email_verified`, for Microsoft Entra (never sends it) and authentik (`false` by default since
   2025.10). Off by default. Anyone who can choose their address at that provider could use an
-  address in `bootstrap_admins` or `allowed_email_domains`, so the page says so beside the option.
-  It only moves a decision that a custom claim mapping at the provider would otherwise make
-  out of sight.
+  address in `allowed_email_domains`, or an existing member's with `link_by_email`, so the page says
+  so beside the option. It only moves a decision that a custom claim mapping at the provider would
+  otherwise make out of sight. Such an address doesn't become or take over an administrator unless
+  the provider also has `allow_unverified_admin`; it's refused rather than made a member, or the
+  real administrator could never sign in.
 - **The Settings page.** Administrators add providers and edit the two lists without a restart.
   Presets (Google, Microsoft, authentik, Keycloak, GitLab, any other) only build the issuer URL and
   say what to do at the provider; discovery does the rest. See "Settings" in

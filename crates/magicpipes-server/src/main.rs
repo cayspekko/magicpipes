@@ -242,6 +242,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             header_read_timeout: Duration::from_secs(cfg.public.header_read_timeout_secs),
             trusted_proxies: cfg.trusted_proxies(),
             proxy_protocol: cfg.public.proxy_protocol,
+            idle_timeout: config::optional_secs(cfg.public.body_idle_timeout_secs),
         },
         shutdown.clone(),
         tracker.clone(),

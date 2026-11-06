@@ -161,7 +161,14 @@ pub enum Target {
     /// tunnel, whose datagrams go to this UDP port.
     Port { host: String, port: u16 },
     /// A directory served by the agent's built-in file server (`--serve`); `serve` is canonical.
-    Static { serve: PathBuf, list: bool },
+    /// `site`: its pages may run scripts. A file from before `--site` existed keeps working the
+    /// way it did, so an upgrade doesn't break a site that's being served.
+    Static {
+        serve: PathBuf,
+        list: bool,
+        #[serde(default = "pages_ran_scripts_before_site_existed")]
+        site: bool,
+    },
     /// A web terminal (`--shell`): each browser session runs `shell` (argv) in a new pty in `cwd`.
     /// Read-only unless `writable`, which requires `key` (it travels in the URL fragment).
     Shell {
@@ -172,6 +179,10 @@ pub enum Target {
         key: Option<String>,
         max_clients: u16,
     },
+}
+
+fn pages_ran_scripts_before_site_existed() -> bool {
+    true
 }
 
 impl Target {
@@ -280,7 +291,7 @@ mod tests {
         let labelled: Vec<LocalTunnel> = serde_json::from_str(labelled).unwrap();
         assert_eq!(labelled[0].visibility, Some(magicpipes_core::proto::Visibility::Private));
 
-        let t = LocalTunnel { target: Target::Static { serve: "/srv/site".into(), list: false }, ..list[0].clone() };
+        let t = LocalTunnel { target: Target::Static { serve: "/srv/site".into(), list: false, site: false }, ..list[0].clone() };
         let json = serde_json::to_value(&t).unwrap();
         assert_eq!((json["serve"].as_str(), json["list"].as_bool(), json.get("port")), (Some("/srv/site"), Some(false), None));
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), t);
@@ -294,7 +305,7 @@ mod tests {
         assert_eq!(t.describe(), "shell:htop (read-write)");
         let secret = Target::Shell { shell: vec!["/usr/bin/psql".into(), "postgres://u:pw@db".into()], cwd: "/".into(), writable: false, key: None, max_clients: 1 };
         assert_eq!(secret.server_description(Kind::Http), "shell:psql (read-only)");
-        let site = Target::Static { serve: "/home/alice/site".into(), list: true };
+        let site = Target::Static { serve: "/home/alice/site".into(), list: true, site: false };
         assert_eq!(site.server_description(Kind::Http), "static:site");
         assert_eq!(t.target.share_url("https://a.t.test"), "https://a.t.test/#k=k1");
 
@@ -310,6 +321,15 @@ mod tests {
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), udp);
         assert_eq!(udp.describe(), "udp://[::1]:53");
         assert!(serde_json::to_value(&list[0]).unwrap().get("kind").is_none(), "HTTP tunnels keep the old file format");
+    }
+
+    /// A file from before `--site`: its tunnel goes on working the way it did. New ones say.
+    #[test]
+    fn older_sites_keep_their_scripts() {
+        let old: Target = serde_json::from_str(r#"{"serve":"/srv/site","list":true}"#).unwrap();
+        assert_eq!(old, Target::Static { serve: "/srv/site".into(), list: true, site: true });
+        let new = Target::Static { serve: "/srv/site".into(), list: true, site: false };
+        assert_eq!(serde_json::from_str::<Target>(&serde_json::to_string(&new).unwrap()).unwrap(), new);
     }
 
     #[test]

@@ -5,7 +5,7 @@ base_domain = "t.example.com"
 data_dir = "/data"            # the magicpipes-data volume
 # Behind a reverse proxy (HAProxy, Traefik, ...) on a Docker network: its addresses, plus
 # proxy_protocol = true in [public]/[management] if it passes TLS through with send-proxy-v2.
-# trusted_proxies = ["172.16.0.0/12"]
+# trusted_proxies = ["172.23.0.2/32"]   # the proxy's own address: anything listed can name any client
 
 [public]
 https_listen = "0.0.0.0:443"
@@ -38,6 +38,7 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = false
 # trust_email = false
+# allow_unverified_admin = false
 
 # TCP/UDP port tunnels (`magicpipes add 5432 --tcp`). Also publish the range in
 # docker-compose.yml.

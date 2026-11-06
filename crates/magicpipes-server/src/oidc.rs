@@ -110,6 +110,8 @@ pub struct Provider {
     client_id: String,
     /// Take this provider's addresses without its word that they're verified.
     trust_email: bool,
+    /// Those addresses may also reach administrators' accounts.
+    pub allow_unverified_admin: bool,
     client_secret: String,
     cache: Mutex<Cache>,
     /// One fetch at a time.
@@ -166,8 +168,11 @@ impl Attempt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Person {
     pub subject: String,
-    /// Only an address the provider says it verified; lowercased by the caller.
+    /// An address the provider says it verified, or any it gives if it's trusted (`trust_email`);
+    /// lowercased by the caller.
     pub verified_email: Option<String>,
+    /// The provider itself said that address is verified.
+    pub vouched_for: bool,
     pub name: String,
 }
 
@@ -183,8 +188,8 @@ struct RawClaims {
 impl RawClaims {
     fn into_person(self, trust_email: bool) -> Person {
         // Some providers send the string "true".
-        let verified = trust_email || matches!(&self.email_verified, Some(serde_json::Value::Bool(true))) || self.email_verified.as_ref().and_then(|v| v.as_str()) == Some("true");
-        Person { subject: self.sub, verified_email: self.email.filter(|_| verified), name: self.name.unwrap_or_default() }
+        let vouched_for = matches!(&self.email_verified, Some(serde_json::Value::Bool(true))) || self.email_verified.as_ref().and_then(|v| v.as_str()) == Some("true");
+        Person { subject: self.sub, verified_email: self.email.filter(|_| vouched_for || trust_email), vouched_for, name: self.name.unwrap_or_default() }
     }
 }
 
@@ -222,6 +227,7 @@ impl Provider {
             link_by_email: cfg.link_by_email,
             client_id: cfg.client_id.clone(),
             trust_email: cfg.trust_email,
+            allow_unverified_admin: cfg.allow_unverified_admin,
             client_secret,
             cache: Mutex::default(),
             refreshing: tokio::sync::Mutex::new(()),
@@ -330,6 +336,7 @@ impl Provider {
             }
             let info = info.into_person(self.trust_email);
             person.verified_email = info.verified_email;
+            person.vouched_for = info.vouched_for;
             if person.name.is_empty() {
                 person.name = info.name;
             }
@@ -762,6 +769,8 @@ mod tests {
         assert_eq!(raw(true.into()).into_person(false).verified_email.as_deref(), Some("a@example.com"));
         assert_eq!(raw("true".into()).into_person(false).verified_email.as_deref(), Some("a@example.com"));
         assert_eq!(raw(false.into()).into_person(true).verified_email.as_deref(), Some("a@example.com"));
+        assert!(!raw(false.into()).into_person(true).vouched_for, "trusted isn't the same as verified");
+        assert!(raw(true.into()).into_person(true).vouched_for);
         assert_eq!(raw(serde_json::Value::Null).into_person(true).verified_email.as_deref(), Some("a@example.com"));
         let none: RawClaims = serde_json::from_value(serde_json::json!({ "sub": "s" })).unwrap();
         assert_eq!(none.into_person(true).verified_email, None, "no address to trust");

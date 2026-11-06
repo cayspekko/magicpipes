@@ -13,8 +13,9 @@ data_dir = "/var/lib/magicpipes"
 # name the client: through a PROXY header where a listener has proxy_protocol = true, or
 # X-Forwarded-For from an HTTP proxy. Client addresses drive login rate limits, per-client
 # connection caps, --allow-cidr and the X-Forwarded-For that tunnels receive. Anyone else is
-# the client, and the forwarding headers it sends are dropped.
-# trusted_proxies = ["172.16.0.0/12"]
+# the client, and the forwarding headers it sends are dropped. List only the proxy itself, not its
+# whole network: anything at a listed address can name any client and skips per-client limits.
+# trusted_proxies = ["172.23.0.2/32"]
 
 [public]
 https_listen = "0.0.0.0:443"
@@ -22,10 +23,15 @@ https_listen = "0.0.0.0:443"
 http_listen = "0.0.0.0:80"
 # url_port = 443                     # port shown in public URLs (defaults to https_listen's port)
 # max_connections = 10000
-# max_connections_per_client = 256   # per client address (per /64 for IPv6); trusted proxies exempt
+# max_connections_per_client = 64    # per client address (per /64 for IPv6); trusted proxies exempt
 # header_read_timeout_secs = 30
 # upstream_response_timeout_secs = 60  # for the app to start answering, after the request body (or its last chunk)
 # websocket_idle_timeout_secs = 600
+# body_idle_timeout_secs = 90         # close a connection after this long with no byte moving, so stalled uploads and
+#                                     # downloads give their place back. Off by default: set it above any quiet period
+#                                     # your applications have (long polling, server-sent events, slow responses)
+# allow_cookie_domain = false         # let applications set cookies for the whole base domain, which reach other tunnels
+#                                     # and the management host. Off: such a Domain is removed, so the cookie stays on its tunnel
 # proxy_protocol = false             # true behind a TCP load balancer passing TLS through (HAProxy send-proxy-v2)
 
 [management]
@@ -35,6 +41,8 @@ hostname = "example.com"
 # cert_file = "/etc/magicpipes/mgmt.crt" # optional: externally provisioned certificate
 # key_file  = "/etc/magicpipes/mgmt.key"
 # proxy_protocol = false               # as in [public]
+# max_connections = 1024                 # while they are HTTP: an agent's session stops counting once it has signed in
+# max_connections_per_client = 64        # per client address (per /64 for IPv6); trusted proxies exempt
 
 [tls]
 # "acme"   - per-hostname certificates via ACME HTTP-01 (default)
@@ -64,6 +72,7 @@ acme_directory = "letsencrypt"
 # bootstrap_admins = ["you@example.com"]  # verified emails that get an administrator's account at their first single sign-on
 # allowed_email_domains = ["example.com"] # verified emails here get a member's account at their first single sign-on (exact domain)
 # members_can_publish = true           # may members' machines create public tunnels? (checked on every new or changed one)
+# max_agents_per_user = 25              # machines a member may enroll themself, counting unused tokens (0: no limit)
 
 [ports]
 # Raw TCP and UDP tunnels (`magicpipes add 5432 --tcp`, `add 53 --udp`). Off unless `range` is
@@ -74,6 +83,7 @@ acme_directory = "letsencrypt"
 # public_host = "example.com"          # host in tcp:// and udp:// URLs (default: management.hostname)
 # proxy_protocol = false               # as in [public]; the proxy must be in trusted_proxies
 # max_connections = 10000              # open TCP connections across all port tunnels
+# tcp_idle_timeout_secs = 3600          # close a TCP connection after this long with no byte moving. Off by default
 # udp_idle_timeout_secs = 60
 # udp_max_flows = 128                  # UDP clients tracked at once per tunnel; one address may hold an eighth
 
@@ -89,3 +99,4 @@ acme_directory = "letsencrypt"
 # client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = false                # a first sign-in with a verified email reaches the account with that email
 # trust_email = false                  # accept addresses it doesn't say it verified: anyone who can choose theirs there can use an address listed above
+# allow_unverified_admin = false       # with trust_email: let those addresses become or take over administrators

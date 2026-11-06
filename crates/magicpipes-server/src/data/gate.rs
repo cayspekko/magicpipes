@@ -67,6 +67,39 @@ pub(super) fn strip_cookies(headers: &mut HeaderMap) {
     }
 }
 
+/// Takes `Domain` off an application's cookies where it would reach beyond its own tunnel, to other
+/// tunnels and the management host (`shared`). The cookie then belongs to the tunnel's hostname.
+/// A custom hostname's own domain, or its own hostname, is left alone.
+pub(super) fn keep_cookies_to_the_tunnel(headers: &mut HeaderMap, shared: &[String]) {
+    if shared.is_empty() || !headers.contains_key(header::SET_COOKIE) {
+        return;
+    }
+    let cleaned: Vec<HeaderValue> = headers.get_all(header::SET_COOKIE).iter().map(|c| without_shared_domain(c, shared)).collect();
+    headers.remove(header::SET_COOKIE);
+    for cookie in cleaned {
+        headers.append(header::SET_COOKIE, cookie);
+    }
+}
+
+fn without_shared_domain(cookie: &HeaderValue, shared: &[String]) -> HeaderValue {
+    let reaches_shared = |attribute: &[u8]| {
+        let mut parts = attribute.splitn(2, |b| *b == b'=');
+        let (Some(name), Some(value)) = (parts.next(), parts.next()) else { return false };
+        if !name.trim_ascii().eq_ignore_ascii_case(b"domain") {
+            return false;
+        }
+        let value = String::from_utf8_lossy(value).trim().trim_matches('.').to_ascii_lowercase();
+        !value.is_empty() && shared.iter().any(|host| *host == value || host.ends_with(&format!(".{value}")))
+    };
+    // The first part is the cookie's name and value, even if it's called `domain`.
+    let parts: Vec<&[u8]> = cookie.as_bytes().split(|b| *b == b';').collect();
+    if !parts.iter().skip(1).any(|a| reaches_shared(a)) {
+        return cookie.clone();
+    }
+    let kept: Vec<&[u8]> = parts.iter().enumerate().filter(|(i, a)| *i == 0 || !reaches_shared(a)).map(|(_, a)| a.trim_ascii()).collect();
+    HeaderValue::from_bytes(&kept.join(&b"; "[..])).unwrap_or_else(|_| cookie.clone())
+}
+
 fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| percent_decode(v))
 }
@@ -338,6 +371,39 @@ mod tests {
         }
         assert_eq!(query_param("x=1&return=%2Fa%3Fb%3Dc", "return").as_deref(), Some("/a?b=c"));
         assert_eq!(percent_decode(&percent_encode("/p?q=1 2&r")), "/p?q=1 2&r");
+    }
+
+    #[test]
+    fn cookies_stay_on_their_tunnel() {
+        let shared = ["t.example.com".to_string(), "example.com".to_string()];
+        let clean = |cookie: &'static str| {
+            let mut h = HeaderMap::new();
+            h.append(header::SET_COOKIE, HeaderValue::from_static(cookie));
+            keep_cookies_to_the_tunnel(&mut h, &shared);
+            h.get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string()
+        };
+        // The base domain, the management host, and anything above them.
+        assert_eq!(clean("a=1; Path=/; Domain=t.example.com; HttpOnly"), "a=1; Path=/; HttpOnly");
+        assert_eq!(clean("a=1; domain=.T.Example.Com"), "a=1");
+        assert_eq!(clean("a=1;DOMAIN = example.com ;Secure"), "a=1; Secure");
+        assert_eq!(clean("a=1; Domain=com"), "a=1");
+        // Its own hostname, or a custom hostname's own domain, reach nothing shared.
+        for kept in ["a=1; Domain=app.t.example.com", "a=1; Domain=shop.example.org", "a=1; Path=/", "domain=example.com"] {
+            assert_eq!(clean(kept), kept);
+        }
+
+        // Several cookies stay several.
+        let mut h = HeaderMap::new();
+        h.append(header::SET_COOKIE, HeaderValue::from_static("a=1; Domain=example.com"));
+        h.append(header::SET_COOKIE, HeaderValue::from_static("b=2"));
+        keep_cookies_to_the_tunnel(&mut h, &shared);
+        assert_eq!(h.get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect::<Vec<_>>(), ["a=1", "b=2"]);
+
+        // `public.allow_cookie_domain`.
+        let mut h = HeaderMap::new();
+        h.append(header::SET_COOKIE, HeaderValue::from_static("a=1; Domain=example.com"));
+        keep_cookies_to_the_tunnel(&mut h, &[]);
+        assert_eq!(h.get(header::SET_COOKIE).unwrap(), "a=1; Domain=example.com");
     }
 
     #[test]

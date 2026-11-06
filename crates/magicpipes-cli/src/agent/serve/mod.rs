@@ -10,7 +10,12 @@
 //! - Hidden entries (names starting with `.`) are neither listed, served nor archived.
 //! - The path is decoded segment by segment; `.`/`..`, backslashes, NUL and (on Windows) `:` are
 //!   refused, and the canonical result must lie inside the canonical root, so symlinks that point
-//!   outside the root are refused (and not listed).
+//!   outside the root are refused (and not listed). That result is then opened one component at a
+//!   time without following anything ([`open_servable`]), and only the open file is used: someone
+//!   who can write to the directory can't swap in a symlink between the check and the read.
+//! - HTML, SVG and XML can't run scripts on the tunnel's origin unless the tunnel was added with
+//!   `--site`: a file in a shared folder shouldn't be able to read the rest of it, with a signed-in
+//!   visitor's session, and send it elsewhere.
 //! - A directory's `index.html` is served either way. Directories without one are listed, and can
 //!   be downloaded as an archive, only when listing is on (`--no-list` turns both off).
 //!
@@ -24,6 +29,7 @@ mod listing;
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
+use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -49,15 +55,39 @@ pub(super) type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 const MAX_LISTED: usize = 5000;
 /// Largest accepted selection form (names of the entries to archive).
 const MAX_FORM: usize = 1024 * 1024;
+/// What a file that could run scripts gets without `--site`. Scripts and forms stay off; its own
+/// styles and images still load, with the visitor's session on a private tunnel.
+const NO_SCRIPTS: &str = "sandbox allow-same-origin allow-downloads allow-popups allow-popups-to-escape-sandbox";
 
 pub struct Site {
     /// Canonical path of the served directory.
     pub root: PathBuf,
     pub list: bool,
+    /// Pages may run scripts (`--site`).
+    pub scripts: bool,
+}
+
+/// What publishing `root` would give away, if it's somewhere nobody means to publish whole: the
+/// filesystem, a home folder, a hidden folder in one (`~/.ssh`), or anything holding this agent's
+/// credentials. Hidden names are never served, but plenty of secrets don't have one.
+fn sensitive_root(root: &Path) -> Option<&'static str> {
+    if root.parent().is_none() {
+        return Some("the whole filesystem");
+    }
+    let state = std::fs::canonicalize(crate::state::home()).unwrap_or_else(|_| crate::state::home());
+    if state.starts_with(root) || root.starts_with(&state) {
+        return Some("this agent's credentials");
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).and_then(|h| std::fs::canonicalize(h).ok())?;
+    if home.starts_with(root) {
+        return Some("your whole home folder");
+    }
+    let hidden = root.strip_prefix(&home).ok()?.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+    hidden.then_some("a hidden folder in your home folder")
 }
 
 /// Validates a directory for `--serve` and returns its canonical path.
-pub async fn check_root(dir: &Path) -> Result<PathBuf, ErrorInfo> {
+pub async fn check_root(dir: &Path, allow_sensitive: bool) -> Result<PathBuf, ErrorInfo> {
     let bad = |m: String| ErrorInfo::new(ErrorCode::InvalidDirectory, m);
     let root = tokio::fs::canonicalize(dir).await.map_err(|e| bad(format!("cannot serve {}: {e}", dir.display())))?;
     let meta = tokio::fs::metadata(&root).await.map_err(|e| bad(format!("cannot serve {}: {e}", dir.display())))?;
@@ -65,6 +95,14 @@ pub async fn check_root(dir: &Path) -> Result<PathBuf, ErrorInfo> {
         return Err(bad(format!("{} is not a directory", dir.display())));
     }
     let _ = tokio::fs::read_dir(&root).await.map_err(|e| bad(format!("cannot read {}: {e}", dir.display())))?;
+    if !allow_sensitive
+        && let Some(what) = sensitive_root(&root)
+    {
+        return Err(bad(format!(
+            "{} would publish {what}. Serve a folder inside it, or pass --allow-sensitive-root if you really mean this one",
+            dir.display()
+        )));
+    }
     Ok(root)
 }
 
@@ -93,18 +131,14 @@ async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
     }
     let Some(segments) = parse_path(req.uri().path()) else { return not_found() };
     let requested: PathBuf = segments.iter().fold(site.root.clone(), |p, s| p.join(s));
-    let Some(path) = contain(&site.root, &requested).await else { return not_found() };
-    let Ok(meta) = tokio::fs::metadata(&path).await else { return not_found() };
+    let Some(opened) = open(&site.root, requested).await else { return not_found() };
     let query = req.uri().query().unwrap_or("").to_string();
-    if meta.is_file() {
+    if opened.meta.is_file() {
         if method == Method::POST {
             return method_not_allowed();
         }
         let name = segments.last().map(String::as_str).unwrap_or("");
-        return file(&path, name, has_flag(&query, "download"), req).await;
-    }
-    if !meta.is_dir() {
-        return not_found();
+        return file(&opened, name, has_flag(&query, "download"), site.scripts, req).await;
     }
     if !req.uri().path().ends_with('/') {
         // Built from the validated segments, never the raw path, so it cannot become `//host`.
@@ -116,13 +150,13 @@ async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
         }
         return redirect(&location);
     }
-    if let Some(index) = contain(&site.root, &path.join("index.html")).await
-        && tokio::fs::metadata(&index).await.is_ok_and(|m| m.is_file())
+    if let Some(index) = open(&site.root, opened.path.join("index.html")).await
+        && index.meta.is_file()
     {
         if method == Method::POST {
             return method_not_allowed();
         }
-        return file(&index, "index.html", false, req).await;
+        return file(&index, "index.html", false, site.scripts, req).await;
     }
     if !site.list {
         return if method == Method::POST { method_not_allowed() } else { not_found() };
@@ -135,13 +169,14 @@ async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
             Ok(_) => return text(StatusCode::BAD_REQUEST, "nothing selected\n"),
             Err(resp) => return resp,
         };
-        return archive_response(&site.root, path, &folder, names);
+        return archive_response(&site.root, opened.path, &folder, names);
     }
+    let path = opened.path.clone();
+    let (entries, omitted) = read_entries(&site.root, opened).await;
     if has_flag(&query, "archive") {
-        let names = read_entries(&site.root, &path).await.0.into_iter().map(|e| e.name).collect();
+        let names = entries.into_iter().map(|e| e.name).collect();
         return archive_response(&site.root, path, &folder, names);
     }
-    let (entries, omitted) = read_entries(&site.root, &path).await;
     let nonce = magicpipes_core::secret::random_string(22);
     let html = listing::render(&Page { site: &site_name, segments: &segments, entries: &entries, omitted, nonce: &nonce });
     let mut resp = Response::new(full(html));
@@ -227,24 +262,34 @@ fn attachment(name: &str) -> String {
     format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", percent_encode(name))
 }
 
-/// Servable entries of a directory, folders first, then by name.
-async fn read_entries(root: &Path, dir: &Path) -> (Vec<Entry>, usize) {
+/// Servable entries of a directory, folders first, then by name. One blocking call for the whole
+/// listing, instead of a hand-off to another thread for each file system call.
+async fn read_entries(root: &Path, dir: Opened) -> (Vec<Entry>, usize) {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || list_entries(&root, &dir)).await.unwrap_or_default()
+}
+
+fn list_entries(root: &Path, dir: &Opened) -> (Vec<Entry>, usize) {
     let mut entries = Vec::new();
     let mut omitted = 0usize;
-    let Ok(mut rd) = tokio::fs::read_dir(dir).await else { return (entries, 0) };
-    while let Ok(Some(e)) = rd.next_entry().await {
+    let Ok(rd) = dir.read_dir() else { return (entries, 0) };
+    for e in rd.flatten() {
         let Ok(name) = e.file_name().into_string() else { continue };
         if !servable_name(&name) {
             continue;
         }
-        // Follow symlinks only when they stay inside the root, exactly like serving does.
-        let Some(real) = contain(root, &e.path()).await else { continue };
-        let Ok(meta) = tokio::fs::metadata(&real).await else { continue };
-        if !meta.is_dir() && !meta.is_file() {
-            continue;
-        }
+        // Only counted from here on, so a huge folder costs no more than the entries shown.
         if entries.len() == MAX_LISTED {
             omitted += 1;
+            continue;
+        }
+        // Follow symlinks only when they stay inside the root, exactly like serving does.
+        let Ok(real) = std::fs::canonicalize(dir.path.join(&name)) else { continue };
+        if !servable_path(root, &real) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&real) else { continue };
+        if !meta.is_dir() && !meta.is_file() {
             continue;
         }
         let modified = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
@@ -302,10 +347,46 @@ fn encode_path(segments: &[String]) -> String {
     })
 }
 
-/// Resolves symlinks; `None` unless the result exists and is servable (see [`servable_path`]).
-async fn contain(root: &Path, path: &Path) -> Option<PathBuf> {
-    let real = tokio::fs::canonicalize(path).await.ok()?;
-    servable_path(root, &real).then_some(real)
+/// A file or directory to serve, open. Its name may point elsewhere by now; the handle can't.
+pub(super) struct Opened {
+    /// The canonical path it was opened at.
+    pub path: PathBuf,
+    file: File,
+    pub meta: Metadata,
+}
+
+impl Opened {
+    /// A path to the open file or directory itself.
+    fn handle(&self) -> PathBuf {
+        crate::platform::handle_path(&self.file).unwrap_or_else(|| self.path.clone())
+    }
+
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn read_dir(&self) -> std::io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(self.handle())
+    }
+}
+
+/// Resolves `path` and opens what it leads to; `None` unless that is a regular file or directory,
+/// inside the root and servable (see [`servable_path`]). Resolving first keeps symlinks inside the
+/// root working; opening the real path follows nothing, so a component swapped for a symlink
+/// since then makes the open fail, instead of leaving the root.
+pub(super) fn open_servable(root: &Path, path: &Path) -> Option<Opened> {
+    let real = std::fs::canonicalize(path).ok()?;
+    if !servable_path(root, &real) {
+        return None;
+    }
+    let file = crate::platform::open_beneath(root, real.strip_prefix(root).ok()?).ok()?;
+    let meta = file.metadata().ok()?;
+    (meta.is_file() || meta.is_dir()).then_some(Opened { path: real, file, meta })
+}
+
+async fn open(root: &Path, path: PathBuf) -> Option<Opened> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || open_servable(&root, &path)).await.ok()?
 }
 
 /// Whether a canonical path lies inside `root` with every component servable. Checking the
@@ -317,19 +398,23 @@ fn servable_path(root: &Path, real: &Path) -> bool {
     })
 }
 
-async fn file(path: &Path, name: &str, download: bool, req: Request<Incoming>) -> Response<Body> {
-    match ServeFile::new_with_mime(path, &kinds::content_type(name)).try_call(req).await {
+async fn file(opened: &Opened, name: &str, download: bool, scripts: bool, req: Request<Incoming>) -> Response<Body> {
+    let mime = kinds::content_type(name);
+    match ServeFile::new_with_mime(opened.handle(), &mime).try_call(req).await {
         Ok(resp) => {
             let mut resp = resp.map(|b| b.boxed_unsync());
             let h = resp.headers_mut();
             h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            if !scripts && kinds::can_run_scripts(&mime) {
+                h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(NO_SCRIPTS));
+            }
             if download && let Ok(v) = HeaderValue::from_str(&attachment(name)) {
                 h.insert(header::CONTENT_DISPOSITION, v);
             }
             resp
         }
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "could not serve file");
+            tracing::warn!(path = %opened.path.display(), error = %e, "could not serve file");
             text(StatusCode::INTERNAL_SERVER_ERROR, "could not read file\n")
         }
     }
@@ -431,11 +516,100 @@ mod tests {
         std::os::unix::fs::symlink(".git", dir.join("repo")).unwrap();
         std::os::unix::fs::symlink("ok.txt", dir.join("alias.txt")).unwrap();
         let root = std::fs::canonicalize(&dir).unwrap();
-        assert!(contain(&root, &root.join("ok.txt")).await.is_some());
-        assert!(contain(&root, &root.join("alias.txt")).await.is_some());
-        assert!(contain(&root, &root.join("notes.txt")).await.is_none());
-        assert!(contain(&root, &root.join("repo")).await.is_none());
+        assert!(open_servable(&root, &root.join("ok.txt")).is_some());
+        assert!(open_servable(&root, &root.join("alias.txt")).is_some());
+        assert!(open_servable(&root, &root.join("notes.txt")).is_none());
+        assert!(open_servable(&root, &root.join("repo")).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Someone who can write to the served folder flips a name between a file and a symlink while
+    /// it is being requested. Whatever they manage, what gets read is never the outside file.
+    #[cfg(unix)]
+    #[test]
+    fn swapping_in_a_symlink_never_leaves_the_root() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("mp-serve-{}", magicpipes_core::secret::random_string(8)));
+        let site = dir.join("site");
+        std::fs::create_dir_all(site.join("sub")).unwrap();
+        std::fs::write(dir.join("secret.txt"), "SECRET").unwrap();
+        let root = std::fs::canonicalize(&site).unwrap();
+        let (real_file, real_sub) = (root.join("a.txt"), root.join("sub"));
+        std::fs::write(&real_file, "fine").unwrap();
+        std::fs::write(real_sub.join("b.txt"), "fine").unwrap();
+        let outside = std::fs::canonicalize(&dir).unwrap();
+        std::fs::create_dir_all(outside.join("elsewhere")).unwrap();
+        std::fs::write(outside.join("elsewhere/b.txt"), "SECRET").unwrap();
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let (stop, real_file, real_sub, outside) = (stop.clone(), real_file.clone(), real_sub.clone(), outside.clone());
+            std::thread::spawn(move || {
+                let (file2, sub2) = (real_file.with_extension("new"), real_sub.with_extension("new"));
+                let (keep_file, keep_sub) = (real_file.with_extension("keep"), real_sub.with_extension("keep"));
+                while !stop.load(Ordering::Relaxed) {
+                    // Swap a file for a link out, and a directory on the path for a link out.
+                    symlink(outside.join("secret.txt"), &file2).unwrap();
+                    std::fs::rename(&real_file, &keep_file).unwrap();
+                    std::fs::rename(&file2, &real_file).unwrap();
+                    symlink(outside.join("elsewhere"), &sub2).unwrap();
+                    std::fs::rename(&real_sub, &keep_sub).unwrap();
+                    std::fs::rename(&sub2, &real_sub).unwrap();
+                    std::thread::yield_now();
+                    std::fs::remove_file(&real_file).unwrap();
+                    std::fs::rename(&keep_file, &real_file).unwrap();
+                    std::fs::remove_file(&real_sub).unwrap();
+                    std::fs::rename(&keep_sub, &real_sub).unwrap();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let mut served = 0;
+        for i in 0..4000 {
+            let path = if i % 2 == 0 { real_file.clone() } else { real_sub.join("b.txt") };
+            if let Some(opened) = open_servable(&root, &path)
+                && let Ok(body) = std::fs::read_to_string(opened.handle())
+            {
+                assert_ne!(body, "SECRET", "read a file outside the root through {}", path.display());
+                served += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert!(served > 0, "the checks don't simply refuse everything");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A FIFO in a served folder neither blocks the server nor gets served.
+    #[cfg(unix)]
+    #[test]
+    fn only_files_and_directories_are_opened() {
+        let dir = std::env::temp_dir().join(format!("mp-serve-{}", magicpipes_core::secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let fifo = std::ffi::CString::new(root.join("pipe").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(open_servable(&root, &root.join("pipe")).is_none());
+        assert!(open_servable(&root, &root).is_some_and(|o| o.meta.is_dir()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folders_nobody_means_to_publish_are_recognized() {
+        assert!(sensitive_root(Path::new("/")).is_some());
+        let state = std::fs::canonicalize(crate::state::home()).unwrap_or_else(|_| crate::state::home());
+        assert!(sensitive_root(&state).is_some(), "the agent's own state");
+        assert!(sensitive_root(&state.join("inside")).is_some());
+        if let Some(home) = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok()) {
+            assert!(sensitive_root(&home).is_some());
+            assert!(sensitive_root(&home.join(".ssh")).is_some());
+            assert!(sensitive_root(&home.join(".config/app")).is_some());
+            assert_eq!(sensitive_root(&home.join("project/dist")), None);
+        }
     }
 
     #[test]

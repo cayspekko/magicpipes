@@ -65,8 +65,8 @@ magicpipes add 8080                          # http (unchanged)
 magicpipes add --serve ./dist                # static files
 magicpipes add --shell -- htop               # web terminal (read-only; --write needs the #k= link)
 magicpipes add --unix /var/run/docker.sock   # http over a unix socket
-magicpipes add 5432 --tcp                    # → tcp://example.com:65307
-magicpipes add 53 --udp --host 10.0.0.2      # → udp://example.com:65311
+magicpipes add 5432 --tcp --allow-any        # → tcp://example.com:65307
+magicpipes add 53 --udp --allow-any --host 10.0.0.2  # → udp://example.com:65311
 magicpipes add 22 --ssh                      # → ssh -J example.com:2222 <name>
 magicpipes add 3389 --rdp --host win-box     # → port + browser desktop
 ```

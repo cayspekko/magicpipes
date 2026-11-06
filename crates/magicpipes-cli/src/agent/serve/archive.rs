@@ -5,11 +5,12 @@
 //! stops it once it disconnects). The writers are shared by every client of every tunnel, so a
 //! download that falls below a minimum rate is ended: reading a trickle can't hold one forever. The same rules as serving apply: hidden entries are skipped,
 //! everything must resolve inside the root, and directory symlinks are not followed (which also
-//! rules out cycles). Unreadable files are skipped; a failure while streaming aborts the response
-//! so the client sees a broken download rather than a silently truncated archive.
+//! rules out cycles). Files and folders are read through what was opened (see
+//! `super::open_servable`), so swapping a name for a symlink can't lead outside the root. Unreadable
+//! files are skipped; a failure while streaming aborts the response so the client sees a broken
+//! download rather than a silently truncated archive.
 
-use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -22,7 +23,7 @@ use flate2::write::GzEncoder;
 use hyper::body::{Body, Frame};
 use tokio::sync::{Semaphore, mpsc};
 
-use super::{servable_name, servable_path};
+use super::{open_servable, servable_name};
 
 const CHUNK: usize = 64 * 1024;
 /// Archives being written at once, across all tunnels: each holds a blocking thread.
@@ -63,25 +64,32 @@ fn write(root: &Path, dir: &Path, names: &[String], out: &mut ChannelWriter) -> 
     Ok(())
 }
 
+/// A file's content as exactly `size` bytes, whatever it does while being read. The size is in the
+/// entry's header: bytes appended after that would be read as further entries, and a file that
+/// shrank would shift everything after it.
+fn exactly(file: impl Read, size: u64) -> impl Read {
+    file.take(size).chain(io::repeat(0)).take(size)
+}
+
 fn add<W: Write>(tar: &mut tar::Builder<W>, root: &Path, path: &Path, name: &Path) -> io::Result<()> {
-    let (Ok(link), Ok(real)) = (std::fs::symlink_metadata(path), std::fs::canonicalize(path)) else { return Ok(()) };
-    if !servable_path(root, &real) {
+    let Ok(link) = std::fs::symlink_metadata(path) else { return Ok(()) };
+    // Opened before the header is written: an unreadable file is skipped, not half-written.
+    let Some(opened) = open_servable(root, path) else { return Ok(()) };
+    if opened.meta.is_file() {
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&opened.meta);
+        return tar.append_data(&mut header, name, exactly(opened.file(), opened.meta.len()));
+    }
+    if link.file_type().is_symlink() {
         return Ok(());
     }
-    let Ok(meta) = std::fs::metadata(&real) else { return Ok(()) };
-    if meta.is_file() {
-        // Opened before the header is written: an unreadable file is skipped, not half-written.
-        let Ok(mut f) = File::open(&real) else { return Ok(()) };
-        return tar.append_file(name, &mut f);
-    }
-    if !meta.is_dir() || link.file_type().is_symlink() {
-        return Ok(());
-    }
-    tar.append_dir(name, &real)?;
-    let Ok(rd) = std::fs::read_dir(&real) else { return Ok(()) };
+    tar.append_dir(name, &opened.path)?;
+    let Ok(rd) = opened.read_dir() else { return Ok(()) };
     let mut children: Vec<String> =
         rd.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| servable_name(n)).collect();
     children.sort();
+    // Not kept open while walking the folders below: their depth isn't ours to choose.
+    let real = opened.path;
     for child in children {
         add(tar, root, &real.join(&child), &name.join(&child))?;
     }
@@ -148,6 +156,18 @@ impl Body for ChannelBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_entry_is_exactly_the_size_its_header_says() {
+        let read = |content: &[u8], size| {
+            let mut out = Vec::new();
+            exactly(content, size).read_to_end(&mut out).unwrap();
+            out
+        };
+        assert_eq!(read(b"12345", 5), b"12345");
+        assert_eq!(read(b"12345 appended later", 5), b"12345", "what grew is left out");
+        assert_eq!(read(b"123", 5), b"123\0\0", "what shrank is padded");
+    }
 
     #[test]
     fn slow_downloads_lose_their_writer() {

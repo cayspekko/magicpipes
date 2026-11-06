@@ -178,7 +178,7 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         }
         tokio::spawn(async move {
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                Ok((client, upstream)) => bridge(TokioIo::new(client), TokioIo::new(upstream), idle, stop.clone()).await,
+                Ok((client, upstream)) => bridge(TokioIo::new(client), TokioIo::new(upstream), Some(idle), stop.clone()).await,
                 Err(e) => tracing::debug!(error = %e, "upgrade failed"),
             }
             // Ends the watcher, if any.
@@ -189,6 +189,7 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     } else {
         clean_response_headers(resp.headers_mut(), false);
     }
+    gate::keep_cookies_to_the_tunnel(resp.headers_mut(), &dp.settings.shared_domains);
     if let Some(nonce) = probe
         && let Ok(v) = HeaderValue::from_str(&format!("{} {}", route.tunnel_id, nonce)) {
             resp.headers_mut().insert(PROBE_ACK_HEADER, v);

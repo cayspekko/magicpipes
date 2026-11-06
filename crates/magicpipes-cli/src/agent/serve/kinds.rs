@@ -101,6 +101,11 @@ pub fn content_type(name: &str) -> Mime {
     guessed
 }
 
+/// Whether a browser given this type could run scripts in it.
+pub fn can_run_scripts(mime: &Mime) -> bool {
+    matches!(mime.subtype().as_str(), "html" | "xml") || mime.suffix().is_some_and(|s| s == mime::XML)
+}
+
 /// Whether a click should open the file in a new tab (the browser can show it) rather than
 /// download it.
 pub fn opens_in_browser(name: &str) -> bool {
@@ -164,6 +169,16 @@ pub const ICON_SYMBOLS: &str = r##"<svg width="0" height="0" style="position:abs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pages_that_could_run_scripts() {
+        for name in ["index.html", "a.htm", "logo.svg", "feed.xml", "doc.xhtml"] {
+            assert!(can_run_scripts(&content_type(name)), "{name}: {}", content_type(name));
+        }
+        for name in ["a.txt", "a.png", "a.pdf", "a.json", "a.js", "a.css", "a.bin"] {
+            assert!(!can_run_scripts(&content_type(name)), "{name}: {}", content_type(name));
+        }
+    }
 
     #[test]
     fn kinds() {

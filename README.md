@@ -32,7 +32,8 @@ Nothing listens for inbound connections on your machine. You don't configure a r
 create per-app DNS records, or restart anything when you add a tunnel. HTTP/1.1 and WebSockets
 both work. `magicpipes add --serve <dir>` publishes a directory of files with a built-in web
 server, `magicpipes add --shell` shares a terminal in the browser (like ttyd), and
-`magicpipes add 5432 --tcp` (or `--udp`) publishes any service on a raw public port. See
+`magicpipes add 5432 --tcp --allow-cidr <network>` (or `--udp`) publishes any service on a raw
+public port. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next (an SSH gateway, browser desktop).
 
 > **Public means public.** Anyone who knows a tunnel URL can reach it. The random name is not
@@ -128,7 +129,7 @@ as HAProxy in `mode tcp`, should send a PROXY header (`send-proxy-v2` on its `se
 and the matching listeners need `proxy_protocol = true`:
 
 ```toml
-trusted_proxies = ["172.16.0.0/12"]   # e.g. the Docker network HAProxy runs on
+trusted_proxies = ["172.23.0.2/32"]   # the proxy's own address
 
 [public]
 proxy_protocol = true
@@ -138,6 +139,8 @@ proxy_protocol = true
 proxy_protocol = true
 ```
 
+List only the proxy itself, not its whole network: anything at a listed address can name any
+client, and skips the per-client limits. In Docker, give the proxy a fixed address on its network.
 Connections from addresses outside `trusted_proxies` still work, with the peer as the client
 and its own forwarding headers dropped. Without `trusted_proxies`, every client behind the
 proxy shares one address, so ten failed logins from anyone would rate-limit everyone's failed
@@ -204,6 +207,26 @@ administrator when they first sign in.
   enrollment tokens, kept for `[users] audit_retention_days` (90).
 
 
+### Settings for when you know what you're doing
+
+The defaults are the safe ones. These turn something on, or tighten it further, on purpose:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `add --allow-any` | off | Opens a raw port to the whole internet |
+| `add --site` | off | Lets HTML and SVG in a served folder run scripts |
+| `add --allow-sensitive-root` | off | Serves a home folder, a hidden folder in it, or the filesystem root |
+| `add --write` | off | Lets anyone with a terminal's link, and whoever controls the server, run commands as you |
+| `[public] allow_cookie_domain` | off | Lets applications set cookies for the whole base domain, which reach other tunnels and the management host |
+| `[[oidc]] trust_email` | off | Accepts addresses the provider didn't verify |
+| `[[oidc]] allow_unverified_admin` | off | Lets those addresses reach administrators' accounts |
+| `[[oidc]] link_by_email` | off | Lets a first sign-in use an existing account with the same address |
+| `[public] body_idle_timeout_secs` | off | Closes a connection after this long with no byte moving; breaks long polling and server-sent events if set below their quiet periods |
+| `[ports] tcp_idle_timeout_secs` | off | The same for raw TCP ports |
+| `[public] max_connections_per_client` | 64 | Open HTTPS connections per client address |
+| `[management] max_connections`, `max_connections_per_client` | 1024, 64 | The same for the management listener. An agent's session stops counting once it has signed in |
+| `[users] max_agents_per_user` | 25 | Machines a member may enroll themself (0: no limit) |
+
 ### Single sign-on
 
 People can sign in through any OpenID Connect provider: Google, Microsoft Entra, GitLab, Okta,
@@ -244,9 +267,11 @@ self-hosted one where people edit their own email).
 **Providers that don't verify addresses.** Microsoft Entra never states `email_verified`, and
 authentik since 2025.10 says `false` by default, so new people can't get in until you turn on
 **Trust this provider's email addresses** for that provider. With it on, **anyone who can choose
-their address at the provider could use an address on your lists**, including one that gets an
-administrator's account. Stop people changing their address there first (in authentik, turn off
-**Allow users to change email**).
+their address at the provider could use any address on your lists**, so stop people changing theirs
+there first (in authentik, turn off **Allow users to change email**). An address the provider didn't
+verify still can't become or take over an administrator, unless you also turn on **Let those
+addresses reach administrators' accounts**: you need that if your own first sign-in comes through
+such a provider.
 
 The temporary password an administrator set stops working once its owner has signed in with
 single sign-on, and no password change is asked for. A password the person chose keeps working.
@@ -271,6 +296,7 @@ client_id = "1234.apps.googleusercontent.com"
 client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = true
 # trust_email = true
+# allow_unverified_admin = true            # needs trust_email
 ```
 
 ### Settings and the generated configuration
@@ -444,8 +470,8 @@ magicpipes add 3000 --name myapp    # https://myapp.t.example.com
 magicpipes add 5173 --json          # machine-readable output (see below)
 magicpipes add --serve ./dist       # serve a directory with the built-in file server
 magicpipes add --shell -- htop      # a terminal in the browser (read-only unless --write)
-magicpipes add 5432 --tcp           # a raw TCP port, e.g. tcp://example.com:65507
-magicpipes add 53 --udp             # a UDP port
+magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24   # a raw TCP port, for one network
+magicpipes add 53 --udp --allow-any # a UDP port, open to anyone
 
 magicpipes list                     # tunnels on this machine and their status
 magicpipes status                   # login, agent and connection status
@@ -492,11 +518,22 @@ Checking directory...         ✓
 * Hidden files and directories (names starting with `.`, such as `.env` or `.git`) are never
   listed, served or archived. Symlinks are followed only if they stay inside the served
   directory (folder symlinks are not followed into archives).
-* Running `add --serve` again for the same directory returns the same tunnel, applying the new
-  `--no-list` setting. `magicpipes remove <name>` stops serving it.
+  The check and the read can't be separated: someone who can write to the directory can't swap a
+  file for a symlink at the right moment to leave it (on Windows, only the last part of the path is
+  protected this way).
+* **Pages can't run scripts unless you say so.** HTML, SVG and XML files open with scripts and
+  forms turned off, so a file in a shared folder can't read the rest of it with a visitor's session
+  and send it elsewhere. Their own styles and images still load. For a web app or a site you trust,
+  add `--site`.
+* **Some folders need `--allow-sensitive-root`:** the filesystem root, your home folder, a hidden
+  folder in it (`~/.ssh`) and anything holding this agent's files, since plenty of secrets aren't
+  in hidden files.
+* Running `add --serve` again for the same directory returns the same tunnel, applying `--site`
+  as given. `--list` or `--no-list` change the listing; with neither it stays as it was.
+  `magicpipes remove <name>` stops serving it.
 
 > Everything in the directory (except hidden entries) is public. Serve a dedicated build or
-> export directory, not your home directory or a source checkout.
+> export directory, not a source checkout.
 
 ### Sharing a terminal
 
@@ -527,12 +564,16 @@ Checking program...           ✓
 * Nerd Font icons (Starship, Powerlevel10k, `eza --icons`, …) render for every viewer: the
   page bundles the symbols-only Nerd Font and downloads it (1.2 MB, once) only when an icon is
   on screen. Emoji and CJK take two columns, as in current terminals.
-* `--max-clients N` limits concurrent sessions (default 5).
+* `--max-clients N` limits how many programs run at once (default 5): a session's place is given
+  back only once its program has gone. A tunnel starts at most 60 programs a minute, so opening and
+  closing sessions in a loop can't run them, and their login scripts, without limit.
 * Running the same command from the same directory again returns the same tunnel. `list` shows
   it as `shell:htop (read-only)`; `list --json` includes the `share_url`.
 
 > The MagicPipes server relays the terminal and can read it (it terminates TLS for every
-> tunnel). Use your own SSH for anything the server operator should not see.
+> tunnel). With `--write` that includes the link's secret, so whoever controls the server can run
+> commands as you. Only use `--write` through a server you trust, and your own SSH for anything the
+> server operator should not see.
 
 ### TCP and UDP ports
 
@@ -560,10 +601,13 @@ psql -h example.com -p 65507 -U me mydb
 
 * **The port stays the same** for the tunnel: re-running `add`, restarting the agent or the
   server keeps it. `--remote-port N` asks for a specific port inside the server's range.
-* **`--allow-cidr`** (repeatable: networks or single addresses) limits who can connect; other
-  clients are disconnected at once. Without it the port is open to the whole internet, and
-  only your service's own authentication protects it. The settings follow the latest `add`:
-  re-adding without `--allow-cidr` removes the limit.
+* **A new port says who may connect:** `--allow-cidr` (repeatable: networks or single addresses),
+  or `--allow-any` for the whole internet, with only your service's own authentication in front of
+  it. With neither, `add` refuses (`invalid_request`). Other clients are disconnected at once.
+  Re-adding without either keeps the list; a new `--allow-cidr` replaces it, and `--allow-any`
+  removes it.
+* **UDP allow-lists aren't authentication.** A datagram's source address can be forged, so a
+  forged packet can reach your service past `--allow-cidr` (the reply goes to the forged address).
 * **Readiness:** the server opens a connection to your service through the agent (so a service
   that is down fails the `add`), then this machine connects to the public port. If that last
   connection does not come through, `add` still succeeds but warns (`"reachable": false`): the

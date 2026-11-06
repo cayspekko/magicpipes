@@ -561,3 +561,31 @@ async fn api_tokens_end_when_an_account_is_taken_back() {
     f.cp.reset_password(&admin, &ann.id).await.unwrap();
     assert!(!works(&four) && works(&bobs));
 }
+
+#[tokio::test]
+async fn members_have_a_limited_number_of_machines() {
+    use crate::authz::Role;
+    use crate::control::EnrollmentOptions;
+    let dir = std::env::temp_dir().join(format!("mp-control-{}", secret::random_string(8)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = fixture_in(dir, "[users]\nmax_agents_per_user = 2");
+    let admin = Principal::AdminToken;
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let as_ann = Principal::User { id: ann.id.clone(), role: Role::Member, tags: Vec::new() };
+    let enroll = |token: String| f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "m".into() }).unwrap().agent_id;
+
+    // A machine and a token not used yet both count.
+    let laptop = enroll(f.cp.create_enrollment(&as_ann, Default::default()).unwrap());
+    let unused = f.cp.create_enrollment(&as_ann, Default::default()).unwrap();
+    assert!(f.cp.create_enrollment(&as_ann, Default::default()).unwrap_err().is(ErrorCode::LimitReached));
+
+    // Using the token changes nothing, and revoking a machine makes room.
+    enroll(unused);
+    assert!(f.cp.create_enrollment(&as_ann, Default::default()).unwrap_err().is(ErrorCode::LimitReached));
+    assert!(f.cp.revoke_agent(&admin, &laptop).unwrap());
+    assert!(f.cp.create_enrollment(&as_ann, Default::default()).is_ok());
+
+    // An administrator isn't held to it, for themself or on someone's behalf.
+    let opts = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), ..Default::default() };
+    assert!(f.cp.create_enrollment(&admin, opts).is_ok());
+}

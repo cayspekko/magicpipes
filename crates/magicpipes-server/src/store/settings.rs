@@ -20,6 +20,7 @@ pub struct OidcProviderRow {
     pub client_id: String,
     pub link_by_email: bool,
     pub trust_email: bool,
+    pub allow_unverified_admin: bool,
 }
 
 /// Who a first sign-in may create an account for.
@@ -32,9 +33,9 @@ pub struct SignInRules {
 impl Store {
     pub fn oidc_provider_rows(&self) -> anyhow::Result<Vec<OidcProviderRow>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, label, issuer, client_id, link_by_email, trust_email FROM oidc_providers WHERE org_id = ?1 ORDER BY created_at, id")?;
+            let mut st = c.prepare("SELECT id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin FROM oidc_providers WHERE org_id = ?1 ORDER BY created_at, id")?;
             st.query_map([DEFAULT_ORG], |r| {
-                Ok(OidcProviderRow { id: r.get(0)?, label: r.get(1)?, issuer: r.get(2)?, client_id: r.get(3)?, link_by_email: r.get(4)?, trust_email: r.get(5)? })
+                Ok(OidcProviderRow { id: r.get(0)?, label: r.get(1)?, issuer: r.get(2)?, client_id: r.get(3)?, link_by_email: r.get(4)?, trust_email: r.get(5)?, allow_unverified_admin: r.get(6)? })
             })?
             .collect()
         })
@@ -48,20 +49,21 @@ impl Store {
                 return Ok(0);
             }
             c.execute(
-                "INSERT INTO oidc_providers (id, org_id, label, issuer, client_id, link_by_email, trust_email, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO oidc_providers (id, org_id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT DO NOTHING",
-                params![p.id, DEFAULT_ORG, p.label, p.issuer, p.client_id, p.link_by_email, p.trust_email, unix_now()],
+                params![p.id, DEFAULT_ORG, p.label, p.issuer, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, unix_now()],
             )
         })?;
         Ok(n == 1)
     }
 
     /// Changes what can change about a provider: its id and issuer stay.
-    pub fn update_oidc_provider(&self, id: &str, label: &str, client_id: &str, link_by_email: bool, trust_email: bool) -> anyhow::Result<bool> {
+    pub fn update_oidc_provider(&self, p: &OidcProviderRow) -> anyhow::Result<bool> {
         let n = self.with(|c| {
             c.execute(
-                "UPDATE oidc_providers SET label = ?2, client_id = ?3, link_by_email = ?4, trust_email = ?5 WHERE org_id = ?6 AND id = ?1",
-                params![id, label, client_id, link_by_email, trust_email, DEFAULT_ORG],
+                "UPDATE oidc_providers SET label = ?2, client_id = ?3, link_by_email = ?4, trust_email = ?5, allow_unverified_admin = ?6 WHERE org_id = ?7 AND id = ?1",
+                params![p.id, p.label, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, DEFAULT_ORG],
             )
         })?;
         Ok(n == 1)
@@ -125,7 +127,7 @@ mod tests {
     use crate::authz::Role;
 
     fn provider(id: &str, issuer: &str) -> OidcProviderRow {
-        OidcProviderRow { id: id.into(), label: "L".into(), issuer: issuer.into(), client_id: "c".into(), link_by_email: false, trust_email: true }
+        OidcProviderRow { id: id.into(), label: "L".into(), issuer: issuer.into(), client_id: "c".into(), link_by_email: false, trust_email: true, allow_unverified_admin: false }
     }
 
     #[test]
@@ -150,8 +152,9 @@ mod tests {
         assert!(!s.create_oidc_provider(&provider("b", "https://a.example.com")).unwrap(), "the issuer is taken");
         assert_eq!(s.oidc_provider_rows().unwrap(), [a]);
 
-        assert!(s.update_oidc_provider("a", "New", "c2", true, false).unwrap());
-        assert!(!s.update_oidc_provider("gone", "New", "c2", true, false).unwrap());
+        let changed = OidcProviderRow { label: "New".into(), client_id: "c2".into(), link_by_email: true, trust_email: false, ..provider("a", "https://ignored.example.com") };
+        assert!(s.update_oidc_provider(&changed).unwrap());
+        assert!(!s.update_oidc_provider(&OidcProviderRow { id: "gone".into(), ..changed }).unwrap());
         let row = s.oidc_provider_rows().unwrap().remove(0);
         assert_eq!((row.label.as_str(), row.client_id.as_str(), row.link_by_email, row.trust_email), ("New", "c2", true, false));
         assert_eq!(row.issuer, "https://a.example.com", "the issuer stays");
@@ -167,6 +170,25 @@ mod tests {
         assert_eq!(s.sign_in_rules().unwrap(), rules);
         s.set_sign_in_rules(&SignInRules::default()).unwrap();
         assert_eq!(s.sign_in_rules().unwrap(), SignInRules::default());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A database from before `allow_unverified_admin` keeps its providers, none of them allowed.
+    #[test]
+    fn existing_providers_do_not_gain_new_powers() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            for m in &MIGRATIONS[..4] {
+                c.execute_batch(m).unwrap();
+            }
+            c.pragma_update(None, "user_version", 4).unwrap();
+            c.execute("INSERT INTO oidc_providers (id, label, issuer, client_id, trust_email, created_at) VALUES ('a', 'A', 'https://a.example.com', 'c', 1, 1)", []).unwrap();
+        }
+        let row = Store::open(&path).unwrap().oidc_provider_rows().unwrap().remove(0);
+        assert!(row.trust_email && !row.allow_unverified_admin);
         std::fs::remove_dir_all(dir).ok();
     }
 
