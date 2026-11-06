@@ -71,7 +71,7 @@ fn exactly(file: impl Read, size: u64) -> impl Read {
     file.take(size).chain(io::repeat(0)).take(size)
 }
 
-fn add<W: Write>(tar: &mut tar::Builder<W>, root: &Path, path: &Path, name: &Path) -> io::Result<()> {
+pub(super) fn add<W: Write>(tar: &mut tar::Builder<W>, root: &Path, path: &Path, name: &Path) -> io::Result<()> {
     let Ok(link) = std::fs::symlink_metadata(path) else { return Ok(()) };
     // Opened before the header is written: an unreadable file is skipped, not half-written.
     let Some(opened) = open_servable(root, path) else { return Ok(()) };
@@ -84,7 +84,14 @@ fn add<W: Write>(tar: &mut tar::Builder<W>, root: &Path, path: &Path, name: &Pat
         return Ok(());
     }
     tar.append_dir(name, &opened.path)?;
-    let Ok(rd) = opened.read_dir() else { return Ok(()) };
+    // The download is already under way, so this can only be skipped, and said here.
+    let rd = match opened.read_dir() {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!(path = %opened.path.display(), error = %e, "left a folder out of a download: could not read it");
+            return Ok(());
+        }
+    };
     let mut children: Vec<String> =
         rd.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| servable_name(n)).collect();
     children.sort();

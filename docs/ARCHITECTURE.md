@@ -262,11 +262,13 @@ a `//host` path cannot become an open redirect. The readiness probe works unchan
 The check can't be separated from the read. `open_servable` resolves the path, then opens the real
 path one component at a time from a descriptor of the root, with `O_NOFOLLOW` and `O_NONBLOCK`
 (`platform::open_beneath`): a component swapped for a symlink since the check makes the open fail,
-and a FIFO can't block it. Everything after that goes through the open handle. `ServeFile` and
-`read_dir` only take paths, so they get one that reaches the handle (`platform::handle_path`:
-`/proc/self/fd/N` on Linux, `/dev/fd/N` on macOS). Windows has no such path and no relative open
-in std, so there only the last component is protected (symlinks need privileges there). An archive
-entry is exactly the size in its header (`archive::exactly`): bytes appended while it's being read
+and a FIFO can't block it. File contents are read through the open handle: `ServeFile` only takes
+paths, so it gets one that reaches the handle (`platform::handle_path`: `/proc/self/fd/N` on Linux,
+`/dev/fd/N` on macOS). A folder is read by its path, because on macOS 15 it reads as empty through
+`/dev/fd`. That gives nothing away, since a listing shows an entry only if its own resolved path is
+inside the root, and a download opens each one with `open_servable`; a folder that can't be read
+answers 500, never an empty listing. Windows has no such path and no relative open in std, so there
+only the last component is protected (symlinks need privileges there). An archive entry is exactly the size in its header (`archive::exactly`): bytes appended while it's being read
 would otherwise be read as further entries.
 
 HTML, SVG and XML get `Content-Security-Policy: sandbox` without `allow-scripts` unless the tunnel

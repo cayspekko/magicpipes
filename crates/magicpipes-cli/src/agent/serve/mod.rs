@@ -172,7 +172,10 @@ async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
         return archive_response(&site.root, opened.path, &folder, names);
     }
     let path = opened.path.clone();
-    let (entries, omitted) = read_entries(&site.root, opened).await;
+    // Not an empty listing: that would say there's nothing here.
+    let Ok((entries, omitted)) = read_entries(&site.root, opened).await else {
+        return text(StatusCode::INTERNAL_SERVER_ERROR, "this folder can't be read right now\n");
+    };
     if has_flag(&query, "archive") {
         let names = entries.into_iter().map(|e| e.name).collect();
         return archive_response(&site.root, path, &folder, names);
@@ -264,15 +267,15 @@ fn attachment(name: &str) -> String {
 
 /// Servable entries of a directory, folders first, then by name. One blocking call for the whole
 /// listing, instead of a hand-off to another thread for each file system call.
-async fn read_entries(root: &Path, dir: Opened) -> (Vec<Entry>, usize) {
+async fn read_entries(root: &Path, dir: Opened) -> std::io::Result<(Vec<Entry>, usize)> {
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || list_entries(&root, &dir)).await.unwrap_or_default()
+    tokio::task::spawn_blocking(move || list_entries(&root, &dir)).await.unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
-fn list_entries(root: &Path, dir: &Opened) -> (Vec<Entry>, usize) {
+fn list_entries(root: &Path, dir: &Opened) -> std::io::Result<(Vec<Entry>, usize)> {
     let mut entries = Vec::new();
     let mut omitted = 0usize;
-    let Ok(rd) = dir.read_dir() else { return (entries, 0) };
+    let rd = dir.read_dir().inspect_err(|e| tracing::warn!(path = %dir.path.display(), error = %e, "could not list a served folder"))?;
     for e in rd.flatten() {
         let Ok(name) = e.file_name().into_string() else { continue };
         if !servable_name(&name) {
@@ -296,7 +299,7 @@ fn list_entries(root: &Path, dir: &Opened) -> (Vec<Entry>, usize) {
         entries.push(Entry { name, dir: meta.is_dir(), size: meta.len(), modified });
     }
     entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-    (entries, omitted)
+    Ok((entries, omitted))
 }
 
 /// Splits and percent-decodes a request path; `None` if any segment is not servable.
@@ -365,8 +368,11 @@ impl Opened {
         &self.file
     }
 
+    /// By path, not through the handle: on macOS 15 a directory reads as empty through `/dev/fd`.
+    /// That's as safe, because whoever uses an entry opens it with [`open_servable`] or checks it
+    /// with [`servable_path`], so a folder swapped for a link meanwhile can't show what's outside.
     pub fn read_dir(&self) -> std::io::Result<std::fs::ReadDir> {
-        std::fs::read_dir(self.handle())
+        std::fs::read_dir(&self.path)
     }
 }
 
@@ -542,6 +548,7 @@ mod tests {
         let outside = std::fs::canonicalize(&dir).unwrap();
         std::fs::create_dir_all(outside.join("elsewhere")).unwrap();
         std::fs::write(outside.join("elsewhere/b.txt"), "SECRET").unwrap();
+        std::fs::write(outside.join("elsewhere/only-outside.txt"), "SECRET").unwrap();
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let swapper = {
@@ -566,7 +573,7 @@ mod tests {
                 }
             })
         };
-        let mut served = 0;
+        let (mut served, mut listed, mut archived) = (0, 0, 0);
         for i in 0..4000 {
             let path = if i % 2 == 0 { real_file.clone() } else { real_sub.join("b.txt") };
             if let Some(opened) = open_servable(&root, &path)
@@ -575,11 +582,63 @@ mod tests {
                 assert_ne!(body, "SECRET", "read a file outside the root through {}", path.display());
                 served += 1;
             }
+            // A folder's listing and its download read it by path, and check every entry.
+            if i % 16 == 0 {
+                if let Some(opened) = open_servable(&root, &real_sub)
+                    && let Ok((entries, _)) = list_entries(&root, &opened)
+                {
+                    assert!(entries.iter().all(|e| e.name != "only-outside.txt"), "listed a file outside the root");
+                    listed += 1;
+                }
+                let mut tar = tar::Builder::new(Vec::new());
+                // It may stop when a name changes under it, which ends the download. It's what got
+                // in before that counts.
+                archived += usize::from(archive::add(&mut tar, &root, &real_sub, Path::new("sub")).is_ok());
+                let bytes = tar.into_inner().unwrap();
+                let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+                assert!(!contains(b"only-outside.txt") && !contains(b"SECRET"), "archived a file outside the root");
+            }
         }
         stop.store(true, Ordering::Relaxed);
         swapper.join().unwrap();
-        assert!(served > 0, "the checks don't simply refuse everything");
+        assert!(served > 0 && listed > 0 && archived > 0, "the checks don't simply refuse everything");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A folder is read by its path, so it can be swapped for a link between being opened and being
+    /// listed. Each entry's own check is what keeps that from showing anything outside.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_for_a_link_lists_nothing_from_outside() {
+        let dir = std::env::temp_dir().join(format!("mp-serve-{}", magicpipes_core::secret::random_string(8)));
+        let site = dir.join("site");
+        std::fs::create_dir_all(site.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::fs::write(dir.join("elsewhere/only-outside.txt"), "SECRET").unwrap();
+        let (root, outside) = (std::fs::canonicalize(&site).unwrap(), std::fs::canonicalize(dir.join("elsewhere")).unwrap());
+        let opened = open_servable(&root, &root.join("sub")).unwrap();
+
+        std::fs::rename(root.join("sub"), root.join("was-sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+
+        let (entries, omitted) = list_entries(&root, &opened).unwrap();
+        assert!(entries.is_empty() && omitted == 0, "{:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Not on Windows, where an open folder can't be removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cant_be_read_doesnt_look_empty() {
+        let dir = std::env::temp_dir().join(format!("mp-serve-{}", magicpipes_core::secret::random_string(8)));
+        let site = dir.join("site");
+        std::fs::create_dir_all(site.join("sub")).unwrap();
+        let root = std::fs::canonicalize(&site).unwrap();
+        let opened = open_servable(&root, &root.join("sub")).unwrap();
+        // Gone since it was opened: nothing can be said about what's in it.
+        std::fs::remove_dir(root.join("sub")).unwrap();
+        assert!(list_entries(&root, &opened).is_err(), "this mustn't read as a folder with nothing in it");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// A FIFO in a served folder neither blocks the server nor gets served.
