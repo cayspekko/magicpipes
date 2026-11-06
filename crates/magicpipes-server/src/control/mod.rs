@@ -90,6 +90,7 @@ const CERT_ORDER_WINDOW: Duration = Duration::from_secs(24 * 3600);
 struct TunnelRecord {
     row: TunnelRow,
     stats: Arc<RouteStats>,
+    version: u64,
 }
 
 impl State {
@@ -142,7 +143,7 @@ impl ControlPlane {
             {
                 tracing::warn!(tunnel = %row.name, port, "the tunnel's port is outside the [ports] range; it stays closed");
             }
-            state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default() });
+            state.tunnels.insert(row.id.clone(), TunnelRecord { row, stats: Arc::default(), version: 0 });
         }
         let file_providers = cfg
             .oidc
@@ -173,6 +174,11 @@ impl ControlPlane {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// See [`DataPlane::on_traffic_threads`].
+    pub fn on_traffic_threads<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.data.on_traffic_threads(f)
     }
 
     /// Starts certificate provisioning for known hostnames, the stale-session reaper and hourly
@@ -228,7 +234,7 @@ impl ControlPlane {
                 }
             };
             let access = AccessPolicy { allow, authz: st.tunnel_authz(t) };
-            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access });
+            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access, version: t.version });
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {
                     table.by_host.insert(t.row.hostname.clone(), route);

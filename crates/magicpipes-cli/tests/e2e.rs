@@ -1873,6 +1873,54 @@ async fn quiet_port_connections_can_be_closed() {
     assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the quiet connection was closed: {read:?}");
 }
 
+/// Management requests wait for the database on threads of their own, so a slow disk or a burst of
+/// writes doesn't hold up tunnels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stuck_database_does_not_hold_up_tunnels() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string(), "--public"]).await;
+    let host = hostname(t["public_url"].as_str().unwrap());
+    assert_eq!(env.get_public(&host, "/").await.0, StatusCode::OK);
+
+    // Another process holds the write lock, and more writers wait for it than the server has threads.
+    let db = rusqlite::Connection::open(env.root.join("server/magicpipes.db")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let admin = env.admin_token();
+    let writers = std::thread::available_parallelism().map_or(8, |n| n.get()).min(48) + 8;
+    let writes = futures_util::future::join_all(
+        (0..writers).map(|_| env.api_json("POST", "/api/v1/enrollments", Some(&admin), serde_json::json!({}))),
+    );
+    let traffic = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..5 {
+            let got = tokio::time::timeout(Duration::from_secs(2), env.get_public(&host, "/")).await;
+            assert_eq!(got.expect("tunnels keep answering").0, StatusCode::OK);
+        }
+        db.execute_batch("ROLLBACK").unwrap();
+    };
+    let (written, ()) = tokio::join!(writes, traffic);
+    for (status, body) in written {
+        assert_eq!(status, StatusCode::CREATED, "the writes finish once the database is free: {body}");
+    }
+}
+
+/// Connections to an application are kept for its tunnel's next requests, whatever happens to other
+/// tunnels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pooled_connections_outlast_changes_to_other_tunnels() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (app, other) = (common::http_app(release.clone()).await, common::http_app(release).await);
+    let t = add_json(&env, &[&app.port.to_string(), "--public", "--name", "web"]).await;
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let used = env.get_public(&host, "/conn").await.2;
+    add_json(&env, &[&other.port.to_string(), "--public", "--name", "other"]).await;
+    assert_eq!(env.get_public(&host, "/conn").await.2, used, "still the same connection");
+}
+
 /// Anyone who can choose their address at a trusted provider can use any address, so that alone
 /// doesn't reach an administrator's account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

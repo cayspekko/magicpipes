@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/magicpipes-core", "crates/magicpipes-server", "crates/magicpipes-cli"]
+members = ["crates/magicpipes-core", "crates/magicpipes-server", "crates/magicpipes-cli", "crates/magicpipes-bench"]
 
 [workspace.package]
 version = "0.1.1"
@@ -44,6 +44,7 @@ argon2 = "0.6"
 hmac = "0.13"
 getrandom = "0.4"
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false, features = ["secure"] }
 tower-http = { version = "0.7", default-features = false, features = ["fs"] }
 mime = "0.3"
 mime_guess = { version = "2", default-features = false }
@@ -53,4 +54,4 @@ time = { version = "0.3", features = ["formatting"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 portable-pty = "0.9"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }

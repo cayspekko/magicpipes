@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use magicpipes_core::mux::COPY_BUFFER;
 use magicpipes_core::proto::StreamStatus;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -116,7 +117,7 @@ where
         }
     };
     tokio::select! {
-        res = tokio::io::copy_bidirectional(&mut a, &mut b) => {
+        res = tokio::io::copy_bidirectional_with_sizes(&mut a, &mut b, COPY_BUFFER, COPY_BUFFER) => {
             if let Err(e) = res {
                 tracing::debug!(error = %e, "bridged connection ended");
             }

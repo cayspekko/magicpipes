@@ -89,6 +89,21 @@ fn http(name: &str) -> RegisterTunnel {
     }
 }
 
+/// A changed target retires the tunnel's pooled connections; nothing else does.
+#[tokio::test]
+async fn a_tunnels_version_follows_its_own_settings() {
+    let f = fixture();
+    let a = f.agent("a");
+    let t = f.cp.register(&a, &http("app")).unwrap();
+    let version = || f.data.lookup(&t.hostname).unwrap().version;
+    let before = version();
+    f.cp.register(&a, &http("app")).unwrap();
+    f.cp.register(&a, &http("other")).unwrap();
+    assert_eq!(version(), before, "the same settings, and another tunnel's");
+    f.cp.register(&a, &RegisterTunnel { target: "http://127.0.0.1:3001".into(), ..http("app") }).unwrap();
+    assert_ne!(version(), before, "a new target");
+}
+
 #[tokio::test]
 async fn agents_cannot_touch_each_others_tunnels() {
     let f = fixture();

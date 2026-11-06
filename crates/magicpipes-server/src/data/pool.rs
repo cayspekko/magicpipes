@@ -3,8 +3,9 @@
 //! Without them every request opens a stream, and the agent a TCP connection to the
 //! application, which costs a round trip and, under load, the agent's local ports (each closed
 //! connection waits a minute before its port is free again). A connection is reused only on the
-//! same agent session and route table generation it was opened on, so a re-registered target or
-//! a reconnected agent always gets fresh ones.
+//! same agent session and tunnel version ([`super::Route::version`]) it was opened on, so a changed
+//! target or a reconnected agent always gets fresh ones, while changes to other tunnels cost
+//! nothing.
 //!
 //! Bounded: at most [`MAX_IDLE_PER_TUNNEL`] per tunnel and [`MAX_IDLE`] in total, each for at
 //! most [`IDLE_TIMEOUT`]. Idle connections hold a place in their session's stream budget (not a
@@ -29,13 +30,13 @@ pub const MAX_IDLE: usize = 4096;
 struct Idle<B> {
     sender: SendRequest<B>,
     session: MuxHandle,
-    generation: u64,
+    version: u64,
     since: Instant,
 }
 
 impl<B> Idle<B> {
-    fn usable(&self, session: &MuxHandle, generation: u64) -> bool {
-        self.generation == generation
+    fn usable(&self, session: &MuxHandle, version: u64) -> bool {
+        self.version == version
             && self.session.same_session(session)
             && !self.session.is_closed()
             && self.since.elapsed() < IDLE_TIMEOUT
@@ -57,12 +58,12 @@ impl<B> Default for Pool<B> {
 impl<B> Pool<B> {
     /// A ready connection to `tunnel` on `session`, if one is idle. Stale ones met on the way
     /// are dropped, which closes them.
-    pub fn take(&self, tunnel: &str, session: &MuxHandle, generation: u64) -> Option<SendRequest<B>> {
+    pub fn take(&self, tunnel: &str, session: &MuxHandle, version: u64) -> Option<SendRequest<B>> {
         let mut idle = self.idle.lock().unwrap();
         let list = idle.get_mut(tunnel)?;
         let found = loop {
             match list.pop() {
-                Some(c) if c.usable(session, generation) => break Some(c.sender),
+                Some(c) if c.usable(session, version) => break Some(c.sender),
                 Some(_) => {}
                 None => break None,
             }
@@ -74,14 +75,14 @@ impl<B> Pool<B> {
     }
 
     /// Keeps a connection for the next request, unless the pool is full.
-    pub fn put(&self, tunnel: &str, session: MuxHandle, generation: u64, sender: SendRequest<B>) {
+    pub fn put(&self, tunnel: &str, session: MuxHandle, version: u64, sender: SendRequest<B>) {
         let mut idle = self.idle.lock().unwrap();
         let total: usize = idle.values().map(Vec::len).sum();
         let list = idle.entry(tunnel.to_string()).or_default();
         if total >= MAX_IDLE || list.len() >= MAX_IDLE_PER_TUNNEL {
             return;
         }
-        list.push(Idle { sender, session, generation, since: Instant::now() });
+        list.push(Idle { sender, session, version, since: Instant::now() });
     }
 
     /// Closes the oldest idle connection on `session`, to free its stream for another request.
@@ -145,18 +146,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuse_stays_on_its_session_and_generation() {
+    async fn reuse_stays_on_its_session_and_version() {
         let pool = Pool::default();
         let ((s1, _p1), (s2, _p2)) = (session(), session());
         let mut peers = Vec::new();
-        let mut put = |tunnel: &str, s: &MuxHandle, generation: u64, c: (SendRequest<Empty<Bytes>>, DuplexStream)| {
+        let mut put = |tunnel: &str, s: &MuxHandle, version: u64, c: (SendRequest<Empty<Bytes>>, DuplexStream)| {
             peers.push(c.1);
-            pool.put(tunnel, s.clone(), generation, c.0);
+            pool.put(tunnel, s.clone(), version, c.0);
         };
         put("tn_a", &s1, 1, connection().await);
         assert!(pool.take("tn_a", &s2, 1).is_none(), "another session (a reconnected agent)");
         put("tn_a", &s1, 1, connection().await);
-        assert!(pool.take("tn_a", &s1, 2).is_none(), "another route generation (a changed target)");
+        assert!(pool.take("tn_a", &s1, 2).is_none(), "another version of the tunnel (a changed target)");
         put("tn_a", &s1, 1, connection().await);
         assert!(pool.take("tn_b", &s1, 1).is_none(), "another tunnel");
         assert!(pool.take("tn_a", &s1, 1).is_some());

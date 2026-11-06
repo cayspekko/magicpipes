@@ -535,12 +535,14 @@ pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
         let mut accepted = 0u64;
+        // Stopping the app closes its connections too, as stopping a real one does.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             let Ok((tcp, _)) = listener.accept().await else { return };
             accepted += 1;
             let conn = accepted;
             let release = release.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let release = release.clone();
                     async move {

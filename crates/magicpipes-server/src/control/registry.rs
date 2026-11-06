@@ -165,6 +165,7 @@ impl ControlPlane {
             if settings(&t.row) != settings(&row) {
                 self.store.update_tunnel(&row).map_err(internal)?;
                 t.row = row.clone();
+                t.version += 1;
                 self.publish(&st);
             }
             if row.kind.is_http() {
@@ -238,7 +239,7 @@ impl ControlPlane {
         if new_cert {
             st.cert_orders.entry(agent_id.to_string()).or_default().push(Instant::now());
         }
-        st.tunnels.insert(row.id.clone(), TunnelRecord { row: row.clone(), stats: Arc::default() });
+        st.tunnels.insert(row.id.clone(), TunnelRecord { row: row.clone(), stats: Arc::default(), version: 0 });
         self.publish(&st);
         let access = row.tags.iter().filter(|t| st.dir.grants_access(t)).cloned().collect();
         drop(st);

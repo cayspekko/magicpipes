@@ -3,7 +3,8 @@
 //! yamux's `Connection` must be polled continuously (inbound polling drives all I/O), so a
 //! single driver task owns it. Other tasks open outbound streams through [`MuxHandle::open`]
 //! and receive inbound streams from the returned channel. Every stream is flow-controlled by
-//! yamux (256 KiB initial window, auto-tuned), which gives per-stream backpressure.
+//! yamux (256 KiB initial window, auto-tuned), which gives per-stream backpressure. Frames
+//! reach the connection in batches ([`Batched`]).
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -11,7 +12,7 @@ use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -65,6 +66,18 @@ pub const MAX_DATA_STREAMS: usize = 224;
 pub const MAX_DATA_STREAMS_PER_CLIENT: usize = 64;
 /// Inbound streams buffered before new ones are refused.
 const INBOUND_QUEUE: usize = 64;
+/// Bytes of frames collected for one write to the connection, per session.
+const WRITE_BATCH: usize = 64 * 1024;
+/// Per direction, for copying between a stream and a socket: yamux and TLS both move up to 16 KiB
+/// at a time, so a buffer of a few of those takes one system call and one wake-up to fill where
+/// the default 8 KiB takes several. A connection holds a stream, so this is bounded with them.
+pub const COPY_BUFFER: usize = 64 * 1024;
+/// How much unsent data the kernel keeps for a session's connection (`TCP_NOTSENT_LOWAT`). Every
+/// stream shares that queue, and by itself it grows to megabytes: on a slow link, seconds of a
+/// download that a page's next request has to wait behind. Kept here instead, data waits per
+/// stream, so what gets sent next is still undecided. In-flight data isn't limited by this, so it
+/// costs no throughput; on a fast link it was measured to make no difference.
+pub const SEND_QUEUE: u32 = 128 * 1024;
 
 type OpenReply = oneshot::Sender<io::Result<MuxStream>>;
 
@@ -202,6 +215,84 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "tunnel session closed")
 }
 
+/// Collects yamux's writes so that they reach the connection together.
+///
+/// yamux writes each frame's header and body separately and flushes after every frame, which over
+/// TLS means two records and two system calls per frame. But it reads from the connection only once
+/// it has nothing more to send, so that is when this writes what it has collected. A full batch
+/// goes out at once, which bounds both the memory and how long a frame can wait.
+struct Batched<T> {
+    io: T,
+    batch: Vec<u8>,
+    /// How much of `batch` the connection has taken.
+    written: usize,
+    /// There is something the peer may not have been sent yet: in `batch`, or inside `io`.
+    unsent: bool,
+}
+
+impl<T> Batched<T> {
+    fn new(io: T) -> Self {
+        Self { io, batch: Vec::with_capacity(WRITE_BATCH), written: 0, unsent: false }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> Batched<T> {
+    /// Hands the batch to the connection and flushes it. While this is pending, the caller's waker
+    /// is registered for when the connection can take more.
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.written < self.batch.len() {
+            let n = ready!(Pin::new(&mut self.io).poll_write(cx, &self.batch[self.written..]))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.written += n;
+        }
+        self.batch.clear();
+        self.written = 0;
+        ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        self.unsent = false;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for Batched<T> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // If this is pending the driver is woken when it can go on, and reads meanwhile: the peer
+        // may be waiting for us to read before it can read what we send.
+        if this.unsent
+            && let Poll::Ready(Err(e)) = this.poll_send(cx)
+        {
+            return Poll::Ready(Err(e));
+        }
+        Pin::new(&mut this.io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Batched<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.batch.len() >= WRITE_BATCH {
+            ready!(this.poll_send(cx))?;
+        }
+        let n = data.len().min(WRITE_BATCH - this.batch.len());
+        this.batch.extend_from_slice(&data[..n]);
+        this.unsent = true;
+        Poll::Ready(Ok(n))
+    }
+
+    /// yamux flushes after every frame; the batch goes out when it next reads.
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_send(cx))?;
+        Pin::new(&mut this.io).poll_shutdown(cx)
+    }
+}
+
 fn config() -> yamux::Config {
     let mut cfg = yamux::Config::default();
     cfg.set_max_connection_receive_window(Some(MAX_STREAMS * 256 * 1024 * 2));
@@ -215,7 +306,7 @@ pub fn spawn<T>(io: T, mode: Mode) -> (MuxHandle, mpsc::Receiver<MuxStream>)
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let mut conn = yamux::Connection::new(io.compat(), config(), mode);
+    let mut conn = yamux::Connection::new(Batched::new(io).compat(), config(), mode);
     let (open_tx, mut open_rx) = mpsc::channel::<OpenReply>(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let token = CancellationToken::new();
@@ -295,6 +386,137 @@ mod tests {
 
         client.close();
         tokio::time::timeout(Duration::from_secs(5), server.closed()).await.unwrap();
+    }
+
+    /// Counts the writes that reach the connection.
+    struct Counted {
+        io: tokio::io::DuplexStream,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for Counted {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Counted {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Pin::new(&mut this.io).poll_write(cx, data)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(20);
+
+    #[tokio::test]
+    async fn frames_share_a_write_and_a_lone_frame_still_goes_out() {
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = spawn(Counted { io: a, writes: writes.clone() }, Mode::Client);
+        let (_server, mut server_in) = spawn(b, Mode::Server);
+
+        // Nothing follows this frame, and nobody writes anything back: it has to go out by itself.
+        let mut s = client.open(WAIT).await.unwrap();
+        s.write_all(b"hello").await.unwrap();
+        let mut r = tokio::time::timeout(WAIT, server_in.recv()).await.unwrap().unwrap();
+        let mut got = [0u8; 5];
+        tokio::time::timeout(WAIT, r.read_exact(&mut got)).await.unwrap().unwrap();
+        assert_eq!(&got, b"hello");
+
+        // Queued together, these go out together: yamux makes a header and a body write of each.
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            streams.push(client.open(WAIT).await.unwrap());
+        }
+        let before = writes.load(std::sync::atomic::Ordering::Relaxed);
+        for s in &mut streams {
+            s.write_all(&[7u8; 1000]).await.unwrap();
+        }
+        for _ in 0..8 {
+            let mut r = tokio::time::timeout(WAIT, server_in.recv()).await.unwrap().unwrap();
+            let mut got = [0u8; 1000];
+            tokio::time::timeout(WAIT, r.read_exact(&mut got)).await.unwrap().unwrap();
+        }
+        let used = writes.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(used < 16, "{used} writes for 8 frames");
+    }
+
+    /// Both sides send more than the connection holds, on many streams at once, so each has to keep
+    /// reading while its own batch waits to go out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sending_both_ways_over_a_small_pipe_never_stalls() {
+        const STREAMS: usize = 8;
+        const BYTES: usize = 4 << 20;
+        let (a, b) = tokio::io::duplex(1024);
+        let (client, mut client_in) = spawn(a, Mode::Client);
+        let (server, mut server_in) = spawn(b, Mode::Server);
+        // Sends `BYTES` of a pattern and reads the same back, checking each byte.
+        async fn exchange(mut s: MuxStream) {
+            let (mut read, mut write) = tokio::io::split(&mut s);
+            let send = async {
+                let block: Vec<u8> = (0..4099).map(|i| (i % 251) as u8).collect();
+                let mut left = BYTES;
+                while left > 0 {
+                    let n = left.min(block.len());
+                    write.write_all(&block[..n]).await.unwrap();
+                    left -= n;
+                }
+                write.shutdown().await.unwrap();
+            };
+            let receive = async {
+                let mut seen = 0usize;
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = read.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    for (i, b) in buf[..n].iter().enumerate() {
+                        assert_eq!(*b, (((seen + i) % 4099) % 251) as u8, "byte {}", seen + i);
+                    }
+                    seen += n;
+                }
+                assert_eq!(seen, BYTES);
+            };
+            tokio::join!(send, receive);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..STREAMS {
+            let (c, s) = (client.open(WAIT).await.unwrap(), server.open(WAIT).await.unwrap());
+            tasks.spawn(exchange(c));
+            tasks.spawn(exchange(s));
+        }
+        for _ in 0..STREAMS {
+            tasks.spawn(exchange(tokio::time::timeout(WAIT, server_in.recv()).await.unwrap().unwrap()));
+            tasks.spawn(exchange(tokio::time::timeout(WAIT, client_in.recv()).await.unwrap().unwrap()));
+        }
+        while let Some(done) = tokio::time::timeout(WAIT, tasks.join_next()).await.expect("the session stalled") {
+            done.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn what_is_batched_goes_out_before_the_connection_closes() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = spawn(a, Mode::Client);
+        let (server, mut server_in) = spawn(b, Mode::Server);
+        let mut s = client.open(WAIT).await.unwrap();
+        s.write_all(b"last words").await.unwrap();
+        s.shutdown().await.unwrap();
+        client.close();
+        let mut r = tokio::time::timeout(WAIT, server_in.recv()).await.unwrap().unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(WAIT, r.read_to_end(&mut got)).await.unwrap().unwrap();
+        assert_eq!(got, b"last words");
+        tokio::time::timeout(WAIT, server.closed()).await.unwrap();
     }
 
     #[test]

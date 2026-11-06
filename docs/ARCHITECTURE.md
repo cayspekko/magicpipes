@@ -26,6 +26,7 @@ streams *inside* the session the agent established.
 | ACME | instant-acme 0.8 | Low-level async ACME client: lets us control which hostnames get ordered, report per-hostname readiness and back off on failure. `rustls-acme` manages a fixed domain list, which does not fit tunnels being created at runtime. |
 | Management API/UI | axum 0.8 | Same hyper stack; server-rendered HTML, no frontend build. |
 | Persistence | rusqlite (bundled SQLite) | One file, no service; used only by the control plane. |
+| Allocator (server, static Linux builds) | mimalloc, `secure` | musl's allocator takes a global lock; see "Threads and memory". |
 | CLI | clap 4 | |
 
 ### Why not Pingora
@@ -58,9 +59,10 @@ connections:
 * A connection returns to the pool once its response has been read to the end; a response cut
   short, an error or a timeout closes it instead. hyper decides whether the connection can carry
   another request (`SendRequest::ready`), so `Connection: close` from the application is honored.
-* A pooled connection is reused only for the same tunnel, on the same agent session and route
-  table generation, so a reconnected agent, a re-registered target or any publish starts over.
-  Local settings the server never sees (a static site's `--no-list`) end the agent's HTTP and
+* A pooled connection is reused only for the same tunnel, on the same agent session and tunnel
+  version (`Route::version`, bumped when the tunnel's settings change), so a reconnected agent or
+  a re-registered target starts over, while changes to other tunnels cost nothing. Local settings
+  the server never sees (a static site's `--no-list`) end the agent's HTTP and
   static-file streams for that tunnel (`Entry::ended`), so the server's next request opens a
   fresh one rather than reaching the old settings.
 * If the application closed an idle connection just as it was taken, hyper hands the request
@@ -113,12 +115,96 @@ connections:
 * Per-route counters (`RouteStats`, atomics) are written by the data plane and read by the
   control plane for status display.
 
-A slow database write or UI render holds only the control-plane mutex. Established streams hold
-their own yamux stream and are not affected by later route changes.
+A slow database write or UI render holds only control-plane threads (see "Threads and memory").
+Established streams hold their own yamux stream and are not affected by later route changes.
 
 The agent is split the same way: `agent/session.rs` (control: connect, authenticate, ping,
 reconnect, RPCs, restoring registrations) and `agent/forward.rs` (data: stream header, connect
 to local target, bidirectional copy). `agent/ops.rs` sits on top of both.
+
+## Threads and memory
+
+The server has two Tokio runtimes (`main.rs`), because the control plane blocks: SQLite (with a
+5 s busy timeout and, by default, an fsync per commit), the registry mutex, building route tables.
+
+* **Traffic threads** (one per core) own every socket: listeners, TLS, public connections,
+  management connections, and each agent's yamux session. Nothing on them waits on the database.
+* **Control threads** (`CONTROL_THREADS`, 2) run management handlers, agent RPCs, certificate work
+  and the control plane's timers. Writes go one at a time anyway, so more threads wouldn't speed
+  them up, and they would compete with traffic for processor time.
+* The crossings are few. `mgmt::serve_mgmt` runs each management request's handler on the control
+  threads while its connection stays on the traffic threads. Control-plane code that creates
+  something for the data plane (a port's listener, an agent's session) goes through
+  `on_traffic_threads`, because a Tokio socket belongs to the runtime it was created on and a
+  spawned task stays on it. A socket on the control threads would stop moving whenever they block.
+
+Measured with 2 traffic threads, 1000 tunnels and 8 clients changing a tag in a loop, a tunnel on
+Linux went from 696 to 67,600 requests a second, and from 23 ms to 0.2 ms at the median. Before
+this split, a stuck database stopped all tunnels (`a_stuck_database_does_not_hold_up_tunnels`).
+
+SQLite stays at `synchronous = FULL`: losing the last commits to a power failure could bring back
+a revoked token, and with commits off the traffic threads their cost no longer reaches tunnels.
+
+An agent's session is one TCP connection shared by all its streams, and three things decide how
+well it carries them (`magicpipes-core/src/mux.rs`):
+
+* **Batched writes** (`Batched`, 64 KiB per session). yamux writes a frame's header and body
+  separately and flushes after each frame, which over TLS is two records and two system calls per
+  frame. Frames are collected instead, and go out when yamux reads next, which it does only once it
+  has nothing more to send. A full batch goes out at once.
+* **64 KiB copy buffers** (`COPY_BUFFER`, per direction, so 128 KiB per bridged or forwarded
+  connection instead of 16; at most about 29 MB per session on each end at 224 streams).
+* **A limit on the kernel's send queue** (`SEND_QUEUE`, `TCP_NOTSENT_LOWAT`, 128 KiB; Linux on both
+  ends, and macOS agents). Unlimited, it grows to about 4 MB, which on a slow link is seconds of a
+  download that every other request on the session has to wait behind.
+
+The server's static Linux builds use mimalloc rather than musl's allocator, which takes a global
+lock around every allocation. In `secure` mode (guard pages and encoded free lists, since this
+process faces the internet and holds C code; about 2% slower than without). It's musl only:
+macOS's allocator measured the same, and it isn't for the agent, whose memory after load went from
+6 MB to 130–460 MB with it, because the blocking threads of a static site's traffic leave their
+heaps behind. On the server it costs memory too: about 30 MB idle instead of 10, and up to about
+100 MB kept after heavy load instead of 10.
+
+Measured on a 4-core Linux VM holding the client, server, agent and application, with static musl
+binaries, so these numbers are only relative. [`scripts/bench`](../scripts/bench/README.md) repeats
+these measurements. The last two rows shape the agent's connection with
+`netem`, as a home or office uplink would:
+
+| | Before | After |
+|---|---|---|
+| Small requests, 16 at once | 57,900/s | 74,700/s |
+| Small requests, 150 at once | 78,300/s | 117,200/s |
+| 64 KiB responses, 16 at once | 540 MB/s | 846 MB/s |
+| One download | 834 MB/s | 1,264 MB/s |
+| Two downloads, with small requests alongside at a median of 2 ms in both | 720 MB/s | 1,243 MB/s |
+| Small request during a download, 100 Mbit/s, 20 ms round trip, median | about 290 ms | about 195 ms |
+| Small request during a download, 20 Mbit/s, 30 ms round trip, median | about 750 ms | about 365 ms |
+
+Downloads on those two links ran at the same speed before and after. What remains of the wait there
+is the link's own queue, which a server can't shorten.
+
+Measured, and not worth doing:
+
+* LTO with one codegen unit: no change in throughput on macOS, though binaries are 23% smaller.
+* A 64 KiB `BufReader` under TLS (slightly worse), TLS session resumption (about 7% on new
+  connections) and fewer allocations in the proxy (they barely register in a profile).
+* Batches or copy buffers under 64 KiB: they move less, and don't shorten a small request's wait
+  during a download.
+* A different `SEND_QUEUE`: anything from 32 to 256 KiB behaved the same.
+* `sendfile`: impossible through TLS and yamux.
+
+Known costs, left as they are for now:
+
+* `publish` is linear in tunnels and users (6.8 ms at 10,000 tunnels), and a reconnecting agent
+  publishes once per registration.
+* A request over the stream budget gets a 503 at once, rather than waiting briefly for a stream.
+* Static files hand off to the blocking pool for each read (`ServeFile`): about 20,000 small files
+  a second on that VM, against 75,000 proxied requests.
+* The UI refetches `ui.js` on every page and has no compression or pagination, which starts to
+  matter at thousands of tunnels (9 MB and 46 ms for the home page at 10,000).
+* No HTTP/2 toward browsers, so they open several connections.
+* A 64 KiB yamux frame size gave about 18% more on a Mac, and hasn't been measured on Linux.
 
 ## Settings: the file, the database and the generated copy
 
@@ -463,7 +549,7 @@ a connection to the public port that must arrive back at the agent (a warning, n
   64 KiB control frames and IPC lines (5 s to send one), ≤256 concurrent streams per agent
   session of which public traffic may use 224 (64 streams or in-flight requests per client;
   idle pooled HTTP connections count toward the 224, see "Upstream connection reuse"), so pings and RPCs always get
-  through; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
+  through; one 64 KiB write batch per session and 64 KiB copy buffers per direction per connection; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
   concurrent ACME orders, per-hostname failure backoff (renewals included); at most 8 archive
   downloads at once per agent, each dropped after 30 s without reading or, after its first 30 s,
   when it averages under 16 KiB/s; at most 5000 names in a selection. Upgraded (WebSocket)

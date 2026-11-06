@@ -197,6 +197,10 @@ pub async fn serve<F, S, B>(
             },
         };
         let _ = tcp.set_nodelay(true);
+        // For agents' sessions, see `SEND_QUEUE`. A public client's connection has one request at a
+        // time, but it has no use for megabytes of kernel memory for a slow reader either.
+        #[cfg(target_os = "linux")]
+        let _ = socket2::SockRef::from(&tcp).set_tcp_notsent_lowat(magicpipes_core::mux::SEND_QUEUE);
         let make_service = make_service.clone();
         let tls = tls.clone();
         let shutdown = shutdown.clone();

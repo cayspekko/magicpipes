@@ -8,6 +8,7 @@ changing behavior, and [docs/ROADMAP.md](docs/ROADMAP.md) before adding a featur
 crates/magicpipes-core     wire protocol (proto.rs), yamux helpers, secrets, names, CIDR, theme
 crates/magicpipes-server   magicpipesd: control/ (registry), data/ (proxy, ports), certs/, mgmt/, gateway.rs, store.rs
 crates/magicpipes-cli      magicpipes: CLI (main.rs), client.rs, ipc.rs, platform.rs, agent/ (session, forward, ops, serve, shell, udp)
+crates/magicpipes-bench    load generator and test application for scripts/bench; never shipped
 ```
 
 ## Before you say a change is done
@@ -28,6 +29,8 @@ cargo deny check
   `browser_signs_in_to_private_tunnels` (headless Chrome via `scripts/browser-sign-in.mjs`;
   needs Chrome and Node 22+). The other e2e tests use a plain HTTP client, which applies neither
   CSP nor cookie rules.
+- Changes to the data path (`data/`, `listen.rs`, `mux.rs`, `agent/forward.rs`, `agent/serve/`):
+  also measure before and after with `scripts/bench`, as "Performance rules" describes.
 - The code is hand-formatted at roughly 120 columns. Do not run `cargo fmt` over whole files; it
   rewrites hundreds of lines. Match the surrounding style instead.
 - CI (`.github/workflows/ci.yml`) runs the three commands above plus a Windows clippy check.
@@ -46,7 +49,9 @@ change and say why.
 - **Data plane vs control plane** (server). `data/` reads an immutable `Arc<RouteTable>` snapshot
   and never touches SQLite, the API or the registry mutex. `control/` validates, persists, then
   publishes a whole new `RouteTable` (`DataPlane::publish`), which is the only interface between
-  them. No database or ACME work on the request path. The agent mirrors this:
+  them. No database or ACME work on the request path. They also run on separate Tokio runtimes:
+  control-plane code that creates a socket or task for the data plane goes through
+  `on_traffic_threads`. The agent mirrors this:
   `agent/session.rs` (control), `agent/forward.rs` (data), `agent/ops.rs` on top.
 - **One RPC per yamux stream**: a length-prefixed JSON `Request`, one `Response`. Server-opened
   streams start with a `ServerOpen` frame and a status byte.
@@ -128,6 +133,50 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   `ignore`, a git or non-crates.io source, or a TLS stack other than rustls+ring is a policy
   change the owner must approve. Prefer the standard library or an existing dependency to a new
   crate.
+
+## Performance rules
+
+Everyone's tunnels share these threads, queues and connections, so slow code here is a bug in
+someone else's traffic too. "Threads and memory" in ARCHITECTURE.md has the reasoning and numbers,
+what has already been tried, and the costs left in place on purpose.
+
+- **Nothing on the traffic threads waits.** No SQLite, registry mutex, file I/O or long CPU work in
+  `data/`, the listeners or a session's driver. A lock there is brief and never held across an
+  `.await`. Blocking work belongs on the control threads. In the agent, give a blocking job one
+  `spawn_blocking`, not a `tokio::fs` call per step: each call is a hand-off to another thread.
+- **A change to one tunnel costs the others nothing.** Anything later requests rely on is scoped to
+  its tunnel (`Route::version`), not global. `publish` rebuilds the whole table under the registry
+  lock, so a change publishes once, not once per item.
+- **Limits match what can be in flight.** A pool or cache smaller than its peak throws away what it
+  is about to need, and performance collapses instead of degrading: with 32 idle connections for
+  224 possible streams, 150 requests in flight got 82 req/s, and 48,900 once the two matched. Test
+  above a new limit, not just below it.
+- **Data moves in large pieces.** Copy between a stream and a socket with
+  `copy_bidirectional_with_sizes` and `COPY_BUFFER`, never the 8 KiB default. Write one message in
+  one call, since over TLS each write is a record and a system call. `mux::spawn` already batches a
+  session's writes, so don't wrap a session in another buffer.
+- **Sockets are set up on purpose.** Every TCP socket gets `set_nodelay(true)`, and every connection
+  that can carry a session gets `SEND_QUEUE`.
+- **A session is one queue.** All of an agent's streams share one TCP connection, so bytes queued
+  below yamux delay everyone's next request. Data waits per stream, where flow control applies.
+- **The agent stays small.** It is a background process on someone else's machine: about 6 MB on
+  Linux, and back there after load. The server may spend bounded memory for speed; the agent may
+  not. Judge an allocator or a cache on memory after load and after idling, as well as on speed.
+- **Durability isn't traded for speed.** SQLite stays at `synchronous = FULL`: a lost commit can
+  bring back a revoked token, and traffic doesn't wait for commits anyway.
+- **Measure data-path changes in release builds**, with `scripts/bench` (see its README), and report
+  what got worse as well as better:
+  - On static Linux too, not only macOS. musl's allocator was the biggest bottleneck on Linux, and
+    a Mac doesn't have it.
+  - Alternating builds (A, B, A, B, at least three rounds). Single runs vary by 10–20%.
+  - More than throughput: small-request latency during a download, memory after load and after
+    idling, and for anything touching a session, a shaped link (`netem`). Loopback hides queues.
+- **Keep the gain with a test that needs no clock**: count writes, hold a lock, compare connection
+  numbers (`frames_share_a_write_and_a_lone_frame_still_goes_out`,
+  `a_stuck_database_does_not_hold_up_tunnels`, `pooled_connections_outlast_changes_to_other_tunnels`).
+  Never assert a throughput number in a test.
+- **No optimization without a measurement.** If a change doesn't show up in the numbers, the simpler
+  code stays.
 
 ## Documentation
 

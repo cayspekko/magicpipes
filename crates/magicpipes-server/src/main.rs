@@ -1,5 +1,10 @@
 //! `magicpipesd` — the MagicPipes public server.
 
+// See "Threads and memory" in docs/ARCHITECTURE.md for why this, and why only here.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod authz;
 mod certs;
 mod config;
@@ -99,7 +104,13 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Run => {
             let cfg = Config::load(&cli.config)?;
-            tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run(cfg))
+            let control = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(CONTROL_THREADS)
+                .thread_name("mp-control")
+                .enable_all()
+                .build()?;
+            let traffic = tokio::runtime::Builder::new_multi_thread().thread_name("mp-traffic").enable_all().build()?;
+            traffic.block_on(run(cfg, control.handle().clone()))
         }
     }
 }
@@ -189,7 +200,13 @@ fn read(p: &Path) -> anyhow::Result<Vec<u8>> {
     std::fs::read(p).with_context(|| format!("reading {}", p.display()))
 }
 
-async fn run(cfg: Config) -> anyhow::Result<()> {
+/// Threads for the control plane, which blocks on SQLite and the registry lock. Its writes go one
+/// at a time anyway, so more would only take processor time from traffic, which has the rest.
+const CONTROL_THREADS: usize = 2;
+
+/// Runs on the traffic threads, which carry listeners and connections. What the control plane
+/// starts (handlers, certificate orders, timers) runs on `control_rt` instead.
+async fn run(cfg: Config, control_rt: tokio::runtime::Handle) -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
     let store = open_store(&cfg)?;
     bootstrap_admin(&cfg, &store)?;
@@ -201,8 +218,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let signer = tunnel_auth::Signer::load_or_create(&cfg.data_dir)?;
     let data = DataPlane::new(ProxySettings::from_config(&cfg, signer), shutdown.clone());
-    let control = ControlPlane::new(cfg.clone(), store, certs.clone(), data.clone())?;
-    let mgmt_resolver = management_resolver(&cfg, &certs)?;
+    let (control, mgmt_resolver) = {
+        let _control_rt = control_rt.enter();
+        (ControlPlane::new(cfg.clone(), store, certs.clone(), data.clone())?, management_resolver(&cfg, &certs)?)
+    };
 
     let public_https = bind(cfg.public.https_listen, "public HTTPS").await?;
     let public_http = match cfg.public.http_listen {
@@ -213,8 +232,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let tracker = TaskTracker::new();
 
-    control.start(shutdown.clone());
-    certs.spawn_renewal(shutdown.clone());
+    {
+        let _control_rt = control_rt.enter();
+        control.start(shutdown.clone());
+        certs.spawn_renewal(shutdown.clone());
+    }
 
     let public_acceptor = TlsAcceptor::from(certs::server_config(certs.resolver()));
     let mgmt_acceptor = TlsAcceptor::from(certs::server_config(mgmt_resolver));
@@ -250,7 +272,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(l) = public_http {
         tasks.spawn(data::ingress::serve_http(l, certs.challenges(), cfg.url_port(), shutdown.clone(), tracker.clone()));
     }
-    tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), shutdown.clone(), tracker.clone()));
+    tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), control_rt, shutdown.clone(), tracker.clone()));
 
     wait_for_signal().await;
     tracing::info!("shutting down");

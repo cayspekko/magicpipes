@@ -35,7 +35,7 @@ use hyper::service::service_fn;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tower::ServiceExt;
 
 use crate::control::ControlPlane;
@@ -213,6 +213,7 @@ pub async fn serve_mgmt(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     control: Arc<ControlPlane>,
+    control_rt: tokio::runtime::Handle,
     shutdown: CancellationToken,
     tracker: TaskTracker,
 ) {
@@ -233,12 +234,23 @@ pub async fn serve_mgmt(
         let app = app.clone();
         let peer = conn.peer;
         let trusted = trusted.clone();
+        let control_rt = control_rt.clone();
         service_fn(move |mut req: http::Request<Incoming>| {
             let client = trusted.client_ip(peer.ip(), req.headers());
             req.extensions_mut().insert(PeerAddr(peer));
             req.extensions_mut().insert(ClientIp(client));
-            let app = app.clone();
-            async move { Ok::<_, Infallible>(app.oneshot(req).await.unwrap_or_else(|e| match e {})) }
+            // The connection stays on the traffic threads, with every agent's session. Handlers
+            // block on the database, so they run on the control plane's threads.
+            let handler = AbortOnDropHandle::new(control_rt.spawn(app.clone().oneshot(req)));
+            async move {
+                Ok::<_, Infallible>(match handler.await {
+                    Ok(resp) => resp.unwrap_or_else(|e| match e {}),
+                    Err(e) => {
+                        tracing::error!(error = %e, "a management request failed");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                })
+            }
         })
     })
     .await

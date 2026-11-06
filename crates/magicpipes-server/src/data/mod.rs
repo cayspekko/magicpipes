@@ -44,6 +44,8 @@ pub struct Route {
     pub session: Option<MuxHandle>,
     pub stats: Arc<RouteStats>,
     pub access: AccessPolicy,
+    /// Changes with the tunnel's settings, which retires its pooled connections.
+    pub version: u64,
 }
 
 /// Who may use a route: the client's network first, then [`authz::authorize`]. The one check
@@ -177,10 +179,14 @@ pub struct DataPlane {
     used_codes: Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
     /// Idle HTTP connections to agents, for the next request to the same tunnel.
     pool: pool::Pool<proxy::Progress<hyper::body::Incoming>>,
+    /// The threads that carry traffic. `None` only in unit tests without a runtime.
+    traffic: Option<tokio::runtime::Handle>,
 }
 
 impl DataPlane {
+    /// Call on the threads that are to carry traffic.
     pub fn new(settings: ProxySettings, shutdown: CancellationToken) -> Arc<Self> {
+        let traffic = tokio::runtime::Handle::try_current().ok();
         let dp = Arc::new_cyclic(|me| Self {
             routes: RwLock::new(Arc::new(RouteTable::default())),
             tcp_permits: Arc::new(Semaphore::new(settings.ports.max_connections)),
@@ -192,10 +198,11 @@ impl DataPlane {
             generation: watch::Sender::new(0),
             used_codes: Mutex::default(),
             pool: pool::Pool::default(),
+            traffic,
         });
         // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in
         // unit tests, nothing is pooled anyway.)
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        if let Some(rt) = &dp.traffic {
             let (me, stop) = (Arc::downgrade(&dp), dp.shutdown.clone());
             rt.spawn(async move {
                 let mut tick = tokio::time::interval(pool::IDLE_TIMEOUT / 2);
@@ -215,6 +222,13 @@ impl DataPlane {
 
     pub fn signer(&self) -> &Signer {
         &self.settings.signer
+    }
+
+    /// Runs `f` so that what it spawns or binds belongs to the traffic threads, wherever this is
+    /// called from: the control plane opens ports and starts agents' sessions.
+    pub fn on_traffic_threads<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _traffic = self.traffic.as_ref().map(tokio::runtime::Handle::enter);
+        f()
     }
 
     fn table(&self) -> Arc<RouteTable> {
@@ -318,7 +332,7 @@ impl DataPlane {
         }
         let me = self.me.upgrade().ok_or_else(|| std::io::Error::other("server is shutting down"))?;
         let stop = self.shutdown.child_token();
-        ports::listen(me, kind, port, stop.clone())?;
+        self.on_traffic_threads(|| ports::listen(me, kind, port, stop.clone()))?;
         listeners.insert((kind, port), stop);
         tracing::info!(%kind, port, "port open");
         Ok(())

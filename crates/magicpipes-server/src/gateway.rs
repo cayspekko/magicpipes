@@ -63,7 +63,8 @@ async fn run_session(
     protocol: u32,
     io: TokioIo<hyper::upgrade::Upgraded>,
 ) {
-    let (handle, mut inbound) = mux::spawn(io, Mode::Server);
+    // All of this agent's traffic goes through the session; only its RPCs stay on this thread.
+    let (handle, mut inbound) = control.on_traffic_threads(|| mux::spawn(io, Mode::Server));
     let Some(conn_id) = control.attach_session(&agent_id, handle.clone(), peer, protocol) else {
         tracing::warn!(agent = %agent_id, %peer, "closing session of revoked agent");
         handle.close();

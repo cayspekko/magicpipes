@@ -369,8 +369,6 @@ impl Store {
 
     // ---- enrollment & agents --------------------------------------------------------------
 
-    /// Creates a single-use enrollment token; the agent enrolled with it gets `spec`'s owner,
-    /// tags and visibility settings.
     /// A user's machines, counting enrollment tokens that could still become one.
     pub fn machines_of(&self, user_id: &str) -> anyhow::Result<usize> {
         let n: i64 = self.with(|c| {
@@ -384,6 +382,8 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Creates a single-use enrollment token; the agent enrolled with it gets `spec`'s owner,
+    /// tags and visibility settings.
     pub fn create_enrollment(&self, ttl_secs: u64, spec: &EnrollmentSpec) -> anyhow::Result<String> {
         let token = secret::new_token("mpenr");
         let hash = secret::sha256_hex(&token);

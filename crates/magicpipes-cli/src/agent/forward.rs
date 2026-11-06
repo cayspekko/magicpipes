@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use magicpipes_core::mux::MuxStream;
+use magicpipes_core::mux::{COPY_BUFFER, MuxStream};
 use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -121,7 +121,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 if kind.is_http() { ended.cancelled().await } else { std::future::pending().await }
             };
             tokio::select! {
-                r = tokio::io::copy_bidirectional(&mut stream, &mut local) => {
+                r = tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut local, COPY_BUFFER, COPY_BUFFER) => {
                     if let Err(e) = r {
                         tracing::debug!(error = %e, "data stream ended");
                     }

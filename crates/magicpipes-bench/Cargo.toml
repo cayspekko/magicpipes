@@ -1,0 +1,24 @@
+[package]
+name = "magicpipes-bench"
+description = "Load generator and test application for scripts/bench; never shipped"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mp-bench-load"
+path = "src/bin/load.rs"
+
+[[bin]]
+name = "mp-bench-app"
+path = "src/bin/app.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true

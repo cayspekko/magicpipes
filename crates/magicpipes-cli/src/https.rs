@@ -59,6 +59,7 @@ pub async fn connect(host: &str, port: u16, tls: &Arc<ClientConfig>, addr: Optio
     .map_err(|_| anyhow!("timed out connecting to {host}:{port}"))?
     .with_context(|| format!("connecting to {host}:{port}"))?;
     let _ = tcp.set_nodelay(true);
+    crate::platform::limit_send_queue(&tcp, magicpipes_core::mux::SEND_QUEUE);
     let name = ServerName::try_from(host.to_string()).map_err(|_| anyhow!("invalid server name {host}"))?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TlsConnector::from(tls.clone()).connect(name, tcp))
         .await

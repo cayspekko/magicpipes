@@ -137,19 +137,19 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         (answer(&route, response_within(sender.send_request(req), uploading, timeout).await)?, None)
     } else {
         let used = session.client_use(client).ok_or_else(busy)?;
-        let generation = *dp.generation.borrow();
-        let (resp, sender) = send_shared(dp, &route, &session, generation, req, uploading).await?;
-        (resp, Some((sender, used, generation)))
+        let version = route.version;
+        let (resp, sender) = send_shared(dp, &route, &session, req, uploading).await?;
+        (resp, Some((sender, used, version)))
     };
     route.stats.record(Outcome::Ok);
     // Back to the pool once the response has been read to the end; a response cut short closes
     // the connection instead. The client's place is kept until then.
     let resp = match reuse {
-        Some((mut sender, used, generation)) => {
+        Some((mut sender, used, version)) => {
             let (dp, tunnel, session) = (dp.clone(), route.tunnel_id.clone(), session.clone());
             tokio::spawn(async move {
                 if sender.ready().await.is_ok() {
-                    dp.pool.put(&tunnel, session, generation, sender);
+                    dp.pool.put(&tunnel, session, version, sender);
                 }
             });
             resp.map(|inner| Holding { inner, _used: used }.boxed())
@@ -244,13 +244,12 @@ async fn send_shared(
     dp: &DataPlane,
     route: &Route,
     session: &MuxHandle,
-    generation: u64,
     req: Request<Progress<Incoming>>,
     uploading: tokio::sync::watch::Receiver<()>,
 ) -> Result<(Response<Incoming>, SendRequest<Progress<Incoming>>), Response<ProxyBody>> {
     let timeout = dp.settings.upstream_response_timeout;
     let mut req = req;
-    if let Some(mut sender) = dp.pool.take(&route.tunnel_id, session, generation) {
+    if let Some(mut sender) = dp.pool.take(&route.tunnel_id, session, route.version) {
         match response_within(sender.try_send_request(req), uploading.clone(), timeout).await {
             Some(Ok(resp)) => return Ok((resp, sender)),
             Some(Err(mut e)) => match e.take_message() {

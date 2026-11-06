@@ -791,6 +791,15 @@ cargo clippy --workspace --all-targets
 scripts/smoke-test.sh target/release   # quick end-to-end check of built binaries
 ```
 
+To measure a change against a baseline, on macOS or Linux (see
+[`scripts/bench`](scripts/bench/README.md)):
+
+```bash
+scripts/bench/build.sh base origin/main
+scripts/bench/build.sh new
+scripts/bench/compare.sh base new
+```
+
 ### CI and releases
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) runs only when a GitHub

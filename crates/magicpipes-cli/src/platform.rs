@@ -339,3 +339,43 @@ mod windows_ipc {
 
     pub fn cleanup_ipc() {}
 }
+
+#[cfg(target_os = "linux")]
+const TCP_NOTSENT_LOWAT: libc::c_int = libc::TCP_NOTSENT_LOWAT;
+// <netinet/tcp.h>; the libc crate doesn't have it for macOS.
+#[cfg(target_os = "macos")]
+const TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
+
+/// Asks the kernel to keep at most `bytes` of this connection's data waiting to be sent, beyond
+/// what is on its way. An optimization: where it isn't available, the connection just queues more.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn limit_send_queue(tcp: &tokio::net::TcpStream, bytes: u32) {
+    use std::os::fd::AsRawFd;
+    let value = bytes as libc::c_int;
+    let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let (fd, ptr) = (tcp.as_raw_fd(), (&raw const value).cast());
+    if unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, TCP_NOTSENT_LOWAT, ptr, size) } != 0 {
+        tracing::debug!(error = %std::io::Error::last_os_error(), "could not limit a connection's send queue");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn limit_send_queue(_tcp: &tokio::net::TcpStream, _bytes: u32) {}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_connections_send_queue_can_be_limited() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        limit_send_queue(&tcp, 128 * 1024);
+        let (mut value, mut size) = (0 as libc::c_int, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        let (fd, ptr) = (tcp.as_raw_fd(), (&raw mut value).cast());
+        assert_eq!(unsafe { libc::getsockopt(fd, libc::IPPROTO_TCP, TCP_NOTSENT_LOWAT, ptr, &mut size) }, 0);
+        assert_eq!(value, 128 * 1024);
+    }
+}
