@@ -13,9 +13,8 @@ Verifying public endpoint...  ✓
 
 Tunnel ready
 
-  Public: https://bright-otter.t.example.com
+  URL:    https://bright-otter.t.example.com
   Local:  http://127.0.0.1:8080
-  Status: connected
 
 Tunnel active in background. Anyone with the URL can reach it.
 ```
@@ -157,7 +156,7 @@ magicpipesd --config ... admin-token       # create another admin token
 magicpipesd --config ... admin-token --rotate   # revoke all others, and their UI sessions
 ```
 
-Log in to the UI at `https://example.com:8443` with that token ("Use an admin token" on the
+Sign in to the UI at `https://example.com:8443` with that token ("Use an admin token" on the
 sign-in page). The admin token always works, whatever else is configured; keep it for
 emergencies.
 
@@ -376,17 +375,9 @@ with your tags (it has none of its own). Without a terminal, add `--browser` to 
 approval anyway.
 
 **With an enrollment token**: create a single-use token (valid 1 hour by default) on the server,
-or in the UI ("Enroll a machine"), or via `POST /api/v1/enrollments`. Administrators choose who
+on the UI's Machines page ("Enroll a machine"), or via `POST /api/v1/enrollments`. Administrators choose who
 the machine belongs to (nobody, for a *service agent*, which then gets tags of its own), and
 whether its tunnels may be public:
-
-```bash
-magicpipesd --config /etc/magicpipes/magicpipesd.toml enroll
-# magicpipes login --server https://example.com:8443 --token mpenr_...
-```
-
-Run the printed command on the application machine: (valid 1 hour by default) on the server, or in the UI
-("Create enrollment token"), or via `POST /api/v1/enrollments`:
 
 ```bash
 magicpipesd --config /etc/magicpipes/magicpipesd.toml enroll
@@ -401,7 +392,8 @@ magicpipes login --server https://example.com:8443 --token mpenr_...
 
 Either way, the enrollment token is exchanged for a long-lived **agent credential** stored in
 `~/.magicpipes/config.json` (mode 0600). The server stores only a SHA-256 hash of it. To keep the
-token out of shell history, pass it as `MAGICPIPES_TOKEN` or type it at the prompt. For a
+token out of shell history and away from other programs on the machine, use `--token-file <file>`,
+pass it as `MAGICPIPES_TOKEN` or type it at the prompt. For a
 `dev-ca` server, add `--ca-cert path/to/ca.crt`.
 
 To revoke a machine (lost laptop, leaked credential), click **Revoke** next to the agent in the
@@ -497,7 +489,7 @@ much like miniserve. The agent serves the files itself, so no local port is open
 $ magicpipes add --serve ./dist --name docs
 Checking directory...         ✓
 ...
-  Public: https://docs.t.example.com
+  URL:    https://docs.t.example.com
   Serving: /home/me/project/dist
 ```
 
@@ -546,7 +538,7 @@ terminal resizes with the window.
 $ magicpipes add --shell --name top -- htop
 Checking program...           ✓
 ...
-  Public: https://top.t.example.com
+  URL:    https://top.t.example.com
   Shell:  htop (read-only)
   In:     /home/me/project
 ```
@@ -590,9 +582,8 @@ Verifying public endpoint...  ✓
 
 Tunnel ready
 
-  Public: tcp://example.com:65507
+  URL:    tcp://example.com:65507
   Local:  tcp://127.0.0.1:5432
-  Status: connected
 ```
 
 ```bash

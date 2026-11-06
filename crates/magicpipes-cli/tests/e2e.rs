@@ -40,7 +40,7 @@ async fn http_websocket_and_lifecycle() {
     let out = env.cli_ok(&["add", &app.port.to_string()]).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stdout.contains("Tunnel ready"), "{stdout}");
+    assert!(stdout.contains("Tunnel ready") && stdout.contains("  URL:    https://") && !stdout.contains("Status:"), "{stdout}");
     assert!(stderr.contains("Verifying public endpoint...  ✓"), "{stderr}");
     let agent_pid = env.agent_pid().expect("agent running after CLI exit");
 
@@ -899,6 +899,15 @@ async fn certificate_failure_is_reported() {
         env.cli_json(&["status", "--json"]).await["agent"]["running"] == false
     })
     .await;
+
+    // A tunnel kept anyway: the list, which only mentions certificates in trouble, says so.
+    env.cli_ok(&["add", &app.port.to_string(), "--no-verify", "--name", "kept"]).await;
+    let admin = admin_session(&env).await;
+    env.eventually("the list shows the failed certificate", Duration::from_secs(30), || async {
+        let home = env.ui("/", Some(&admin), None).await.html;
+        home.contains(">certificate failed</span>") && home.contains(r##"<a href="#tunnels">1 certificate failed</a>"##)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -999,8 +1008,8 @@ async fn user_accounts() {
     // Members get their account and machines, not the administration pages.
     let account = env.ui("/account", Some(&cookie2), None).await;
     assert!(account.status == 200 && account.html.contains("ann@example.com"), "{}", account.html);
-    let home = env.ui("/", Some(&cookie2), None).await;
-    assert!(home.status == 200 && !home.html.contains("Create enrollment token"), "members see their machines, not the administration");
+    let machines = env.ui("/machines", Some(&cookie2), None).await;
+    assert!(machines.status == 200 && !machines.html.contains("Create enrollment token"), "members see their machines, not the administration");
     assert_eq!(env.ui("/users", Some(&cookie2), None).await.location.as_deref(), Some("/account"));
 
     // An API token acts as its user, with the user's role.
@@ -1120,7 +1129,7 @@ async fn browser_login_enrolls_your_machine() {
     let personal = env.api("GET", &format!("/api/v1/users/{ann}"), Some(&admin)).await.1["personal_tag"].as_str().unwrap().to_string();
     assert_eq!(laptop["tags"], serde_json::json!(["team:dev", personal]));
     assert_eq!(laptop["default_private"], true);
-    let mine = env.ui("/", Some(&cookie), None).await;
+    let mine = env.ui("/machines", Some(&cookie), None).await;
     assert!(mine.status == 200 && mine.html.contains("laptop"), "members see their own machines");
 
     // Denying works too, and the waiting CLI says so.
@@ -1183,7 +1192,7 @@ async fn tag_forms_apply_only_what_changed() {
     env.api_json("PATCH", &format!("/api/v1/users/{ann}"), Some(&admin), serde_json::json!({ "tags": ["env:prod", "team:dev"] })).await;
     let csrf = users.csrf();
     let saved = env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "team:dev"), ("tags", "team:dev team:ops")])).await;
-    assert_eq!(saved.location.as_deref(), Some("/users"));
+    assert_eq!(saved.location.as_deref(), Some("/users?done=tags-saved"));
     assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["env:prod", "team:dev", "team:ops"]));
     // Checkboxes from the page: everything unchecked but one.
     env.ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "env:prod team:dev team:ops"), ("tag", "team:ops")])).await;
@@ -1198,7 +1207,7 @@ async fn tag_forms_apply_only_what_changed() {
     let made = env
         .ui(&format!("/users/{ann}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "team:ops"), ("tags", "team:ops team:qa"), ("create", "team:qa")]))
         .await;
-    assert_eq!(made.location.as_deref(), Some("/users"), "{}", made.html);
+    assert_eq!(made.location.as_deref(), Some("/users?done=tags-saved"), "{}", made.html);
     assert_eq!(tags_of(ann.clone()).await, serde_json::json!(["team:ops", "team:qa"]));
     let (_, v) = env.api("GET", "/api/v1/tags", Some(&admin)).await;
     assert!(v["tags"].as_array().unwrap().iter().any(|t| t["name"] == "team:qa"));
@@ -1209,8 +1218,8 @@ async fn tag_forms_apply_only_what_changed() {
     // Agents work the same way.
     let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
     let agent = v["agents"][0]["id"].as_str().unwrap().to_string();
-    let index = env.ui("/", Some(&cookie), None).await;
-    assert!(index.html.contains(&format!(r#"href="/agents/{agent}/tags" aria-label="Edit tags of"#)), "{}", index.html);
+    let machines = env.ui("/machines", Some(&cookie), None).await;
+    assert!(machines.html.contains(&format!(r#"href="/agents/{agent}/tags" aria-label="Edit tags of"#)), "{}", machines.html);
     env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", ""), ("tags", "team:dev env:prod")])).await;
     env.ui(&format!("/agents/{agent}/tags"), Some(&cookie), Some(&[("csrf", &csrf), ("base", "env:prod team:dev"), ("tags", "team:dev")])).await;
     let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
@@ -1219,7 +1228,7 @@ async fn tag_forms_apply_only_what_changed() {
     assert!(page.html.contains(r#"value="team:dev" checked"#) && page.html.contains(r#"value="team:ops">"#), "{}", page.html);
 
     // Enrollment tokens take checkboxes too.
-    assert!(index.html.contains(r#"fieldset class="tags" data-picker"#), "{}", index.html);
+    assert!(machines.html.contains(r#"fieldset class="tags" data-picker"#), "{}", machines.html);
     let made = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:ops"), ("allow_public", "on")])).await;
     assert!(made.status == StatusCode::OK && made.html.contains("--token"), "{}", made.html);
     let bad = env.ui("/enrollments", Some(&cookie), Some(&[("csrf", &csrf), ("owner", ""), ("tag", "team:nope")])).await;
@@ -1368,7 +1377,7 @@ async fn private_tunnels() {
     let pair_host = hostname(pair["public_url"].as_str().unwrap());
     assert!(open_private(&env, &pair_host, "/", &bob).await.is_ok() && open_private(&env, &pair_host, "/", &cy).await.is_err());
     let index = env.ui("/", Some(&ann), None).await;
-    assert!(index.html.contains(&format!(r#"<code title="{ann_tag}">you</code>"#)), "{}", index.html);
+    assert!(index.html.contains(&format!(r#"<code class="tag" title="{ann_tag}">you</code>"#)), "{}", index.html);
     // Icons go with the words, which are still there for anyone who can't see them.
     assert!(index.html.contains(r#"<span class="kind" title="Web app"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true">"#), "{}", index.html);
     assert!(index.html.contains(r#"<span class="status ok iconic"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true">"#) && index.html.contains("</svg>private</span>"), "{}", index.html);
@@ -1921,6 +1930,152 @@ async fn pooled_connections_outlast_changes_to_other_tunnels() {
     assert_eq!(env.get_public(&host, "/conn").await.2, used, "still the same connection");
 }
 
+/// After a change the page says what happened, and a form that fails comes back as it was typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ui_says_what_happened_and_keeps_what_you_typed() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = admin_session(&env).await;
+    let page = async |path: &str| env.ui(path, Some(&admin), None).await;
+    let csrf = page("/tags").await.csrf();
+
+    // A change redirects with a key, and only known keys ever put words on the page.
+    let made = env.ui("/tags", Some(&admin), Some(&[("csrf", &csrf), ("name", "team:dev"), ("access", "on")])).await;
+    assert_eq!(made.location.as_deref(), Some("/tags?done=tag-created"));
+    assert!(page("/tags?done=tag-created").await.html.contains(r#"role="status""#));
+    assert!(page("/tags?done=tag-created").await.html.contains("Tag created."));
+    let forged = page("/tags?done=%3Cscript%3E").await;
+    assert!(!forged.html.contains("class=\"done") && !forged.html.contains("%3Cscript"), "{}", forged.html);
+
+    // A failure keeps what was typed, names the field and says so in the title. A password never comes back.
+    let bad = env.ui("/tags", Some(&admin), Some(&[("csrf", &csrf), ("name", "NOT OK!"), ("description", "for the &team")])).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert!(bad.html.contains("<title>Error: Tags") && bad.html.contains(r#"value="NOT OK!" aria-invalid="true""#) && bad.html.contains(r#"value="for the &amp;team""#), "{}", bad.html);
+    assert!(bad.html.contains(r#"id="form-error""#) && !bad.html.contains("access\" value=\"on\" checked"), "the unchecked box stays unchecked: {}", bad.html);
+    let secret = "not-the-address-short";
+    let bad = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "nope"), ("display_name", "Ann"), ("role", "admin"), ("password", secret)])).await;
+    assert!(bad.status == StatusCode::BAD_REQUEST && bad.html.contains(r#"value="nope" aria-invalid="true""#) && bad.html.contains(r#"value="Ann""#), "{}", bad.html);
+    assert!(bad.html.contains(r#"value="admin" selected"#) && !bad.html.contains(secret), "{}", bad.html);
+    let bad = env.ui("/hostnames", Some(&admin), Some(&[("csrf", &csrf), ("hostname", "shop.example.com"), ("assign", "")])).await;
+    assert!(bad.status == StatusCode::BAD_REQUEST && bad.html.contains(r#"value="shop.example.com""#) && bad.html.contains(r#"name="assign" aria-invalid="true""#), "{}", bad.html);
+
+    // Removing what's already gone says so, instead of looking like it worked.
+    let gone = async || env.ui("/tags/delete", Some(&admin), Some(&[("csrf", &csrf), ("name", "team:dev")])).await;
+    assert_eq!(gone().await.location.as_deref(), Some("/tags?done=tag-deleted"));
+    let again = gone().await;
+    assert!(again.status == StatusCode::NOT_FOUND && again.html.contains("already gone") && again.html.contains(r#"role="alert""#), "{}", again.html);
+
+    // Where you are, in the words the page uses.
+    let tags = page("/tags").await;
+    assert!(tags.html.contains(r#"href="/tags" aria-current="page""#) && !tags.html.contains(r#"href="/users" aria-current"#), "{}", tags.html);
+    assert!(page("/settings/providers/new?type=oidc").await.html.contains(r#"href="/settings" aria-current="true""#));
+    assert!(!tags.html.contains("Log out") && tags.html.contains("Sign out"));
+
+    // Pages that used to be bare.
+    let missing = page("/no/such/page").await;
+    assert!(missing.status == StatusCode::NOT_FOUND && missing.html.contains("<h1>") && missing.html.contains("<title>Not found"), "{}", missing.html);
+    let (status, body) = env.api("GET", "/api/v1/nope", None).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("not_found")));
+    let expired = env.ui("/tags", Some(&admin), Some(&[("csrf", "stale"), ("name", "team:x")])).await;
+    assert!(expired.status == StatusCode::FORBIDDEN && expired.html.contains("expired"), "{}", expired.html);
+
+    // The script can be kept, because its address changes with it.
+    let script = tags.html.split(r#"<script src=""#).nth(1).and_then(|s| s.split('"').next()).expect("a script").to_string();
+    assert!(script.starts_with("/ui.js?v="), "{script}");
+    let get = Request::get(&script).header(header::HOST, format!("localhost:{}", env.mgmt_port)).body(Full::new(Bytes::new())).unwrap();
+    let resp = env.send("localhost", env.mgmt_port, get).await;
+    assert!(resp.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"));
+}
+
+/// A tunnel's row shows a few tags, so that many can't push the rest of the list off the page, and
+/// its own page shows them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tunnels_list_keeps_to_a_few_tags() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let admin = env.admin_token();
+    let names = ["team:a", "team:b", "team:c", "team:d", "team:e", "team:f"];
+    for name in names {
+        env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": name, "access": true })).await;
+    }
+    let (_, agents) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent = agents["agents"][0]["id"].as_str().unwrap().to_string();
+    env.api_json("PATCH", &format!("/api/v1/agents/{agent}"), Some(&admin), serde_json::json!({ "tags": names })).await;
+
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let port = app.port.to_string();
+    let add = async |name: &str, tags: &[&str]| {
+        let mut args = vec![port.as_str(), "--name", name];
+        for tag in tags {
+            args.extend(["--tag", tag]);
+        }
+        add_json(&env, &args).await["id"].as_str().unwrap().to_string()
+    };
+    add("four", &names[..4]).await;
+    let many = add("many", &names).await;
+
+    let cookie = admin_session(&env).await;
+    let home = env.ui("/", Some(&cookie), None).await.html;
+    let row = |name: &str| {
+        let at = home.find(&format!(">{name}</a>")).unwrap_or_else(|| panic!("{name} is listed: {home}"));
+        home[at..].split("</tr>").next().unwrap().to_string()
+    };
+    let chips = |html: &str| html.matches(r#"<code class="tag""#).count();
+    assert!(!row("four").contains(">ready<"), "a certificate that's fine isn't worth a word in the list: {}", row("four"));
+    assert!(chips(&row("four")) == 4 && !row("four").contains("more"), "{}", row("four"));
+    assert_eq!(chips(&row("many")), 3, "{}", row("many"));
+    assert!(row("many").contains(&format!(r#"href="/tunnels/{many}""#)) && row("many").contains("+3 more</a>"), "{}", row("many"));
+    assert!(row("many").contains(r#"title="team:d, team:e, team:f""#) && row("many").contains(r#"aria-label="All 6 tags of many""#), "{}", row("many"));
+
+    let page = env.ui(&format!("/tunnels/{many}"), Some(&cookie), None).await.html;
+    assert!(chips(&page) == 6 && !page.contains("+3 more"), "{page}");
+
+    let machines = env.ui("/machines", Some(&cookie), None).await.html;
+    assert_eq!(chips(&machines), 6, "editing a machine's tags needs to see them all: {machines}");
+}
+
+/// The home page answers "is everything OK?", and from nothing shows the way to a working tunnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_home_page_says_how_things_are() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = admin_session(&env).await;
+    let home = async || env.ui("/", Some(&admin), None).await.html;
+    let first = home().await;
+    assert!(first.contains("Get started") && first.contains("/machines") && !first.contains(r#"class="stats""#), "{first}");
+
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    add_json(&env, &[&app.port.to_string(), "--public", "--name", "web"]).await;
+    let healthy = home().await;
+    assert!(healthy.contains("Your tunnel is healthy") && !healthy.contains("Get started"), "{healthy}");
+    assert!(env.ui("/machines", Some(&admin), None).await.html.contains("test-agent"), "machines have a page of their own");
+
+    // The CLI's list says who can open it, and lines up however long a target is.
+    let list = String::from_utf8(env.cli_ok(&["list"]).await.stdout).unwrap();
+    let mut lines = list.lines();
+    let (head, row) = (lines.next().unwrap(), lines.next().unwrap());
+    assert!(head.contains("ACCESS") && row.contains("public"), "{list}");
+    assert_eq!(head.find("ACCESS"), row.find("public"), "{list}");
+
+    env.cli_ok(&["agent", "stop"]).await;
+    env.eventually("the home page notices", Duration::from_secs(10), || async {
+        home().await.contains(r#"<a href="/machines">1 machine offline</a>"#)
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enrollment_token_can_come_from_a_file() {
+    let env = Env::new(Tls::DevCa).await;
+    let file = env.root.join("token");
+    std::fs::write(&file, format!("{}\n", env.enrollment_token())).unwrap();
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token-file", &file.to_string_lossy(), "--ca-cert", &ca, "--name", "from-a-file"]).await;
+    let admin = env.admin_token();
+    let (_, agents) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    assert_eq!(agents["agents"][0]["name"], "from-a-file");
+    let missing = env.cli(&["login", "--server", &url, "--token-file", "/no/such/file", "--json"]).await;
+    assert!(!missing.status.success() && String::from_utf8_lossy(&missing.stdout).contains("config_error"), "{missing:?}");
+}
+
 /// Anyone who can choose their address at a trusted provider can use any address, so that alone
 /// doesn't reach an administrator's account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2155,7 +2310,7 @@ async fn settings_page_adds_providers_without_a_restart() {
 
     // A discovery URL does as well as the issuer, and the button is there at once.
     let r = send("/settings/providers/new", post(&add(&format!("{}/.well-known/openid-configuration", idp.issuer), "Fake ID", &csrf))).await;
-    assert_eq!((r.status, r.location.as_deref()), (StatusCode::SEE_OTHER, Some("/settings")), "{}", r.html);
+    assert_eq!((r.status, r.location.as_deref()), (StatusCode::SEE_OTHER, Some("/settings?done=provider-added")), "{}", r.html);
     assert!(env.ui("/login", None, None).await.html.contains(r#"href="/auth/oidc/oidc""#));
     let r = send("/settings/providers/new", post(&add(&idp.issuer, "Again", &csrf))).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "the same id and issuer again: {}", r.html);

@@ -239,7 +239,7 @@ Every change below takes effect on the next request through the published snapsh
 | Delete a rule | Every user who got a tag only through that rule loses it |
 | Delete a tag | Cascades to every user, agent, enrollment token, rule and tunnel; a tunnel left without a tag that grants access is reachable by nobody |
 | Disable a user or remove their membership | Sessions, API tokens and tunnel cookies are rejected. Their personal agents can't connect, and their tunnels are unpublished |
-| "Log out everywhere" | Bumps `sessions_valid_after`; every session and tunnel cookie issued before it is rejected |
+| "Sign out everywhere" | Bumps `sessions_valid_after`; every session and tunnel cookie issued before it is rejected |
 | Revoke an agent | As today, plus its tunnels' access rows |
 
 **Long-lived connections are re-checked too.** Each one carries its principal: WebSockets,

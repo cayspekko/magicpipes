@@ -1,3 +1,10 @@
+// A change's "done" message is about that moment: reloading the page shouldn't repeat it.
+if (new URLSearchParams(location.search).has('done')) {
+  const here = new URL(location.href);
+  here.searchParams.delete('done');
+  history.replaceState(null, '', here);
+}
+
 (() => {
   const COPY = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
   const DONE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
@@ -18,6 +25,11 @@
     t.remove();
     return ok;
   };
+  // Tells screen readers, which don't see the button change.
+  const said = document.createElement('span');
+  said.className = 'sr';
+  said.setAttribute('role', 'status');
+  document.body.appendChild(said);
   document.querySelectorAll('pre.term:not([data-nocopy])').forEach((pre) => {
     const box = document.createElement('div');
     box.className = 'codebox';
@@ -38,8 +50,9 @@
       btn.classList.add('done');
       btn.innerHTML = DONE;
       btn.title = 'Copied';
+      said.textContent = 'Copied';
       clearTimeout(timer);
-      timer = setTimeout(() => { btn.classList.remove('done'); btn.innerHTML = COPY; btn.title = 'Copy to clipboard'; }, 1600);
+      timer = setTimeout(() => { btn.classList.remove('done'); btn.innerHTML = COPY; btn.title = 'Copy to clipboard'; said.textContent = ''; }, 1600);
     });
     box.appendChild(btn);
   });
@@ -115,8 +128,9 @@
     ui.list.addEventListener('click', (e) => { const p = e.target.closest('.pill'); if (p) { toggle(p.dataset.n); update(); } });
     ui.tray.addEventListener('click', (e) => {
       const p = e.target.closest('.pill');
-      if (p) { cur.pending.delete(p.dataset.n); update(); }
-      if (e.target.closest('.tp-clear')) { cur.pending.clear(); update(); }
+      if (p) { cur.pending.delete(p.dataset.n); update(); ui.filter.focus(); }
+      // The button pressed is gone now, so focus has to go somewhere.
+      if (e.target.closest('.tp-clear')) { cur.pending.clear(); update(); ui.filter.focus(); }
     });
   };
 
@@ -220,9 +234,11 @@
       if (closes) {
         const these = removes.length === 1 ? 'this tag' : 'these tags';
         const tunnels = plural(closes, 'private tunnel', 'private tunnels');
-        ui.tray.append(make('p', 'tp-warn', cur.opts.reachKind === 'agent'
+        const warning = make('p', 'tp-warn', cur.opts.reachKind === 'agent'
           ? `Up to ${tunnels} of this machine stop admitting people through ${these}, at once.`
-          : `Removing ${these} ends access to up to ${tunnels} at once.`));
+          : `Removing ${these} ends access to up to ${tunnels} at once.`);
+        warning.setAttribute('role', 'alert');
+        ui.tray.append(warning);
       }
     }
     const parts = [];
@@ -318,7 +334,7 @@
       if (!shown.length) sum.append(make('span', 'sub', 'none'));
       for (const n of shown) {
         const s = !want.has(n) ? 'remove' : held.has(n) ? 'held' : 'add';
-        sum.append(make('code', `chip ${s}`, s === 'add' ? `+ ${n}` : s === 'remove' ? `− ${n}` : n));
+        sum.append(make('code', `tag chip ${s}`, s === 'add' ? `+ ${n}` : s === 'remove' ? `− ${n}` : n));
       }
       const btn = make('button', 'btn small', 'Choose tags');
       btn.type = 'button';
@@ -374,6 +390,8 @@
       d.querySelector('.menu-item')?.focus();
     });
     d.querySelector('.menu-list').addEventListener('click', (e) => { if (e.target.closest('.menu-item')) d.open = false; });
+    // Tabbing out closes it. Without a new target it's a click, which may be on one of its items.
+    d.addEventListener('focusout', (e) => { if (e.relatedTarget && !d.contains(e.relatedTarget)) d.open = false; });
   }
   document.addEventListener('click', (e) => { if (!e.target.closest('details.menu')) closeAll(); });
   document.addEventListener('keydown', (e) => {

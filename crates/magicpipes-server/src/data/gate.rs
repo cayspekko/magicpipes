@@ -265,8 +265,12 @@ fn own_page(content_type: &'static str, body: &'static str) -> Response<ProxyBod
 fn callback_page() -> Response<ProxyBody> {
     own_page(
         "text/html; charset=utf-8",
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Signing in…</title><script src="/.magicpipes/callback.js" defer></script></head>
-<body style="margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.55 ui-sans-serif,-apple-system,'Helvetica Neue',sans-serif"><main style="padding:24px 16px;max-width:30em"><p id="msg">Signing you in…</p><noscript><p>Signing in to a private tunnel needs JavaScript.</p></noscript></main></body></html>"#,
+        concat!(
+            r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Signing in…</title><script src="/.magicpipes/callback.js" defer></script><style>"#,
+            magicpipes_core::theme_palette!(),
+            r#"body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:16px/1.55 var(--sans)}main{padding:24px 16px;max-width:30em}</style></head>
+<body><main><p id="msg">Signing you in…</p><noscript><p>Signing in to a private tunnel needs JavaScript.</p></noscript></main></body></html>"#,
+        ),
     )
 }
 

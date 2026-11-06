@@ -167,7 +167,7 @@ pub fn render(p: &Page<'_>) -> String {
 <div class="card scroll"><table class="files">
 <thead><tr><th class="ck">{select_all}</th><th aria-sort="ascending"><button type="button" data-sort="name">Name</button></th><th class="num c-size"><button type="button" data-sort="size">Size</button></th><th class="c-mod"><button type="button" data-sort="mtime">Modified</button></th><th class="act"></th></tr></thead>
 <tbody>{rows}</tbody></table></div>{more}
-<div class="bar" id="bar"><span id="sel-info">Selected items</span><span class="actions"><button type="button" class="btn ghost small" id="clear">Clear</button><button class="btn small" type="submit"><svg class="ic" style="width:16px;height:16px;color:inherit"><use href="#i-download"/></svg>Download .tar.gz</button></span></div>
+<div class="bar" id="bar"><span id="sel-info" role="status">Selected items</span><span class="actions"><button type="button" class="btn ghost small" id="clear">Clear</button><button class="btn small" type="submit"><svg class="ic" style="width:16px;height:16px;color:inherit"><use href="#i-download"/></svg>Download .tar.gz</button></span></div>
 </form>
 </main>
 <footer class="foot">Shared with MagicPipes · read-only</footer>

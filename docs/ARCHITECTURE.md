@@ -201,10 +201,40 @@ Known costs, left as they are for now:
 * A request over the stream budget gets a 503 at once, rather than waiting briefly for a stream.
 * Static files hand off to the blocking pool for each read (`ServeFile`): about 20,000 small files
   a second on that VM, against 75,000 proxied requests.
-* The UI refetches `ui.js` on every page and has no compression or pagination, which starts to
-  matter at thousands of tunnels (9 MB and 46 ms for the home page at 10,000).
+* The UI has no compression or pagination, which starts to matter at thousands of tunnels (9 MB
+  and 46 ms for the home page at 10,000).
 * No HTTP/2 toward browsers, so they open several connections.
 * A 64 KiB yamux frame size gave about 18% more on a Mac, and hasn't been measured on Linux.
+
+## Management UI
+
+Server-rendered pages (`mgmt/`) with one small script, which only enhances them. The aims are that
+someone can always tell where they are, whether things are working, and what their last action did.
+
+* **Where you are:** the navigation marks the current section (`aria-current`).
+* **Whether things are working:** the home page leads with one line, such as "All 5 tunnels are
+  healthy" or "1 machine offline · 1 certificate failed". A machine with no tunnels isn't a problem
+  for being off. From nothing, it shows the three steps to a first tunnel instead.
+* **What just happened:** a change redirects to `?done=<key>`, and that page shows the key's fixed
+  message. Keys rather than text, so a link can't put words on the page; `ui.js` then drops it from
+  the address, so reloading doesn't repeat it. This keeps the redirect after a POST that makes
+  reloading safe, without a flash cookie to store.
+* **What went wrong:** a form that fails comes back with what was typed (never a password), the
+  message beside it, its field marked `aria-invalid` and focused, and "Error:" in the title.
+* **Before anything that can't be undone:** a question that names the effect. Native `confirm`, for
+  now, so without scripts these go ahead straight away.
+* **Tags** are small chips that wrap, in the shape the tag picker uses. A row of the Tunnels list
+  shows three and "+N more" (a person's own access first), since seven once pushed the rest of the
+  list off the page; the tunnel's page, Users and Machines show them all. To leave them room, the
+  list puts a tunnel's local target under its machine, and mentions its certificate only when it
+  isn't ready.
+* **Words:** a *machine* is what people enroll and see; the *agent* is its background process; a
+  *service agent* is a machine nobody owns. Tunnels and machines have a page each, like Tailscale's
+  Machines or Pangolin's sites and resources. `/agents/...` form addresses and the API keep their
+  names, since scripts rely on the API.
+
+`ui.js` is served with a digest in its address and cached for good, so moving between pages doesn't
+fetch it again, and a new version still arrives at once.
 
 ## Settings: the file, the database and the generated copy
 

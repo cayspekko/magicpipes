@@ -1,21 +1,37 @@
 //! The MagicPipes visual theme, shared by the management UI (`magicpipesd`) and the agent's
 //! built-in file server, so both look like one product.
 
+/// The colors and type, as one literal so that [`STYLE`] and pages built at compile time can both
+/// start with it. Text colors reach 4.5:1 against the backgrounds they sit on, and `--field` 3:1
+/// (WCAG 2.2, 1.4.3 and 1.4.11).
+#[macro_export]
+macro_rules! theme_palette {
+    () => {
+        r#"
+:root{--bg:#f6f4ef;--surface:#fffdf8;--hover:#f8f5ee;--ink:#1d1c1a;--ink-2:#4b4842;--muted:#6e6a62;--line:#e6e1d6;--line-2:#d6d0c3;--field:#8f897d;
+--accent:#b24a22;--ok:#35704a;--warn:#b0741c;--bad:#b23a2c;--term:#1d1c1a;--term-ink:#ece9e2;
+--serif:ui-serif,"New York","Iowan Old Style",Georgia,serif;--sans:ui-sans-serif,-apple-system,"Helvetica Neue","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#131312;--surface:#1a1a18;--hover:#1f1f1d;--ink:#ece9e2;--ink-2:#c3bfb6;--muted:#8e8a82;--line:#2a2927;--line-2:#3a3834;--field:#6f6b63;
+--accent:#ec7a4b;--ok:#7cc48e;--warn:#e2a954;--bad:#ef7a6b;--term:#0c0c0b;--term-ink:#ece9e2}}
+"#
+    };
+}
+
+/// Just the colors and type, for a page that needs no more.
+pub const PALETTE: &str = crate::theme_palette!();
+
 /// Warm paper and ink, one terracotta accent, serif display type over a sans body, hairlines
 /// instead of shadows. Inline-only: no web fonts or images, so pages work under a strict CSP.
-pub const STYLE: &str = r#"
-:root{--bg:#f6f4ef;--surface:#fffdf8;--hover:#f8f5ee;--ink:#1d1c1a;--ink-2:#4b4842;--muted:#7a766d;--line:#e6e1d6;--line-2:#d6d0c3;
---accent:#c2562b;--ok:#3f7d50;--warn:#b0741c;--bad:#b23a2c;--term:#1d1c1a;--term-ink:#ece9e2;
---serif:ui-serif,"New York","Iowan Old Style",Georgia,serif;--sans:ui-sans-serif,-apple-system,"Helvetica Neue","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
-@media (prefers-color-scheme:dark){:root{--bg:#131312;--surface:#1a1a18;--hover:#1f1f1d;--ink:#ece9e2;--ink-2:#c3bfb6;--muted:#8e8a82;--line:#2a2927;--line-2:#3a3834;
---accent:#ec7a4b;--ok:#7cc48e;--warn:#e2a954;--bad:#ef7a6b;--term:#0c0c0b;--term-ink:#ece9e2}}
-*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+pub const STYLE: &str = concat!(crate::theme_palette!(), r#"*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration-color:var(--line-2);text-underline-offset:3px}a:hover{color:var(--accent);text-decoration-color:currentColor}
 code{font:12.5px var(--mono);color:var(--ink-2)}
 .top{border-bottom:1px solid var(--line)}
 .top-in,main,.foot{width:100%;max-width:1080px;margin:0 auto;padding-left:24px;padding-right:24px}
-.top-in{display:flex;align-items:center;justify-content:space-between;gap:16px;height:64px}
+.top-in{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 16px;min-height:64px;padding-top:10px;padding-bottom:10px}
+.nav{display:flex;flex-wrap:wrap;align-items:center;gap:4px}.nav .btn{padding:9px 10px}
+.nav a[aria-current]{color:var(--ink);text-decoration:underline 1px var(--accent);text-underline-offset:6px}
+.nav .me{max-width:14em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0 4px 0 8px}
 .brand{display:flex;align-items:center;gap:10px;font:400 20px/1 var(--serif);letter-spacing:-.01em;text-decoration:none}
 .brand:hover{color:var(--ink)}
 .glyph{color:var(--ink)}.glyph .flow{stroke:var(--accent);stroke-dasharray:1.5 3.5}
@@ -41,12 +57,13 @@ h2{font:400 23px/1.2 var(--serif);letter-spacing:-.01em;margin:0}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
 .scroll{overflow-x:auto}
 table{width:100%;border-collapse:collapse}
-th{font-size:11px;font-weight:500;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);text-align:left;padding:13px 18px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:15px 18px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
+th{font-size:11px;font-weight:500;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);text-align:left;padding:13px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:15px 14px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
+th:first-child,td:first-child{padding-left:18px}th:last-child,td:last-child{padding-right:18px}
 tbody tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--hover)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 .name{font-weight:500;text-decoration:none}
-.sub{display:block;margin-top:2px;font:12.5px var(--mono);color:var(--muted);text-decoration:none}
+.sub{display:block;margin-top:4px;font:12.5px var(--mono);color:var(--muted);text-decoration:none}
 a.sub:hover{color:var(--accent)}
 .when{color:var(--muted);font-size:13.5px;font-variant-numeric:tabular-nums}
 .empty{padding:36px 20px;text-align:center;color:var(--muted)}
@@ -64,7 +81,7 @@ form{margin:0}
 .btn.danger:hover{border-color:var(--bad);background:color-mix(in srgb,var(--bad) 7%,var(--surface));color:var(--bad)}
 .btn.small{padding:7px 11px;font-size:12.5px}.btn.block{width:100%}
 .panel{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;padding:22px 24px}
-.panel h3{font:400 19px/1.25 var(--serif);margin:0 0 4px}.panel p{margin:0;color:var(--muted);max-width:56ch}
+.panel h2,.panel h3{font:400 19px/1.25 var(--serif);margin:0 0 4px}.panel p{margin:0;color:var(--muted);max-width:56ch}
 .panel.danger{border-color:color-mix(in srgb,var(--bad) 30%,var(--line))}
 .crumb{display:inline-flex;gap:6px;font-size:13.5px;color:var(--muted);text-decoration:none}
 dl{display:grid;grid-template-columns:200px 1fr;margin:0}
@@ -82,16 +99,25 @@ dl>:nth-last-child(-n+2){border-bottom:0}
 .auth .card{padding:30px 28px 26px}
 .card.form{padding:22px 24px 24px}
 label{display:block;font-size:13px;font-weight:500;color:var(--ink-2);margin:22px 0 8px}
-input:not([type]),input[type=text],input[type=email],input[type=password],input[type=search],select{width:100%;font:14px var(--sans);padding:12px 14px;border-radius:10px;border:1px solid var(--line-2);background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
-input[type=password]{font-family:var(--mono)}
-input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent)}
-input::placeholder{color:var(--muted)}
+input:not([type]),input[type=text],input[type=email],input[type=password],input[type=search],select,textarea{width:100%;font:14px var(--sans);padding:12px 14px;border-radius:10px;border:1px solid var(--field);background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
+input[type=password],textarea{font-family:var(--mono)}textarea{font-size:13px;line-height:1.5}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent)}
+input::placeholder,textarea::placeholder{color:var(--muted)}
+[aria-invalid=true]{border-color:var(--bad)}
 input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;margin:0 8px 0 0;vertical-align:-3px}
 label:has(input[type=checkbox]){font-weight:400;color:var(--ink);margin:14px 0 0}
 td input:not([type]),td input[type=text]{padding:7px 10px;font-size:13px;border-radius:8px}
 .alert{margin:0 0 20px;padding:11px 14px;border-radius:10px;font-size:13.5px;color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--bad) 25%,var(--line))}
+.done{margin:0 0 24px;padding:11px 14px;border-radius:10px;font-size:13.5px;color:var(--ok);background:color-mix(in srgb,var(--ok) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--ok) 25%,var(--line))}
+.health{margin:28px 0 0;font-size:15px}.health .status{font-size:15px;color:var(--ink)}.health a{margin-left:2px}
+.steps{margin:0;padding:0;list-style:none;counter-reset:step;display:grid;gap:28px}
+.steps li{counter-increment:step;display:grid;grid-template-columns:32px minmax(0,1fr);gap:0 8px}
+.steps li::before{content:counter(step);font:400 23px/1.2 var(--serif);color:var(--accent)}
+.steps p{margin:0}.steps .codebox,.steps pre.term{margin-top:12px}
+details.more{margin-top:14px}details.more>summary{cursor:pointer;font-size:13.5px;color:var(--ink-2)}details.more>div{margin-top:10px;max-width:62ch;color:var(--ink-2);font-size:14px}details.more p{margin:8px 0 0}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 @media (max-width:640px){.top-in,main,.foot{padding-left:16px;padding-right:16px}main{padding-top:32px}dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:2px}dd{padding-top:0}}
-"#;
+"#);
 
 /// The MagicPipes mark: two endpoints joined by a flowing line.
 pub const GLYPH: &str = r#"<svg class="glyph" width="26" height="14" viewBox="0 0 26 14" aria-hidden="true"><line class="flow" x1="6" y1="7" x2="20" y2="7" stroke-width="2.4" stroke-linecap="round"/><circle cx="4.5" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="21.5" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>"#;

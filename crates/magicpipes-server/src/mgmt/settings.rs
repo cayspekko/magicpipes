@@ -11,7 +11,7 @@ use super::AppState;
 use super::accounts::{admins_only, csrf};
 use super::icons::{BACK, DOWNLOAD};
 use super::oidc::redirect_uri;
-use super::ui::{CsrfForm, UiUser, alert, badge, esc, page};
+use super::ui::{CsrfForm, Done, UiUser, alert, badge, done, esc, failed, page, title_of};
 use crate::control::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 
 /// A kind of provider: all an administrator needs to know to add one. Only `issuer` matters to
@@ -107,8 +107,6 @@ impl Preset {
     }
 }
 
-const TEXTAREA: &str = "width:100%;box-sizing:border-box;font:13px/1.5 var(--mono,monospace);padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink)";
-
 fn option_chips(p: &ProviderView) -> String {
     let mut on = Vec::new();
     if p.trust_email {
@@ -172,17 +170,16 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
     };
     let config = app.control.generated_config(&user.who).unwrap_or_default();
     let body = format!(
-        r#"<div class="head"><div><div class="eyebrow">Administration</div><h1>Settings</h1>
-<p class="lede">Changes here take effect at once, without a restart. Listeners, domains and TLS stay in the configuration file, and are shown below.</p></div></div>
+        r#"<h1>Settings</h1><p class="lede">Changes here take effect at once; listeners, domains and TLS stay in the configuration file.</p>
 {err}<div class="section"><h2>Sign-in providers</h2></div>
 <div class="card scroll"><table><thead><tr><th>Provider</th><th>Options</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <p class="note">Try a new provider from a private window. If a sign-in fails, the server's log says why.</p>
 <p class="note" style="margin-top:18px">Add a provider:</p><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">{add}</div>
 <div class="section"><h2>Who can sign in</h2></div>
 <div class="card form"><form method="post" action="/settings/sign-in">{csrf}
-<label for="sa" style="margin-top:0">New administrators</label><textarea id="sa" name="bootstrap_admins" rows="3" style="{TEXTAREA}" placeholder="you@example.com" spellcheck="false">{admins}</textarea>
+<label for="sa" style="margin-top:0">New administrators</label><textarea id="sa" name="bootstrap_admins" rows="3" placeholder="you@example.com" spellcheck="false">{admins}</textarea>
 {locked_admins}<p class="note">One address per line. The first sign-in with one of these addresses creates an administrator's account.</p>
-<label for="sd">New members, by email domain</label><textarea id="sd" name="email_domains" rows="3" style="{TEXTAREA}" placeholder="example.com" spellcheck="false">{domains}</textarea>
+<label for="sd">New members, by email domain</label><textarea id="sd" name="email_domains" rows="3" placeholder="example.com" spellcheck="false">{domains}</textarea>
 {locked_domains}<p class="note">One domain per line, exact, no subdomains. Empty: nobody gets an account just for being at a provider.</p>
 <button class="btn primary" style="margin-top:14px">Save</button></form></div>
 <div class="section"><h2>Configuration in effect</h2></div>
@@ -240,7 +237,7 @@ pub async fn save_rules(user: UiUser, State(app): State<AppState>, Form(f): Form
         return r;
     }
     match app.control.set_sign_in_rules(&user.who, &f.bootstrap_admins, &f.email_domains) {
-        Ok(()) => Redirect::to("/settings").into_response(),
+        Ok(()) => done("/settings", Done::SignInSaved),
         Err(e) => (StatusCode::BAD_REQUEST, settings_page(&user, &app, Some(&e.message), Some((&f.bootstrap_admins, &f.email_domains)))).into_response(),
     }
 }
@@ -298,7 +295,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
         format!(r#"<label for="pp">{label}</label><input id="pp" name="part" placeholder="{placeholder}" value="{}" maxlength="200" required>"#, esc(typed.map_or("", |f| &f.part)))
     });
     let body = format!(
-        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow" style="margin-top:22px">Sign-in providers</div><h1>Add {name}</h1>
+        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow spaced">Sign-in providers</div><h1>Add {name}</h1>
 {err}<div class="section"><h2>1. Register this server there</h2></div>
 <div class="card form"><p style="margin-top:0">{steps}</p><label>Redirect URI</label><pre class="term">{redirect}</pre></div>
 <div class="section"><h2>2. Enter what it gave you</h2></div>
@@ -322,7 +319,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
         client_id = esc(typed.map_or("", |f| &f.client_id)),
         toggles = toggles(typed.is_some_and(|f| f.trust_email.is_some()), typed.is_some_and(|f| f.allow_unverified_admin.is_some()), typed.is_some_and(|f| f.link_by_email.is_some())),
     );
-    page(&format!("Add {}", p.name), Some(user), &body)
+    page(&title_of(&format!("Add {}", p.name), error.is_some()), Some(user), &body)
 }
 
 pub async fn new_provider(user: UiUser, State(app): State<AppState>, Query(q): Query<NewQuery>) -> Response {
@@ -361,19 +358,20 @@ pub async fn create_provider(user: UiUser, State(app): State<AppState>, Form(f):
         Err(m) => Err(m),
     };
     match added {
-        Ok(()) => Redirect::to("/settings").into_response(),
+        Ok(()) => done("/settings", Done::ProviderAdded),
         Err(m) => (StatusCode::BAD_REQUEST, new_provider_page(&user, &app, p, &f.id, Some(&f), Some(&m))).into_response(),
     }
 }
 
-fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, error: Option<&str>) -> Response {
+/// `typed`: what a form that came back said; a secret isn't sent back.
+fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, typed: Option<&ProviderForm>, error: Option<&str>) -> Response {
     let body = format!(
-        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow" style="margin-top:22px">Sign-in providers</div><h1>{label}</h1>
+        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow spaced">Sign-in providers</div><h1>{label}</h1>
 {err}<div class="card form"><label style="margin-top:0">Issuer</label><p><code>{issuer}</code></p><p class="note">To change it, remove this provider and add it again. People's accounts are tied to the issuer, so with a different one they sign in as new people.</p>
 <label>Redirect URI</label><pre class="term">{redirect}</pre></div>
 <div class="section"><h2>Change</h2></div>
 <div class="card form"><form method="post" action="/settings/providers/{id}">{csrf}
-<label for="pl" style="margin-top:0">Button on the sign-in page</label><input id="pl" name="label" value="{label}" maxlength="60" required>
+<label for="pl" style="margin-top:0">Button on the sign-in page</label><input id="pl" name="label" value="{typed_label}" maxlength="60" required>
 <label for="pc">Client ID</label><input id="pc" name="client_id" value="{client_id}" maxlength="512" autocomplete="off" required>
 <label for="ps">New client secret</label><input id="ps" type="password" name="client_secret" maxlength="4096" autocomplete="new-password">
 <p class="note">Leave it empty to keep the current one, which can't be shown.</p>
@@ -385,10 +383,14 @@ fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, error: Op
         redirect = esc(&redirect_uri(app, &p.id)),
         id = esc(&p.id),
         csrf = csrf(user),
-        client_id = esc(&p.client_id),
-        toggles = toggles(p.trust_email, p.allow_unverified_admin, p.link_by_email),
+        typed_label = esc(typed.map_or(p.label.as_str(), |f| &f.label)),
+        client_id = esc(typed.map_or(p.client_id.as_str(), |f| &f.client_id)),
+        toggles = match typed {
+            Some(f) => toggles(f.trust_email.is_some(), f.allow_unverified_admin.is_some(), f.link_by_email.is_some()),
+            None => toggles(p.trust_email, p.allow_unverified_admin, p.link_by_email),
+        },
     );
-    page(&p.label, Some(user), &body)
+    page(&title_of(&p.label, error.is_some()), Some(user), &body)
 }
 
 /// A provider that can be changed here: not one from the configuration file.
@@ -401,7 +403,7 @@ pub async fn edit_provider(user: UiUser, State(app): State<AppState>, Path(id): 
         return r;
     }
     match editable(&user, &app, &id) {
-        Some(p) => edit_provider_page(&user, &app, &p, None),
+        Some(p) => edit_provider_page(&user, &app, &p, None, None),
         None => Redirect::to("/settings").into_response(),
     }
 }
@@ -415,9 +417,9 @@ pub async fn update_provider(user: UiUser, State(app): State<AppState>, Path(id)
     }
     let changes = ProviderChanges { label: &f.label, client_id: &f.client_id, client_secret: &f.client_secret, link_by_email: f.link_by_email.is_some(), trust_email: f.trust_email.is_some(), allow_unverified_admin: f.allow_unverified_admin.is_some() };
     match app.control.update_oidc_provider(&user.who, &id, changes) {
-        Ok(()) => Redirect::to("/settings").into_response(),
+        Ok(()) => done("/settings", Done::ProviderSaved),
         Err(e) => match editable(&user, &app, &id) {
-            Some(p) => (StatusCode::BAD_REQUEST, edit_provider_page(&user, &app, &p, Some(&e.message))).into_response(),
+            Some(p) => (StatusCode::BAD_REQUEST, edit_provider_page(&user, &app, &p, Some(&f), Some(&e.message))).into_response(),
             None => Redirect::to("/settings").into_response(),
         },
     }
@@ -431,8 +433,8 @@ pub async fn delete_provider(user: UiUser, State(app): State<AppState>, Path(id)
         return r;
     }
     match app.control.delete_oidc_provider(&user.who, &id) {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(e) => (StatusCode::FORBIDDEN, e.message).into_response(),
+        Ok(_) => done("/settings", Done::ProviderRemoved),
+        Err(e) => failed(&user, StatusCode::FORBIDDEN, "/settings", "Settings", &e.message),
     }
 }
 

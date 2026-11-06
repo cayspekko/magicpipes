@@ -22,7 +22,19 @@ use crate::ipc::{AddRequest, ErrorInfo, IpcRequest, StepState};
 use crate::state::AgentConfig;
 
 #[derive(Parser)]
-#[command(name = "magicpipes", version, about = "Expose local applications at public HTTPS URLs")]
+#[command(
+    name = "magicpipes",
+    version,
+    about = "Expose local applications at public HTTPS URLs",
+    after_help = "Examples:
+  magicpipes login --server https://mp.example.com   Enroll this machine
+  magicpipes add 8080                                Give a local port its own address
+  magicpipes add 8080 --private                      Only for people who sign in and are allowed
+  magicpipes add --serve ./public                    Share a folder
+  magicpipes add 22 --tcp --allow-cidr 203.0.113.0/24   Open a raw TCP port to one network
+  magicpipes list                                    See what's running
+  magicpipes remove <name>                           Stop one"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,6 +53,9 @@ struct Output {
 #[derive(Subcommand)]
 enum Command {
     /// Enroll this machine with a MagicPipes server.
+    #[command(after_help = "Examples:
+  magicpipes login --server https://mp.example.com                     Approve it in your browser
+  magicpipes login --server https://mp.example.com --token-file token  With an enrollment token")]
     Login {
         /// Management URL of the server, e.g. https://example.com:8443
         #[arg(long)]
@@ -49,8 +64,12 @@ enum Command {
         /// CLI opens the server's sign-in page so you can approve this machine as yours.
         #[arg(long, env = "MAGICPIPES_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Read the enrollment token from this file, which unlike --token doesn't show it to other
+        /// programs on this machine.
+        #[arg(long, value_name = "FILE", conflicts_with = "token")]
+        token_file: Option<PathBuf>,
         /// Approve this machine in the browser even when not run in a terminal.
-        #[arg(long, conflicts_with = "token")]
+        #[arg(long, conflicts_with_all = ["token", "token_file"])]
         browser: bool,
         /// Extra CA certificate (PEM) to trust, e.g. the server's development CA.
         #[arg(long)]
@@ -62,6 +81,16 @@ enum Command {
         out: Output,
     },
     /// Expose a local port, serve a directory or share a terminal; returns once the public address is verified to work.
+    #[command(after_help = "Examples:
+  magicpipes add 8080                         Anyone with the address can reach it
+  magicpipes add 8080 --private               Only you, after signing in
+  magicpipes add 8080 --tag team:dev          You and people with that tag
+  magicpipes add 8080 --hostname shop.example.com
+  magicpipes add --serve ./public             Share a folder
+  magicpipes add --shell -- htop              Let people watch a program
+  magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24
+
+Run it again with other options to change a tunnel.")]
     Add {
         /// Local port of the application (TCP; UDP with --udp).
         port: Option<u16>,
@@ -229,7 +258,12 @@ fn check_add_args(cmd: &Command) {
     else {
         return;
     };
-    let fail = |kind, msg: &str| Cli::command().find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit();
+    let fail = |kind, msg: &str| {
+        let mut cli = Cli::command();
+        // Gives the subcommand's usage line its full name.
+        cli.build();
+        cli.find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit()
+    };
     if port.is_none() && serve.is_none() && !shell {
         fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --serve <DIR> or --shell");
     }
@@ -284,7 +318,7 @@ fn read_pid() -> Option<String> {
 
 async fn dispatch(cmd: Command) -> ExitCode {
     let (out, result) = match cmd {
-        Command::Login { server, token, browser, ca_cert, name, out } => (out, login(server, token, browser, ca_cert, name, out).await),
+        Command::Login { server, token, token_file, browser, ca_cert, name, out } => (out, login(server, token, token_file, browser, ca_cert, name, out).await),
         Command::Add {
             port,
             tcp,
@@ -408,7 +442,7 @@ fn prompt_token() -> Result<String, ErrorInfo> {
 /// the user approves this machine there. Returns the enrollment token, or `None` if the server
 /// predates this kind of login.
 async fn browser_login(server: &str, tls: &Arc<rustls::ClientConfig>, agent_name: &str, quiet: bool) -> Result<Option<String>, ErrorInfo> {
-    let unreachable = |e: anyhow::Error| ErrorInfo::new(ErrorCode::ServerUnreachable, format!("{e:#}"));
+    let unreachable = |e: anyhow::Error| unreachable_server(&e);
     let (status, resp) = https::post_json(server, "/api/v1/device", tls, &json!({ "agent_name": agent_name })).await.map_err(unreachable)?;
     if matches!(status.as_u16(), 404 | 405) {
         return Ok(None);
@@ -447,9 +481,23 @@ async fn browser_login(server: &str, tls: &Arc<rustls::ClientConfig>, agent_name
     }
 }
 
+/// A failed attempt to reach the server, with what to try next.
+fn unreachable_server(e: &anyhow::Error) -> ErrorInfo {
+    let text = format!("{e:#}");
+    let hint = if text.contains("UnknownIssuer") {
+        " Its certificate isn't from an authority this machine trusts: for a private one, pass --ca-cert <file>."
+    } else if text.contains("connecting to ") {
+        " Check the server's URL and port, and that it's running."
+    } else {
+        ""
+    };
+    ErrorInfo::new(ErrorCode::ServerUnreachable, format!("{text}.{hint}"))
+}
+
 async fn login(
     server: String,
     token: Option<String>,
+    token_file: Option<PathBuf>,
     browser: bool,
     ca_cert: Option<PathBuf>,
     name: Option<String>,
@@ -464,6 +512,10 @@ async fn login(
     let tls = https::tls_config(ca_pem.as_deref()).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     let agent_name = name.unwrap_or_else(platform::hostname);
     let interactive = std::io::stdin().is_terminal();
+    let token = match &token_file {
+        Some(path) => Some(std::fs::read_to_string(path).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("reading {}: {e}", path.display())))?),
+        None => token,
+    };
     let token = match token {
         Some(t) => t,
         None if browser || interactive => match browser_login(&server, &tls, &agent_name, out.quiet).await? {
@@ -482,7 +534,7 @@ async fn login(
     let body = json!({ "enrollment_token": token.trim(), "agent_name": agent_name });
     let (status, resp) = https::post_json(&server, "/api/v1/enroll", &tls, &body)
         .await
-        .map_err(|e| ErrorInfo::new(ErrorCode::ServerUnreachable, format!("{e:#}")))?;
+        .map_err(|e| unreachable_server(&e))?;
     if !status.is_success() {
         let msg = resp["error"]["message"].as_str().unwrap_or("enrollment failed").to_string();
         let code = resp["error"]["code"].as_str().unwrap_or(ErrorCode::InvalidEnrollmentToken.as_str());
@@ -603,7 +655,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         println!();
         println!("Tunnel ready");
         println!();
-        println!("  Public: {}", data["share_url"].as_str().or(data["public_url"].as_str()).unwrap_or_default());
+        println!("  URL:    {}", data["share_url"].as_str().or(data["public_url"].as_str()).unwrap_or_default());
         match (&serving, &shell) {
             (Some(dir), _) => println!("  Serving: {}", state::display_path(dir)),
             (_, Some((cmd, writable, cwd))) => {
@@ -612,7 +664,6 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             }
             _ => println!("  Local:  {}", data["target"].as_str().unwrap_or_default()),
         }
-        println!("  Status: connected");
         println!();
         let private = data["visibility"] == "private";
         match &shell {
@@ -717,21 +768,26 @@ async fn list(out: Output) -> Result<(), ErrorInfo> {
     if tunnels.is_empty() {
         println!("No tunnels. Create one with: magicpipes add <port>");
     } else {
-        let w = tunnels.iter().map(|t| t["name"].as_str().unwrap_or("").len()).max().unwrap_or(4).max(4);
-        let u = tunnels.iter().map(|t| t["public_url"].as_str().unwrap_or("").len()).max().unwrap_or(10).max(10);
-        println!("{:<w$}  {:<u$}  {:<24}  STATUS", "NAME", "PUBLIC URL", "TARGET");
+        let width = |field: &str, heading: &str| tunnels.iter().map(|t| t[field].as_str().unwrap_or("").chars().count()).max().unwrap_or(0).max(heading.len());
+        let (w, u, l) = (width("name", "NAME"), width("public_url", "URL"), width("target", "TARGET"));
+        println!("{:<w$}  {:<u$}  {:<l$}  {:<7}  STATUS", "NAME", "URL", "TARGET", "ACCESS");
         for t in &tunnels {
             println!(
-                "{:<w$}  {:<u$}  {:<24}  {}",
+                "{:<w$}  {:<u$}  {:<l$}  {:<7}  {}",
                 t["name"].as_str().unwrap_or(""),
                 t["public_url"].as_str().unwrap_or(""),
                 t["target"].as_str().unwrap_or(""),
+                t["visibility"].as_str().unwrap_or("-"),
                 t["status"].as_str().unwrap_or(""),
             );
         }
     }
     if data["agent_running"] == false {
-        println!("\nThe agent is not running; start it with: magicpipes agent start");
+        if matches!(AgentConfig::load(), Ok(Some(_))) {
+            println!("\nThe agent is not running; start it with: magicpipes agent start");
+        } else {
+            println!("\nThis machine isn't enrolled yet; start with: magicpipes login --server <url>");
+        }
     }
     Ok(())
 }
@@ -846,5 +902,18 @@ async fn logs(lines: usize, follow: bool) -> std::io::Result<()> {
             std::io::stdout().flush()?;
             pos = len;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_connections_say_what_to_try() {
+        let message = |text: &str| unreachable_server(&anyhow::anyhow!(text.to_string())).message;
+        assert!(message("TLS handshake with mp.example.com:443: invalid peer certificate: UnknownIssuer").contains("--ca-cert"));
+        assert!(message("connecting to mp.example.com:443: Connection refused (os error 61)").contains("URL and port"));
+        assert_eq!(message("the server answered 500"), "the server answered 500.");
     }
 }

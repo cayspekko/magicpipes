@@ -16,7 +16,12 @@ use super::ui::{UiUser, chips, esc};
 
 /// Styles for the picker and its fallback checkboxes; appended to the theme on every page.
 pub(super) const STYLE: &str = r#"[hidden]{display:none!important}
-.tagcell{display:flex;gap:8px;align-items:center}.tagchips{white-space:normal;min-width:13em;max-width:22em;line-height:1.8}
+.tagcell{display:flex;gap:8px;align-items:center}.tagchips{flex:1;white-space:normal;min-width:10em;max-width:24em}
+.taglist{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;white-space:normal;vertical-align:middle}
+.tag{padding:1px 8px;border:1px solid var(--line-2);border-radius:999px;font:12px/1.5 var(--mono);color:var(--ink-2);overflow-wrap:anywhere}
+.tagmore{padding:3px 4px;font-size:12.5px;color:var(--ink-2);white-space:nowrap}
+.access{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;white-space:normal}.access .taglist{display:contents}.access .status{margin-right:4px}
+td .access{min-width:15em;max-width:26em}.status.below{display:flex;margin-top:6px;font-size:12.5px}
 .chip.add{color:var(--ok)}.chip.remove{color:var(--bad);text-decoration:line-through}
 fieldset.tags{border:0;padding:0;margin:22px 0 0;min-width:0}
 fieldset.tags legend{padding:0;font-size:13px;font-weight:500;color:var(--ink-2);margin-bottom:8px}

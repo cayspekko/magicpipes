@@ -14,6 +14,7 @@ macro_rules! icon {
 
 pub const APP_WINDOW: &str = icon!("ic", r#"<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/>"#);
 pub const BACK: &str = icon!("ic sm", r#"<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>"#);
+pub const CHECK: &str = icon!("ic", r#"<path d="M20 6 9 17l-5-5"/>"#);
 pub const DOWNLOAD: &str = icon!("ic sm", r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>"#);
 pub const FOLDER: &str = icon!("ic", r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#);
 pub const GLOBE: &str = icon!("ic", r#"<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>"#);
@@ -31,7 +32,7 @@ pub const STYLE: &str = r#".ic{display:inline-block;width:16px;height:16px;flex:
 .crumb{align-items:center}
 .with-ic{display:flex;align-items:flex-start;gap:10px}.with-ic>.ic,.with-ic>.kind{margin-top:3px}
 .kind{flex:none;line-height:0;color:var(--muted)}
-.alert.with-ic>.ic{margin-top:1px}
+.alert.with-ic>.ic,.done.with-ic>.ic{margin-top:1px}
 .status.iconic{gap:7px}.status.iconic::before{display:none}.status.iconic.ok .ic{color:var(--ok)}.status.iconic.warn .ic{color:var(--warn)}
 "#;
 

@@ -23,7 +23,7 @@ pub struct Page<'a> {
 const TERM_STYLE: &str = r#"
 @font-face{font-family:"Symbols Nerd Font Mono";src:local("Symbols Nerd Font Mono"),local("SymbolsNerdFontMono-Regular"),url(/assets/symbols-nerd-font-mono.woff2) format("woff2");
 font-display:block;unicode-range:U+23FB-23FE,U+2B58,U+E000-F8FF,U+F0000-F1AF0}
-html,body{height:100%}body{min-height:0;overflow:hidden}
+html,body{height:100%}body{min-height:0;overflow:hidden}.top h1{margin:0}
 .brand{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .side{display:flex;align-items:center;gap:14px;flex:none}
 .badge{font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line-2);border-radius:999px;padding:4px 10px;white-space:nowrap}
@@ -50,8 +50,8 @@ pub fn render(p: &Page<'_>) -> String {
 <meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>{program} · MagicPipes</title>
 <link rel="stylesheet" href="/assets/xterm.css"><style>{STYLE}{TERM_STYLE}</style></head>
 <body data-access="{access}">
-<header class="top"><div class="top-in"><span class="brand">{GLYPH}{program}</span>
-<div class="side"><span class="status warn" id="st">Connecting</span><span class="{badge_class}" id="mode">{badge}</span></div></div></header>
+<header class="top"><div class="top-in"><h1 class="brand">{GLYPH}{program}</h1>
+<div class="side"><span class="status warn" id="st" role="status">Connecting</span><span class="{badge_class}" id="mode">{badge}</span></div></div></header>
 <main class="tm">
 <div class="cmd"><code>{command}</code><span class="hint">{hint}</span></div>
 <div class="screen"><div id="t"></div><div class="notice" id="nt" hidden><span id="nt-text"></span><button class="btn" id="nt-btn" type="button"></button></div></div>
