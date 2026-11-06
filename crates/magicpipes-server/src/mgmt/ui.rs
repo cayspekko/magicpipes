@@ -5,47 +5,22 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use axum::Form;
-use axum::extract::{FromRequestParts, Path, RawForm, State};
+use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use http::request::Parts;
 use http::{HeaderValue, StatusCode, Uri, header};
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::{ErrorBody, Visibility};
 use magicpipes_core::theme::{GLYPH, STYLE};
+use magicpipes_core::url;
 use serde::Deserialize;
 
-use super::icons::{self, BACK, CHECK, GLOBE, LOCK, MORE, OPENS_ELSEWHERE, WARNING};
+use super::extract::{Fields, NoFields, Posted, UiUser};
+use super::html::{self, Actions, Number, Text, alert, back, badge, chips, count, esc, form_alert, menu_post, row_menu, table, tag_chip, title_of, tone, when};
+use super::icons::{self, CHECK, GLOBE, LOCK, OPENS_ELSEWHERE};
 use super::picker::{self, Holder, Submitted};
 use super::{AppState, ClientIp, Rejected, SESSION_COOKIE};
-use crate::authz::Principal;
-use crate::control::{EnrollmentOptions, Login, LoginError, TunnelView, UserView};
-
-/// Percent-encodes everything but unreserved characters.
-pub(super) fn url_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect()
-}
-
-/// A `next` target that stays on this site: a path, never `//host` or a scheme.
-pub(super) fn safe_next(next: Option<&str>) -> Option<&str> {
-    next.filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains('\\') && n.len() < 512 && !n.chars().any(char::is_control))
-}
-
-pub(super) fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
+use crate::control::{EnrollmentOptions, Login, LoginError, TunnelView};
+use crate::tunnel_auth::safe_path;
 
 /// What a change did, said in one quiet line on the page it redirects to. The address carries only
 /// a key from this list, so a link can't put words on the page.
@@ -61,6 +36,11 @@ macro_rules! done_messages {
 
             fn message(key: &str) -> Option<&'static str> {
                 match key { $($key => Some($message),)* _ => None }
+            }
+
+            /// What the address says a change just did.
+            pub(super) fn from_query(query: Option<&str>) -> Option<&'static str> {
+                query?.split('&').find_map(|pair| Self::message(pair.strip_prefix("done=")?))
             }
         }
     };
@@ -99,14 +79,16 @@ pub(super) fn done(to: &str, what: Done) -> Response {
     Redirect::to(&done_url(to, what)).into_response()
 }
 
-fn done_message(query: Option<&str>) -> Option<&'static str> {
-    query?.split('&').find_map(|pair| Done::message(pair.strip_prefix("done=")?))
-}
-
 /// A change that didn't happen: the reason, and the way back to `to`.
 pub(super) fn failed(user: &UiUser, status: StatusCode, to: &str, to_label: &str, message: &str) -> Response {
-    let body = format!(r#"<a class="crumb" href="{to}">{BACK}{to_label}</a><div class="spaced">{}</div>"#, alert(Some(message)), to = esc(to), to_label = esc(to_label));
+    let body = format!(r#"{}<div class="spaced">{}</div>"#, back(to, to_label), alert(Some(message)));
     (status, page("Error", Some(user), &body)).into_response()
+}
+
+/// A thing that isn't there, or that this user may not know about.
+pub(super) fn not_there(user: &UiUser, to: &str, to_label: &str, why: &str) -> Response {
+    let body = format!(r#"{}<h1>Not found</h1><p class="lede">{}</p>"#, back(to, to_label), esc(why));
+    (StatusCode::NOT_FOUND, page("Not found", Some(user), &body)).into_response()
 }
 
 /// What a change to one thing came to: back to `to` saying so, or the reason it didn't happen.
@@ -116,67 +98,6 @@ pub(super) fn outcome(user: &UiUser, result: Result<bool, ErrorBody>, to: &str, 
         Ok(true) => done(to, what),
         Ok(false) => failed(user, StatusCode::NOT_FOUND, to, to_label, gone),
         Err(e) => failed(user, StatusCode::BAD_REQUEST, to, to_label, &e.message),
-    }
-}
-
-fn cookie_value(parts: &Parts) -> Option<String> {
-    cookie_from(&parts.headers, SESSION_COOKIE)
-}
-
-pub(super) fn cookie_from(headers: &http::HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.to_string())
-}
-
-/// Extractor: a logged-in UI session. Redirects to the login page otherwise, and to the password
-/// page while the user still has to replace a password an administrator set.
-pub struct UiUser {
-    pub(super) cookie: String,
-    pub(super) who: Principal,
-    pub(super) csrf: String,
-    /// `None` for an admin-token session.
-    pub(super) user: Option<UserView>,
-    /// The address, for marking the current page.
-    path: String,
-    /// What a change just did, from the address.
-    done: Option<&'static str>,
-}
-
-impl FromRequestParts<AppState> for UiUser {
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Self::Rejection> {
-        // After signing in, the browser comes back to the page it asked for.
-        let here = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        let back = |to: &str| match here {
-            "/" => Redirect::to(to).into_response(),
-            _ => Redirect::to(&format!("{to}?next={}", url_encode(here))).into_response(),
-        };
-        let cookie = cookie_value(parts).ok_or_else(|| back("/login"))?;
-        let s = app.control.session(&cookie).ok_or_else(|| back("/login"))?;
-        let must_change = s.user.as_ref().is_some_and(|u| u.must_change_password);
-        if must_change && !matches!(parts.uri.path(), "/password" | "/logout") {
-            return Err(back("/password"));
-        }
-        Ok(UiUser { cookie, who: s.who, csrf: s.csrf, user: s.user, path: parts.uri.path().to_string(), done: done_message(parts.uri.query()) })
-    }
-}
-
-impl UiUser {
-    #[allow(clippy::result_large_err)] // error pages are returned by value on purpose
-    pub(super) fn check_csrf(&self, submitted: &str) -> Result<(), Response> {
-        if magicpipes_core::secret::constant_time_eq(self.csrf.as_bytes(), submitted.as_bytes()) {
-            Ok(())
-        } else {
-            let body = r#"<div class="auth"><h1>This page <em>expired</em></h1><p class="lede">Nothing was changed. Go back, reload the page and try again.</p></div>"#;
-            Err((StatusCode::FORBIDDEN, page("Page expired", Some(self), body)).into_response())
-        }
     }
 }
 
@@ -248,9 +169,9 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
                 .collect();
             let me = u.user.as_ref().map_or("admin token".to_string(), |v| v.email.clone());
             format!(
-                r#"<nav class="nav" aria-label="Main">{nav}<span class="sub me" title="{me}">{me}</span><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="btn ghost">Sign out</button></form></nav>"#,
+                r#"<nav class="nav" aria-label="Main">{nav}<span class="sub me" title="{me}">{me}</span><form method="post" action="/logout">{csrf}<button class="btn ghost">Sign out</button></form></nav>"#,
                 me = esc(&me),
-                csrf = esc(&u.csrf)
+                csrf = u.csrf_field()
             )
         })
         .unwrap_or_default();
@@ -258,12 +179,13 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title>
-<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{icon_style}{picker}{MENU_STYLE}</style><script src="{script}" defer></script></head><body>
+<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{icon_style}{picker}{shared}</style><script src="{script}" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{nav}</div></header>
 <main>{done}{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),
         icon_style = icons::STYLE,
-        picker = super::picker::STYLE,
+        picker = picker::STYLE,
+        shared = html::STYLE,
         script = SCRIPT_URL.as_str(),
         version = esc(magicpipes_core::VERSION),
     ))
@@ -280,61 +202,12 @@ pub async fn not_found(uri: Uri) -> Response {
     (StatusCode::NOT_FOUND, page("Not found", None, body)).into_response()
 }
 
-/// An error message, if there is one.
-pub(super) fn alert(msg: Option<&str>) -> String {
-    msg.map(|m| format!(r#"<div class="alert with-ic" role="alert">{WARNING}<span>{}</span></div>"#, esc(m))).unwrap_or_default()
-}
-
-/// An error about a form, for the top of that form; [`invalid`] ties a field to it.
-pub(super) fn form_alert(msg: Option<&str>) -> String {
-    msg.map(|m| format!(r#"<div class="alert with-ic" role="alert" id="form-error">{WARNING}<span>{}</span></div>"#, esc(m))).unwrap_or_default()
-}
-
-/// A field's attributes when the form's error is about it: announced with the message, and focused.
-pub(super) fn invalid(on: bool) -> &'static str {
-    if on { r#" aria-invalid="true" aria-describedby="form-error" autofocus"# } else { "" }
-}
-
-/// A page's title when its form came back with an error, as a screen reader hears it first.
-pub(super) fn title_of(title: &str, has_error: bool) -> String {
-    if has_error { format!("Error: {title}") } else { title.to_string() }
-}
-
-/// `3 people`, `1 person`.
-pub(super) fn count(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
-/// The color of a state.
-fn tone(state: &str) -> &'static str {
-    match state {
-        "connected" | "ready" => "ok",
-        "pending" => "warn",
-        "disconnected" | "error" | "failed" => "bad",
-        _ => "",
-    }
-}
-
-/// A status dot plus its label. The tone comes from the state, the text stays the raw state name.
-pub(super) fn badge(state: &str) -> String {
-    format!(r#"<span class="status {}">{}</span>"#, tone(state), esc(state))
-}
-
 /// A tunnel's certificate, in the Tunnels list: only worth a line while it isn't ready.
 fn certificate_note(t: &TunnelView) -> String {
     if !t.kind.is_http() || t.tls == "ready" {
         return String::new();
     }
     format!(r#"<span class="status {} below">certificate {}</span>"#, tone(t.tls), esc(t.tls))
-}
-
-/// `2026-10-30T04:08:00Z` -> `2026-10-30 · 04:08 UTC`, with the exact value as a tooltip.
-pub(super) fn when(ts: &str) -> String {
-    let short = match (ts.get(..10), ts.get(11..16)) {
-        (Some(d), Some(t)) if ts.as_bytes().get(10) == Some(&b'T') => format!("{d} · {t} UTC"),
-        _ => ts.to_string(),
-    };
-    format!(r#"<time class="when" datetime="{0}" title="{0}">{1}</time>"#, esc(ts), esc(&short))
 }
 
 fn display_url(url: &str) -> &str {
@@ -361,55 +234,6 @@ pub(super) fn server_url(app: &AppState) -> String {
         443 => format!("https://{}", cfg.management.hostname),
         port => format!("https://{}:{port}", cfg.management.hostname),
     }
-}
-
-/// Row menus (`row_menu`).
-const MENU_STYLE: &str = r#"details.menu{display:inline-block;position:relative;text-align:left}
-details.menu>summary{list-style:none;font-size:16px;letter-spacing:1px;padding:5px 10px}details.menu>summary::-webkit-details-marker{display:none}
-details.menu[open]>summary{border-color:var(--line-2);color:var(--ink)}
-.menu-list{display:flex;flex-direction:column;min-width:12em;margin-top:6px;padding:5px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
-details.menu.float .menu-list{position:fixed;z-index:20;margin:0;box-shadow:0 10px 30px rgba(0,0,0,.14)}
-.menu-list form{margin:0}.menu-list hr{border:0;border-top:1px solid var(--line);margin:4px 2px}
-.menu-item{display:block;width:100%;text-align:left;font:13.5px/1.2 var(--sans);padding:9px 11px;border:0;border-radius:7px;background:none;color:var(--ink);cursor:pointer;text-decoration:none;white-space:nowrap}
-.menu-item:hover{background:var(--hover)}.menu-item:focus-visible{background:var(--hover);outline:2px solid var(--accent);outline-offset:-2px}.menu-item.danger{color:var(--bad)}
-.spaced{margin-top:22px}"#;
-
-/// A row's "More actions" menu. Without scripts the list opens in place; `ui.js` floats it next
-/// to the button.
-pub(super) fn row_menu(subject: &str, items: &[String]) -> String {
-    format!(
-        r#"<details class="menu"><summary class="btn small ghost" aria-label="More actions for {}" title="More actions">{MORE}</summary><div class="menu-list">{}</div></details>"#,
-        esc(subject),
-        items.concat()
-    )
-}
-
-/// A menu entry that posts `fields` to `action`; `confirm`: a question asked first (by `ui.js`).
-pub(super) fn menu_post(action: &str, csrf: &str, fields: &[(&str, &str)], label: &str, danger: bool, confirm: Option<&str>) -> String {
-    let hidden: String = fields.iter().map(|(k, v)| format!(r#"<input type="hidden" name="{}" value="{}">"#, esc(k), esc(v))).collect();
-    format!(
-        r#"<form method="post" action="{action}"{confirm}><input type="hidden" name="csrf" value="{csrf}">{hidden}<button class="menu-item{danger}">{label}</button></form>"#,
-        action = esc(action),
-        confirm = confirm.map(|c| format!(r#" data-confirm="{}""#, esc(c))).unwrap_or_default(),
-        csrf = esc(csrf),
-        danger = if danger { " danger" } else { "" },
-        label = esc(label),
-    )
-}
-
-/// One tag. `title`: the tag itself, where `shown` is a person's name for it.
-fn tag_chip(shown: &str, title: Option<&str>) -> String {
-    let title = title.map(|t| format!(r#" title="{}""#, esc(t))).unwrap_or_default();
-    format!(r#"<code class="tag"{title}>{}</code>"#, esc(shown))
-}
-
-/// Tags as small chips that wrap; `none` when empty.
-pub(super) fn chips(tags: &[String]) -> String {
-    if tags.is_empty() {
-        return r#"<span class="sub">none</span>"#.into();
-    }
-    let list: Vec<String> = tags.iter().map(|t| tag_chip(t, None)).collect();
-    format!(r#"<span class="taglist">{}</span>"#, list.join(" "))
 }
 
 /// How many of a tunnel's `total` tags its row in the list shows. The list is for scanning, and the
@@ -487,10 +311,10 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
     for t in &tunnels {
         let (kind_icon, kind_name) = icons::tunnel_kind(t.kind, &t.target);
         rows.push_str(&format!(
-            r#"<tr><td><div class="with-ic"><span class="kind" title="{kind_name}">{kind_icon}</span><div><a class="name" href="/tunnels/{id}">{name}</a>{address}</div></div></td><td>{access}</td><td>{agent}<code class="sub">{target}</code></td><td>{status}{certificate}</td><td class="num">{requests}</td></tr>"#,
+            r#"<tr><td><div class="with-ic"><span class="kind" title="{kind_name}">{kind_icon}</span><div><a class="name" href="/tunnels/{id}">{name}</a>{address}</div></div></td><td>{access}</td><td>{agent}<code class="sub wrap">{target}</code></td><td>{status}{certificate}</td><td class="num">{requests}</td></tr>"#,
             id = esc(&t.id),
             name = esc(&t.name),
-            address = public_address(t, "sub"),
+            address = public_address(t, "sub wrap"),
             target = esc(&t.target),
             access = access_cell(t, &people, true),
             agent = esc(&agent_name(&t.agent_id)),
@@ -498,9 +322,6 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
             certificate = certificate_note(t),
             requests = t.requests,
         ));
-    }
-    if tunnels.is_empty() {
-        rows = r#"<tr><td colspan="5" class="empty">No tunnels yet. Run <code>magicpipes add 8080</code> on one of your machines.</td></tr>"#.into();
     }
     let online = agents.iter().filter(|a| a.connected).count();
     let offline_with_tunnels = agents.iter().filter(|a| !a.connected && a.tunnels > 0).count();
@@ -515,9 +336,10 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
 <div class="stat"><div class="k">Couldn't reach app</div><div class="v">{errors}</div></div>
 </div>
 <p class="note">Requests are counted since the server last started.</p>
-<div class="card scroll spaced" id="tunnels"><table><thead><tr><th>Tunnel</th><th>Who can open it</th><th>Machine</th><th>Status</th><th class="num">Requests</th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="spaced" id="tunnels">{list}</div>
 {shared}"#,
         health = health_line(&tunnels, offline_with_tunnels).unwrap_or_default(),
+        list = table(&[Text("Tunnel"), Text("Who can open it"), Text("Machine"), Text("Status"), Number("Requests")], &rows, "No tunnels yet. Run <code>magicpipes add 8080</code> on one of your machines."),
         n = tunnels.len(),
         agents_total = agents.len(),
     );
@@ -564,14 +386,14 @@ fn machines_page(app: &AppState, user: &UiUser, attempt: Option<EnrollAttempt>) 
             row_menu(&a.name, &[
                 edit.link(user, "menu-item", "Edit tags", &format!("Edit tags of {}", a.name)),
                 "<hr>".into(),
-                menu_post(&revoke_url, &user.csrf, &[], "Revoke", true, Some(&question)),
+                menu_post(&revoke_url, &user.csrf_field(), &[], "Revoke", true, Some(&question)),
             ])
         } else {
             format!(
-                r#"<form method="post" action="{url}" data-confirm="{question}"><input type="hidden" name="csrf" value="{csrf}"><button class="btn danger small" aria-label="Revoke {name}">Revoke</button></form>"#,
+                r#"<form method="post" action="{url}" data-confirm="{question}">{csrf}<button class="btn danger small" aria-label="Revoke {name}">Revoke</button></form>"#,
                 url = esc(&revoke_url),
                 question = esc(&question),
-                csrf = esc(&user.csrf),
+                csrf = user.csrf_field(),
                 name = esc(&a.name),
             )
         };
@@ -583,14 +405,12 @@ fn machines_page(app: &AppState, user: &UiUser, attempt: Option<EnrollAttempt>) 
             id = esc(&a.id),
         ));
     }
-    if agents.is_empty() {
-        rows = r#"<tr><td colspan="7" class="empty">No machines yet.</td></tr>"#.into();
-    }
     let error = attempt.as_ref().map(|a| a.error);
     let body = format!(
         r#"<h1>Machines</h1><p class="lede">The computers running the <code>magicpipes</code> agent, each serving its own tunnels.</p>
-<div class="card scroll spaced"><table><thead><tr><th>Machine</th><th>Owner</th><th>Tags</th><th>Status</th><th class="num">Tunnels</th><th>Last seen</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="spaced">{list}</div>
 {enroll}{registry}"#,
+        list = table(&[Text("Machine"), Text("Owner"), Text("Tags"), Text("Status"), Number("Tunnels"), Text("Last seen"), Actions], &rows, "No machines yet."),
         registry = picker::registry(app, user),
         enroll = if admin { enroll_panel(app, user, attempt.as_ref()) } else { member_enroll_hint(app) },
     );
@@ -603,12 +423,11 @@ pub async fn machines(user: UiUser, State(app): State<AppState>) -> Response {
 
 pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(t) = app.control.tunnel(&user.who, &id) else {
-        let body = format!(r#"<a class="crumb" href="/">{BACK}Tunnels</a><h1>Not found</h1><p class="lede">There is no tunnel with that id or name. It may have been deleted.</p>"#);
-        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), &body)).into_response();
+        return not_there(&user, "/", "Tunnels", "There is no tunnel with that id or name. It may have been deleted.");
     };
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf, &people))
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people))
 }
 
 fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>) -> String {
@@ -616,7 +435,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
     dl.push_str(&field("Machine", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
-    let change = r#"<p class="note" style="margin:8px 0 0">To change it, run the same <code>magicpipes add</code> on that machine with <code>--private</code>, <code>--public</code> or <code>--tag</code>.</p>"#;
+    let change = r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--private</code>, <code>--public</code> or <code>--tag</code>.</p>"#;
     dl.push_str(&field("Who can open it", &format!("{}{change}", access_cell(t, people, false))));
     if t.kind.is_http() {
         dl.push_str(&field("TLS certificate", &badge(t.tls)));
@@ -634,7 +453,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     dl.push_str(&field("Created", &when(&t.created_at)));
     let last = t.last_request_at.as_deref().map(when).unwrap_or_else(|| "never".into());
     format!(
-        r#"<a class="crumb" href="/">{BACK}Tunnels</a>
+        r#"{back}
 <h1>{name}</h1><p class="lede">{address}</p>
 <div class="stats">
 <div class="stat"><div class="k">Status</div><div class="v sm">{status}</div></div>
@@ -644,8 +463,9 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
 </div>
 <div class="section"><h2>Details</h2></div>
 <div class="card"><dl>{dl}</dl></div>
-<div class="card panel danger" style="margin-top:20px"><div><h3>Delete tunnel</h3><p>The public URL stops working at once and the agent stops serving it. In-flight requests finish.</p></div>
-<form method="post" action="/tunnels/{id}/delete" data-confirm="Delete {name}? Its address stops working at once."><input type="hidden" name="csrf" value="{csrf}"><button class="btn danger">Delete tunnel</button></form></div>"#,
+<div class="card panel danger spaced"><div><h3>Delete tunnel</h3><p>The public URL stops working at once and the agent stops serving it. In-flight requests finish.</p></div>
+<form method="post" action="/tunnels/{id}/delete" data-confirm="Delete {name}? Its address stops working at once.">{csrf}<button class="btn danger">Delete tunnel</button></form></div>"#,
+        back = back("/", "Tunnels"),
         name = esc(&t.name),
         address = public_address(t, ""),
         requests_label = if t.kind.is_http() { "Requests" } else { "Connections" },
@@ -653,64 +473,47 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
         status = badge(t.status),
         requests = t.requests,
         errors = t.upstream_errors,
-        csrf = esc(csrf),
     )
 }
 
-#[derive(Deserialize)]
-pub struct CsrfForm {
-    pub(super) csrf: String,
-}
-
-impl CsrfForm {
-    pub(super) fn csrf(&self) -> &str {
-        &self.csrf
-    }
-}
-
-pub async fn delete_tunnel(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<CsrfForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn delete_tunnel(State(app): State<AppState>, Path(id): Path<String>, Posted(user, _): Posted<NoFields>) -> Response {
     outcome(&user, app.control.delete_tunnel(&user.who, &id), "/", "Tunnels", Done::TunnelDeleted, "That tunnel is already gone.")
 }
 
 /// Without scripts, an agent's Edit link opens this page of checkboxes.
 pub async fn agent_tags_page(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(agent) = app.control.agents(&user.who).into_iter().find(|a| a.id == id) else {
-        let body = format!(r#"<a class="crumb" href="/machines">{BACK}Machines</a><h1>Not found</h1><p class="lede">There is no machine with that id.</p>"#);
-        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), &body)).into_response();
+        return not_there(&user, "/machines", "Machines", "There is no machine with that id.");
     };
     if agent.owner_user_id.is_some() || !user.who.is_admin() {
         let body = format!(
-            r#"<a class="crumb" href="/machines">{BACK}Machines</a><h1>Tags of <em>{}</em></h1><p class="lede">A personal machine publishes with its owner's tags. Only service agents have tags of their own, which administrators set.</p>"#,
+            r#"{}<h1>Tags of <em>{}</em></h1><p class="lede">A personal machine publishes with its owner's tags. Only service agents have tags of their own, which administrators set.</p>"#,
+            back("/machines", "Machines"),
             esc(&agent.name)
         );
         return page("Machine tags", Some(&user), &body);
     }
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
     let body = format!(
-        r#"<a class="crumb" href="/machines">{BACK}Machines</a><div class="eyebrow spaced">Service agent</div><h1>Tags of <em>{name}</em></h1>
-<div class="card form"><form method="post" action="/agents/{id}/tags"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="base" value="{base}">
-{boxes}<p class="note">Its tunnels can carry only these tags.</p><button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
+        r#"{back}<div class="eyebrow spaced">Service agent</div><h1>Tags of <em>{name}</em></h1>
+<div class="card form"><form method="post" action="/agents/{id}/tags">{csrf}<input type="hidden" name="base" value="{base}">
+{boxes}<p class="note">Its tunnels can carry only these tags.</p><button class="btn primary">Save</button></form></div>"#,
+        back = back("/machines", "Machines"),
         name = esc(&agent.name),
         id = esc(&agent.id),
-        csrf = esc(&user.csrf),
+        csrf = user.csrf_field(),
         base = esc(&agent.tags.join(" ")),
         boxes = picker::fieldset("Tags", &all, &agent.tags, None),
     );
     page("Machine tags", Some(&user), &body)
 }
 
-pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, RawForm(raw): RawForm) -> Response {
+pub async fn agent_tags(State(app): State<AppState>, Path(id): Path<String>, Posted(user, fields): Posted<Fields>) -> Response {
     let refused = |message: &str| failed(&user, StatusCode::BAD_REQUEST, "/machines", "Machines", message);
-    let form = match Submitted::parse(&raw) {
+    let form = match Submitted::parse(fields) {
         Ok(f) => f,
         Err(e) => return refused(&e),
     };
-    if let Err(r) = user.check_csrf(&form.csrf) {
-        return r;
-    }
     if let Err(e) = form.create_missing(&app, &user.who) {
         return refused(&e);
     }
@@ -724,10 +527,7 @@ pub async fn agent_tags(user: UiUser, State(app): State<AppState>, Path(id): Pat
     }
 }
 
-pub async fn revoke_agent(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<CsrfForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn revoke_agent(State(app): State<AppState>, Path(id): Path<String>, Posted(user, _): Posted<NoFields>) -> Response {
     outcome(&user, app.control.revoke_agent(&user.who, &id), "/machines", "Machines", Done::MachineRevoked, "That machine is already gone.")
 }
 
@@ -792,8 +592,9 @@ fn shared_section(app: &AppState, user: &UiUser) -> String {
         .collect();
     format!(
         r#"<div class="section"><h2>Shared with you<span class="count">{n}</span></h2></div>
-<div class="card scroll"><table><thead><tr><th>Tunnel</th><th>Owner</th><th>Who can open it</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
-        n = shared.len()
+{list}"#,
+        n = shared.len(),
+        list = table(&[Text("Tunnel"), Text("Owner"), Text("Who can open it")], &rows, ""),
     )
 }
 
@@ -811,17 +612,17 @@ fn enroll_panel(app: &AppState, user: &UiUser, attempt: Option<&EnrollAttempt>) 
     let tags = picker::fieldset("Tags for a service agent", &all, typed.map_or(&[], |f| &f.want), Some("For the new machine"));
     format!(
         r#"<div class="section"><h2>Enroll a machine</h2></div>
-<div class="card form">{error}<p class="note" style="margin-top:0">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>
-<form method="post" action="/enrollments"><input type="hidden" name="csrf" value="{csrf}">
+<div class="card form">{error}<p class="note">Creates a single-use token for <code>magicpipes login</code>, shown once and valid for {mins} minutes. People can also enroll their own machines with <code>magicpipes login --server {server}</code>.</p>
+<form method="post" action="/enrollments">{csrf}
 <label for="eo">Belongs to</label><select id="eo" name="owner"><option value="">Nobody (a service agent, managed by administrators)</option>{owners}</select>
 {tags}
 <label><input type="checkbox" name="allow_public"{allow_public}> Its tunnels may be public</label>
 <label><input type="checkbox" name="default_private"{private}> Its tunnels are private unless asked otherwise</label>
-<button class="btn primary" style="margin-top:14px">Create enrollment token</button></form></div>"#,
+<button class="btn primary">Create enrollment token</button></form></div>"#,
         error = form_alert(attempt.map(|a| a.error)),
         mins = app.control.config().agents.enrollment_ttl_secs / 60,
         server = esc(&server_url(app)),
-        csrf = esc(&user.csrf),
+        csrf = user.csrf_field(),
         allow_public = checked("allow_public", true),
         private = checked("default_private", !users.is_empty()),
     )
@@ -835,15 +636,12 @@ fn member_enroll_hint(app: &AppState) -> String {
     )
 }
 
-pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawForm(raw): RawForm) -> Response {
+pub async fn create_enrollment(State(app): State<AppState>, Posted(user, fields): Posted<Fields>) -> Response {
     // Checkboxes named `tag`, or a `tags` field from an older page.
-    let form = match Submitted::parse(&raw) {
+    let form = match Submitted::parse(fields) {
         Ok(f) => f,
         Err(e) => return failed(&user, StatusCode::BAD_REQUEST, "/machines", "Machines", &e),
     };
-    if let Err(r) = user.check_csrf(&form.csrf) {
-        return r;
-    }
     let refused = |error: &str| (StatusCode::BAD_REQUEST, machines_page(&app, &user, Some(EnrollAttempt { form: &form, error }))).into_response();
     if let Err(e) = form.create_missing(&app, &user.who) {
         return refused(&e);
@@ -862,11 +660,12 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
     let cfg = app.control.config();
     let server = server_url(&app);
     let body = format!(
-        r#"<a class="crumb" href="/machines">{BACK}Machines</a>
+        r#"{back}
 <div class="eyebrow spaced">Enrollment token</div><h1>Enroll a <em>machine</em></h1>
 <p class="lede">Run this on the machine you want to enroll. The token works once, expires in {mins} minutes, and is not shown again.</p>
 <pre class="term"><span class="p">$ </span>magicpipes login --server {server} --token {token}</pre>
 <p class="note">Then expose a local port with <code>magicpipes add 8080</code>.</p>"#,
+        back = back("/machines", "Machines"),
         mins = cfg.agents.enrollment_ttl_secs / 60,
         server = esc(&server),
         token = esc(&token),
@@ -876,7 +675,7 @@ pub async fn create_enrollment(user: UiUser, State(app): State<AppState>, RawFor
 
 pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
     let err = alert(error);
-    let next = safe_next(next);
+    let next = safe_path(next);
     let providers = app.control.oidc_providers();
     // One link per provider, above the password form. They carry the destination too.
     let sso = if admin_token || providers.is_empty() {
@@ -885,29 +684,29 @@ pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool,
         let links: String = providers
             .iter()
             .map(|p| {
-                let q = next.map(|n| format!("?next={}", url_encode(n))).unwrap_or_default();
-                format!(r#"<a class="btn block" style="margin-bottom:10px;text-align:center" href="/auth/oidc/{}{q}">Continue with {}</a>"#, esc(&p.id), esc(&p.label))
+                let q = next.map(|n| format!("?next={}", url::encode(n))).unwrap_or_default();
+                format!(r#"<a class="btn block sso" href="/auth/oidc/{}{q}">Continue with {}</a>"#, esc(&p.id), esc(&p.label))
             })
             .collect();
-        format!(r#"{links}<p class="note" style="text-align:center;margin:14px 0">or</p>"#)
+        format!(r#"{links}<p class="note or">or</p>"#)
     };
     // Switching between the two forms keeps the destination.
-    let nq = next.map(|n| format!("&amp;next={}", url_encode(n))).unwrap_or_default();
+    let nq = next.map(|n| format!("&amp;next={}", url::encode(n))).unwrap_or_default();
     let next = next.map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
     let form = if admin_token {
-        r#"<form method="post" action="/login">{next}<label for="t" style="margin-top:0">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
-<button class="btn primary block" style="margin-top:18px">Sign in</button></form></div>
+        r#"<form method="post" action="/login">{next}<label for="t">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
+<button class="btn primary block">Sign in</button></form></div>
 <p class="note"><a href="/login?method=password{nq}">Sign in with email and password</a> instead. The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>; create another with <code>magicpipesd admin-token</code>.</p>"#
     } else {
-        r#"<form method="post" action="/login">{next}<label for="e" style="margin-top:0">Email</label><input id="e" type="email" name="email" autocomplete="username" autofocus required>
+        r#"<form method="post" action="/login">{next}<label for="e">Email</label><input id="e" type="email" name="email" autocomplete="username" autofocus required>
 <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required>
-<button class="btn primary block" style="margin-top:18px">Sign in</button></form></div>
+<button class="btn primary block">Sign in</button></form></div>
 <p class="note">Administrators create accounts. <a href="/login?method=token{nq}">Use an admin token</a></p>"#
     };
     page(
         "Sign in",
         None,
-        &format!(r#"<div class="auth"><h1>Sign <em>in</em></h1><div class="card" style="margin-top:28px">{err}{sso}{form}</div>"#, form = form.replace("{next}", &next).replace("{nq}", &nq)),
+        &format!(r#"<div class="auth"><h1>Sign <em>in</em></h1><div class="card">{err}{sso}{form}</div>"#, form = form.replace("{next}", &next).replace("{nq}", &nq)),
     )
 }
 
@@ -949,9 +748,9 @@ pub(super) fn logged_in(app: &AppState, login: Login, next: Option<&str>) -> Res
 
 /// As [`logged_in`], going to `landing` when nothing asked for another page.
 pub(super) fn logged_in_to(app: &AppState, login: Login, next: Option<&str>, landing: &str) -> Response {
-    let next = safe_next(next);
+    let next = safe_path(next);
     let mut resp = match (login.must_change_password, next) {
-        (true, Some(n)) => Redirect::to(&format!("/password?next={}", url_encode(n))).into_response(),
+        (true, Some(n)) => Redirect::to(&format!("/password?next={}", url::encode(n))).into_response(),
         (true, None) => Redirect::to("/password").into_response(),
         (false, Some(n)) => continue_page(n),
         (false, None) => Redirect::to(landing).into_response(),
@@ -1046,18 +845,14 @@ pub async fn login(
 
 #[derive(Deserialize)]
 pub struct LogoutForm {
-    csrf: String,
     /// "Switch account": where to go after signing in again.
     next: Option<String>,
 }
 
-pub async fn logout(user: UiUser, State(app): State<AppState>, Form(f): Form<LogoutForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn logout(State(app): State<AppState>, Posted(user, f): Posted<LogoutForm>) -> Response {
     app.control.logout(&user.who, &user.cookie);
-    let to = match safe_next(f.next.as_deref()) {
-        Some(n) => format!("/login?next={}", url_encode(n)),
+    let to = match safe_path(f.next.as_deref()) {
+        Some(n) => format!("/login?next={}", url::encode(n)),
         None => "/login".to_string(),
     };
     let mut resp = Redirect::to(&to).into_response();
@@ -1070,24 +865,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tags_are_chips_that_escape_what_they_show() {
-        assert_eq!(chips(&[]), r#"<span class="sub">none</span>"#);
-        assert_eq!(chips(&["team:dev".into()]), r#"<span class="taglist"><code class="tag">team:dev</code></span>"#);
-        assert_eq!(tag_chip("<ann>", Some("user:\"x")), r#"<code class="tag" title="user:&quot;x">&lt;ann&gt;</code>"#);
-    }
-
-    #[test]
     fn a_row_shows_a_few_tags_and_never_hides_just_one() {
         assert_eq!((0..=7).map(tags_in_a_row).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 3, 3, 3]);
     }
 
     #[test]
     fn only_known_keys_say_anything() {
-        assert_eq!(done_message(Some("done=tag-created")), Some("Tag created."));
-        assert_eq!(done_message(Some("a=b&done=tag-created&c=d")), Some("Tag created."));
-        assert_eq!(done_message(Some("done=%3Cscript%3E")), None);
-        assert_eq!(done_message(Some("done=")), None);
-        assert_eq!(done_message(None), None);
+        assert_eq!(Done::from_query(Some("done=tag-created")), Some("Tag created."));
+        assert_eq!(Done::from_query(Some("a=b&done=tag-created&c=d")), Some("Tag created."));
+        assert_eq!(Done::from_query(Some("done=%3Cscript%3E")), None);
+        assert_eq!(Done::from_query(Some("done=")), None);
+        assert_eq!(Done::from_query(None), None);
         assert_eq!(done_url("/tags", Done::TagCreated), "/tags?done=tag-created");
     }
 

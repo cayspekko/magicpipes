@@ -28,7 +28,6 @@ mod kinds;
 mod listing;
 
 use std::convert::Infallible;
-use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,6 +41,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use magicpipes_core::error::ErrorCode;
+use magicpipes_core::url;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_http::services::ServeFile;
 
@@ -227,7 +227,7 @@ fn parse_selection(body: &str) -> Result<Vec<String>, (StatusCode, &'static str)
         if k != "f" {
             continue;
         }
-        match percent_decode(&v.replace('+', " ")) {
+        match url::decode(&v.replace('+', " ")) {
             Some(name) if servable_name(&name) => {
                 if seen.insert(name.clone()) {
                     names.push(name);
@@ -262,7 +262,7 @@ fn archive_response(root: &Path, dir: PathBuf, folder: &str, names: Vec<String>)
 /// `Content-Disposition: attachment` with an ASCII fallback and the exact UTF-8 name.
 fn attachment(name: &str) -> String {
     let ascii: String = name.chars().map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' { c } else { '_' }).collect();
-    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", percent_encode(name))
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", url::encode(name))
 }
 
 /// Servable entries of a directory, folders first, then by name. One blocking call for the whole
@@ -304,7 +304,7 @@ fn list_entries(root: &Path, dir: &Opened) -> std::io::Result<(Vec<Entry>, usize
 
 /// Splits and percent-decodes a request path; `None` if any segment is not servable.
 fn parse_path(raw: &str) -> Option<Vec<String>> {
-    raw.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s).filter(|s| servable_name(s))).collect()
+    raw.split('/').filter(|s| !s.is_empty()).map(|s| url::decode(s).filter(|s| servable_name(s))).collect()
 }
 
 /// Whether a single file name may be served or listed.
@@ -313,39 +313,10 @@ fn servable_name(name: &str) -> bool {
     !(name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', '\0']) || windows_special)
 }
 
-fn percent_decode(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = b.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
-
 fn encode_path(segments: &[String]) -> String {
     segments.iter().fold(String::new(), |mut p, s| {
         p.push('/');
-        p.push_str(&percent_encode(s));
+        p.push_str(&url::encode(s));
         p
     })
 }
@@ -674,7 +645,7 @@ mod tests {
     #[test]
     fn encoding_round_trips() {
         let name = "a b&c/é?#%.txt";
-        assert_eq!(percent_decode(&percent_encode(name)).as_deref(), Some(name));
+        assert_eq!(url::decode(&url::encode(name)).as_deref(), Some(name));
         assert_eq!(encode_path(&["x y".into(), "z".into()]), "/x%20y/z");
     }
 

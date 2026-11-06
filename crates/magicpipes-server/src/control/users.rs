@@ -15,7 +15,7 @@ use magicpipes_core::proto::ErrorBody;
 use magicpipes_core::{rfc3339, secret, unix_now};
 use serde::Serialize;
 
-use super::{ControlPlane, err, internal};
+use super::{ControlPlane, OrLog, err, internal, logged};
 use crate::authz::{self, Action, Principal, Resource, Role};
 use crate::store::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
 
@@ -251,7 +251,7 @@ impl ControlPlane {
         if !email.is_empty() && self.accounts.throttled(&email) {
             return Err(LoginError::Throttled);
         }
-        let found = if email.is_empty() { None } else { self.store.password_login(&email).map_err(|_| LoginError::Internal)? };
+        let found = if email.is_empty() { None } else { self.store.password_login(&email).map_err(logged(LoginError::Internal))? };
         let hash = found.as_ref().map(|(_, h)| h.clone());
         let matches = self.password_matches(password.to_string(), hash).await;
         let user = match found {
@@ -265,8 +265,8 @@ impl ControlPlane {
             }
         };
         self.accounts.succeeded(&email);
-        let _ = self.store.touch_login(&user.id, LOCAL_ISSUER);
-        let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(|_| LoginError::Internal)?;
+        self.store.touch_login(&user.id, LOCAL_ISSUER).or_log();
+        let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(LoginError::Internal))?;
         let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };
         self.audit(&who, "session.login", &user.id, "password");
         Ok(Login { cookie, must_change_password: user.must_change_password })
@@ -285,7 +285,7 @@ impl ControlPlane {
     /// The principal of an active user, with their current role and tags, or `None` if the
     /// account is disabled or gone.
     fn user_principal(&self, user_id: &str) -> Option<(Principal, UserRow)> {
-        let u = self.store.user(user_id).ok().flatten().filter(|u| !u.disabled)?;
+        let u = self.store.user(user_id).or_log().flatten().filter(|u| !u.disabled)?;
         let tags = self.state.lock().unwrap().dir.user_tags(&u.id);
         Some((Principal::User { id: u.id.clone(), role: u.role, tags }, u))
     }
@@ -298,7 +298,7 @@ impl ControlPlane {
     }
 
     pub fn session(&self, cookie: &str) -> Option<UiSession> {
-        let row = self.store.session(cookie).ok().flatten()?;
+        let row = self.store.session(cookie).or_log().flatten()?;
         let Some(user_id) = row.user_id else {
             return Some(UiSession { who: Principal::AdminToken, csrf: row.csrf, user: None });
         };
@@ -310,7 +310,7 @@ impl ControlPlane {
     }
 
     pub fn logout(&self, who: &Principal, cookie: &str) {
-        let _ = self.store.delete_session(cookie);
+        self.store.delete_session(cookie).or_log();
         self.audit(who, "session.logout", who.actor(), "");
     }
 
@@ -371,7 +371,7 @@ impl ControlPlane {
 
     pub fn tokens(&self, who: &Principal) -> Vec<TokenView> {
         match who {
-            Principal::User { id, .. } => self.store.api_tokens(id).unwrap_or_default().into_iter().map(Into::into).collect(),
+            Principal::User { id, .. } => self.store.api_tokens(id).or_log().unwrap_or_default().into_iter().map(Into::into).collect(),
             _ => Vec::new(),
         }
     }
@@ -428,7 +428,7 @@ impl ControlPlane {
         if !authz::authorize(who, Action::Manage, Resource::User(id)) {
             return None;
         }
-        self.store.user(id).ok().flatten().map(|u| self.user_view(u))
+        self.store.user(id).or_log().flatten().map(|u| self.user_view(u))
     }
 
     /// Creates a password account. Without `password`, one is generated and returned (shown

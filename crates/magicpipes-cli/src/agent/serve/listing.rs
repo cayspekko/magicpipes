@@ -8,7 +8,9 @@ use std::fmt::Write as _;
 use magicpipes_core::theme::{GLYPH, STYLE};
 
 use super::kinds::{self, ICON_SYMBOLS};
-use super::{esc, human_size, percent_encode};
+use magicpipes_core::url;
+
+use super::{esc, human_size};
 
 pub struct Entry {
     pub name: String,
@@ -40,7 +42,7 @@ table.files td{padding:13px 18px}
 table.files tbody tr{transition:background .12s}
 .ck{width:46px;padding-right:0!important}
 input[type=checkbox]{accent-color:var(--ink);width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer}
-th button{all:unset;cursor:pointer;border-radius:4px}th button:hover{color:var(--ink)}
+th button{all:unset;cursor:pointer;border-radius:6px}th button:hover{color:var(--ink)}
 th button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 th[aria-sort=ascending] button::after{content:" ↑"}th[aria-sort=descending] button::after{content:" ↓"}
 .nm{white-space:normal;width:100%}
@@ -52,15 +54,15 @@ th[aria-sort=ascending] button::after{content:" ↑"}th[aria-sort=descending] bu
 .meta{display:none;font:400 12.5px var(--sans);color:var(--muted);margin-top:2px}
 .c-size,.c-mod{color:var(--muted);font-size:13.5px;font-variant-numeric:tabular-nums}
 .act{width:1%;text-align:right;padding-left:4px!important}
-.dl{display:inline-flex;padding:7px;border-radius:8px;color:var(--muted);opacity:.75;transition:opacity .12s,background .12s}
+.dl{display:inline-flex;padding:7px;border-radius:10px;color:var(--muted);opacity:.75;transition:opacity .12s,background .12s}
 tr:hover .dl,.dl:focus-visible{opacity:1}.dl:hover{color:var(--accent);background:var(--bg)}
-.dl .ic{width:18px;height:18px;color:inherit}
+.dl .ic{width:18px;height:18px;color:inherit}.btn .ic{width:16px;height:16px;color:inherit}
 tr.up .ic{color:var(--muted)}tr.up .fn{color:var(--muted);font-weight:400}
 tbody tr.sel td{background:color-mix(in srgb,var(--ink) 5%,var(--surface))}
 .bar{position:sticky;bottom:18px;z-index:2;margin-top:18px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 10px 10px 20px;
-background:var(--ink);color:var(--bg);border-radius:12px;box-shadow:0 10px 30px rgb(0 0 0/.16)}
+background:var(--ink);color:var(--bg);border-radius:14px;box-shadow:0 10px 30px rgb(0 0 0/.16)}
 .bar[hidden]{display:none}
-.bar span{font-size:14px;font-variant-numeric:tabular-nums}
+.bar span{font-size:13.5px;font-variant-numeric:tabular-nums}
 .bar .actions{display:flex;gap:6px}
 .bar .btn{background:var(--bg);border-color:var(--bg);color:var(--ink)}.bar .btn:hover{background:var(--surface);border-color:var(--surface);color:var(--ink)}
 .bar .btn.ghost{background:transparent;border-color:transparent;color:var(--bg);opacity:.8}.bar .btn.ghost:hover{opacity:1;background:transparent;color:var(--bg)}
@@ -110,7 +112,7 @@ pub fn render(p: &Page<'_>) -> String {
     let mut crumbs = format!(r#"<a href="/">{}</a>"#, esc(p.site));
     let mut href = String::from("/");
     for (i, s) in p.segments.iter().enumerate() {
-        href.push_str(&percent_encode(s));
+        href.push_str(&url::encode(s));
         href.push('/');
         crumbs.push_str(r#"<span class="sep">/</span>"#);
         if i + 1 == p.segments.len() {
@@ -162,12 +164,12 @@ pub fn render(p: &Page<'_>) -> String {
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}{site}</a><span class="tag">Shared with MagicPipes</span></div></header>
 <main>
 <div class="head"><div>{crumbs}<h1>{here}</h1><p class="lede">{summary}</p></div>
-<a class="btn" href="?archive" download><svg class="ic" style="width:16px;height:16px;color:inherit"><use href="#i-download"/></svg>Download folder</a></div>
+<a class="btn" href="?archive" download><svg class="ic"><use href="#i-download"/></svg>Download folder</a></div>
 <form id="files" class="list" method="post" action="./">
 <div class="card scroll"><table class="files">
 <thead><tr><th class="ck">{select_all}</th><th aria-sort="ascending"><button type="button" data-sort="name">Name</button></th><th class="num c-size"><button type="button" data-sort="size">Size</button></th><th class="c-mod"><button type="button" data-sort="mtime">Modified</button></th><th class="act"></th></tr></thead>
 <tbody>{rows}</tbody></table></div>{more}
-<div class="bar" id="bar"><span id="sel-info" role="status">Selected items</span><span class="actions"><button type="button" class="btn ghost small" id="clear">Clear</button><button class="btn small" type="submit"><svg class="ic" style="width:16px;height:16px;color:inherit"><use href="#i-download"/></svg>Download .tar.gz</button></span></div>
+<div class="bar" id="bar"><span id="sel-info" role="status">Selected items</span><span class="actions"><button type="button" class="btn ghost small" id="clear">Clear</button><button class="btn small" type="submit"><svg class="ic"><use href="#i-download"/></svg>Download .tar.gz</button></span></div>
 </form>
 </main>
 <footer class="foot">Shared with MagicPipes · read-only</footer>
@@ -189,7 +191,7 @@ pub fn render(p: &Page<'_>) -> String {
 
 fn row(e: &Entry) -> String {
     let kind = kinds::kind(&e.name, e.dir);
-    let enc = percent_encode(&e.name);
+    let enc = url::encode(&e.name);
     let name = esc(&e.name);
     let (href, target, download) = if e.dir {
         (format!("{enc}/"), "", format!("{enc}/?archive"))

@@ -2257,6 +2257,65 @@ async fn admin_session(env: &Env) -> String {
     env.ui("/login", None, Some(&[("token", token.as_str())])).await.cookie.expect("signed in")
 }
 
+/// What every form gets from `Posted` and `AdminPosted`, and where signing in may send a browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_needs_its_token_a_whole_form_and_the_right_person() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = admin_session(&env).await;
+    let token = env.admin_token();
+    let csrf = env.ui("/tags", Some(&admin), None).await.csrf();
+
+    // No token, a wrong one, or two: nothing happens, and the page says so.
+    let forms: [&[(&str, &str)]; 3] = [&[("name", "team:x")], &[("csrf", "wrong"), ("name", "team:x")], &[("csrf", &csrf), ("csrf", &csrf), ("name", "team:x")]];
+    for form in forms {
+        let refused = env.ui("/tags", Some(&admin), Some(form)).await;
+        assert!(refused.status == StatusCode::FORBIDDEN && refused.html.contains("Nothing was changed"), "{form:?}: {}", refused.html);
+    }
+    assert!(!env.ui("/tags", Some(&admin), None).await.html.contains("team:x"));
+
+    // A form without a field it needs gets a page, not a bare error.
+    let incomplete = env.ui("/tags/delete", Some(&admin), Some(&[("csrf", &csrf)])).await;
+    assert!(incomplete.status == StatusCode::BAD_REQUEST && incomplete.html.contains(r#"role="alert""#) && incomplete.html.contains("incomplete"), "{}", incomplete.html);
+
+    // What's for administrators sends anyone else to their own page, with a good token too.
+    let password = "correct horse battery";
+    let body = serde_json::json!({ "email": "ann@example.com", "password": password });
+    let (_, v) = env.api_json("POST", "/api/v1/users", Some(&token), body).await;
+    let ann_id = v["user"]["id"].as_str().unwrap().to_string();
+    let ann = sign_in(&env, "ann@example.com", password).await;
+    for page in ["/users", "/tags", "/hostnames", "/audit", "/settings", "/settings/export", "/settings/providers/new?type=google", &format!("/users/{ann_id}/tags")] {
+        assert_eq!(env.ui(page, Some(&ann), None).await.location.as_deref(), Some("/account"), "{page}");
+    }
+    let hers = env.ui("/account", Some(&ann), None).await.csrf();
+    let refused = env.ui("/settings/sign-in", Some(&ann), Some(&[("csrf", &hers), ("bootstrap_admins", "ann@evil.example")])).await;
+    assert_eq!(refused.location.as_deref(), Some("/account"));
+    assert!(!env.ui("/settings", Some(&admin), None).await.html.contains("ann@evil.example"));
+
+    // A sign-in stays on this host, however the path is written, and one check says so everywhere.
+    for bad in ["%2F%5Cevil.example", "%2F%2Fevil.example", "https%3A%2F%2Fevil.example", "%2F%09%2Fevil.example"] {
+        assert!(!env.ui(&format!("/login?next={bad}"), None, None).await.html.contains("evil.example"), "{bad}");
+    }
+    let long = format!("/{}", "a".repeat(1500));
+    assert!(env.ui(&format!("/login?next={long}"), None, None).await.html.contains(&long), "a long address on this host is fine");
+
+    let body = serde_json::json!({ "owner_user_id": ann_id });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&token), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "laptop"]).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    add_json(&env, &[&app.port.to_string(), "--private", "--name", "one"]).await;
+    let host = format!("one.{BASE}");
+    let sent = env.tunnel_get(&host, "/report", "", true).await.location.unwrap();
+    let at = sent.strip_prefix(&format!("https://localhost:{}", env.mgmt_port)).unwrap();
+    let (start, wanted) = at.rsplit_once("return=").unwrap();
+    assert_eq!(wanted, "%2Freport");
+    let back_to = async |path: &str| env.ui(&format!("{start}return={path}"), Some(&ann), None).await.location.unwrap();
+    assert!(back_to("%2Freport").await.ends_with("&return=%2Freport"));
+    for bad in ["%2F%5Cevil.example", "%2F%2Fevil.example", "https%3A%2F%2Fevil.example"] {
+        assert!(back_to(bad).await.ends_with("&return=%2F"), "{bad}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settings_page_adds_providers_without_a_restart() {
     use std::os::unix::fs::PermissionsExt;

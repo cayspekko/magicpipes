@@ -283,28 +283,23 @@ impl Agent {
                 Ok(other) => return Err(ErrorInfo::new(ErrorCode::Protocol, format!("unexpected response {other:?}"))),
             }
         };
-        if info.kind != req.kind {
-            // A server that predates port tunnels ignores `kind` and registers an HTTP tunnel.
+        // What an older server did differently from what was asked, without saying so.
+        let differs = if info.kind != req.kind {
+            // It predates port tunnels: it ignores `kind` and registers an HTTP tunnel.
+            Some(format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind))
+        } else if hostname.as_ref().is_some_and(|h| *h != info.hostname) {
+            Some("the server did not serve the tunnel at the hostname asked for; it needs a newer magicpipesd".to_string())
+        } else if (expect_private || rpc_req.visibility == Some(Visibility::Private)) && info.visibility != Some(Visibility::Private) {
+            // It predates private tunnels, so this one came out public: never leave that.
+            Some("the server does not support private tunnels; it needs a newer magicpipesd".to_string())
+        } else {
+            None
+        };
+        if let Some(message) = differs {
             if info.created {
                 let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
             }
-            return Err(ErrorInfo::new(
-                ErrorCode::ServerOutdated,
-                format!("the server does not support {} tunnels; it needs a newer magicpipesd", req.kind),
-            ));
-        }
-        if hostname.as_ref().is_some_and(|h| *h != info.hostname) {
-            if info.created {
-                let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
-            }
-            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server did not serve the tunnel at the hostname asked for; it needs a newer magicpipesd"));
-        }
-        if (expect_private || rpc_req.visibility == Some(Visibility::Private)) && info.visibility != Some(Visibility::Private) {
-            // A server that predates private tunnels would have made it public: never leave that.
-            if info.created {
-                let _ = self.session.rpc(&Rpc::Unregister { id: info.id.clone() }, Duration::from_secs(10)).await;
-            }
-            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private tunnels; it needs a newer magicpipesd"));
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, message));
         }
         let tunnel = LocalTunnel {
             created_at: existing.as_ref().map(|t| t.created_at).unwrap_or_else(magicpipes_core::unix_now),

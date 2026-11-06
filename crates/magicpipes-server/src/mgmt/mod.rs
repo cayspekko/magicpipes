@@ -12,6 +12,8 @@
 
 mod accounts;
 mod api;
+mod extract;
+mod html;
 mod icons;
 mod oidc;
 mod picker;

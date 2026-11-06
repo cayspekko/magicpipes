@@ -5,6 +5,32 @@ if (new URLSearchParams(location.search).has('done')) {
   history.replaceState(null, '', here);
 }
 
+// Asks before a change that can't be undone. A dialog rather than `confirm()`, so that its button
+// says what it does; Escape and Cancel, which has the focus, say no. Answers with a promise.
+const ask = (() => {
+  let dlg, answered;
+  const build = () => {
+    dlg = document.createElement('dialog');
+    dlg.className = 'ask';
+    dlg.setAttribute('role', 'alertdialog');
+    dlg.setAttribute('aria-labelledby', 'ask-q');
+    dlg.innerHTML = '<p id="ask-q"></p><form method="dialog" class="dialog-foot"><button class="btn" value="no" autofocus>Cancel</button><button class="ask-yes" value="yes"></button></form>';
+    // The event can arrive late, when the next question is already open: it isn't the answer to that.
+    dlg.addEventListener('close', () => { if (!dlg.open) answered(dlg.returnValue === 'yes'); });
+    document.body.append(dlg);
+  };
+  return (question, yes, danger) => new Promise((resolve) => {
+    if (!dlg) build();
+    answered = resolve;
+    dlg.querySelector('#ask-q').textContent = question;
+    const button = dlg.querySelector('.ask-yes');
+    button.textContent = yes;
+    button.className = `ask-yes btn ${danger ? 'danger' : 'primary'}`;
+    dlg.returnValue = 'no';
+    dlg.showModal();
+  });
+})();
+
 (() => {
   const COPY = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
   const DONE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
@@ -95,7 +121,7 @@ if (new URLSearchParams(location.search).has('done')) {
 <div class="tp-meta"><span id="tp-count" aria-live="polite"></span><span class="tp-hint"></span></div>
 <div class="tp-tray"></div><button type="button" class="pill tp-create" hidden></button><p class="note tp-syntax" hidden>A tag is <code>key</code> or <code>key:value</code>, with a-z, 0-9 and <code>._-</code>.</p><div class="tp-list"></div>
 <p class="note tp-locked" hidden>You can remove this machine's tags. Adding one takes an administrator.</p>
-<div class="tp-foot"><button type="button" class="btn tp-cancel">Cancel</button><button type="button" class="btn primary tp-save"></button></div>`;
+<div class="dialog-foot"><button type="button" class="btn tp-cancel">Cancel</button><button type="button" class="btn primary tp-save"></button></div>`;
     document.body.appendChild(dlg);
     const q = (s) => dlg.querySelector(s);
     ui = { title: q('#tp-title'), subject: q('.tp-subject'), filter: q('.tp-q'), count: q('#tp-count'), hint: q('.tp-hint'),
@@ -115,6 +141,8 @@ if (new URLSearchParams(location.search).has('done')) {
       e.preventDefault();
       if (ui.filter.value) { ui.filter.value = ''; update(); } else { leave(); }
     });
+    // A menu closed when its item was chosen, so the focus goes back to its button.
+    dlg.addEventListener('close', () => { if (!dlg.open) cur.opts.back?.focus(); });
     q('.tp-x').addEventListener('click', leave);
     q('.tp-cancel').addEventListener('click', () => dlg.close());
     ui.save.addEventListener('click', () => {
@@ -134,7 +162,7 @@ if (new URLSearchParams(location.search).has('done')) {
     });
   };
 
-  const leave = () => { if (!cur.pending.size || confirm('Discard your changes to these tags?')) dlg.close(); };
+  const leave = async () => { if (!cur.pending.size || await ask('Discard your changes to these tags?', 'Discard', true)) dlg.close(); };
   const stateOf = (n) => cur.pending.get(n) || (cur.held.has(n) ? 'held' : 'none');
   const canAdd = (n) => cur.opts.addable || cur.held.has(n);
   const actionable = (n) => stateOf(n) !== 'none' || canAdd(n);
@@ -272,7 +300,8 @@ if (new URLSearchParams(location.search).has('done')) {
   // opts: title, subject, tags [{n, d}], held Set, want Set (defaults to held), addable,
   // creatable (new tags may be made up; the server creates them on save), reach Map,
   // reachKind, heldWord, saveWord, lockedNote, inForm (setting a form's checkboxes, so saving
-  // nothing still applies), onSave(want, created) -> 'busy' to stay open.
+  // nothing still applies), back (what gets the focus afterwards, if not what had it before),
+  // onSave(want, created) -> 'busy' to stay open.
   const open = (opts) => {
     if (!dlg) build();
     const descs = new Map();
@@ -312,6 +341,7 @@ if (new URLSearchParams(location.search).has('done')) {
       const reach = new Map(words(a.dataset.reach).map((kv) => { const i = kv.lastIndexOf('='); return [kv.slice(0, i), Number(kv.slice(i + 1)) || 0]; }));
       const addable = a.dataset.addable === '1';
       open({ title: a.dataset.title || 'Edit tags', subject: a.dataset.subject, tags: addable ? registry : [], held, addable,
+        back: a.closest('details.menu')?.querySelector('summary'),
         creatable: addable && admin, reach, reachKind: a.dataset.reachKind, heldWord: 'held', saveWord: 'Save', lockedNote: true,
         onSave: (want, created) => post(a.href, { csrf: a.dataset.csrf, base: [...held].join(' '), tags: [...want].join(' '), create: created.join(' ') }) });
     });
@@ -400,7 +430,21 @@ if (new URLSearchParams(location.search).has('done')) {
   });
   addEventListener('resize', () => closeAll());
   addEventListener('scroll', (e) => { if (!e.target.closest?.('.menu-list')) closeAll(); }, true);
+  // Going ahead submits again, with the button pressed, and that one isn't asked about.
+  let going = false;
   document.querySelectorAll('form[data-confirm]').forEach((f) => {
-    f.addEventListener('submit', (e) => { if (!confirm(f.dataset.confirm)) e.preventDefault(); });
+    f.addEventListener('submit', async (e) => {
+      if (going) return;
+      e.preventDefault();
+      const pressed = e.submitter;
+      if (await ask(f.dataset.confirm, pressed.textContent.trim(), pressed.classList.contains('danger'))) {
+        going = true;
+        f.requestSubmit(pressed);
+        going = false;
+      } else {
+        // A menu closed when its item was chosen, so the focus goes back to its button.
+        (pressed.closest('details.menu')?.querySelector('summary') || pressed).focus();
+      }
+    });
   });
 })();

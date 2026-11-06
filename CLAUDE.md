@@ -5,7 +5,7 @@ background agent on the user's machine). Read [docs/ARCHITECTURE.md](docs/ARCHIT
 changing behavior, and [docs/ROADMAP.md](docs/ROADMAP.md) before adding a feature.
 
 ```text
-crates/magicpipes-core     wire protocol (proto.rs), yamux helpers, secrets, names, CIDR, theme
+crates/magicpipes-core     wire protocol (proto.rs), yamux helpers, secrets, names, CIDR, theme, url
 crates/magicpipes-server   magicpipesd: control/ (registry), data/ (proxy, ports), certs/, mgmt/, gateway.rs, store.rs
 crates/magicpipes-cli      magicpipes: CLI (main.rs), client.rs, ipc.rs, platform.rs, agent/ (session, forward, ops, serve, shell, udp)
 crates/magicpipes-bench    load generator and test application for scripts/bench; never shipped
@@ -114,7 +114,8 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   escape every interpolated value. Keep the CSPs tight; don't add inline event handlers or
   third-party origins. Vendored browser assets live in `agent/shell/assets/` with a README
   (source, version) and their license file, which `release.yml` must copy into archives.
-- **Management UI**: state-changing requests need the session cookie *and* the CSRF token. A
+- **Management UI**: state-changing requests need the session cookie *and* the CSRF token, so a
+  handler takes `Posted<T>` or `AdminPosted<T>` (`mgmt/extract.rs`), never a bare `Form`. A
   form submission never redirects off the management host (browsers apply `form-action 'self'`
   to its redirects); continue with a page that navigates on its own. Never put a secret in a
   URL query string; a one-time code to another host goes in the fragment.
@@ -141,7 +142,9 @@ trusted with each other's tunnels), and, from the agent's side, the server.
 The aim is simple elegance: anyone can tell where they are, whether things are working, what their
 last action did and what to do next. "Management UI" in ARCHITECTURE.md has the reasoning. Layout
 and colors follow the theme in `magicpipes-core/src/theme.rs`, whose tokens meet WCAG 2.2 AA in both
-color schemes: check any new one (4.5:1 for text, 3:1 for field borders and focus outlines).
+color schemes: check any new one (4.5:1 for text, 3:1 for field borders and focus outlines). Type
+sizes and corner radii come from the short lists there, and styles from a class, never a `style`
+attribute. Shared markup is in `mgmt/html.rs`; a list is `html::table`.
 
 What a page says:
 
@@ -151,7 +154,8 @@ What a page says:
   password or other secret. Put `form_alert` at the top of that form, `invalid` on the field
   concerned and `title_of` on the page. Never `let _ =` a control-plane call.
 - **Ask before anything that can't be undone** (`data-confirm`), and name the effect: "It leaves 3
-  people and 2 private tunnels", not "Are you sure?".
+  people and 2 private tunnels", not "Are you sure?". The dialog's button repeats the one pressed,
+  so that one says what it does.
 - **One word per thing.** A *machine* is what people enroll; the *agent* is the background process
   on it, and a *service agent* a machine nobody owns. *Sign in*, not log in. API paths and JSON
   fields keep their names.
@@ -174,7 +178,7 @@ How it holds up:
   for the detail page.
 - **What can grow must wrap, and has a floor.** Give a wrapping cell a `min-width`, or the table
   squeezes it to one word per line.
-- **Tags are chips** (`ui::chips`). A list that's for scanning shows a few and links to the rest
+- **Tags are chips** (`html::chips`). A list that's for scanning shows a few and links to the rest
   (`tags_in_a_row`), and never hides just one; a page where you edit them shows them all.
 - **Works at 320 px and without scripts.** Scripts only enhance; the pages stay usable without them.
   A wide table scrolls inside its own box, and the page itself never scrolls sideways.

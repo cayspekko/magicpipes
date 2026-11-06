@@ -11,7 +11,7 @@ use magicpipes_core::proto::ErrorBody;
 use magicpipes_core::{rfc3339, tags};
 use serde::Serialize;
 
-use super::{ControlPlane, err, internal};
+use super::{ControlPlane, OrLog, err, internal};
 use crate::authz::{self, Action, Principal, Resource};
 use crate::store::{EnrollmentSpec, MAX_TAGS};
 
@@ -95,7 +95,7 @@ impl ControlPlane {
         if !authz::authorize(who, Action::Discover, Resource::Org) {
             return Vec::new();
         }
-        let rows = self.store.tags().unwrap_or_default();
+        let rows = self.store.tags().or_log().unwrap_or_default();
         rows.into_iter()
             .filter(|t| t.user_id.is_none())
             .map(|t| TagView { name: t.name, description: t.description, access: t.access, created_at: rfc3339(t.created_at) })

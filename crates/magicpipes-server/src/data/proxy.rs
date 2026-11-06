@@ -536,9 +536,9 @@ pub fn error_page(code: ErrorCode, message: &str) -> Response<ProxyBody> {
     // The management UI's palette, without the rest of its styles: these pages can be requested by anyone.
     let body = format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>{status}</title><style>
-{PALETTE}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;box-sizing:border-box;background:var(--bg);color:var(--ink);font:16px/1.55 ui-sans-serif,-apple-system,"Helvetica Neue",sans-serif}}
+{PALETTE}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;box-sizing:border-box;background:var(--bg);color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,"Helvetica Neue",sans-serif}}
 main{{width:min(520px,100%)}}.code{{margin:0;font:400 clamp(72px,18vw,112px)/1 ui-serif,"New York",Georgia,serif;letter-spacing:-.04em;color:var(--accent)}}
-p{{margin:18px 0 0;font-size:18px}}.meta{{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);font-size:13px;color:var(--muted);display:flex;justify-content:space-between;gap:12px}}
+p{{margin:18px 0 0;font-size:19px}}.meta{{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);font-size:13.5px;color:var(--muted);display:flex;justify-content:space-between;gap:12px}}
 code{{font:12.5px ui-monospace,"SF Mono",Menlo,monospace}}</style></head>
 <body><main><h1 class="code">{}</h1><p>{message}</p><div class="meta"><span>MagicPipes</span><code>{code}</code></div></main></body></html>"#,
         status.as_u16()

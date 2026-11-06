@@ -6,7 +6,7 @@ use std::time::Instant;
 use magicpipes_core::mux::MuxHandle;
 use magicpipes_core::unix_now;
 
-use super::{ControlPlane, Session};
+use super::{ControlPlane, OrLog, Session};
 
 impl ControlPlane {
     pub(super) fn reap_sessions(&self) {
@@ -27,7 +27,7 @@ impl ControlPlane {
     pub fn attach_session(&self, agent_id: &str, handle: MuxHandle, remote: SocketAddr, protocol: u32) -> Option<u64> {
         let mut st = self.state.lock().unwrap();
         // Checked under the state lock, which `revoke_agent` also holds while deleting.
-        if !self.store.agent_exists(agent_id).unwrap_or(false) || !st.dir.agent_active(agent_id) {
+        if !self.store.agent_exists(agent_id).or_log().unwrap_or(false) || !st.dir.agent_active(agent_id) {
             return None;
         }
         st.next_conn_id += 1;
@@ -38,7 +38,7 @@ impl ControlPlane {
         }
         self.publish(&st);
         drop(st);
-        let _ = self.store.touch_agent(agent_id);
+        self.store.touch_agent(agent_id).or_log();
         tracing::info!(agent = %agent_id, %remote, conn_id, protocol, "agent connected");
         Some(conn_id)
     }

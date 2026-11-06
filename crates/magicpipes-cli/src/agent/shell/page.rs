@@ -35,7 +35,7 @@ main.tm{flex:1;min-height:0;display:flex;flex-direction:column;padding-top:18px;
 .screen{position:relative;flex:1;min-height:0;background:var(--term);border:1px solid var(--line);border-radius:14px;padding:12px 6px 12px 14px;overflow:hidden}
 #t{height:100%}
 .xterm .xterm-viewport{background:transparent!important;scrollbar-width:thin;scrollbar-color:#4b4842 transparent}
-.notice{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);display:flex;align-items:center;gap:16px;max-width:calc(100% - 32px);padding:10px 10px 10px 18px;border-radius:12px;background:var(--surface);color:var(--ink);border:1px solid var(--line-2);font-size:13.5px;box-shadow:0 10px 30px rgba(0,0,0,.28)}
+.notice{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);display:flex;align-items:center;gap:16px;max-width:calc(100% - 32px);padding:10px 10px 10px 18px;border-radius:14px;background:var(--surface);color:var(--ink);border:1px solid var(--line-2);font-size:13.5px;box-shadow:0 10px 30px rgba(0,0,0,.28)}
 .notice[hidden],.notice .btn[hidden]{display:none}
 .notice .btn{padding:8px 13px}
 .notice.solo{padding:12px 18px}

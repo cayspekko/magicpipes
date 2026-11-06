@@ -1,17 +1,17 @@
 //! The Settings page: sign-in providers, who a first sign-in may create an account for, and the
 //! configuration in effect. The decisions are in `control::settings`.
 
-use axum::Form;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use http::{HeaderValue, StatusCode, header};
 use serde::Deserialize;
 
 use super::AppState;
-use super::accounts::{admins_only, csrf};
-use super::icons::{BACK, DOWNLOAD};
+use super::extract::{AdminPosted, AdminUser, NoFields, UiUser};
+use super::html::{Actions, Text, alert, back, badge, esc, table, title_of};
+use super::icons::DOWNLOAD;
 use super::oidc::redirect_uri;
-use super::ui::{CsrfForm, Done, UiUser, alert, badge, done, esc, failed, page, title_of};
+use super::ui::{Done, done, failed, page};
 use crate::control::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 
 /// A kind of provider: all an administrator needs to know to add one. Only `issuer` matters to
@@ -125,7 +125,10 @@ fn option_chips(p: &ProviderView) -> String {
 }
 
 fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Option<(&str, &str)>) -> Response {
-    let providers = app.control.oidc_provider_views(&user.who).unwrap_or_default();
+    // Empty rules on this page would be saved as empty rules.
+    let (Ok(providers), Ok(rules)) = (app.control.oidc_provider_views(&user.who), app.control.sign_in_rules(&user.who)) else {
+        return failed(user, StatusCode::INTERNAL_SERVER_ERROR, "/", "Tunnels", "The settings can't be read right now. The server's log says why.");
+    };
     let mut rows = String::new();
     for p in &providers {
         let actions = if p.from_file {
@@ -137,26 +140,22 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
                 n => format!("Remove {}? {n} people can only sign in with it, and would lose access until they get passwords.", p.label),
             };
             format!(
-                r#"<a class="btn small" href="/settings/providers/{id}">Edit</a> <form method="post" action="/settings/providers/{id}/delete" style="display:inline" data-confirm="{question}">{csrf}<button class="btn danger small">Remove</button></form>"#,
+                r#"<a class="btn small" href="/settings/providers/{id}">Edit</a> <form class="inline" method="post" action="/settings/providers/{id}/delete" data-confirm="{question}">{csrf}<button class="btn danger small">Remove</button></form>"#,
                 id = esc(&p.id),
                 question = esc(&question),
-                csrf = csrf(user),
+                csrf = user.csrf_field(),
             )
         };
-        let status = if p.available { badge("ready") } else { format!(r#"{}<p class="note" style="margin:4px 0 0">Client secret can't be read</p>"#, badge("failed")) };
+        let status = if p.available { badge("ready") } else { format!(r#"{}<p class="note">Client secret can't be read</p>"#, badge("failed")) };
         rows.push_str(&format!(
-            r#"<tr><td><span class="name">{label}</span><div class="sub" style="overflow-wrap:anywhere;margin-top:3px">{issuer}</div></td><td>{options}</td><td>{status}</td><td class="num" style="white-space:nowrap">{actions}</td></tr>"#,
+            r#"<tr><td><span class="name">{label}</span><div class="sub wrap">{issuer}</div></td><td>{options}</td><td>{status}</td><td class="num">{actions}</td></tr>"#,
             label = esc(&p.label),
             issuer = esc(&p.issuer),
             options = option_chips(p),
         ));
     }
-    if rows.is_empty() {
-        rows = r#"<tr><td colspan="4" class="empty">None yet: people sign in with a password.</td></tr>"#.into();
-    }
     let add: String = PRESETS.iter().map(|p| format!(r#"<a class="btn" href="/settings/providers/new?type={}">{}</a>"#, p.key, esc(p.name))).collect();
 
-    let rules = app.control.sign_in_rules(&user.who).unwrap_or_default();
     let (admins, domains) = match typed {
         Some((a, d)) => (a.to_string(), d.to_string()),
         None => (rules.saved.bootstrap_admins.join("\n"), rules.saved.email_domains.join("\n")),
@@ -172,21 +171,22 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
     let body = format!(
         r#"<h1>Settings</h1><p class="lede">Changes here take effect at once; listeners, domains and TLS stay in the configuration file.</p>
 {err}<div class="section"><h2>Sign-in providers</h2></div>
-<div class="card scroll"><table><thead><tr><th>Provider</th><th>Options</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+{list}
 <p class="note">Try a new provider from a private window. If a sign-in fails, the server's log says why.</p>
-<p class="note" style="margin-top:18px">Add a provider:</p><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">{add}</div>
+<p class="note spaced">Add a provider:</p><div class="row">{add}</div>
 <div class="section"><h2>Who can sign in</h2></div>
 <div class="card form"><form method="post" action="/settings/sign-in">{csrf}
-<label for="sa" style="margin-top:0">New administrators</label><textarea id="sa" name="bootstrap_admins" rows="3" placeholder="you@example.com" spellcheck="false">{admins}</textarea>
+<label for="sa">New administrators</label><textarea id="sa" name="bootstrap_admins" rows="3" placeholder="you@example.com" spellcheck="false">{admins}</textarea>
 {locked_admins}<p class="note">One address per line. The first sign-in with one of these addresses creates an administrator's account.</p>
 <label for="sd">New members, by email domain</label><textarea id="sd" name="email_domains" rows="3" placeholder="example.com" spellcheck="false">{domains}</textarea>
 {locked_domains}<p class="note">One domain per line, exact, no subdomains. Empty: nobody gets an account just for being at a provider.</p>
-<button class="btn primary" style="margin-top:14px">Save</button></form></div>
+<button class="btn primary">Save</button></form></div>
 <div class="section"><h2>Configuration in effect</h2></div>
 <p class="note">Always current, at <code>{path}</code> in the data directory. It holds no secrets. <a href="/settings/export">{DOWNLOAD} Download it</a>.</p>
 <details><summary class="btn small">Show it</summary><pre class="term">{config}</pre></details>"#,
+        list = table(&[Text("Provider"), Text("Options"), Text("Status"), Actions], &rows, "None yet: people sign in with a password."),
         err = alert(error),
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
         admins = esc(&admins),
         domains = esc(&domains),
         locked_admins = locked(&rules.from_file.bootstrap_admins),
@@ -197,17 +197,11 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
     page("Settings", Some(user), &body)
 }
 
-pub async fn settings(user: UiUser, State(app): State<AppState>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn settings(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
     settings_page(&user, &app, None, None)
 }
 
-pub async fn export(user: UiUser, State(app): State<AppState>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn export(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
     match app.control.generated_config(&user.who) {
         Ok(text) => {
             let headers = [
@@ -222,20 +216,13 @@ pub async fn export(user: UiUser, State(app): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 pub struct RulesForm {
-    csrf: String,
     #[serde(default)]
     bootstrap_admins: String,
     #[serde(default)]
     email_domains: String,
 }
 
-pub async fn save_rules(user: UiUser, State(app): State<AppState>, Form(f): Form<RulesForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn save_rules(State(app): State<AppState>, AdminPosted(user, f): AdminPosted<RulesForm>) -> Response {
     match app.control.set_sign_in_rules(&user.who, &f.bootstrap_admins, &f.email_domains) {
         Ok(()) => done("/settings", Done::SignInSaved),
         Err(e) => (StatusCode::BAD_REQUEST, settings_page(&user, &app, Some(&e.message), Some((&f.bootstrap_admins, &f.email_domains)))).into_response(),
@@ -265,7 +252,6 @@ pub struct NewQuery {
 
 #[derive(Deserialize)]
 pub struct ProviderForm {
-    csrf: String,
     #[serde(rename = "type", default)]
     kind: String,
     #[serde(default)]
@@ -289,15 +275,15 @@ pub struct ProviderForm {
 fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed: Option<&ProviderForm>, error: Option<&str>) -> Response {
     let url_value = typed.map_or(p.url.map_or("", |(_, _, start)| start), |f| &f.url);
     let url_field = p.url.map_or(String::new(), |(label, placeholder, _)| {
-        format!(r#"<label for="pu" style="margin-top:0">{label}</label><input id="pu" name="url" placeholder="{placeholder}" value="{}" maxlength="1024" required>"#, esc(url_value))
+        format!(r#"<label for="pu">{label}</label><input id="pu" name="url" placeholder="{placeholder}" value="{}" maxlength="1024" required>"#, esc(url_value))
     });
     let part_field = p.part.map_or(String::new(), |(label, placeholder)| {
         format!(r#"<label for="pp">{label}</label><input id="pp" name="part" placeholder="{placeholder}" value="{}" maxlength="200" required>"#, esc(typed.map_or("", |f| &f.part)))
     });
     let body = format!(
-        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow spaced">Sign-in providers</div><h1>Add {name}</h1>
+        r#"{back}<div class="eyebrow spaced">Sign-in providers</div><h1>Add {name}</h1>
 {err}<div class="section"><h2>1. Register this server there</h2></div>
-<div class="card form"><p style="margin-top:0">{steps}</p><label>Redirect URI</label><pre class="term">{redirect}</pre></div>
+<div class="card form"><p>{steps}</p><label>Redirect URI</label><pre class="term">{redirect}</pre></div>
 <div class="section"><h2>2. Enter what it gave you</h2></div>
 <div class="card form"><form method="post" action="/settings/providers/new">{csrf}<input type="hidden" name="type" value="{key}"><input type="hidden" name="id" value="{id}">
 {url_field}{part_field}
@@ -306,13 +292,14 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
 <label for="pc">Client ID</label><input id="pc" name="client_id" value="{client_id}" maxlength="512" autocomplete="off" required>
 <label for="ps">Client secret</label><input id="ps" type="password" name="client_secret" maxlength="4096" autocomplete="new-password" required>
 {toggles}
-<button class="btn primary" style="margin-top:14px">Check and add</button></form>
+<button class="btn primary">Check and add</button></form>
 <p class="note">Adding it asks the provider about itself first, so a wrong address or an unusable signing key shows up now. A wrong client ID or secret only shows at the first sign-in.</p></div>"#,
+        back = back("/settings", "Settings"),
         name = esc(p.name),
         err = alert(error),
         steps = p.steps,
         redirect = esc(&redirect_uri(app, id)),
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
         key = p.key,
         id = esc(id),
         label = esc(typed.map_or(p.label(), |f| &f.label)),
@@ -322,10 +309,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
     page(&title_of(&format!("Add {}", p.name), error.is_some()), Some(user), &body)
 }
 
-pub async fn new_provider(user: UiUser, State(app): State<AppState>, Query(q): Query<NewQuery>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn new_provider(AdminUser(user): AdminUser, State(app): State<AppState>, Query(q): Query<NewQuery>) -> Response {
     let Some(p) = preset(&q.kind) else { return Redirect::to("/settings").into_response() };
     match app.control.free_provider_id(&user.who, p.key) {
         Ok(id) => new_provider_page(&user, &app, p, &id, None, None),
@@ -333,13 +317,7 @@ pub async fn new_provider(user: UiUser, State(app): State<AppState>, Query(q): Q
     }
 }
 
-pub async fn create_provider(user: UiUser, State(app): State<AppState>, Form(f): Form<ProviderForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn create_provider(State(app): State<AppState>, AdminPosted(user, f): AdminPosted<ProviderForm>) -> Response {
     let Some(p) = preset(&f.kind) else { return Redirect::to("/settings").into_response() };
     let added = match p.entered_issuer(&f.url, &f.part) {
         Ok(issuer) => {
@@ -366,23 +344,24 @@ pub async fn create_provider(user: UiUser, State(app): State<AppState>, Form(f):
 /// `typed`: what a form that came back said; a secret isn't sent back.
 fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, typed: Option<&ProviderForm>, error: Option<&str>) -> Response {
     let body = format!(
-        r#"<a class="crumb" href="/settings">{BACK}Settings</a><div class="eyebrow spaced">Sign-in providers</div><h1>{label}</h1>
-{err}<div class="card form"><label style="margin-top:0">Issuer</label><p><code>{issuer}</code></p><p class="note">To change it, remove this provider and add it again. People's accounts are tied to the issuer, so with a different one they sign in as new people.</p>
+        r#"{back}<div class="eyebrow spaced">Sign-in providers</div><h1>{label}</h1>
+{err}<div class="card form"><label>Issuer</label><p><code>{issuer}</code></p><p class="note">To change it, remove this provider and add it again. People's accounts are tied to the issuer, so with a different one they sign in as new people.</p>
 <label>Redirect URI</label><pre class="term">{redirect}</pre></div>
 <div class="section"><h2>Change</h2></div>
 <div class="card form"><form method="post" action="/settings/providers/{id}">{csrf}
-<label for="pl" style="margin-top:0">Button on the sign-in page</label><input id="pl" name="label" value="{typed_label}" maxlength="60" required>
+<label for="pl">Button on the sign-in page</label><input id="pl" name="label" value="{typed_label}" maxlength="60" required>
 <label for="pc">Client ID</label><input id="pc" name="client_id" value="{client_id}" maxlength="512" autocomplete="off" required>
 <label for="ps">New client secret</label><input id="ps" type="password" name="client_secret" maxlength="4096" autocomplete="new-password">
 <p class="note">Leave it empty to keep the current one, which can't be shown.</p>
 {toggles}
-<button class="btn primary" style="margin-top:14px">Save</button></form></div>"#,
+<button class="btn primary">Save</button></form></div>"#,
+        back = back("/settings", "Settings"),
         label = esc(&p.label),
         err = alert(error),
         issuer = esc(&p.issuer),
         redirect = esc(&redirect_uri(app, &p.id)),
         id = esc(&p.id),
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
         typed_label = esc(typed.map_or(p.label.as_str(), |f| &f.label)),
         client_id = esc(typed.map_or(p.client_id.as_str(), |f| &f.client_id)),
         toggles = match typed {
@@ -398,23 +377,14 @@ fn editable(user: &UiUser, app: &AppState, id: &str) -> Option<ProviderView> {
     app.control.oidc_provider_views(&user.who).ok()?.into_iter().find(|p| p.id == id && !p.from_file)
 }
 
-pub async fn edit_provider(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn edit_provider(AdminUser(user): AdminUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
     match editable(&user, &app, &id) {
         Some(p) => edit_provider_page(&user, &app, &p, None, None),
         None => Redirect::to("/settings").into_response(),
     }
 }
 
-pub async fn update_provider(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<ProviderForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn update_provider(State(app): State<AppState>, Path(id): Path<String>, AdminPosted(user, f): AdminPosted<ProviderForm>) -> Response {
     let changes = ProviderChanges { label: &f.label, client_id: &f.client_id, client_secret: &f.client_secret, link_by_email: f.link_by_email.is_some(), trust_email: f.trust_email.is_some(), allow_unverified_admin: f.allow_unverified_admin.is_some() };
     match app.control.update_oidc_provider(&user.who, &id, changes) {
         Ok(()) => done("/settings", Done::ProviderSaved),
@@ -425,13 +395,7 @@ pub async fn update_provider(user: UiUser, State(app): State<AppState>, Path(id)
     }
 }
 
-pub async fn delete_provider(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<CsrfForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn delete_provider(State(app): State<AppState>, Path(id): Path<String>, AdminPosted(user, _): AdminPosted<NoFields>) -> Response {
     match app.control.delete_oidc_provider(&user.who, &id) {
         Ok(_) => done("/settings", Done::ProviderRemoved),
         Err(e) => failed(&user, StatusCode::FORBIDDEN, "/settings", "Settings", &e.message),

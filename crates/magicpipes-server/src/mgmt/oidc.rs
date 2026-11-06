@@ -5,10 +5,11 @@ use axum::response::{IntoResponse, Redirect, Response};
 use http::{HeaderValue, StatusCode, header};
 use serde::Deserialize;
 
-use super::ui::{cookie_from, logged_in, login_page, safe_next, server_url};
+use super::ui::{logged_in, login_page, server_url};
 use super::{AppState, ClientIp};
 use crate::control::OidcError;
 use crate::oidc::ATTEMPT_COOKIE_MAX_AGE;
+use crate::tunnel_auth::{cookie, safe_path};
 
 /// `__Host-`, like the session cookie: content on a tunnel subdomain can't set or shadow it.
 /// `SameSite=Lax`: the way back from the provider is a navigation from another site.
@@ -30,7 +31,7 @@ pub struct StartQuery {
 /// Leaves for the provider. A plain link, so it's safe for another site to link here: all it can
 /// do is start a sign-in that comes back to this browser's own cookie.
 pub async fn start(State(app): State<AppState>, Path(id): Path<String>, Query(q): Query<StartQuery>) -> Response {
-    let next = safe_next(q.next.as_deref());
+    let next = safe_path(q.next.as_deref());
     let Some(provider) = app.control.oidc_provider(&id) else {
         return (StatusCode::NOT_FOUND, login_page(&app, Some("That sign-in method doesn't exist."), false, next)).into_response();
     };
@@ -72,9 +73,9 @@ async fn finish(app: &AppState, id: &str, client: Option<std::net::IpAddr>, head
     let page = |status: StatusCode, msg: &str, next: Option<&str>| (status, login_page(app, Some(msg), false, next)).into_response();
     let expired = "That sign-in has expired. Try again.";
     let Some(provider) = app.control.oidc_provider(id) else { return page(StatusCode::NOT_FOUND, "That sign-in method doesn't exist.", None) };
-    let attempt = cookie_from(headers, ATTEMPT_COOKIE).and_then(|c| app.control.oidc_attempt(&provider, &c));
+    let attempt = cookie(headers, ATTEMPT_COOKIE).and_then(|c| app.control.oidc_attempt(&provider, c));
     let Some(attempt) = attempt else { return page(StatusCode::BAD_REQUEST, expired, None) };
-    let next = safe_next(attempt.next.as_deref());
+    let next = safe_path(attempt.next.as_deref());
     let Some(state) = q.state.as_deref() else { return page(StatusCode::BAD_REQUEST, expired, next) };
     // A provider's error says nothing useful to the person, and it can be typed in by anyone.
     if q.error.is_some() {

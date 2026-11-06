@@ -130,8 +130,27 @@ fn err(code: ErrorCode, msg: impl Into<String>) -> ErrorBody {
 }
 
 fn internal(e: anyhow::Error) -> ErrorBody {
-    tracing::error!(error = %format!("{e:#}"), "control plane storage error");
-    err(ErrorCode::Internal, "internal server error")
+    logged(err(ErrorCode::Internal, "internal server error"))(e)
+}
+
+/// For `map_err`: logs a storage error, which the caller then answers with `answer`.
+fn logged<E>(answer: E) -> impl FnOnce(anyhow::Error) -> E {
+    move |e| {
+        tracing::error!(error = %format!("{e:#}"), "control plane storage error");
+        answer
+    }
+}
+
+/// For storage calls whose caller carries on without an answer: what they returned, or `None` after
+/// logging why. A broken database must not just look like "no such session".
+trait OrLog<T> {
+    fn or_log(self) -> Option<T>;
+}
+
+impl<T> OrLog<T> for anyhow::Result<T> {
+    fn or_log(self) -> Option<T> {
+        self.map_err(logged(())).ok()
+    }
 }
 
 impl ControlPlane {

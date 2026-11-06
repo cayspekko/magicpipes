@@ -18,7 +18,7 @@ use std::time::Duration;
 use magicpipes_core::secret;
 
 use super::users::{Login, clean_name, normalize_email};
-use super::ControlPlane;
+use super::{ControlPlane, logged};
 use crate::authz::{Principal, Role};
 use crate::oidc::{Attempt, Person, Provider};
 use crate::store::UserRow;
@@ -91,8 +91,8 @@ impl ControlPlane {
                 self.audit(&Principal::Anonymous, "login.failed", &format!("oidc:{}", provider.id), email.as_deref().unwrap_or(""));
             }
         })?;
-        self.store.finish_sso_login(&user.id, &provider.issuer).map_err(|_| OidcError::Internal)?;
-        let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(|_| OidcError::Internal)?;
+        self.store.finish_sso_login(&user.id, &provider.issuer).map_err(logged(OidcError::Internal))?;
+        let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(OidcError::Internal))?;
         let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };
         self.audit(&who, "session.login", &user.id, &format!("oidc:{}", provider.id));
         // Finishing can have removed a temporary password, which was forcing a change.
@@ -103,14 +103,14 @@ impl ControlPlane {
     fn oidc_account(&self, provider: &Provider, person: &Person) -> Result<UserRow, OidcError> {
         let email = person.verified_email.as_deref().and_then(normalize_email);
         let refused = || OidcError::NotAllowed(email.clone());
-        let known = self.store.identity_user(&provider.issuer, &person.subject).map_err(|_| OidcError::Internal)?;
+        let known = self.store.identity_user(&provider.issuer, &person.subject).map_err(logged(OidcError::Internal))?;
         if let Some(user) = known {
             return if user.disabled { Err(refused()) } else { Ok(user) };
         }
         let Some(address) = email.as_deref() else { return Err(refused()) };
         let may_be_admin = person.vouched_for || provider.allow_unverified_admin;
         let unverified = if person.vouched_for { "" } else { " unverified address" };
-        if let Some(user) = self.store.user_by_email(address).map_err(|_| OidcError::Internal)? {
+        if let Some(user) = self.store.user_by_email(address).map_err(logged(OidcError::Internal))? {
             if !provider.link_by_email || user.disabled {
                 return Err(refused());
             }
@@ -118,7 +118,7 @@ impl ControlPlane {
                 tracing::warn!(provider = %provider.id, "refused a sign-in: an unverified address can't take over an administrator's account without allow_unverified_admin");
                 return Err(refused());
             }
-            if !self.store.link_identity(&user.id, &provider.issuer, &person.subject).map_err(|_| OidcError::Internal)? {
+            if !self.store.link_identity(&user.id, &provider.issuer, &person.subject).map_err(logged(OidcError::Internal))? {
                 return Err(refused());
             }
             self.audit(&Principal::Anonymous, "user.link", &user.id, &format!("oidc:{}{unverified}", provider.id));
@@ -139,9 +139,9 @@ impl ControlPlane {
             return Err(refused());
         };
         let name = clean_name(&person.name, 100);
-        let id = self.store.create_sso_user(address, &name, role, &provider.issuer, &person.subject).map_err(|_| OidcError::Internal)?.ok_or_else(refused)?;
+        let id = self.store.create_sso_user(address, &name, role, &provider.issuer, &person.subject).map_err(logged(OidcError::Internal))?.ok_or_else(refused)?;
         self.audit(&Principal::Anonymous, "user.create", &id, &format!("oidc:{} {}{unverified}", provider.id, role.as_str()));
         self.refresh();
-        self.store.user(&id).map_err(|_| OidcError::Internal)?.ok_or(OidcError::Internal)
+        self.store.user(&id).map_err(logged(OidcError::Internal))?.ok_or(OidcError::Internal)
     }
 }

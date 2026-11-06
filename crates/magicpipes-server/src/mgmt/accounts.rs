@@ -1,30 +1,27 @@
 //! UI pages for accounts: changing your password, your API tokens and sessions, user
 //! administration, tags, custom hostnames and the audit log.
 
-use axum::Form;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use http::StatusCode;
+use magicpipes_core::url;
 use serde::Deserialize;
 
 use super::AppState;
-use super::icons::BACK;
+use super::extract::{AdminUser, Fields, NoFields, Posted, UiUser};
+use super::html::{Actions, Text, alert, back, badge, chips, count, esc, form_alert, invalid, menu_post, row_menu, table, title_of, when};
 use super::picker::{self, Holder, Submitted};
-use super::ui::{CsrfForm, Done, UiUser, alert, badge, chips, count, done, done_url, esc, failed, form_alert, invalid, logged_in_to, menu_post, outcome, page, row_menu, safe_next, server_url, title_of, when};
+use super::ui::{Done, done, done_url, failed, logged_in_to, not_there, outcome, page, server_url};
 use crate::authz::{Principal, Role};
 use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
-
-/// A hidden CSRF field for a form.
-pub(super) fn csrf(user: &UiUser) -> String {
-    format!(r#"<input type="hidden" name="csrf" value="{}">"#, esc(&user.csrf))
-}
+use crate::tunnel_auth::safe_path;
 
 /// A page that shows a secret once, with a way back. `more`: HTML to follow it.
-fn shown_once(user: &UiUser, title: &str, lede: &str, secret: &str, more: &str, back: &str) -> Response {
+fn shown_once(user: &UiUser, title: &str, lede: &str, secret: &str, more: &str, to: &str) -> Response {
     let body = format!(
-        r#"<a class="crumb" href="{back}">{BACK}Back</a><div class="eyebrow spaced">Shown once</div><h1>{title}</h1>
+        r#"{back}<div class="eyebrow spaced">Shown once</div><h1>{title}</h1>
 <p class="lede">{lede}</p><pre class="term">{secret}</pre>{more}"#,
-        back = esc(back),
+        back = back(to, "Back"),
         title = esc(title),
         lede = esc(lede),
         secret = esc(secret),
@@ -38,13 +35,13 @@ fn invitation(app: &AppState, email: &str, password: &str) -> String {
         "Your MagicPipes account is ready.\n\nSign in at {}\nEmail: {email}\nPassword: {password}\n\nYou'll choose your own password when you sign in.",
         server_url(app)
     );
-    format!(r#"<p class="note" style="margin-top:28px">Or send them all of it:</p><pre class="term">{}</pre>"#, esc(&message))
+    format!(r#"<p class="note spaced">Or send them all of it:</p><pre class="term">{}</pre>"#, esc(&message))
 }
 
 // ---- password --------------------------------------------------------------------------------
 
 fn password_page(user: &UiUser, error: Option<&str>, next: Option<&str>) -> Response {
-    let next = safe_next(next).map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
+    let next = safe_path(next).map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
     let forced = user.user.as_ref().is_some_and(|u| u.must_change_password);
     let lede = if forced {
         "An administrator set your password. Choose your own to continue."
@@ -53,15 +50,15 @@ fn password_page(user: &UiUser, error: Option<&str>, next: Option<&str>) -> Resp
     };
     let body = format!(
         r#"<div class="auth"><div class="eyebrow">Account</div><h1>Change <em>password</em></h1><p class="lede">{lede}</p>
-<div class="card" style="margin-top:28px">{err}<form method="post" action="/password">{csrf}{next}
-<label for="c" style="margin-top:0">Current password</label><input id="c" type="password" name="current" autocomplete="current-password" required autofocus>
+<div class="card">{err}<form method="post" action="/password">{csrf}{next}
+<label for="c">Current password</label><input id="c" type="password" name="current" autocomplete="current-password" required autofocus>
 <label for="n">New password</label><input id="n" type="password" name="new" autocomplete="new-password" minlength="{min}" required>
 <label for="r">Repeat the new password</label><input id="r" type="password" name="repeat" autocomplete="new-password" minlength="{min}" required>
-<button class="btn primary block" style="margin-top:18px">Change password</button></form></div>
+<button class="btn primary block">Change password</button></form></div>
 <p class="note">At least {min} characters. A long phrase is easier to remember than a short jumble.</p></div>"#,
         lede = esc(lede),
         err = alert(error),
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
         min = MIN_PASSWORD_CHARS,
     );
     page("Change password", Some(user), &body)
@@ -81,17 +78,13 @@ pub async fn password_form(user: UiUser, axum::extract::Query(q): axum::extract:
 
 #[derive(Deserialize)]
 pub struct PasswordForm {
-    csrf: String,
     current: String,
     new: String,
     repeat: String,
     next: Option<String>,
 }
 
-pub async fn change_password(user: UiUser, State(app): State<AppState>, Form(f): Form<PasswordForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn change_password(State(app): State<AppState>, Posted(user, f): Posted<PasswordForm>) -> Response {
     let next = f.next.as_deref();
     if f.new != f.repeat {
         return (StatusCode::BAD_REQUEST, password_page(&user, Some("The new passwords don't match."), next)).into_response();
@@ -125,11 +118,8 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
             created = when(&t.created_at),
             used = t.last_used_at.as_deref().map(when).unwrap_or_else(|| "never".into()),
             expires = t.expires_at.as_deref().map(when).unwrap_or_else(|| "never".into()),
-            csrf = csrf(user),
+            csrf = user.csrf_field(),
         ));
-    }
-    if rows.is_empty() {
-        rows = r#"<tr><td colspan="5" class="empty">No API tokens.</td></tr>"#.into();
     }
     let error = attempt.map(|(_, m)| m);
     let bad_expiry = error == Some(BAD_EXPIRY);
@@ -137,18 +127,19 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
         r#"<div class="eyebrow">Account</div><h1>{name}</h1><p class="lede">{email} · {role}</p>
 {password}
 <div class="section"><h2>API tokens</h2></div>
-<div class="card scroll"><table><thead><tr><th>Token</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
-<div class="card form" style="margin-top:12px">{form_error}<form method="post" action="/account/tokens">{csrf}
-<label for="tn" style="margin-top:0">Name</label><input id="tn" name="name" maxlength="64" placeholder="ci-deploy" value="{typed_name}"{name_invalid} required>
+{list}
+<div class="card form spaced">{form_error}<form method="post" action="/account/tokens">{csrf}
+<label for="tn">Name</label><input id="tn" name="name" maxlength="64" placeholder="ci-deploy" value="{typed_name}"{name_invalid} required>
 <label for="te">Expires after (days, empty = never)</label><input id="te" name="expires_in_days" inputmode="numeric" pattern="[0-9]*" value="{typed_days}"{days_invalid}>
-<button class="btn primary" style="margin-top:14px">Create API token</button></form>
+<button class="btn primary">Create API token</button></form>
 <p class="note">Use it as <code>Authorization: Bearer &lt;token&gt;</code>. It acts as you, with your current role.</p></div>
-<div class="card panel danger" style="margin-top:20px"><div><h2>Sign out everywhere</h2><p>Ends every browser session of this account, this one included. API tokens keep working.</p></div>
+<div class="card panel danger spaced"><div><h2>Sign out everywhere</h2><p>Ends every browser session of this account, this one included. API tokens keep working.</p></div>
 <form method="post" action="/account/logout-everywhere">{csrf}<button class="btn danger">Sign out everywhere</button></form></div>"#,
         name = esc(if me.display_name.is_empty() { &me.email } else { &me.display_name }),
         email = esc(&me.email),
         role = me.role.as_str(),
-        csrf = csrf(user),
+        list = table(&[Text("Token"), Text("Created"), Text("Last used"), Text("Expires"), Actions], &rows, "No API tokens yet. Create one below for scripts and CI."),
+        csrf = user.csrf_field(),
         form_error = form_alert(error),
         typed_name = esc(attempt.map_or("", |(f, _)| &f.name)),
         typed_days = esc(attempt.map_or("", |(f, _)| &f.expires_in_days)),
@@ -156,7 +147,7 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
         days_invalid = invalid(bad_expiry),
         // Someone who only signs in with single sign-on has no password to change.
         password = if me.has_password {
-            r#"<div class="card panel" style="margin-top:20px"><div><h2>Password</h2><p>Changing it signs you out on other devices.</p></div><a class="btn" href="/password">Change password</a></div>"#
+            r#"<div class="card panel spaced"><div><h2>Password</h2><p>Changing it signs you out on other devices.</p></div><a class="btn" href="/password">Change password</a></div>"#
         } else {
             ""
         },
@@ -170,16 +161,12 @@ pub async fn account(user: UiUser, State(app): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 pub struct TokenForm {
-    csrf: String,
     name: String,
     #[serde(default)]
     expires_in_days: String,
 }
 
-pub async fn create_token(user: UiUser, State(app): State<AppState>, Form(f): Form<TokenForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn create_token(State(app): State<AppState>, Posted(user, f): Posted<TokenForm>) -> Response {
     let refused = |message: &str| (StatusCode::BAD_REQUEST, account_page(&user, &app, Some((&f, message)))).into_response();
     let days = match f.expires_in_days.trim() {
         "" => None,
@@ -202,17 +189,11 @@ pub async fn create_token(user: UiUser, State(app): State<AppState>, Form(f): Fo
     }
 }
 
-pub async fn delete_token(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<CsrfForm>) -> Response {
-    if let Err(r) = user.check_csrf(f.csrf()) {
-        return r;
-    }
+pub async fn delete_token(State(app): State<AppState>, Path(id): Path<String>, Posted(user, _): Posted<NoFields>) -> Response {
     outcome(&user, app.control.delete_token(&user.who, &id), "/account", "Account", Done::TokenDeleted, "That API token is already gone.")
 }
 
-pub async fn logout_everywhere(user: UiUser, State(app): State<AppState>, Form(f): Form<CsrfForm>) -> Response {
-    if let Err(r) = user.check_csrf(f.csrf()) {
-        return r;
-    }
+pub async fn logout_everywhere(State(app): State<AppState>, Posted(user, _): Posted<NoFields>) -> Response {
     match app.control.logout_everywhere(&user.who) {
         Ok(()) => Redirect::to("/login").into_response(),
         Err(e) => failed(&user, StatusCode::INTERNAL_SERVER_ERROR, "/account", "Account", &e.message),
@@ -243,7 +224,7 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
         };
         let tags = edit.cell(user);
         let post = |action: &str, label: &str, danger: bool, confirm: Option<String>| {
-            menu_post(&format!("/users/{}", u.id), &user.csrf, &[("action", action)], label, danger, confirm.as_deref())
+            menu_post(&format!("/users/{}", u.id), &user.csrf_field(), &[("action", action)], label, danger, confirm.as_deref())
         };
         let mut items = vec![edit.link(user, "menu-item", "Edit tags", &format!("Edit tags of {}", u.email))];
         if !me {
@@ -263,10 +244,10 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
                 post("disable", "Disable", true, Some(format!("Disable {}? They are signed out, and their machines stop serving tunnels.", u.email)))
             });
         }
-        let you = if me { r#"<span class="sub" style="display:inline;margin-right:8px">you</span>"# } else { "" };
+        let you = if me { r#"<span class="sub you">you</span>"# } else { "" };
         let actions = format!("{you}{}", row_menu(&u.email, &items));
         rows.push_str(&format!(
-            r#"<tr><td><span class="name">{name}</span><span class="sub">{email}{personal}</span></td><td>{role}</td><td>{tags}</td><td>{state}</td><td>{last}</td><td class="num">{actions}</td></tr>"#,
+            r#"<tr><td><span class="name">{name}</span><span class="sub wrap">{email}{personal}</span></td><td>{role}</td><td>{tags}</td><td>{state}</td><td>{last}</td><td class="num">{actions}</td></tr>"#,
             name = esc(if u.display_name.is_empty() { &u.email } else { &u.display_name }),
             email = esc(&u.email),
             personal = u.personal_tag.as_deref().map(|t| format!(" · <code>{}</code>", esc(t))).unwrap_or_default(),
@@ -274,25 +255,23 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
             last = u.last_login_at.as_deref().map(when).unwrap_or_else(|| "never".into()),
         ));
     }
-    if rows.is_empty() {
-        rows = r#"<tr><td colspan="6" class="empty">No users yet.</td></tr>"#.into();
-    }
     let form_error = attempt.map(|(_, m)| m);
     let bad_password = form_error.is_some_and(|m| m.contains("password"));
     let typed = |value: fn(&NewUserForm) -> &str| esc(attempt.map_or("", |(f, _)| value(f)));
     let admin_role = attempt.is_some_and(|(f, _)| f.role == "admin");
     let body = format!(
         r#"<h1>Users</h1><p class="lede">People who can sign in, and the tags that decide which private tunnels they reach.</p>
-{err}<div class="card scroll spaced"><table><thead><tr><th>User</th><th>Role</th><th>Tags</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+{err}<div class="spaced">{list}</div>
 <div class="section" id="add"><h2>Add a user</h2></div>
 <div class="card form">{form_error}<form method="post" action="/users">{csrf}
-<label for="ue" style="margin-top:0">Email</label><input id="ue" type="email" name="email" value="{email}"{email_invalid} required>
+<label for="ue">Email</label><input id="ue" type="email" name="email" value="{email}"{email_invalid} required>
 <label for="un">Name</label><input id="un" name="display_name" value="{name}" maxlength="100">
 <label for="ur">Role</label><select id="ur" name="role"><option value="member">Member</option><option value="admin"{admin_selected}>Administrator</option></select>
 <label for="up">Password (empty = generate one)</label><input id="up" type="password" name="password" autocomplete="new-password" minlength="{min}"{password_invalid}>
-<button class="btn primary" style="margin-top:14px">Add user</button></form>
+<button class="btn primary">Add user</button></form>
 <p class="note">They replace a password you set here when they first sign in. With a single sign-on provider, they can sign in with that instead.</p></div>{registry}"#,
         registry = picker::registry(app, user),
+        list = table(&[Text("User"), Text("Role"), Text("Tags"), Text("Status"), Text("Last sign-in"), Actions], &rows, "No users yet. Add the first one below."),
         err = alert(error),
         form_error = form_alert(form_error),
         email = typed(|f| &f.email),
@@ -300,26 +279,18 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
         admin_selected = if admin_role { " selected" } else { "" },
         email_invalid = invalid(form_error.is_some() && !bad_password),
         password_invalid = invalid(bad_password),
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
         min = MIN_PASSWORD_CHARS,
     );
     page(&title_of("Users", form_error.is_some()), Some(user), &body)
 }
 
-pub(super) fn admins_only(user: &UiUser) -> Option<Response> {
-    (!user.who.is_admin()).then(|| Redirect::to("/account").into_response())
-}
-
-pub async fn users(user: UiUser, State(app): State<AppState>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn users(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
     users_page(&user, &app, None, None)
 }
 
 #[derive(Deserialize)]
 pub struct NewUserForm {
-    csrf: String,
     email: String,
     #[serde(default)]
     display_name: String,
@@ -328,10 +299,7 @@ pub struct NewUserForm {
     password: String,
 }
 
-pub async fn create_user(user: UiUser, State(app): State<AppState>, Form(f): Form<NewUserForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn create_user(State(app): State<AppState>, Posted(user, f): Posted<NewUserForm>) -> Response {
     let role = Role::parse(&f.role).unwrap_or(Role::Member);
     let password = (!f.password.is_empty()).then_some(f.password.as_str());
     match app.control.create_user(&user.who, &f.email, &f.display_name, role, password).await {
@@ -350,16 +318,12 @@ pub async fn create_user(user: UiUser, State(app): State<AppState>, Form(f): For
 
 #[derive(Deserialize)]
 pub struct UserActionForm {
-    csrf: String,
     action: String,
     #[serde(default)]
     tags: String,
 }
 
-pub async fn update_user(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Form(f): Form<UserActionForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn update_user(State(app): State<AppState>, Path(id): Path<String>, Posted(user, f): Posted<UserActionForm>) -> Response {
     let (result, what) = match f.action.as_str() {
         "reset" => match app.control.reset_password(&user.who, &id).await {
             Ok(password) => {
@@ -390,12 +354,9 @@ pub async fn update_user(user: UiUser, State(app): State<AppState>, Path(id): Pa
 }
 
 /// Without scripts, a user's Edit link opens this page of checkboxes.
-pub async fn user_tags_page(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn user_tags_page(AdminUser(user): AdminUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(u) = app.control.user(&user.who, &id) else {
-        return (StatusCode::NOT_FOUND, page("Not found", Some(&user), &format!(r#"<a class="crumb" href="/users">{BACK}Users</a><h1>Not found</h1>"#))).into_response();
+        return not_there(&user, "/users", "Users", "There is no user with that id.");
     };
     let all: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
     let boxes = if all.is_empty() {
@@ -404,26 +365,24 @@ pub async fn user_tags_page(user: UiUser, State(app): State<AppState>, Path(id):
         picker::fieldset("Tags", &all, &u.tags, None)
     };
     let body = format!(
-        r#"<a class="crumb" href="/users">{BACK}Users</a><div class="head"><div><div class="eyebrow">User</div><h1>Tags of <em>{email}</em></h1></div></div>
+        r#"{back}<div class="head"><div><div class="eyebrow">User</div><h1>Tags of <em>{email}</em></h1></div></div>
 <div class="card form"><form method="post" action="/users/{id}/tags">{csrf}<input type="hidden" name="base" value="{base}">
-{boxes}<button class="btn primary" style="margin-top:18px">Save</button></form></div>"#,
+{boxes}<button class="btn primary">Save</button></form></div>"#,
+        back = back("/users", "Users"),
         email = esc(&u.email),
         id = esc(&u.id),
-        csrf = csrf(&user),
+        csrf = user.csrf_field(),
         base = esc(&u.tags.join(" ")),
     );
     page("User tags", Some(&user), &body)
 }
 
 /// Saves a user's tags from the picker or the page above: only what changed since it was shown.
-pub async fn user_tags(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, axum::extract::RawForm(raw): axum::extract::RawForm) -> Response {
-    let form = match Submitted::parse(&raw) {
+pub async fn user_tags(State(app): State<AppState>, Path(id): Path<String>, Posted(user, fields): Posted<Fields>) -> Response {
+    let form = match Submitted::parse(fields) {
         Ok(f) => f,
         Err(e) => return (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e), None)).into_response(),
     };
-    if let Err(r) = user.check_csrf(&form.csrf) {
-        return r;
-    }
     if let Err(e) = form.create_missing(&app, &user.who) {
         return (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e), None)).into_response();
     }
@@ -461,8 +420,8 @@ pub async fn auth_tunnel(user: UiUser, State(app): State<AppState>, axum::extrac
     }
     match app.control.tunnel_sign_in(&user.who, &q.host, &q.state) {
         TunnelSignIn::Allowed { callback } => {
-            let back = if q.back.starts_with('/') && !q.back.starts_with("//") { q.back.as_str() } else { "/" };
-            Redirect::to(&format!("{callback}&return={}", super::ui::url_encode(back))).into_response()
+            let back = safe_path(Some(&q.back)).unwrap_or("/");
+            Redirect::to(&format!("{callback}&return={}", url::encode(back))).into_response()
         }
         TunnelSignIn::NotFound => {
             let body = format!(r#"<div class="auth"><h1>Not found</h1><p class="lede">There is no private tunnel at <code>{}</code>.</p></div>"#, esc(&q.host));
@@ -472,16 +431,11 @@ pub async fn auth_tunnel(user: UiUser, State(app): State<AppState>, axum::extrac
             let body = format!(
                 r#"<div class="auth"><div class="eyebrow">Private tunnel</div><h1>No <em>access</em></h1>
 <p class="lede">You're signed in as {email}, but you don't have access to <code>{host}</code>. Ask its owner or an administrator.</p>
-<form method="post" action="/logout" style="margin-top:20px">{csrf}<input type="hidden" name="next" value="{here}"><button class="btn">Switch account</button></form></div>"#,
+<form class="spaced" method="post" action="/logout">{csrf}<input type="hidden" name="next" value="{here}"><button class="btn">Switch account</button></form></div>"#,
                 email = esc(&me.email),
                 host = esc(&q.host),
-                csrf = csrf(&user),
-                here = esc(&format!(
-                    "/auth/tunnel?host={}&state={}&return={}",
-                    super::ui::url_encode(&q.host),
-                    super::ui::url_encode(&q.state),
-                    super::ui::url_encode(&q.back)
-                )),
+                csrf = user.csrf_field(),
+                here = esc(&format!("/auth/tunnel?host={}&state={}&return={}", url::encode(&q.host), url::encode(&q.state), url::encode(&q.back))),
             );
             (StatusCode::FORBIDDEN, page("No access", Some(&user), &body)).into_response()
         }
@@ -512,33 +466,29 @@ pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Qu
     let body = format!(
         r#"<div class="auth"><div class="eyebrow">magicpipes login</div><h1>Approve <em>{name}</em>?</h1>
 <p class="lede">A machine asked to sign in as you {ago} seconds ago, from <code>{client}</code>. Compare the code with the one in its terminal.</p>
-<div class="card" style="margin-top:20px"><div class="stat"><div class="k">Code</div><div class="v sm"><code>{code}</code></div></div>
+<div class="card"><div class="stat"><div class="k">Code</div><div class="v sm"><code>{code}</code></div></div>
 <form method="post" action="/cli">{csrf}<input type="hidden" name="code" value="{code}">
 <p class="note">Its private tunnels are for you alone until it shares one with a tag you hold (<code>magicpipes add --tag</code>).</p>
-<div style="display:flex;gap:10px;margin-top:18px"><button class="btn primary" name="answer" value="approve">Approve</button><button class="btn danger" name="answer" value="deny">Deny</button></div></form></div>
+<div class="row"><button class="btn primary" name="answer" value="approve">Approve</button><button class="btn danger" name="answer" value="deny">Deny</button></div></form></div>
 <p class="note">Only approve a request you just started yourself: an approved machine acts as you and can publish tunnels in your name.</p></div>"#,
         name = esc(&req.agent_name),
         ago = req.age_secs,
         client = esc(&req.client.to_string()),
         code = esc(&req.user_code),
-        csrf = csrf(&user),
+        csrf = user.csrf_field(),
     );
     page("Approve a machine", Some(&user), &body)
 }
 
 #[derive(Deserialize)]
 pub struct DeviceAnswer {
-    csrf: String,
     #[serde(default)]
     code: String,
     #[serde(default)]
     answer: String,
 }
 
-pub async fn answer_device(user: UiUser, State(app): State<AppState>, Form(f): Form<DeviceAnswer>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn answer_device(State(app): State<AppState>, Posted(user, f): Posted<DeviceAnswer>) -> Response {
     let approved = f.answer == "approve";
     match app.control.answer_device_login(&user.who, &f.code, approved) {
         Ok(()) => {
@@ -551,38 +501,6 @@ pub async fn answer_device(user: UiUser, State(app): State<AppState>, Form(f): F
         }
         Err(e) => (StatusCode::BAD_REQUEST, page("Approve a machine", Some(&user), &alert(Some(&e.message)))).into_response(),
     }
-}
-
-/// `application/x-www-form-urlencoded` pairs, decoded.
-pub(super) fn form_urlencoded_pairs(body: &[u8]) -> Vec<(String, String)> {
-    let decode = |s: &str| {
-        let s = s.replace('+', " ");
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while i < b.len() {
-            match (b[i], b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())) {
-                (b'%', Some(v)) => {
-                    out.push(v);
-                    i += 3;
-                }
-                (c, _) => {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    };
-    String::from_utf8_lossy(body)
-        .split('&')
-        .filter(|kv| !kv.is_empty())
-        .take(500)
-        .map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (decode(k), decode(v))
-        })
-        .collect()
 }
 
 // ---- tags ----------------------------------------------------------------------------------
@@ -613,17 +531,14 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option
             (r#"<span class="when">label only</span>"#, "on", "Turn on", None)
         };
         rows.push_str(&format!(
-            r#"<tr><td><code>{name}</code></td><td>{description}</td><td>{state} <form method="post" action="/tags/access" style="display:inline"{ask}>{csrf}<input type="hidden" name="name" value="{name}"><input type="hidden" name="access" value="{flip}"><button class="btn small ghost" aria-label="{label} {name}">{label}</button></form></td><td>{created}</td><td class="num"><form method="post" action="/tags/delete" data-confirm="Delete {name}? {effect}">{csrf}<input type="hidden" name="name" value="{name}"><button class="btn danger small" aria-label="Delete {name}">Delete</button></form></td></tr>"#,
+            r#"<tr><td class="wrap"><code>{name}</code></td><td class="wrap">{description}</td><td>{state} <form class="inline" method="post" action="/tags/access"{ask}>{csrf}<input type="hidden" name="name" value="{name}"><input type="hidden" name="access" value="{flip}"><button class="btn small ghost" aria-label="{label} {name}">{label}</button></form></td><td>{created}</td><td class="num"><form method="post" action="/tags/delete" data-confirm="Delete {name}? {effect}">{csrf}<input type="hidden" name="name" value="{name}"><button class="btn danger small" aria-label="Delete {name}">Delete</button></form></td></tr>"#,
             name = esc(&t.name),
             description = esc(&t.description),
             ask = ask.map(|q| format!(r#" data-confirm="{}""#, esc(&q))).unwrap_or_default(),
             effect = esc(&tag_reach(holders, tunnels)),
             created = when(&t.created_at),
-            csrf = csrf(user),
+            csrf = user.csrf_field(),
         ));
-    }
-    if rows.is_empty() {
-        rows = r#"<tr><td colspan="5" class="empty">No tags yet.</td></tr>"#.into();
     }
     let form_error = attempt.map(|(_, m)| m);
     let body = format!(
@@ -632,36 +547,33 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option
 <p>A person can open a private tunnel when they share a tag with it that grants access. A tag that doesn't is only a label. Matching is exact.</p>
 <p>Everyone also holds a personal tag (<code>user:…</code>), which the server puts on the tunnels of their machines. That's how people reach their own tunnels, and adding someone's personal tag to a tunnel shares it with just them.</p>
 <p>Deleting a tag removes it from everyone and everything at once.</p></div></details>
-{err}<div class="card scroll spaced"><table><thead><tr><th>Tag</th><th>Description</th><th>Access</th><th>Created</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+{err}<div class="spaced">{list}</div>
 <div class="section"><h2>Create a tag</h2></div>
 <div class="card form">{form_error}<form method="post" action="/tags">{csrf}
-<label for="tn" style="margin-top:0">Name</label><input id="tn" name="name" placeholder="team:dev" maxlength="64" value="{name}"{name_invalid} required>
+<label for="tn">Name</label><input id="tn" name="name" placeholder="team:dev" maxlength="64" value="{name}"{name_invalid} required>
 <label for="td">Description</label><input id="td" name="description" maxlength="200" value="{description}">
 <label><input type="checkbox" name="access" value="on"{access}> Grants access: people and private tunnels sharing it connect</label>
-<button class="btn primary" style="margin-top:14px">Create tag</button></form>
+<button class="btn primary">Create tag</button></form>
 <p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>; <code>user:</code> is for personal tags. Example tags: {examples}</p></div>"#,
+        list = table(&[Text("Tag"), Text("Description"), Text("Access"), Text("Created"), Actions], &rows, "No tags yet. Create the first one below."),
         err = alert(error),
         form_error = form_alert(form_error),
         name = esc(attempt.map_or("", |(f, _)| &f.name)),
         description = esc(attempt.map_or("", |(f, _)| &f.description)),
         name_invalid = invalid(form_error.is_some()),
         access = if attempt.is_none_or(|(f, _)| f.access.as_deref() == Some("on")) { " checked" } else { "" },
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
         examples = chips(&["team:dev".into(), "contractor:acme".into()]),
     );
     page(&title_of("Tags", form_error.is_some()), Some(user), &body)
 }
 
-pub async fn tags(user: UiUser, State(app): State<AppState>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn tags(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
     tags_page(&user, &app, None, None)
 }
 
 #[derive(Deserialize)]
 pub struct TagForm {
-    csrf: String,
     name: String,
     #[serde(default)]
     description: String,
@@ -669,27 +581,18 @@ pub struct TagForm {
     access: Option<String>,
 }
 
-pub async fn create_tag(user: UiUser, State(app): State<AppState>, Form(f): Form<TagForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn create_tag(State(app): State<AppState>, Posted(user, f): Posted<TagForm>) -> Response {
     match app.control.create_tag(&user.who, &f.name, &f.description, f.access.as_deref() == Some("on")) {
         Ok(_) => done("/tags", Done::TagCreated),
         Err(e) => (StatusCode::BAD_REQUEST, tags_page(&user, &app, None, Some((&f, &e.message)))).into_response(),
     }
 }
 
-pub async fn delete_tag(user: UiUser, State(app): State<AppState>, Form(f): Form<TagForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn delete_tag(State(app): State<AppState>, Posted(user, f): Posted<TagForm>) -> Response {
     outcome(&user, app.control.delete_tag(&user.who, &f.name), "/tags", "Tags", Done::TagDeleted, "That tag is already gone.")
 }
 
-pub async fn tag_access(user: UiUser, State(app): State<AppState>, Form(f): Form<TagForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn tag_access(State(app): State<AppState>, Posted(user, f): Posted<TagForm>) -> Response {
     let on = f.access.as_deref() == Some("on");
     match app.control.set_tag_access(&user.who, &f.name, on) {
         Ok(true) => done("/tags", if on { Done::AccessOn } else { Done::AccessOff }),
@@ -717,11 +620,8 @@ fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: O
             host = esc(&h.hostname),
             tls = badge(h.tls),
             created = when(&h.created_at),
-            csrf = csrf(user),
+            csrf = user.csrf_field(),
         ));
-    }
-    if rows.is_empty() {
-        rows = r#"<tr><td colspan="6" class="empty">No custom hostnames yet.</td></tr>"#.into();
     }
     let users: String = app
         .control
@@ -740,44 +640,38 @@ fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: O
     let form_error = attempt.map(|(_, m)| m);
     let body = format!(
         r#"<h1>Hostnames</h1><p class="lede">Your own domains, outside <code>{base}</code>, each served by one person's machines or one service agent.</p>
-{err}<div class="card scroll spaced"><table><thead><tr><th>Hostname</th><th>Served by</th><th>Tunnel</th><th>TLS</th><th>Registered</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+{err}<div class="spaced">{list}</div>
 <div class="section"><h2>Register a hostname</h2></div>
 <div class="card form">{form_error}<form method="post" action="/hostnames">{csrf}
-<label for="hn" style="margin-top:0">Hostname</label><input id="hn" name="hostname" placeholder="shop.example.com" maxlength="253" value="{typed_host}"{host_invalid} required>
+<label for="hn">Hostname</label><input id="hn" name="hostname" placeholder="shop.example.com" maxlength="253" value="{typed_host}"{host_invalid} required>
 <label for="ha">Served by</label><select id="ha" name="assign"{assign_invalid} required><option value="">Choose…</option>{users}{agents}</select>
-<button class="btn primary" style="margin-top:14px">Register</button></form>
+<button class="btn primary">Register</button></form>
 <p class="note">One exact name, no wildcards, with its DNS pointing at this server. Its certificate is ordered as soon as you register it, so it can be ready before traffic moves over. Then serve a tunnel on it with <code>magicpipes add PORT --hostname NAME</code>. Removing it deletes that tunnel.</p></div>"#,
         base = esc(&app.control.config().base_domain),
+        list = table(&[Text("Hostname"), Text("Served by"), Text("Tunnel"), Text("TLS"), Text("Registered"), Actions], &rows, "No custom hostnames yet. Register one below, or use names under the base domain."),
         err = alert(error),
         form_error = form_alert(form_error),
         typed_host = esc(attempt.map_or("", |(f, _)| &f.hostname)),
         host_invalid = invalid(form_error.is_some() && !assigned.is_empty()),
         assign_invalid = invalid(form_error.is_some() && assigned.is_empty()),
-        csrf = csrf(user),
+        csrf = user.csrf_field(),
     );
     page(&title_of("Hostnames", form_error.is_some()), Some(user), &body)
 }
 
-pub async fn hostnames(user: UiUser, State(app): State<AppState>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
+pub async fn hostnames(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
     hostnames_page(&user, &app, None, None)
 }
 
 #[derive(Deserialize)]
 pub struct HostnameForm {
-    csrf: String,
     hostname: String,
     /// `user:<id>` or `agent:<id>`.
     #[serde(default)]
     assign: String,
 }
 
-pub async fn create_hostname(user: UiUser, State(app): State<AppState>, Form(f): Form<HostnameForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn create_hostname(State(app): State<AppState>, Posted(user, f): Posted<HostnameForm>) -> Response {
     let (owner, agent) = match f.assign.split_once(':') {
         Some(("user", id)) => (Some(id), None),
         Some(("agent", id)) => (None, Some(id)),
@@ -789,26 +683,22 @@ pub async fn create_hostname(user: UiUser, State(app): State<AppState>, Form(f):
     }
 }
 
-pub async fn delete_hostname(user: UiUser, State(app): State<AppState>, Form(f): Form<HostnameForm>) -> Response {
-    if let Err(r) = user.check_csrf(&f.csrf) {
-        return r;
-    }
+pub async fn delete_hostname(State(app): State<AppState>, Posted(user, f): Posted<HostnameForm>) -> Response {
     outcome(&user, app.control.delete_hostname(&user.who, &f.hostname), "/hostnames", "Hostnames", Done::HostnameRemoved, "That hostname is already gone.")
 }
 
 // ---- audit log -------------------------------------------------------------------------------
 
-pub async fn audit(user: UiUser, State(app): State<AppState>) -> Response {
-    if let Some(r) = admins_only(&user) {
-        return r;
-    }
-    let entries = app.control.audit_entries(&user.who, 200).unwrap_or_default();
+pub async fn audit(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
+    let Ok(entries) = app.control.audit_entries(&user.who, 200) else {
+        return failed(&user, StatusCode::INTERNAL_SERVER_ERROR, "/", "Tunnels", "The audit log can't be read right now. The server's log says why.");
+    };
     let users = app.control.users(&user.who);
     let name = |id: &str| users.iter().find(|u| u.id == id).map(|u| u.email.clone()).unwrap_or_else(|| id.to_string());
     let mut rows = String::new();
     for e in &entries {
         rows.push_str(&format!(
-            "<tr><td>{at}</td><td>{actor}</td><td><code>{action}</code></td><td><code>{resource}</code></td><td>{detail}</td></tr>",
+            r#"<tr><td>{at}</td><td>{actor}</td><td><code>{action}</code></td><td class="wrap"><code>{resource}</code></td><td class="wrap">{detail}</td></tr>"#,
             at = when(&e.at),
             actor = esc(&name(&e.actor)),
             action = esc(&e.action),
@@ -816,13 +706,11 @@ pub async fn audit(user: UiUser, State(app): State<AppState>) -> Response {
             detail = esc(&e.detail),
         ));
     }
-    if rows.is_empty() {
-        rows = r#"<tr><td colspan="5" class="empty">Nothing recorded yet.</td></tr>"#.into();
-    }
     let body = format!(
         r#"<h1>Audit log</h1><p class="lede">Sign-ins, account changes and management actions, newest first. Kept for {days} days.</p>
-<div class="card scroll spaced"><table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>On</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+<div class="spaced">{list}</div>"#,
         days = app.control.config().users.audit_retention_days,
+        list = table(&[Text("When"), Text("Who"), Text("Action"), Text("On"), Text("Detail")], &rows, "Nothing recorded yet."),
     );
     page("Audit log", Some(&user), &body)
 }

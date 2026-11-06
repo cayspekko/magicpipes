@@ -221,8 +221,9 @@ someone can always tell where they are, whether things are working, and what the
   reloading safe, without a flash cookie to store.
 * **What went wrong:** a form that fails comes back with what was typed (never a password), the
   message beside it, its field marked `aria-invalid` and focused, and "Error:" in the title.
-* **Before anything that can't be undone:** a question that names the effect. Native `confirm`, for
-  now, so without scripts these go ahead straight away.
+* **Before anything that can't be undone:** a question that names the effect, in a dialog whose
+  button says what it does (`ask` in `ui.js`). Cancel has the focus. Without scripts these go ahead
+  straight away.
 * **Tags** are small chips that wrap, in the shape the tag picker uses. A row of the Tunnels list
   shows three and "+N more" (a person's own access first), since seven once pushed the rest of the
   list off the page; the tunnel's page, Users and Machines show them all. To leave them room, the
@@ -232,6 +233,12 @@ someone can always tell where they are, whether things are working, and what the
   *service agent* is a machine nobody owns. Tunnels and machines have a page each, like Tailscale's
   Machines or Pangolin's sites and resources. `/agents/...` form addresses and the API keep their
   names, since scripts rely on the API.
+
+A handler says what it needs in its signature (`mgmt/extract.rs`), so a check can't be left out:
+`UiUser` to look, `AdminUser` for what only administrators see, `Posted<T>` and `AdminPosted<T>` to
+change something, which check the CSRF token before the handler runs. `authorize` still decides
+what each one may do. Markup that pages share is in `mgmt/html.rs`, and `theme.rs` lists the few
+type sizes and corner radii a new rule picks from. No management page uses a `style` attribute.
 
 `ui.js` is served with a digest in its address and cached for good, so moving between pages doesn't
 fetch it again, and a new version still arrives at once.
@@ -627,8 +634,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   Docker. On 2026-10-28 it passed against Pebble with real HTTP-01 validation: account
   registration, order, challenge served by `magicpipesd`, finalize, download, on-disk cache, no
   reissue after a restart. A validation failure (nothing listening on the challenge port) was
-  reported as `tls_failed` with the CA's reason. Let's Encrypt itself has not been tried; run
-  the acceptance test below once on a real domain.
+  reported as `tls_failed` with the CA's reason. Let's Encrypt issues certificates for a live
+  deployment too, but the acceptance test below hasn't been run from start to finish.
 * Per-hostname certificates, so the first `add` of a new name waits for one ACME order (a few
   seconds with Let's Encrypt). Wildcard certificates via DNS-01 are planned for a later
   milestone (Cloudflare integration); `tls.mode = "files"` covers wildcard certs today.
@@ -641,7 +648,6 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * There is no body idle timeout for regular HTTP requests, only a time-to-first-response timeout,
   counted from the last request body chunk (so uploads can take as long as they keep moving).
   Upgraded (WebSocket) connections have an idle timeout.
-* UI sessions live in memory; restarting the server logs administrators out.
 * Read-only web terminals are anonymous: anyone with the link can hold one of its
   `--max-clients` sessions for as long as they keep the page open, and start up to 60 programs a
   minute.

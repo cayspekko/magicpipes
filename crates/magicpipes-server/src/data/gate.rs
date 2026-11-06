@@ -17,12 +17,12 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::proto::ERROR_HEADER;
-use magicpipes_core::{secret, unix_now};
+use magicpipes_core::{secret, unix_now, url};
 
 use super::proxy::{ProxyBody, error_page};
 use super::{DataPlane, Route, RouteTable, TunnelUser};
 use crate::authz::{self, Action, Principal, Resource};
-use crate::tunnel_auth::{CALLBACK_PATH, CALLBACK_SCRIPT_PATH, LOGOUT_PATH, RESERVED_PREFIX, STATE_COOKIE, TUNNEL_COOKIE, token_safe};
+use crate::tunnel_auth::{CALLBACK_PATH, CALLBACK_SCRIPT_PATH, LOGOUT_PATH, RESERVED_PREFIX, STATE_COOKIE, TUNNEL_COOKIE, cookie, safe_path, token_safe};
 
 /// Largest body the code exchange accepts.
 const MAX_EXCHANGE_BODY: usize = 4096;
@@ -32,18 +32,6 @@ const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// the same time don't overwrite each other's.
 fn state_cookie(nonce: &str) -> String {
     format!("{STATE_COOKIE}{nonce}")
-}
-
-/// The value of cookie `name` in a request.
-fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v)
 }
 
 /// Removes MagicPipes' own cookies before a request reaches the tunnel's application. A request
@@ -101,41 +89,7 @@ fn without_shared_domain(cookie: &HeaderValue, shared: &[String]) -> HeaderValue
 }
 
 fn query_param(query: &str, name: &str) -> Option<String> {
-    query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| percent_decode(v))
-}
-
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
-        match (b[i], hex) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            (b'+', _) => {
-                out.push(b' ');
-                i += 1;
-            }
-            (c, _) => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-pub(super) fn percent_encode(s: &str) -> String {
-    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
-}
-
-/// A path to send the browser back to: on this host, never `//other` or a scheme.
-fn safe_return(path: Option<String>) -> String {
-    path.filter(|p| p.starts_with('/') && !p.starts_with("//") && !p.contains('\\') && p.len() < 2048 && !p.chars().any(char::is_control))
-        .unwrap_or_else(|| "/".to_string())
+    query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| url::decode_form(v))
 }
 
 fn set_cookie(resp: &mut Response<ProxyBody>, name: &str, value: &str, max_age: i64) {
@@ -214,8 +168,8 @@ pub(super) fn check(dp: &DataPlane, req: &Request<Incoming>, host: &str, route: 
     let to = format!(
         "{}/auth/tunnel?host={}&state={nonce}&return={}",
         dp.settings.management_url,
-        percent_encode(host),
-        percent_encode(back)
+        url::encode(host),
+        url::encode(back)
     );
     let mut resp = redirect(&to);
     set_cookie(&mut resp, &state_cookie(&nonce), "1", 600);
@@ -268,7 +222,7 @@ fn callback_page() -> Response<ProxyBody> {
         concat!(
             r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Signing in…</title><script src="/.magicpipes/callback.js" defer></script><style>"#,
             magicpipes_core::theme_palette!(),
-            r#"body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:16px/1.55 var(--sans)}main{padding:24px 16px;max-width:30em}</style></head>
+            r#"body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans)}main{padding:24px 16px;max-width:30em}</style></head>
 <body><main><p id="msg">Signing you in…</p><noscript><p>Signing in to a private tunnel needs JavaScript.</p></noscript></main></body></html>"#,
         ),
     )
@@ -334,7 +288,8 @@ async fn exchange(dp: &DataPlane, req: Request<Incoming>, host: &str) -> Respons
     if !started_here || claims.issued_at > unix_now() + 5 || !dp.use_code(&claims.user_id, &claims.nonce) {
         return bad(expired);
     }
-    let mut resp = json(StatusCode::OK, &serde_json::json!({ "to": safe_return(query_param(&form, "return")) }));
+    let back = query_param(&form, "return");
+    let mut resp = json(StatusCode::OK, &serde_json::json!({ "to": safe_path(back.as_deref()).unwrap_or("/") }));
     let ttl = dp.settings.tunnel_cookie_ttl_secs;
     set_cookie(&mut resp, TUNNEL_COOKIE, &dp.signer().cookie(&claims.user_id, host, ttl), ttl);
     set_cookie(&mut resp, &state, "", 0);
@@ -346,7 +301,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cookies_and_return_paths() {
+    fn cookies_and_query_values() {
         let mut h = HeaderMap::new();
         h.insert(header::COOKIE, HeaderValue::from_static("a=1; __Host-mp_tunnel=secret; b=2"));
         h.append(header::COOKIE, HeaderValue::from_static("__Host-mp_state_n1=1; __Host-mp_state_n2=1"));
@@ -369,12 +324,7 @@ mod tests {
         strip_cookies(&mut theirs);
         assert_eq!(theirs.get_all(header::COOKIE).iter().count(), 2);
 
-        assert_eq!(safe_return(Some("/a?b=c".into())), "/a?b=c");
-        for bad in ["//evil.example/", "https://evil.example/", "/\\evil", "", "a"] {
-            assert_eq!(safe_return(Some(bad.into())), "/", "{bad}");
-        }
         assert_eq!(query_param("x=1&return=%2Fa%3Fb%3Dc", "return").as_deref(), Some("/a?b=c"));
-        assert_eq!(percent_decode(&percent_encode("/p?q=1 2&r")), "/p?q=1 2&r");
     }
 
     #[test]

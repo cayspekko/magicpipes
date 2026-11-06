@@ -10,44 +10,42 @@ use std::collections::HashMap;
 use magicpipes_core::tags;
 
 use super::AppState;
+use super::extract::{Fields, UiUser};
+use super::html::{chips, esc};
 use crate::authz::Principal;
-use super::accounts::form_urlencoded_pairs;
-use super::ui::{UiUser, chips, esc};
 
 /// Styles for the picker and its fallback checkboxes; appended to the theme on every page.
 pub(super) const STYLE: &str = r#"[hidden]{display:none!important}
 .tagcell{display:flex;gap:8px;align-items:center}.tagchips{flex:1;white-space:normal;min-width:10em;max-width:24em}
 .taglist{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;white-space:normal;vertical-align:middle}
-.tag{padding:1px 8px;border:1px solid var(--line-2);border-radius:999px;font:12px/1.5 var(--mono);color:var(--ink-2);overflow-wrap:anywhere}
+.tag{padding:1px 8px;border:1px solid var(--line-2);border-radius:999px;font:12.5px/1.45 var(--mono);color:var(--ink-2);overflow-wrap:anywhere}
 .tagmore{padding:3px 4px;font-size:12.5px;color:var(--ink-2);white-space:nowrap}
 .access{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;white-space:normal}.access .taglist{display:contents}.access .status{margin-right:4px}
 td .access{min-width:15em;max-width:26em}.status.below{display:flex;margin-top:6px;font-size:12.5px}
 .chip.add{color:var(--ok)}.chip.remove{color:var(--bad);text-decoration:line-through}
 fieldset.tags{border:0;padding:0;margin:22px 0 0;min-width:0}
-fieldset.tags legend{padding:0;font-size:13px;font-weight:500;color:var(--ink-2);margin-bottom:8px}
-.tagboxes{display:flex;flex-wrap:wrap;gap:0 18px;max-height:18em;overflow:auto}.tagboxes label{margin:8px 0 0}
+fieldset.tags legend{padding:0;font-size:13.5px;font-weight:500;color:var(--ink-2);margin-bottom:8px}
+.tagboxes{display:flex;flex-wrap:wrap;gap:0 18px;max-height:18em;overflow:auto}.tagboxes label{margin:8px 0 0}.tagboxes .note{margin:0}
 .tagsum{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}
-dialog.tagpick{width:min(600px,calc(100% - 32px));max-height:calc(100% - 48px);padding:20px 22px;border:1px solid var(--line);border-radius:14px;background:var(--surface);color:var(--ink)}
+dialog.tagpick{width:min(600px,calc(100% - 32px))}
 dialog.tagpick[open]{display:flex;flex-direction:column}.tp-list{overflow:auto;min-height:6em;flex:1 1 auto}
-dialog.tagpick::backdrop{background:rgba(0,0,0,.45)}
 .tp-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}.tp-head h3{margin:0}
 .tp-meta{display:flex;justify-content:space-between;gap:12px;font-size:12.5px;color:var(--muted);margin:6px 2px 0}
 .tp-tray{margin-top:12px;padding:10px 12px;border-radius:10px;background:var(--bg)}
-.tp-empty-tray{font-size:13px;color:var(--muted)}.tp-warn{margin:8px 0 0;font-size:12.5px;color:var(--bad)}
-.tp-key{font:12px var(--mono);color:var(--muted);margin:14px 0 6px}
+.tp-empty-tray{font-size:13.5px;color:var(--muted)}.tp-warn{margin:8px 0 0;font-size:12.5px;color:var(--bad)}
+.tp-key{font:12.5px var(--mono);color:var(--muted);margin:14px 0 6px}
 .pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .pill{display:inline-flex;align-items:center;gap:6px;font:12.5px/1.4 var(--mono);padding:4px 5px 4px 11px;border-radius:999px;border:1px solid var(--line-2);background:var(--surface);color:var(--ink);cursor:pointer}
 .pill:hover{border-color:var(--ink)}.pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.pill .act{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:var(--hover);color:var(--muted);font-size:13px}
+.pill .act{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:var(--hover);color:var(--muted);font-size:13.5px}
 .pill.held{background:var(--hover)}
 .pill.add{background:color-mix(in srgb,var(--ok) 14%,var(--surface));border-color:color-mix(in srgb,var(--ok) 45%,var(--line));color:var(--ok)}
 .pill.remove{background:color-mix(in srgb,var(--bad) 12%,var(--surface));border-color:color-mix(in srgb,var(--bad) 45%,var(--line));color:var(--bad)}
 .pill.remove .nm{text-decoration:line-through}.pill.add .act,.pill.remove .act{background:transparent;color:inherit}
 .pill[aria-disabled]{cursor:not-allowed;color:var(--muted);border-style:dashed}.pill[aria-disabled]:hover{border-color:var(--line-2)}
-.pill mark{background:color-mix(in srgb,var(--warn) 30%,transparent);color:inherit;border-radius:2px}
+.pill mark{background:color-mix(in srgb,var(--warn) 30%,transparent);color:inherit}
 .tp-create{margin-top:12px;padding:5px 12px;border-style:dashed;border-color:var(--accent);color:var(--accent);font-family:var(--sans)}.tp-syntax{margin:10px 2px 0;font-size:12.5px}
-.tp-new{font:10.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.04em;padding:2px 5px;border-radius:5px;background:color-mix(in srgb,currentColor 14%,transparent)}
-.tp-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}"#;
+.tp-new{font:11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.04em;padding:2px 5px;border-radius:6px;background:color-mix(in srgb,currentColor 14%,transparent)}"#;
 
 /// The registered tags as JSON for the picker, on administrators' pages. A data block isn't run,
 /// so the CSP doesn't apply; `<` is escaped so a description can't end the element.
@@ -128,14 +126,16 @@ pub(super) fn fieldset(legend: &str, all: &[(String, String)], checked: &[String
             )
         })
         .collect();
-    let boxes = if boxes.is_empty() { r#"<p class="note" style="margin:0">None yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string() } else { boxes };
+    let boxes = if boxes.is_empty() { r#"<p class="note">None yet: create them under <a href="/tags">Tags</a>.</p>"#.to_string() } else { boxes };
     let picker = picker.map(|subject| format!(r#" data-picker data-title="{0}" data-subject="{1}""#, esc(legend), esc(subject))).unwrap_or_default();
     format!(r#"<fieldset class="tags"{picker}><legend>{}</legend><div class="tagboxes">{boxes}</div></fieldset>"#, esc(legend))
 }
 
+/// The most fields read from a form, which is how many tags one change can name.
+const MAX_FIELDS: usize = 500;
+
 /// What a tag form submitted.
 pub(super) struct Submitted {
-    pub csrf: String,
     /// The tags wanted: `tags` (space or comma separated) and every `tag` checkbox.
     pub want: Vec<String>,
     /// The tags shown when the page was made; `None` from a form that replaces the whole list.
@@ -147,16 +147,15 @@ pub(super) struct Submitted {
 }
 
 impl Submitted {
-    pub fn parse(raw: &[u8]) -> Result<Self, String> {
-        let fields = form_urlencoded_pairs(raw);
+    pub fn parse(mut fields: Fields) -> Result<Self, String> {
+        fields.truncate(MAX_FIELDS);
         let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         let wanted: Vec<&str> = fields.iter().filter(|(n, _)| n == "tags" || n == "tag").map(|(_, v)| v.as_str()).collect();
-        let csrf = get("csrf").unwrap_or("").to_string();
         let want = tags::normalize_list(&wanted)?;
         let base = get("base").map(|b| tags::normalize_list(&[b])).transpose()?;
         let create: Vec<&str> = fields.iter().filter(|(n, _)| n == "create").map(|(_, v)| v.as_str()).collect();
         let create = tags::normalize_list(&create)?;
-        Ok(Self { csrf, want, base, create, fields })
+        Ok(Self { want, base, create, fields })
     }
 
     /// Registers the `create` tags that don't exist yet (administrators only: `create_tag`
@@ -193,27 +192,36 @@ impl Submitted {
 mod tests {
     use super::*;
 
+    fn parse(form: &str) -> Result<Submitted, String> {
+        Submitted::parse(serde_urlencoded::from_str(form).unwrap())
+    }
+
+    #[test]
+    fn a_form_is_only_read_so_far() {
+        let many = format!("{}tag=z", "tag=a&".repeat(MAX_FIELDS));
+        assert_eq!(parse(&many).unwrap().want, ["a"]);
+    }
+
     #[test]
     fn forms_say_what_changed() {
-        let f = Submitted::parse(b"csrf=x&base=team%3Adev+env%3Aprod&tags=team%3Adev+team%3Aops").unwrap();
-        assert_eq!(f.csrf, "x");
+        let f = parse("base=team%3Adev+env%3Aprod&tags=team%3Adev+team%3Aops").unwrap();
         assert_eq!(f.change(), Some((vec!["team:ops".to_string()], vec!["env:prod".to_string()])));
 
         // Checkboxes from the page without scripts, with nothing left checked.
-        let f = Submitted::parse(b"csrf=x&base=team%3Adev").unwrap();
+        let f = parse("base=team%3Adev").unwrap();
         assert_eq!(f.change(), Some((vec![], vec!["team:dev".to_string()])));
-        let f = Submitted::parse(b"csrf=x&base=&tag=b&tag=a&tag=a").unwrap();
+        let f = parse("base=&tag=b&tag=a&tag=a").unwrap();
         assert_eq!(f.change(), Some((vec!["a".to_string(), "b".to_string()], vec![])));
 
         // An older page's text field replaces the list.
-        let f = Submitted::parse(b"csrf=x&tags=a%2C+b").unwrap();
+        let f = parse("tags=a%2C+b").unwrap();
         assert_eq!((f.change(), f.want), (None, vec!["a".to_string(), "b".to_string()]));
 
-        assert!(Submitted::parse(b"csrf=x&base=&tags=not+ok%21").is_err());
+        assert!(parse("base=&tags=not+ok%21").is_err());
 
         // Tags the picker made up, from the dialog (one field) or the enrollment form (several).
-        let f = Submitted::parse(b"csrf=x&base=&tags=team%3Aqa&create=Team%3AQA+env%3Anew&create=env%3Anew").unwrap();
+        let f = parse("base=&tags=team%3Aqa&create=Team%3AQA+env%3Anew&create=env%3Anew").unwrap();
         assert_eq!(f.create, ["env:new", "team:qa"]);
-        assert!(Submitted::parse(b"csrf=x&create=bad%21").is_err());
+        assert!(parse("create=bad%21").is_err());
     }
 }

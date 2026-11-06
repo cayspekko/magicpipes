@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::{Method, Request, Uri, header};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
-use magicpipes_core::{secret, unix_now};
+use magicpipes_core::{secret, unix_now, url};
 use ring::signature;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
@@ -125,7 +125,7 @@ pub struct Attempt {
     pub state: String,
     nonce: String,
     verifier: String,
-    /// The path to continue to afterwards. Unchecked: callers pass it through `safe_next`.
+    /// The path to continue to afterwards. Unchecked: callers pass it through `safe_path`.
     pub next: Option<String>,
 }
 
@@ -210,10 +210,6 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn form_encode(s: &str) -> String {
-    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
-}
-
 impl Provider {
     /// Reads the client secret. A missing file is a configuration mistake worth stopping for.
     pub fn load(cfg: &OidcConfig) -> anyhow::Result<Self> {
@@ -286,8 +282,8 @@ impl Provider {
         let sep = if endpoint.contains('?') { '&' } else { '?' };
         Ok(format!(
             "{endpoint}{sep}response_type=code&scope=openid%20email%20profile&client_id={}&redirect_uri={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
-            form_encode(&self.client_id),
-            form_encode(redirect_uri),
+            url::encode(&self.client_id),
+            url::encode(redirect_uri),
             attempt.state,
             attempt.nonce,
             pkce_challenge(&attempt.verifier),
@@ -299,17 +295,17 @@ impl Provider {
         let m = self.metadata(false).await?;
         let mut body = format!(
             "grant_type=authorization_code&code={}&redirect_uri={}&code_verifier={}",
-            form_encode(code),
-            form_encode(redirect_uri),
-            form_encode(&attempt.verifier),
+            url::encode(code),
+            url::encode(redirect_uri),
+            url::encode(&attempt.verifier),
         );
         // `client_secret_basic` is the default when a provider doesn't list its methods.
         let basic = m.discovery.token_endpoint_auth_methods_supported.as_ref().is_none_or(|l| l.iter().any(|a| a == "client_secret_basic"));
         let auth = if basic {
-            let pair = format!("{}:{}", form_encode(&self.client_id), form_encode(&self.client_secret));
+            let pair = format!("{}:{}", url::encode(&self.client_id), url::encode(&self.client_secret));
             Some(format!("Basic {}", STANDARD.encode(pair)))
         } else {
-            body.push_str(&format!("&client_id={}&client_secret={}", form_encode(&self.client_id), form_encode(&self.client_secret)));
+            body.push_str(&format!("&client_id={}&client_secret={}", url::encode(&self.client_id), url::encode(&self.client_secret)));
             None
         };
         let bytes = request(Method::POST, &m.discovery.token_endpoint, auth.as_deref(), Some(body)).await.context("token request")?;
@@ -759,6 +755,16 @@ mod tests {
         assert!(Attempt::open(&signer, &signer.cookie("us_x", "h.t", 60)).is_none());
         let expired = signer.seal("o~1~google~s~n~v~");
         assert!(Attempt::open(&signer, &expired).is_none());
+    }
+
+    #[test]
+    fn the_longest_destination_fits_a_browsers_cookie_limit() {
+        let signer = Signer::for_tests();
+        let longest = format!("/{}", "a".repeat(2047));
+        assert!(crate::tunnel_auth::safe_path(Some(&longest)).is_some());
+        let cookie = Attempt::new(&"p".repeat(40), Some(&longest)).seal(&signer);
+        assert!(format!("__Host-mp_oidc={cookie}").len() < 4096, "{}", cookie.len());
+        assert_eq!(Attempt::open(&signer, &cookie).unwrap().next.as_deref(), Some(longest.as_str()));
     }
 
     #[test]

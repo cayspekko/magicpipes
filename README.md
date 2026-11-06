@@ -660,7 +660,7 @@ On failure:
 | Exit | Codes | Meaning |
 |---|---|---|
 | 0 | | Success (for `add`: verified ready) |
-| 1 | `internal`, ... | Unexpected error |
+| 1 | `internal`, `invalid_request`, `bad_request`, `protocol`, `busy`, `rate_limited`, `invalid_server`, ... | Unexpected error, or a request that can't be served as it is |
 | 2 | | Invalid command-line usage |
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden`, `unauthenticated` | Enrollment, credentials or local configuration |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
@@ -670,8 +670,25 @@ On failure:
 | 8 | `probe_failed` | Public URL did not reach the application |
 
 `name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:
-another machine's agent owns it. Codes are listed in `crates/magicpipes-core/src/error.rs`; new
-ones may appear in later versions, so treat an unknown code like `internal`.
+another machine's agent owns it. `busy`: the local agent is in the middle of a conflicting operation.
+`rate_limited`: too many failed attempts from this client. Codes are listed in
+`crates/magicpipes-core/src/error.rs`; new ones may appear in later versions, so treat an unknown
+code like `internal`.
+
+Pages the server generates for public traffic say which of these it was in an `x-magicpipes-error`
+header, so a script can tell them from the application's own answers:
+
+| HTTP | Code | Meaning |
+|---|---|---|
+| 400 | `bad_host`, `bad_uri` | The request's host or address is malformed |
+| 404 | `tunnel_not_found` | No tunnel has this address |
+| 405 | `method_not_allowed` | `CONNECT` isn't supported |
+| 421 | `misdirected_request` | The request names a different host than its TLS connection |
+| 502 | `agent_offline` | The machine serving the tunnel isn't connected |
+| 502 | `tunnel_inactive` | The agent no longer serves this tunnel |
+| 502 | `local_unreachable`, `upstream_error`, `bad_upstream` | The application couldn't be reached, broke off, or sent an invalid answer |
+| 503 | `agent_busy` | The tunnel is handling too many connections; try again shortly |
+| 504 | `upstream_timeout` | The application didn't answer in time |
 
 ### Run the agent under a service manager
 

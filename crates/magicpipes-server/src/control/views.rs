@@ -6,7 +6,7 @@ use magicpipes_core::proto::{Kind, Visibility};
 use magicpipes_core::rfc3339;
 use serde::Serialize;
 
-use super::{ControlPlane, State, TunnelRecord};
+use super::{ControlPlane, OrLog, State, TunnelRecord};
 use crate::authz::{self, Action, Principal, Resource};
 use crate::certs::CertStatus;
 use crate::data::Outcome;
@@ -182,7 +182,7 @@ impl ControlPlane {
 
     /// The agents `who` manages.
     pub fn agents(&self, who: &Principal) -> Vec<AgentView> {
-        let rows = self.store.agents().unwrap_or_default();
+        let rows = self.store.agents().or_log().unwrap_or_default();
         let st = self.state.lock().unwrap();
         rows.into_iter()
             .filter(|a| authz::authorize(who, Action::Manage, st.agent_resource(&a.id)))

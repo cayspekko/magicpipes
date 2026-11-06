@@ -8,6 +8,7 @@
 //! * [`secret`] — token generation, hashing and constant-time comparison.
 //! * [`tags`] — tag syntax.
 //! * [`theme`] — the shared stylesheet and logo used by every HTML page.
+//! * [`url`] — percent-encoding.
 
 pub mod cidr;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod proto;
 pub mod secret;
 pub mod tags;
 pub mod theme;
+pub mod url;
 
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> i64 {

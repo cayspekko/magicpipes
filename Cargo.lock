@@ -1040,7 +1040,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
- "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1055,12 +1054,10 @@ dependencies = [
 name = "magicpipes-core"
 version = "0.1.1"
 dependencies = [
- "anyhow",
  "getrandom 0.4.3",
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.21",
  "time",
  "tokio",
  "tokio-util",
@@ -1093,9 +1090,9 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "socket2",
- "thiserror 2.0.21",
  "time",
  "tokio",
  "tokio-rustls",

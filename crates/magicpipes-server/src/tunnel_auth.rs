@@ -34,6 +34,9 @@ pub const CALLBACK_PATH: &str = "/.magicpipes/callback";
 pub const CALLBACK_SCRIPT_PATH: &str = "/.magicpipes/callback.js";
 pub const LOGOUT_PATH: &str = "/.magicpipes/logout";
 pub const CODE_TTL_SECS: i64 = 60;
+/// The longest path [`safe_path`] accepts. Also what makes a sign-in's destination fit the attempt
+/// cookie, which browsers limit to about 4 KiB.
+const MAX_PATH: usize = 2048;
 
 #[derive(Clone)]
 pub struct Signer {
@@ -146,9 +149,42 @@ pub fn token_safe(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// A place to send a browser next, only if it stays on this host: a path, never `//host`, `/\\host`
+/// (browsers read that the same way) or a scheme. Browsers drop tabs and newlines before they parse
+/// an address, so control characters are out too.
+pub fn safe_path(path: Option<&str>) -> Option<&str> {
+    path.filter(|p| p.starts_with('/') && !p.starts_with("//") && !p.contains('\\') && p.len() <= MAX_PATH && !p.chars().any(char::is_control))
+}
+
+/// The value of cookie `name` in a request.
+pub fn cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_browser_is_only_sent_to_paths_on_this_host() {
+        for ok in ["/", "/a?b=c", "/a/b#c", "/%5Cevil", "/.magicpipes/x"] {
+            assert_eq!(safe_path(Some(ok)), Some(ok));
+        }
+        for bad in ["", "a", "//evil.example/", "https://evil.example/", "/\\evil", "\\\\evil", "/a\\b", "/\t/evil.example", "/a\nb", " /a"] {
+            assert_eq!(safe_path(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(safe_path(None), None);
+        let at_limit = format!("/{}", "a".repeat(MAX_PATH - 1));
+        assert!(safe_path(Some(&at_limit)).is_some());
+        assert_eq!(safe_path(Some(&format!("{at_limit}a"))), None);
+    }
 
     #[test]
     fn tokens_are_bound_to_kind_host_and_key() {
