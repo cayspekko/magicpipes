@@ -34,7 +34,11 @@ const CONTAINER_SOCKETS: [&str; 10] = [
 /// published by accident. `path` is canonical.
 fn sensitive_socket(path: &Path) -> Option<&'static str> {
     let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
-    if path.starts_with(canonical(crate::state::home())) || path == canonical(crate::state::socket_path()) {
+    if path.starts_with(canonical(crate::state::home())) {
+        return Some("control of this agent");
+    }
+    #[cfg(unix)]
+    if path == canonical(crate::state::socket_path()) {
         return Some("control of this agent");
     }
     if std::env::var_os("SSH_AUTH_SOCK").is_some_and(|agent| path == canonical(PathBuf::from(agent))) {
@@ -101,7 +105,7 @@ pub async fn check(path: &Path, allow_sensitive: bool) -> Result<PathBuf, ErrorI
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -166,38 +170,35 @@ mod tests {
         assert_eq!(code(check(&file, false).await).as_deref(), Some("invalid_socket"));
         assert_eq!(code(check(&dir, false).await).as_deref(), Some("invalid_socket"), "a folder isn't one either");
 
-        #[cfg(unix)]
-        {
-            let path = dir.join("a.sock");
-            let listener = tokio::net::UnixListener::bind(&path).unwrap();
-            assert_eq!(check(&path, false).await.unwrap(), path);
+        let path = dir.join("a.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(check(&path, false).await.unwrap(), path);
 
-            // The path stays as given, so a deploy can point a link at a new release.
-            let link = dir.join("current.sock");
-            std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert_eq!(check(&link, false).await.unwrap(), link);
+        // The path stays as given, so a deploy can point a link at a new release.
+        let link = dir.join("current.sock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(check(&link, false).await.unwrap(), link);
 
-            // A socket file with nothing behind it, as an application leaves when it crashes.
-            drop(listener);
-            let e = check(&path, false).await.unwrap_err();
-            assert!(e.code == "local_unreachable" && e.message.contains("Start your application"), "{e:?}");
+        // A socket file with nothing behind it, as an application leaves when it crashes.
+        drop(listener);
+        let e = check(&path, false).await.unwrap_err();
+        assert!(e.code == "local_unreachable" && e.message.contains("Start your application"), "{e:?}");
 
-            // Refused by what it is, and before it's connected to.
-            let docker = dir.join("docker.sock");
-            let listener = tokio::net::UnixListener::bind(&docker).unwrap();
-            let e = check(&docker, false).await.unwrap_err();
-            assert!(e.code == "invalid_socket" && e.message.contains("--allow-sensitive-socket") && e.message.contains("containers"), "{e:?}");
-            assert_eq!(check(&docker, true).await.unwrap(), docker);
-            drop(listener);
+        // Refused by what it is, and before it's connected to.
+        let docker = dir.join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&docker).unwrap();
+        let e = check(&docker, false).await.unwrap_err();
+        assert!(e.code == "invalid_socket" && e.message.contains("--allow-sensitive-socket") && e.message.contains("containers"), "{e:?}");
+        assert_eq!(check(&docker, true).await.unwrap(), docker);
+        drop(listener);
 
-            // Followed through a link, whatever the link is called.
-            let inner = dir.join("inner");
-            std::fs::create_dir_all(&inner).unwrap();
-            let _listener = tokio::net::UnixListener::bind(inner.join("docker.sock")).unwrap();
-            let innocent = dir.join("innocent.sock");
-            std::os::unix::fs::symlink(inner.join("docker.sock"), &innocent).unwrap();
-            assert_eq!(code(check(&innocent, false).await).as_deref(), Some("invalid_socket"));
-        }
+        // Followed through a link, whatever the link is called.
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let _listener = tokio::net::UnixListener::bind(inner.join("docker.sock")).unwrap();
+        let innocent = dir.join("innocent.sock");
+        std::os::unix::fs::symlink(inner.join("docker.sock"), &innocent).unwrap();
+        assert_eq!(code(check(&innocent, false).await).as_deref(), Some("invalid_socket"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

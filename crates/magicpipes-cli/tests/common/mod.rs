@@ -46,10 +46,11 @@ pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-/// `n` consecutive ports free for TCP and UDP, below the usual ephemeral range.
+/// `n` consecutive ports free for TCP and UDP, below the ephemeral ranges (Linux's starts at 32768),
+/// or another test's outgoing connection could take one between here and the server opening it.
 pub fn free_port_range(n: u16) -> (u16, u16) {
     loop {
-        let first = 20_000 + (magicpipes_core_rand_u16() % 20_000);
+        let first = 20_000 + (magicpipes_core_rand_u16() % 12_000);
         let free = (first..first + n).all(|p| {
             std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
         });
