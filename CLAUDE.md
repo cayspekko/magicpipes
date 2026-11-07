@@ -131,7 +131,8 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   0700 directories (written atomically). Static file serving must stay inside the served root,
   including through symlinks and archives.
 - **Certificates** are only ordered for hostnames the control plane authorized, never on demand
-  from SNI.
+  from SNI. Certificates people bring (`certs/provided.rs`) never apply to the server's own names,
+  and their private keys are never shown again or quoted in a message.
 - **Dependencies**: `cargo deny check` must pass. A new license in `deny.toml`, an advisory in
   `ignore`, a git or non-crates.io source, or a TLS stack other than rustls+ring is a policy
   change the owner must approve. Prefer the standard library or an existing dependency to a new

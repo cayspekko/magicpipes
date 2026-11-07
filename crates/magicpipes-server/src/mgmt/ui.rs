@@ -63,11 +63,14 @@ done_messages! {
     AccessOn "access-on" "That tag grants access now.",
     AccessOff "access-off" "That tag no longer grants access.",
     HostnameRegistered "hostname-registered" "Hostname registered. Its certificate is being ordered.",
+    HostnameCovered "hostname-covered" "Hostname registered. It uses the certificate you added.",
     HostnameRemoved "hostname-removed" "Hostname removed, with the tunnel on it.",
     SignInSaved "sign-in-saved" "Saved. It applies from the next sign-in.",
     ProviderAdded "provider-added" "Provider added. Try it from a private window.",
     ProviderSaved "provider-saved" "Provider saved.",
     ProviderRemoved "provider-removed" "Provider removed.",
+    CertificateAdded "certificate-added" "Certificate added. Its names use it now.",
+    CertificateRemoved "certificate-removed" "Certificate removed.",
 }
 
 /// The address of `to`, saying what a change did.
@@ -247,7 +250,7 @@ fn tags_in_a_row(total: usize) -> usize {
 
 /// What's wrong, in one line, for the top of the home page. Machines without tunnels aren't a
 /// problem by being off. `None` while there's nothing to report on.
-fn health_line(tunnels: &[TunnelView], offline_machines: usize) -> Option<String> {
+fn health_line(tunnels: &[TunnelView], offline_machines: usize, certificates_expiring: usize) -> Option<String> {
     if tunnels.is_empty() {
         return None;
     }
@@ -264,9 +267,16 @@ fn health_line(tunnels: &[TunnelView], offline_machines: usize) -> Option<String
     if failed_certs > 0 {
         problems.push(format!(r##"<a href="#tunnels">{} failed</a>"##, count(failed_certs, "certificate", "certificates")));
     }
-    let (tone, text) = match (problems.is_empty(), pending_certs) {
-        (false, _) => ("bad", problems.join(" · ")),
-        (true, 0) => (
+    let mut notes = Vec::new();
+    if pending_certs > 0 {
+        notes.push(format!("{} being ordered", count(pending_certs, "certificate", "certificates")));
+    }
+    if certificates_expiring > 0 {
+        notes.push(format!(r#"<a href="/settings#certificates">{certificates_expiring} of your certificates expiring soon</a>"#));
+    }
+    let (tone, text) = match (problems.is_empty(), notes.is_empty()) {
+        (false, _) => ("bad", [problems, notes].concat().join(" · ")),
+        (true, true) => (
             "ok",
             match tunnels.len() {
                 1 => "Your tunnel is healthy".to_string(),
@@ -274,9 +284,10 @@ fn health_line(tunnels: &[TunnelView], offline_machines: usize) -> Option<String
                 n => format!("All {n} tunnels are healthy"),
             },
         ),
-        (true, n) => ("warn", format!("{} being ordered; everything else is healthy", count(n, "certificate", "certificates"))),
+        (true, false) => ("warn", format!("{}; everything else is healthy", notes.join(" · "))),
     };
-    Some(format!(r#"<p class="health"><span class="status {tone}">{text}</span></p>"#))
+    // The inner span keeps links and words in one line of text, or a flex gap comes between them.
+    Some(format!(r#"<p class="health"><span class="status {tone}"><span>{text}</span></span></p>"#))
 }
 
 /// The way from nothing to a working tunnel.
@@ -340,7 +351,7 @@ pub async fn index(user: UiUser, State(app): State<AppState>) -> Response {
 <p class="note">Requests are counted since the server last started.</p>
 <div class="spaced" id="tunnels">{list}</div>
 {shared}"#,
-        health = health_line(&tunnels, offline_with_tunnels).unwrap_or_default(),
+        health = health_line(&tunnels, offline_with_tunnels, app.control.certificates_expiring(&user.who)).unwrap_or_default(),
         list = table(&[Text("Tunnel"), Text("Who can open it"), Text("Machine"), Text("Status"), Number("Requests")], &rows, "No tunnels yet. Run <code>magicpipes add 8080</code> on one of your machines."),
         n = tunnels.len(),
         agents_total = agents.len(),

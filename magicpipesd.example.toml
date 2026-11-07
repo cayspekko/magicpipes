@@ -57,6 +57,11 @@ acme_directory = "letsencrypt"
 # key_file  = "/etc/magicpipes/wildcard.key"
 # issuance_timeout_secs = 120
 # failure_backoff_secs = 300
+# Your own certificates, for the names they cover, in any mode. Files that change are picked up within
+# 5 minutes, so another tool can renew them. You can also add them on the Settings page.
+# [[tls.certificates]]
+# cert_file = "/etc/magicpipes/shop.crt"
+# key_file  = "/etc/magicpipes/shop.key"
 
 [agents]
 # session_timeout_secs = 45

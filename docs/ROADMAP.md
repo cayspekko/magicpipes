@@ -262,4 +262,4 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 5 | SSH gateway + SSH web terminal | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | done (with phase 3) |
-| 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done; wildcard names (DNS-01) planned |
+| 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |

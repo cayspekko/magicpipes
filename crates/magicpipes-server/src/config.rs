@@ -327,6 +327,18 @@ pub struct TlsConfig {
     pub issuance_timeout_secs: u64,
     /// After a failed order, don't retry the same hostname for this long (CA rate limits).
     pub failure_backoff_secs: u64,
+    /// Your own certificates, for the names they cover, whatever the mode. Last: in TOML a table
+    /// can't come before plain values.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<CertFiles>,
+}
+
+/// A certificate kept in files, which another tool may renew.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertFiles {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
 }
 
 impl Default for TlsConfig {
@@ -340,6 +352,7 @@ impl Default for TlsConfig {
             key_file: None,
             issuance_timeout_secs: 120,
             failure_backoff_secs: 300,
+            certificates: Vec::new(),
         }
     }
 }
@@ -739,6 +752,12 @@ client_id = "c"
 client_secret_file = "/data/oidc-secrets/authentik"
 trust_email = true
 allow_unverified_admin = true
+[[tls.certificates]]
+cert_file = "/etc/magicpipes/shop.crt"
+key_file = "/etc/magicpipes/shop.key"
+[[tls.certificates]]
+cert_file = "/data/provided-certs/abc.crt"
+key_file = "/data/provided-certs/abc.key"
 "#;
         for text in [full, "base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n"] {
             let mut first: Config = toml::from_str(text).unwrap();
@@ -751,7 +770,8 @@ allow_unverified_admin = true
         let mut c: Config = toml::from_str(full).unwrap();
         c.validate().unwrap();
         let written = c.to_toml().unwrap();
-        for line in ["client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\""] {
+        assert_eq!(c.tls.certificates.len(), 2);
+        for line in ["[[tls.certificates]]", "cert_file = \"/data/provided-certs/abc.crt\"", "client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\""] {
             assert!(written.contains(line), "{line} in {written}");
         }
     }

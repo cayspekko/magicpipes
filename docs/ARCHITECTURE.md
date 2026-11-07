@@ -248,11 +248,12 @@ fetch it again, and a new version still arrives at once.
 Settings have two homes, because neither can hold everything:
 
 * **The configuration file** holds what's needed before the database opens, or what could lock an
-  administrator out of the page that would fix it: listeners, domains, TLS, `data_dir`, trusted
-  proxies. It's read once and never written; in Docker it's a read-only mount in a read-only
+  administrator out of the page that would fix it: listeners, domains, the TLS mode, `data_dir`,
+  trusted proxies. It's read once and never written; in Docker it's a read-only mount in a read-only
   container.
 * **The database** holds what the Settings page changes: OpenID Connect providers and the two
-  lists of who a first sign-in may create an account for (`control/settings.rs`). A change is
+  lists of who a first sign-in may create an account for (`control/settings.rs`). Certificates are
+  the exception, kept only as files (below). A change is
   validated, saved and audited like any other, then the providers and lists in effect are replaced
   whole. There's no restart, and a sign-in under way keeps the provider it started with. This is
   management-side only: the data plane never sees any of it.
@@ -273,6 +274,13 @@ named by the provider's validated id. They're never shown again, and aren't in t
 generated copy. A saved provider whose secret can't be read is left out with an error in the log,
 and the page says so; a file's provider with a missing secret stops startup, as a configuration
 mistake.
+
+**Certificates added on the page** are files under `<data_dir>/provided-certs/` (0600 in 0700), named
+by a digest of the certificate, and the directory is the only record of them. A private key is never
+shown again, and a form that fails doesn't give back a certificate box with a key pasted in it. The
+generated copy names their files like any other `[[tls.certificates]]`. One that can't be read at
+startup stays listed so it can be removed, and costs nothing else; one in the configuration file that
+can't be read stops startup.
 
 **Bounds:** 32 saved providers, 500 entries per list, and the request limits of the management
 listener. Adding a provider asks it about itself first: at most two requests of 4 s and 256 KiB,
@@ -608,7 +616,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   every publish, registered custom hostnames included (with or without a tunnel). Others are no
   longer renewed, and are forgotten (resolver and cache) after a week, so a hostname removed and
   added again soon keeps its certificate. Registering a custom hostname orders its certificate
-  at once, so it can be ready before traffic moves over.
+  at once, so it can be ready before traffic moves over. Your own certificates are bounded too: 64
+  on the Settings page, 64 in the configuration file, 64 KiB of PEM each.
 * Secrets are never logged. The bootstrap admin token goes to a 0600 file, not to the log.
 * The server sees only what it needs about local targets: the program name of a web terminal
   (not its arguments) and the folder name of a static site (not its path). The public terminal
@@ -647,6 +656,17 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * Per-hostname certificates, so the first `add` of a new name waits for one ACME order (a few
   seconds with Let's Encrypt). Wildcard certificates via DNS-01 are planned for a later
   milestone (Cloudflare integration); `tls.mode = "files"` covers wildcard certs today.
+* Your own certificates (`certs/provided.rs`) sit alongside the mode. They come from
+  `[[tls.certificates]]` or the Settings page, go before the usual source in the public listener's
+  resolver, and a name one covers is noted but never ordered, so removing the certificate can start
+  an order at once. A handshake only reads a map that's replaced whole; files are read on the control
+  threads, checked every 5 minutes for those in the configuration. When several cover a name, an
+  exact name beats a wildcard, the configuration file beats the page, and then the one that lasts
+  longest wins. One that has expired stays in use and shows as failed instead of falling back: it was
+  chosen on purpose, and the usual source may be why it was needed. The server's own names never use
+  them: the management listener asks `lookup_issued`, and neither status nor ordering counts them
+  for those names. So a bad certificate pasted on the page can't lock anyone out of the page that
+  removes it, the same reason listeners stay in the configuration file.
 * Public side is HTTP/1.1 only (ALPN `http/1.1`); no HTTP/2 or HTTP/3 yet.
 * One TCP connection per agent: yamux streams share it, so a lossy link causes head-of-line
   blocking across tunnels of that agent. UDP tunnels ride the same TCP connection, so they

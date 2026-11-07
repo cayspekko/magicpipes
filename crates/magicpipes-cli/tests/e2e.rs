@@ -2515,6 +2515,147 @@ async fn a_change_needs_its_token_a_whole_form_and_the_right_person() {
     }
 }
 
+/// Your own certificate from the Settings page: what it serves, what it never serves, and what a
+/// failed form gives back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certificate_added_on_the_settings_page_serves_its_names() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let token = env.admin_token();
+    let admin = admin_session(&env).await;
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&token)).await;
+    let agent = v["agents"][0]["id"].as_str().unwrap().to_string();
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let shop = format!("shop.app.{BASE}");
+    let mut page = env.ui("/settings", Some(&admin), None).await;
+    assert!(page.html.contains("None yet: every name gets its certificate from the development CA.") && page.html.contains(r#"href="/settings/certificates/new""#), "{}", page.html);
+    let csrf = page.csrf();
+    let new = "/settings/certificates/new";
+
+    // It names the management hostname too, which must keep what it has.
+    let (ca, chain, key) = common::own_certificate(&[&shop, "localhost"], None);
+    let (_, _, wrong_key) = common::own_certificate(&[&shop], None);
+    let key_body = |k: &str| k.lines().nth(1).unwrap().to_string();
+
+    // A failed form keeps the certificate and names the problem, and never gives a key back.
+    let bad = env.ui(new, Some(&admin), Some(&[("csrf", &csrf), ("chain", &chain), ("key", &wrong_key)])).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert!(bad.html.contains("belong to the first certificate") && bad.html.contains("<title>Error: Add a certificate") && bad.html.contains(chain.lines().nth(1).unwrap()), "{}", bad.html);
+    assert!(bad.html.contains(r#"name="key" rows="6" spellcheck="false" autocomplete="off" placeholder="-----BEGIN PRIVATE KEY-----" required aria-invalid="true""#), "{}", bad.html);
+    assert!(!bad.html.contains(&key_body(&wrong_key)), "{}", bad.html);
+    let both = format!("{chain}{key}");
+    let bad = env.ui(new, Some(&admin), Some(&[("csrf", &csrf), ("chain", &both), ("key", &key)])).await;
+    assert!(bad.status == StatusCode::BAD_REQUEST && !bad.html.contains(&key_body(&key)), "a combined file isn't shown again: {}", bad.html);
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains("None yet"));
+
+    // The token is checked before anything else, like any other form.
+    let forged = env.ui(new, Some(&admin), Some(&[("csrf", "wrong"), ("chain", &chain), ("key", &key)])).await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+
+    // Only administrators get here at all.
+    let password = "correct horse battery";
+    let (_, _) = env.api_json("POST", "/api/v1/users", Some(&token), serde_json::json!({ "email": "ann@example.com", "password": password })).await;
+    let ann = sign_in(&env, "ann@example.com", password).await;
+    assert_eq!(env.ui(new, Some(&ann), None).await.location.as_deref(), Some("/account"));
+    let hers = env.ui("/account", Some(&ann), None).await.csrf();
+    let refused = env.ui(new, Some(&ann), Some(&[("csrf", &hers), ("chain", &chain), ("key", &key)])).await;
+    assert_eq!(refused.location.as_deref(), Some("/account"));
+    assert!(env.connect_trusting(&ca, &shop, env.https_port).await.is_err());
+
+    let made = env.ui(new, Some(&admin), Some(&[("csrf", &csrf), ("chain", &chain), ("key", &key)])).await;
+    assert_eq!(made.location.as_deref(), Some("/settings?done=certificate-added"));
+
+    // Its names use it at once, and a hostname registered now says so instead of being ordered.
+    let assign = format!("agent:{agent}");
+    let form = [("csrf", csrf.as_str()), ("hostname", shop.as_str()), ("assign", assign.as_str())];
+    assert_eq!(env.ui("/hostnames", Some(&admin), Some(&form)).await.location.as_deref(), Some("/hostnames?done=hostname-covered"));
+    add_json(&env, &[&app.port.to_string(), "--hostname", &shop, "--public", "--no-verify"]).await;
+    let (_, v) = env.api("GET", "/api/v1/hostnames", Some(&token)).await;
+    assert_eq!(v["hostnames"][0]["tls"], "ready", "{v}");
+    assert!(env.try_connect(&shop, env.https_port).await.is_err(), "not the development CA's any more");
+    let get_home = async |ca: &str| {
+        let mut tls = env.connect_trusting(ca, &shop, env.https_port).await.unwrap();
+        tls.write_all(format!("GET / HTTP/1.1\r\nHost: {shop}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        tls.read_to_string(&mut answer).await.unwrap();
+        answer
+    };
+    assert!(get_home(&ca).await.contains("hello from app"));
+
+    // The management listener keeps its own, though the certificate names it.
+    assert!(env.try_connect("localhost", env.mgmt_port).await.is_ok());
+    assert!(env.connect_trusting(&ca, "localhost", env.mgmt_port).await.is_err());
+
+    page = env.ui("/settings", Some(&admin), None).await;
+    assert!(page.html.contains(&format!(r#"<span class="name">{shop}</span>"#)) && page.html.contains(">ready<") && page.html.contains("data-confirm=\"Remove the certificate for"), "{}", page.html);
+    let (_, audit) = env.api("GET", "/api/v1/audit", Some(&token)).await;
+    assert!(audit.to_string().contains("settings.certificate.add"), "{audit}");
+    let config = env.ui("/settings/export", Some(&admin), None).await.html;
+    assert!(config.contains("[[tls.certificates]]") && !config.contains(&key_body(&key)), "{config}");
+
+    // One about to run out shows on the home page, for administrators.
+    assert!(!env.ui("/", Some(&admin), None).await.html.contains("expiring soon"));
+    let (_, soon_chain, soon_key) = common::own_certificate(&[&format!("late.app.{BASE}"), &shop], Some(10));
+    env.ui(new, Some(&admin), Some(&[("csrf", &csrf), ("chain", &soon_chain), ("key", &soon_key)])).await;
+    let home = env.ui("/", Some(&admin), None).await.html;
+    assert!(home.contains(r##"<a href="/settings#certificates">1 of your certificates expiring soon</a>"##), "{home}");
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains(">expires soon<"));
+    assert!(get_home(&ca).await.contains("hello from app"), "the longer-lived one still serves it");
+
+    // A restart keeps them.
+    env.stop_server().await;
+    env.start_server().await;
+    let admin = admin_session(&env).await;
+    let csrf = env.ui("/settings", Some(&admin), None).await.csrf();
+    assert!(env.connect_trusting(&ca, &shop, env.https_port).await.is_ok());
+
+    // Removing them hands the name back to the usual source, without being asked again.
+    let page = env.ui("/settings", Some(&admin), None).await;
+    let ids: Vec<&str> = page.html.split("/settings/certificates/").skip(1).filter_map(|s| s.split_once("/delete")).map(|(id, _)| id).filter(|id| id.len() == 16).collect();
+    assert_eq!(ids.len(), 2, "{}", page.html);
+    let remove = async |id: &str| env.ui(&format!("/settings/certificates/{id}/delete"), Some(&admin), Some(&[("csrf", &csrf)])).await;
+    for id in &ids {
+        assert_eq!(remove(id).await.location.as_deref(), Some("/settings?done=certificate-removed"));
+    }
+    let again = remove(ids[0]).await;
+    assert!(again.status == StatusCode::NOT_FOUND && again.html.contains("already gone"), "{}", again.html);
+    let start = std::time::Instant::now();
+    while env.try_connect(&shop, env.https_port).await.is_err() {
+        assert!(start.elapsed() < Duration::from_secs(10), "it never went back to the development CA");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(env.connect_trusting(&ca, &shop, env.https_port).await.is_err());
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains("None yet"));
+}
+
+/// Certificates in the configuration file: read at startup, shown on the page, not removable there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certificate_in_the_configuration_file_is_listed_and_kept() {
+    let dir = std::env::temp_dir().join(format!("mpe2e-certs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shop = format!("shop.app.{BASE}");
+    let (ca, chain, key) = common::own_certificate(&[&shop], None);
+    let (cert_file, key_file) = (dir.join("shop.crt"), dir.join("shop.key"));
+    std::fs::write(&cert_file, chain).unwrap();
+    std::fs::write(&key_file, key).unwrap();
+    let mut env = Env::with_config(Tls::DevCa, &format!("[[tls.certificates]]\ncert_file = {cert_file:?}\nkey_file = {key_file:?}\n")).await;
+
+    assert!(env.connect_trusting(&ca, &shop, env.https_port).await.is_ok());
+    let admin = admin_session(&env).await;
+    let page = env.ui("/settings", Some(&admin), None).await.html;
+    assert!(page.contains("in the configuration file") && page.contains(&shop), "{page}");
+    assert!(!page.contains("data-confirm=\"Remove the certificate"), "{page}");
+
+    // A mistake in the file stops the server, as other configuration mistakes do.
+    env.stop_server().await;
+    std::fs::remove_file(&key_file).unwrap();
+    let why = env.why_server_wont_start().await;
+    assert!(why.contains("shop.key"), "{why}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settings_page_adds_providers_without_a_restart() {
     use std::os::unix::fs::PermissionsExt;

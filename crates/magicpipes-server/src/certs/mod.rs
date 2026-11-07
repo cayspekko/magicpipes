@@ -4,10 +4,12 @@
 //! (registered tunnels and the management hostname). Nothing is issued on demand for arbitrary
 //! SNI names, so an attacker cannot make the server request certificates. Issued certificates
 //! are cached on disk and installed into the [`CertResolver`], which the TLS acceptors consult
-//! for every handshake without touching the control plane.
+//! for every handshake without touching the control plane. Certificates people bring themselves
+//! are in [`provided`].
 
 mod acme;
 mod devca;
+mod provided;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{TlsConfig, TlsMode};
 
 pub use acme::Http01Challenges;
+pub use provided::{AddError, ProvidedCert};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertStatus {
@@ -46,11 +49,13 @@ impl CertStatus {
 
 // ---- resolver ----------------------------------------------------------------------------
 
-/// SNI -> certificate lookup. Exact names first, then single-label wildcards.
+/// SNI -> certificate lookup. Exact names first, then single-label wildcards. Certificates people
+/// brought go before any others.
 #[derive(Default, Debug)]
 pub struct CertResolver {
     exact: RwLock<HashMap<String, Arc<CertifiedKey>>>,
     wildcard: RwLock<HashMap<String, Arc<CertifiedKey>>>,
+    provided: RwLock<provided::NameMap>,
 }
 
 impl CertResolver {
@@ -67,9 +72,19 @@ impl CertResolver {
         self.exact.write().unwrap().remove(&name.to_ascii_lowercase());
     }
 
+    /// What the public listener serves.
     pub fn lookup(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let host = host.to_ascii_lowercase();
-        if let Some(k) = self.exact.read().unwrap().get(&host) {
+        self.provided.read().unwrap().get(&host).or_else(|| self.issued(&host))
+    }
+
+    /// Without what people brought, for the management listener.
+    pub fn lookup_issued(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        self.issued(&host.to_ascii_lowercase())
+    }
+
+    fn issued(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        if let Some(k) = self.exact.read().unwrap().get(host) {
             return Some(k.clone());
         }
         let (_, parent) = host.split_once('.')?;
@@ -85,7 +100,8 @@ impl ResolvesServerCert for CertResolver {
 
 /// Answers for one hostname only. The management listener uses this: the shared resolver also
 /// holds every tunnel's certificate, and the management UI must not be reachable under a
-/// tunnel's hostname (its session cookie would then belong to the tunnel's origin).
+/// tunnel's hostname (its session cookie would then belong to the tunnel's origin). It never uses
+/// a certificate people brought: a bad one must not lock anyone out of the page that removes it.
 #[derive(Debug)]
 pub struct SingleHost {
     pub host: String,
@@ -95,7 +111,7 @@ pub struct SingleHost {
 impl ResolvesServerCert for SingleHost {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let name = hello.server_name()?;
-        if name.eq_ignore_ascii_case(&self.host) { self.inner.lookup(&self.host) } else { None }
+        if name.eq_ignore_ascii_case(&self.host) { self.inner.lookup_issued(&self.host) } else { None }
     }
 }
 
@@ -123,7 +139,8 @@ pub fn load_pem(chain_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<LoadedCert> 
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow!("invalid certificate PEM: {e}"))?;
     let leaf = chain.first().ok_or_else(|| anyhow!("certificate PEM contains no certificate"))?;
-    let key_der = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| anyhow!("invalid private key PEM: {e}"))?;
+    // Without the parser's words: they can quote a line of the key.
+    let key_der = PrivateKeyDer::from_pem_slice(key_pem).map_err(|_| anyhow!("invalid private key PEM"))?;
     let signing = rustls::crypto::ring::sign::any_supported_type(&key_der).context("unsupported private key")?;
     let (_, x509) = x509_parser::parse_x509_certificate(leaf).map_err(|e| anyhow!("invalid certificate: {e}"))?;
     let mut names = Vec::new();
@@ -143,7 +160,7 @@ pub fn load_pem(chain_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<LoadedCert> 
     })
 }
 
-fn covers(names: &[String], host: &str) -> bool {
+pub fn covers(names: &[String], host: &str) -> bool {
     names.iter().any(|n| {
         n == host || n.strip_prefix("*.").is_some_and(|s| host.split_once('.').is_some_and(|(_, p)| p == s))
     })
@@ -187,6 +204,8 @@ impl HostCert {
 /// A hostname no tunnel uses is no longer renewed, and is forgotten (resolver, cache) after this
 /// long, so a tunnel removed and added again soon keeps its certificate.
 const FORGET_UNWANTED_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How soon a certificate file another tool renewed is used.
+const PROVIDED_FILES_CHECK: Duration = Duration::from_secs(300);
 
 pub struct CertManager {
     cfg: TlsConfig,
@@ -200,10 +219,16 @@ pub struct CertManager {
     order_slots: Semaphore,
     /// Names covered by `tls.mode = "files"`.
     static_names: Vec<String>,
+    /// Certificates people brought; a later one overrules an earlier one. See [`provided`].
+    provided: Mutex<Vec<provided::Entry>>,
+    provided_dir: PathBuf,
+    /// The server's own names, which these never apply to.
+    own_names: Vec<String>,
 }
 
 impl CertManager {
-    /// `domains`: the names certificates may be issued for (base domain, management hostname).
+    /// `domains`: the server's own names, which certificates may be issued for (base domain,
+    /// management hostname).
     pub fn new(cfg: &TlsConfig, data_dir: &Path, domains: &[&str]) -> anyhow::Result<Arc<Self>> {
         let dir = data_dir.join("certs");
         std::fs::create_dir_all(&dir)?;
@@ -222,6 +247,8 @@ impl CertManager {
             tracing::info!(names = ?loaded.names, "loaded certificate from files");
             static_names = loaded.names;
         }
+        let provided_dir = data_dir.join(provided::DIR);
+        let provided = Mutex::new(provided::load_all(&cfg.certificates, &provided_dir)?);
         let challenges = Arc::new(Http01Challenges::default());
         let acme = acme::AcmeClient::new(cfg, data_dir, challenges.clone());
         let mgr = Arc::new(Self {
@@ -234,7 +261,11 @@ impl CertManager {
             devca,
             order_slots: Semaphore::new(2),
             static_names,
+            provided,
+            provided_dir,
+            own_names: domains.iter().map(|d| d.to_ascii_lowercase()).collect(),
         });
+        mgr.install_provided();
         if cfg.mode == TlsMode::Acme {
             mgr.load_cache();
         }
@@ -296,6 +327,9 @@ impl CertManager {
     }
 
     pub fn status(&self, host: &str) -> CertStatus {
+        if let Some(status) = self.provided_status(host) {
+            return status;
+        }
         if self.cfg.mode == TlsMode::Files {
             return self.files_status(host);
         }
@@ -310,14 +344,19 @@ impl CertManager {
         }
     }
 
-    /// Makes sure a certificate for `host` exists or is being obtained. Never blocks.
+    /// Makes sure a certificate for `host` exists or is being obtained. Never blocks. A name someone
+    /// brought a certificate for is only noted, so it's ordered if that certificate goes away.
     pub fn ensure(self: &Arc<Self>, host: &str) {
         if self.cfg.mode == TlsMode::Files {
             return;
         }
+        let covered = self.provided_covers(host);
         let backoff = Duration::from_secs(self.cfg.failure_backoff_secs);
         let mut hosts = self.hosts.lock().unwrap();
         let entry = hosts.entry(host.to_string()).or_insert_with(HostCert::new);
+        if covered {
+            return;
+        }
         let retry = entry.failed_at.is_none_or(|t| t.elapsed() >= backoff);
         let needs = match &*entry.status.borrow() {
             CertStatus::Ready => needs_renewal(entry.not_before, entry.not_after) && retry,
@@ -381,6 +420,9 @@ impl CertManager {
 
     /// Waits until the certificate for `host` is ready or has failed, at most `timeout`.
     pub async fn wait(self: &Arc<Self>, host: &str, timeout: Duration) -> CertStatus {
+        if let Some(status) = self.provided_status(host) {
+            return status;
+        }
         if self.cfg.mode == TlsMode::Files {
             return self.files_status(host);
         }
@@ -431,20 +473,38 @@ impl CertManager {
             .collect()
     }
 
-    /// Periodically renews certificates that passed two thirds of their lifetime, and forgets
-    /// those of hostnames no tunnel has used for a week.
+    /// Starts certificates for wanted hostnames waiting on one, now that fewer names are covered
+    /// by certificates people brought.
+    fn ensure_pending(self: &Arc<Self>) {
+        let pending: Vec<String> = {
+            let hosts = self.hosts.lock().unwrap();
+            hosts.iter().filter(|(_, h)| h.unwanted_since.is_none() && !h.issuing && matches!(*h.status.borrow(), CertStatus::Pending)).map(|(k, _)| k.clone()).collect()
+        };
+        for host in pending {
+            self.ensure(&host);
+        }
+    }
+
+    /// Periodically renews certificates that passed two thirds of their lifetime, forgets those of
+    /// hostnames no tunnel has used for a week, and picks up certificate files that changed.
     pub fn spawn_renewal(self: &Arc<Self>, shutdown: CancellationToken) {
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            let mut files = tokio::time::interval(PROVIDED_FILES_CHECK);
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    _ = tick.tick() => {}
-                }
-                for host in me.maintain(FORGET_UNWANTED_AFTER) {
-                    tracing::info!(%host, "renewing certificate");
-                    me.ensure(&host);
+                    _ = files.tick() => me.reload_provided_files(),
+                    _ = tick.tick() => {
+                        for host in me.maintain(FORGET_UNWANTED_AFTER) {
+                            // Yours to renew, for a name someone brought a certificate for.
+                            if !me.provided_covers(&host) {
+                                tracing::info!(%host, "renewing certificate");
+                                me.ensure(&host);
+                            }
+                        }
+                    }
                 }
             }
         });

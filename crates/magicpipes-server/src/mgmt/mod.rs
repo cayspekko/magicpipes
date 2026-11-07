@@ -13,6 +13,7 @@
 
 mod accounts;
 mod api;
+mod certificates;
 mod extract;
 mod html;
 mod icons;
@@ -131,6 +132,8 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/settings/providers/new", get(settings::new_provider).post(settings::create_provider))
         .route("/settings/providers/{id}", get(settings::edit_provider).post(settings::update_provider))
         .route("/settings/providers/{id}/delete", post(settings::delete_provider))
+        .route("/settings/certificates/new", get(certificates::new_certificate).post(certificates::add_certificate))
+        .route("/settings/certificates/{id}/delete", post(certificates::delete_certificate))
         .route("/cli", get(accounts::device).post(accounts::answer_device))
         .route("/auth/tunnel", get(accounts::auth_tunnel))
         .route("/auth/oidc/{id}", get(oidc::start))

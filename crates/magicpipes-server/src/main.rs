@@ -186,7 +186,7 @@ fn management_resolver(cfg: &Config, certs: &Arc<CertManager>) -> anyhow::Result
         resolver
     } else {
         if cfg.tls.mode == TlsMode::Files {
-            if certs.resolver().lookup(host).is_none() {
+            if certs.resolver().lookup_issued(host).is_none() {
                 bail!("tls.cert_file does not cover the management hostname {host}; set management.cert_file");
             }
         } else {

@@ -19,6 +19,11 @@ hostname = "example.com"
 mode = "acme"
 acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # acme_email = "ops@example.com"
+# Your own certificates, for the names they cover (mount the files). You can also add them on the
+# Settings page.
+# [[tls.certificates]]
+# cert_file = "/etc/magicpipes/shop.crt"
+# key_file  = "/etc/magicpipes/shop.key"
 
 # [users]
 # session_max_age_secs = 43200

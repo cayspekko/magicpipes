@@ -108,6 +108,27 @@ from `MAGICPIPESD_CONFIG`.
 The management listener uses the same certificate source for `management.hostname`, or
 `management.cert_file` / `management.key_file` if set.
 
+**Your own certificates** work alongside any mode, for a name the usual source can't serve: an
+internal name, one without port 80, a certificate from a company CA, or a wildcard you already have.
+A name one covers uses it and is never ordered. Add one in either of two ways:
+
+* On the **Settings** page, under **Certificates**: paste the certificate and its private key. They're
+  kept in `data_dir/provided-certs` (0600), and in use at once.
+* In the configuration file, when another tool renews it. Changed files are picked up within 5 minutes.
+  Files that can't be used leave the loaded certificate in use, and the page says why.
+
+  ```toml
+  [[tls.certificates]]
+  cert_file = "/etc/magicpipes/shop.crt"
+  key_file = "/etc/magicpipes/shop.key"
+  ```
+
+Nothing renews these for you. The Settings page shows what's about to expire, and the home page warns
+when one in use is within 30 days of it. An expired one stays in use and its tunnels show their
+certificate as failed, until you replace or remove it; removing it hands its names back to the usual
+source. The management hostname never uses one, so a bad certificate can't lock you out of the page
+that fixes it: use `management.cert_file` for that.
+
 **TCP and UDP ports** are off until you give the server a port range:
 
 ```toml

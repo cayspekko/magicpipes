@@ -680,7 +680,7 @@ fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: O
 <label for="hn">Hostname</label><input id="hn" name="hostname" placeholder="shop.example.com" maxlength="253" value="{typed_host}"{host_invalid} required>
 <label for="ha">Served by</label><select id="ha" name="assign"{assign_invalid} required><option value="">Choose…</option>{users}{agents}</select>
 <button class="btn primary">Register</button></form>
-<p class="note">One exact name, no wildcards, with its DNS pointing at this server. Its certificate is ordered as soon as you register it, so it can be ready before traffic moves over. Then serve a tunnel on it with <code>magicpipes add PORT --hostname NAME</code>. Removing it deletes that tunnel.</p></div>"#,
+<p class="note">One exact name, no wildcards, with its DNS pointing at this server. Its certificate is ordered as soon as you register it, so it can be ready before traffic moves over; if it can't be ordered, <a href="/settings#certificates">add your own</a>. Then serve a tunnel on it with <code>magicpipes add PORT --hostname NAME</code>. Removing it deletes that tunnel.</p></div>"#,
         base = esc(&app.control.config().base_domain),
         list = table(&[Text("Hostname"), Text("Served by"), Text("Tunnel"), Text("TLS"), Text("Registered"), Actions], &rows, "No custom hostnames yet. Register one below, or use names under the base domain."),
         err = alert(error),
@@ -712,6 +712,7 @@ pub async fn create_hostname(State(app): State<AppState>, Posted(user, f): Poste
         _ => (None, None),
     };
     match app.control.create_hostname(&user.who, &f.hostname, owner, agent) {
+        Ok(h) if app.control.certificate_covers(&h.hostname) => done("/hostnames", Done::HostnameCovered),
         Ok(_) => done("/hostnames", Done::HostnameRegistered),
         Err(e) => (StatusCode::BAD_REQUEST, hostnames_page(&user, &app, None, Some((&f, &e.message)))).into_response(),
     }

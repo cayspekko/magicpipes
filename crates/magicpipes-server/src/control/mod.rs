@@ -11,7 +11,8 @@
 //! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
-//! * `settings` — sign-in settings made on the Settings page, and the generated configuration;
+//! * `settings` — sign-in settings and certificates made on the Settings page, and the generated
+//!   configuration;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
 //! * `users` — accounts, logins, UI sessions, API tokens and the audit log;
 //! * `views` — what the API and the UI show.
@@ -49,7 +50,7 @@ use crate::store::{Store, TunnelRow};
 pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
 pub use oidc::SignInError;
 pub use registry::TunnelSignIn;
-pub use settings::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
+pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 pub use tags::EnrollmentOptions;
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
@@ -171,7 +172,7 @@ impl ControlPlane {
             .map(|p| crate::oidc::Provider::load(p).map(Arc::new).with_context(|| format!("oidc provider '{}'", p.id)))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let proxy_auth = cfg.proxy_auth.as_ref().map(|p| crate::proxy_auth::ProxyAuth::load(p, cfg.trusted_proxies())).transpose().context("proxy_auth")?;
-        let effective = settings::effective_config(&cfg, &store)?;
+        let effective = settings::effective_config(&cfg, &store, &certs)?;
         let sign_in = RwLock::new(Arc::new(settings::SignIn::new(&effective, &file_providers)));
         settings::write_generated(&effective);
         let cp = Arc::new(Self {

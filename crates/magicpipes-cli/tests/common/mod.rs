@@ -319,6 +319,31 @@ udp_idle_timeout_secs = 5
         TlsConnector::from(self.tls()).connect(ServerName::try_from(host.to_string()).unwrap(), tcp).await
     }
 
+    /// As [`Env::try_connect`], trusting only `ca_pem`: this succeeds only if the server presents a
+    /// certificate from that CA.
+    pub async fn connect_trusting(&self, ca_pem: &str, host: &str, port: u16) -> std::io::Result<TlsStream<TcpStream>> {
+        let mut roots = rustls::RootCertStore::empty();
+        for c in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let tls = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+        TlsConnector::from(Arc::new(tls)).connect(ServerName::try_from(host.to_string()).unwrap(), tcp).await
+    }
+
+    /// What the server says when its configuration keeps it from starting.
+    pub async fn why_server_wont_start(&self) -> String {
+        let mut cmd = tokio::process::Command::new(bin("magicpipesd"));
+        cmd.arg("--config").arg(self.root.join("server.toml")).kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(20), cmd.output()).await.expect("the server started after all").unwrap();
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
     pub async fn send(&self, host: &str, port: u16, req: Request<Full<Bytes>>) -> Response<Incoming> {
         let stream = self.connect(host, port).await;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
@@ -517,6 +542,30 @@ fn test_certs(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::write(&crt, cert.pem()).unwrap();
     std::fs::write(&k, key.serialize_pem()).unwrap();
     (ca, crt, k)
+}
+
+/// A certificate from a CA of its own: `(ca, chain, key)`, as PEM text. `days_left`: its end, after
+/// a long life already. Otherwise it lasts for a year.
+pub fn own_certificate(names: &[&str], days_left: Option<u64>) -> (String, String, String) {
+    use std::time::{Duration, SystemTime};
+
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    let day = Duration::from_secs(24 * 3600);
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+    let now = SystemTime::now();
+    params.not_before = match days_left {
+        Some(_) => (now - day * 300).into(),
+        None => (now - day).into(),
+    };
+    params.not_after = (now + day * days_left.unwrap_or(365) as u32).into();
+    let cert = params.signed_by(&key, &issuer).unwrap();
+    (ca_cert.pem(), cert.pem(), key.serialize_pem())
 }
 
 // ---- local test applications --------------------------------------------------------------
