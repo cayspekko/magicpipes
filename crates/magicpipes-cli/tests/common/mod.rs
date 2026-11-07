@@ -87,6 +87,11 @@ impl Env {
 
     /// `extra` is appended to the server's configuration.
     pub async fn with_config(tls: Tls, extra: &str) -> Env {
+        Self::with_settings(tls, "", extra).await
+    }
+
+    /// `top` goes before the first section of the server's configuration, `extra` after the last.
+    pub async fn with_settings(tls: Tls, top: &str, extra: &str) -> Env {
         let root = std::env::temp_dir().join(format!("mpe2e-{}", magicpipes_core_rand()));
         std::fs::create_dir_all(root.join("home")).unwrap();
         let (https_port, mut http_port, mgmt_port) = (free_port(), free_port(), free_port());
@@ -133,6 +138,7 @@ impl Env {
         let cfg = format!(
             r#"base_domain = "{BASE}"
 data_dir = "{data}"
+{top}
 [public]
 https_listen = "127.0.0.1:{https_port}"
 http_listen = "127.0.0.1:{http_port}"
@@ -390,7 +396,15 @@ udp_idle_timeout_secs = 5
     /// A management UI request: GET without `form`, otherwise a POSTed form. Returns the status,
     /// the `Location` and `Set-Cookie` session values (if any) and the body.
     pub async fn ui(&self, path: &str, cookie: Option<&str>, form: Option<&[(&str, &str)]>) -> UiResponse {
+        self.ui_with(path, cookie, form, &[]).await
+    }
+
+    /// As [`Env::ui`], with what an authenticating proxy would add.
+    pub async fn ui_with(&self, path: &str, cookie: Option<&str>, form: Option<&[(&str, &str)]>, headers: &[(&str, &str)]) -> UiResponse {
         let mut b = Request::builder().uri(path).header(header::HOST, format!("localhost:{}", self.mgmt_port));
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
         if let Some(c) = cookie {
             b = b.header(header::COOKIE, c);
         }
@@ -527,7 +541,7 @@ impl Drop for App {
 /// HTTP app: `GET /` -> "hello from app", `POST /echo` streams the body back,
 /// `GET /stream` sends "first" then waits for `release` before "second",
 /// `GET /status/401` -> 401, `GET /conn` -> the number of the TCP connection it came on,
-/// anything else -> 404.
+/// `GET /headers` -> the names of the request's headers, anything else -> 404.
 pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
     use http_body_util::combinators::BoxBody;
     use hyper::service::service_fn;
@@ -561,6 +575,10 @@ pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
                                 let h = |n: &str| req.headers().get(n).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
                                 let body = format!("user={} id={} cookie={}", h("x-magicpipes-user"), h("x-magicpipes-user-id"), h("cookie"));
                                 Response::new(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                            }
+                            ("GET", "/headers") => {
+                                let names: Vec<&str> = req.headers().keys().map(|k| k.as_str()).collect();
+                                Response::new(Full::new(Bytes::from(names.join(","))).map_err(|never| match never {}).boxed())
                             }
                             ("GET", "/stream") => {
                                 let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
@@ -695,6 +713,8 @@ pub struct FakeOidc {
     pub person: Arc<std::sync::Mutex<OidcPerson>>,
     pub token_requests: Arc<std::sync::atomic::AtomicUsize>,
     pub task: tokio::task::JoinHandle<()>,
+    key: Arc<ring::signature::EcdsaKeyPair>,
+    other_key: Arc<ring::signature::EcdsaKeyPair>,
 }
 
 pub const OIDC_CLIENT: &str = "client-1";
@@ -714,6 +734,7 @@ impl FakeOidc {
         let rng = SystemRandom::new();
         let new_key = || EcdsaKeyPair::from_pkcs8(&ALG, EcdsaKeyPair::generate_pkcs8(&ALG, &rng).unwrap().as_ref(), &rng).unwrap();
         let (key, other) = (Arc::new(new_key()), Arc::new(new_key()));
+        let (signing_key, other_key) = (key.clone(), other.clone());
         let person = Arc::new(std::sync::Mutex::new(OidcPerson::new("sub-1", "ann@example.com")));
         let codes: Arc<std::sync::Mutex<std::collections::HashMap<String, Code>>> = Arc::default();
         let token_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -800,7 +821,17 @@ impl FakeOidc {
                 });
             }
         });
-        FakeOidc { issuer, person, token_requests, task }
+        FakeOidc { issuer, person, token_requests, task, key: signing_key, other_key }
+    }
+
+    /// A token with these claims, signed with the key this provider publishes.
+    pub fn sign(&self, claims: &Value) -> String {
+        sign_es256(&self.key, claims)
+    }
+
+    /// A token signed with a key nobody published, under the same key id.
+    pub fn sign_with_another_key(&self, claims: &Value) -> String {
+        sign_es256(&self.other_key, claims)
     }
 
     /// The configuration that uses this provider.
@@ -814,6 +845,14 @@ impl FakeOidc {
             secret.display(),
         )
     }
+}
+
+fn sign_es256(key: &ring::signature::EcdsaKeyPair, claims: &Value) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    let msg = format!("{}.{}", B64.encode(r#"{"alg":"ES256","kid":"k1"}"#), B64.encode(claims.to_string()));
+    let sig = key.sign(&ring::rand::SystemRandom::new(), msg.as_bytes()).unwrap();
+    format!("{msg}.{}", B64.encode(sig.as_ref()))
 }
 
 fn parse_form(s: &str) -> std::collections::HashMap<String, String> {

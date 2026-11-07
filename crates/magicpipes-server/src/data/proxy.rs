@@ -108,6 +108,9 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     // MagicPipes' own cookies are never the application's, public or private: a name can pass to
     // someone else, and a browser still sends what it was given for it.
     gate::strip_cookies(req.headers_mut());
+    for name in &dp.settings.identity_headers {
+        req.headers_mut().remove(name);
+    }
     if let Some(a) = &admitted {
         // The application learns who is asking. Clients can't forge these: `prepare_request`
         // dropped every client-sent x-magicpipes-* header.

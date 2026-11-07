@@ -220,6 +220,9 @@ The defaults are the safe ones. These turn something on, or tighten it further, 
 | `[[oidc]] trust_email` | off | Accepts addresses the provider didn't verify |
 | `[[oidc]] allow_unverified_admin` | off | Lets those addresses reach administrators' accounts |
 | `[[oidc]] link_by_email` | off | Lets a first sign-in use an existing account with the same address |
+| `[proxy_auth] trust_email` | off | Accepts addresses nothing says were verified |
+| `[proxy_auth] allow_unverified_admin` | off | Lets those addresses reach administrators' accounts |
+| `[proxy_auth] auto_create` | off | Gives anyone new with an accepted address a member account |
 | `[public] body_idle_timeout_secs` | off | Closes a connection after this long with no byte moving; breaks long polling and server-sent events if set below their quiet periods |
 | `[ports] tcp_idle_timeout_secs` | off | The same for raw TCP ports |
 | `[public] max_connections_per_client` | 64 | Open HTTPS connections per client address |
@@ -297,6 +300,69 @@ client_secret_file = "/etc/magicpipes/google-secret"
 # trust_email = true
 # allow_unverified_admin = true            # needs trust_email
 ```
+
+### Authenticating proxy
+
+If the management host already sits behind something that signs people in (oauth2-proxy, Authelia,
+authentik's outpost, Pomerium, Cloudflare Access, or Caddy or nginx with forward auth), it can tell
+MagicPipes who they are, instead of a sign-in page here. It's off unless `[proxy_auth]` is set.
+
+A **signed token** is the safer way, because a forged request can't make one:
+
+```toml
+[proxy_auth]
+mode = "jwt"
+jwt_header = "Cf-Access-Jwt-Assertion"     # or Authorization, for oauth2-proxy's bearer token
+jwks_url = "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+issuer = "https://team.cloudflareaccess.com"
+audience = "your-application-audience"
+```
+
+**Plain headers** are for proxies that can't sign anything. They're believed only from an address
+in `trusted_proxies` that also sends a shared secret of at least 16 characters, so configure the
+proxy to add that header:
+
+```toml
+trusted_proxies = ["172.23.0.2/32"]   # at the top of the file: the proxy's own address
+
+[proxy_auth]
+mode = "headers"
+user_header = "X-Forwarded-Email"
+secret_header = "X-MagicPipes-Proxy-Secret"
+secret_file = "/etc/magicpipes/proxy-secret"
+```
+
+The proxy must replace any copy of these headers a client sends. A header sent twice counts as
+nobody, in case a client's copy is beside the proxy's.
+
+**Who gets in** follows the single sign-on rules above: someone seen before is recognized by their
+identity, and a first visit needs a verified address. A token says so with `email_verified`; for a
+token that doesn't, and for plain headers, set `trust_email = true`, since the proxy is what checked
+the address. Then an account an administrator created with that address, an address under **New
+administrators**, or a domain under **New members** lets them in. `auto_create = true` also gives
+anyone else with an accepted address a member account. An unverified address reaches an
+administrator's account only with `allow_unverified_admin = true`, so you need that if your own
+first sign-in comes through plain headers.
+
+**How it behaves:**
+
+* Every page request has to keep naming the same person. If it stops, or names someone else, the
+  session ends, so signing out at the proxy signs out here.
+* Passwords and sign-in providers aren't offered, since their sessions couldn't last. An admin token
+  still works, at `/login?method=token`, for when the proxy is down or misconfigured.
+* "Sign out" leads to `sign_out_url`, if you set it, such as `https://auth.example.com/logout`.
+  Otherwise there's no such button, because signing out here alone would sign you straight back in.
+* These headers never reach a tunnel's application, except `Authorization`, which may be the
+  application's own.
+
+**What the proxy needs.** It has to read HTTP, so it must terminate TLS for the management host and
+connect to MagicPipes over HTTPS, keeping the `Host` header. A proxy that passes TLS through by SNI,
+such as HAProxy in TCP mode, can't do this. For plain headers, `management.proxy_protocol` must be
+off, so that the connection's address is the proxy's. Let these paths past the proxy's sign-in,
+because agents and scripts have their own credentials: everything under `/api/`, plus `/healthz`.
+
+Tunnels aren't covered: this signs people in to the management host, and private tunnels then work
+as usual.
 
 ### Settings and the generated configuration
 

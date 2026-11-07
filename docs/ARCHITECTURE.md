@@ -515,6 +515,14 @@ a connection to the public port that must arrive back at the agent (a warning, n
     described in the README: accounts are keyed by `(issuer, subject)`, and only a verified
     email (any address, on a provider an administrator marked `trust_email`) can create or link
     one;
+  * **an authenticating proxy** (`proxy_auth.rs`, `mgmt/proxy_auth.rs`), if configured: a signed
+    token, checked as an ID token is but without a nonce, or a plain header from a
+    `trusted_proxies` address with a shared secret. A header sent twice counts as nobody. A layer
+    in front of the page handlers turns that into a normal session, and every page request must
+    keep naming the session's user, or the session ends. So passwords and providers aren't offered,
+    whose sessions couldn't last; admin-token sessions don't depend on it. Accounts follow the
+    same rules as single sign-on (`control/oidc.rs`). A refusal is only logged, since every page
+    request would otherwise add to the audit log;
   * **user API tokens** `tok_<id>.mpu_<secret>`, acting as their user with the user's current
     role, at most 20 per user, optional expiry;
   * **single-use enrollment tokens** with an expiry;

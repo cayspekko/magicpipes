@@ -16,6 +16,7 @@ mod listen;
 mod proxy_header;
 mod mgmt;
 mod oidc;
+mod proxy_auth;
 mod store;
 mod tunnel_auth;
 

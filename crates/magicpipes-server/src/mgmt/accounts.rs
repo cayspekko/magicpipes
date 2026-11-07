@@ -133,8 +133,7 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
 <label for="te">Expires after (days, empty = never)</label><input id="te" name="expires_in_days" inputmode="numeric" pattern="[0-9]*" value="{typed_days}"{days_invalid}>
 <button class="btn primary">Create API token</button></form>
 <p class="note">Use it as <code>Authorization: Bearer &lt;token&gt;</code>. It acts as you, with your current role.</p></div>
-<div class="card panel danger spaced"><div><h2>Sign out everywhere</h2><p>Ends every browser session of this account, this one included. API tokens keep working.</p></div>
-<form method="post" action="/account/logout-everywhere">{csrf}<button class="btn danger">Sign out everywhere</button></form></div>"#,
+{sign_out_everywhere}"#,
         name = esc(if me.display_name.is_empty() { &me.email } else { &me.display_name }),
         email = esc(&me.email),
         role = me.role.as_str(),
@@ -145,8 +144,18 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
         typed_days = esc(attempt.map_or("", |(f, _)| &f.expires_in_days)),
         name_invalid = invalid(error.is_some() && !bad_expiry),
         days_invalid = invalid(bad_expiry),
+        // At the proxy, signing out everywhere is the proxy's to do: here it would only sign back in.
+        sign_out_everywhere = if user.through_proxy() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="card panel danger spaced"><div><h2>Sign out everywhere</h2><p>Ends every browser session of this account, this one included. API tokens keep working.</p></div>
+<form method="post" action="/account/logout-everywhere">{}<button class="btn danger">Sign out everywhere</button></form></div>"#,
+                user.csrf_field()
+            )
+        },
         // Someone who only signs in with single sign-on has no password to change.
-        password = if me.has_password {
+        password = if me.has_password && !user.through_proxy() {
             r#"<div class="card panel spaced"><div><h2>Password</h2><p>Changing it signs you out on other devices.</p></div><a class="btn" href="/password">Change password</a></div>"#
         } else {
             ""
@@ -206,6 +215,8 @@ pub async fn logout_everywhere(State(app): State<AppState>, Posted(user, _): Pos
 fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option<(&NewUserForm, &str)>) -> Response {
     let users = app.control.users(&user.who);
     let reach = app.control.private_reach(&user.who);
+    // Behind an authenticating proxy, nobody signs in with a password.
+    let passwords = app.control.proxy_auth().is_none();
     let mut rows = String::new();
     for u in &users {
         let state = match (u.disabled, u.must_change_password) {
@@ -233,8 +244,10 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
             } else {
                 post("admin", "Make admin", false, Some(format!("Make {} an administrator? They can see and change everything here.", u.email)))
             });
-            let reset = format!("Reset the password of {}? Their sessions end, their API tokens are revoked, and they must replace the new password when they next sign in.", u.email);
-            items.push(post("reset", "Reset password", false, Some(reset)));
+            if passwords {
+                let reset = format!("Reset the password of {}? Their sessions end, their API tokens are revoked, and they must replace the new password when they next sign in.", u.email);
+                items.push(post("reset", "Reset password", false, Some(reset)));
+            }
             let revoke = format!("Revoke every API token of {}? Anything using them stops working.", u.email);
             items.push(post("revoke-tokens", "Revoke API tokens", false, Some(revoke)));
             items.push("<hr>".into());
@@ -267,9 +280,8 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
 <label for="ue">Email</label><input id="ue" type="email" name="email" value="{email}"{email_invalid} required>
 <label for="un">Name</label><input id="un" name="display_name" value="{name}" maxlength="100">
 <label for="ur">Role</label><select id="ur" name="role"><option value="member">Member</option><option value="admin"{admin_selected}>Administrator</option></select>
-<label for="up">Password (empty = generate one)</label><input id="up" type="password" name="password" autocomplete="new-password" minlength="{min}"{password_invalid}>
-<button class="btn primary">Add user</button></form>
-<p class="note">They replace a password you set here when they first sign in. With a single sign-on provider, they can sign in with that instead.</p></div>{registry}"#,
+{password_field}<button class="btn primary">Add user</button></form>
+<p class="note">{how_they_sign_in}</p></div>{registry}"#,
         registry = picker::registry(app, user),
         list = table(&[Text("User"), Text("Role"), Text("Tags"), Text("Status"), Text("Last sign-in"), Actions], &rows, "No users yet. Add the first one below."),
         err = alert(error),
@@ -278,9 +290,21 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
         name = typed(|f| &f.display_name),
         admin_selected = if admin_role { " selected" } else { "" },
         email_invalid = invalid(form_error.is_some() && !bad_password),
-        password_invalid = invalid(bad_password),
+        password_field = if passwords {
+            format!(
+                r#"<label for="up">Password (empty = generate one)</label><input id="up" type="password" name="password" autocomplete="new-password" minlength="{MIN_PASSWORD_CHARS}"{}>
+"#,
+                invalid(bad_password)
+            )
+        } else {
+            String::new()
+        },
+        how_they_sign_in = if passwords {
+            "They replace a password you set here when they first sign in. With a single sign-on provider, they can sign in with that instead."
+        } else {
+            "They sign in through the proxy, once it vouches for this address."
+        },
         csrf = user.csrf_field(),
-        min = MIN_PASSWORD_CHARS,
     );
     page(&title_of("Users", form_error.is_some()), Some(user), &body)
 }
@@ -303,6 +327,8 @@ pub async fn create_user(State(app): State<AppState>, Posted(user, f): Posted<Ne
     let role = Role::parse(&f.role).unwrap_or(Role::Member);
     let password = (!f.password.is_empty()).then_some(f.password.as_str());
     match app.control.create_user(&user.who, &f.email, &f.display_name, role, password).await {
+        // It can't be used here, and its first sign-in through the proxy removes it.
+        Ok(_) if app.control.proxy_auth().is_some() => done("/users", Done::UserAddedForProxy),
         Ok((u, Some(generated))) => shown_once(
             &user,
             &format!("Password for {}", u.email),
@@ -431,11 +457,19 @@ pub async fn auth_tunnel(user: UiUser, State(app): State<AppState>, axum::extrac
             let body = format!(
                 r#"<div class="auth"><div class="eyebrow">Private tunnel</div><h1>No <em>access</em></h1>
 <p class="lede">You're signed in as {email}, but you don't have access to <code>{host}</code>. Ask its owner or an administrator.</p>
-<form class="spaced" method="post" action="/logout">{csrf}<input type="hidden" name="next" value="{here}"><button class="btn">Switch account</button></form></div>"#,
+{switch}</div>"#,
                 email = esc(&me.email),
                 host = esc(&q.host),
-                csrf = user.csrf_field(),
-                here = esc(&format!("/auth/tunnel?host={}&state={}&return={}", url::encode(&q.host), url::encode(&q.state), url::encode(&q.back))),
+                // Behind a proxy, it's the proxy that decides who this is.
+                switch = if user.through_proxy() {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<form class="spaced" method="post" action="/logout">{}<input type="hidden" name="next" value="{}"><button class="btn">Switch account</button></form>"#,
+                        user.csrf_field(),
+                        esc(&format!("/auth/tunnel?host={}&state={}&return={}", url::encode(&q.host), url::encode(&q.state), url::encode(&q.back))),
+                    )
+                },
             );
             (StatusCode::FORBIDDEN, page("No access", Some(&user), &body)).into_response()
         }

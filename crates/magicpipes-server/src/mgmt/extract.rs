@@ -17,6 +17,16 @@ use crate::authz::Principal;
 use crate::control::UserView;
 use crate::tunnel_auth::cookie;
 
+/// How someone gets out of a session.
+pub(super) enum SignOut {
+    Here,
+    /// At the authenticating proxy that signed them in, at this address.
+    AtProxy(String),
+    /// At the authenticating proxy, at an address nobody configured. A session ended here would
+    /// only start again at the next request.
+    AtProxyElsewhere,
+}
+
 /// A signed-in UI session. Redirects to the sign-in page otherwise, and to the password page while
 /// the user still has to replace a password an administrator set.
 pub struct UiUser {
@@ -29,6 +39,7 @@ pub struct UiUser {
     pub(super) path: String,
     /// What a change just did, from the address.
     pub(super) done: Option<&'static str>,
+    pub(super) sign_out: SignOut,
 }
 
 impl FromRequestParts<AppState> for UiUser {
@@ -47,11 +58,16 @@ impl FromRequestParts<AppState> for UiUser {
         if must_change && !matches!(parts.uri.path(), "/password" | "/logout") {
             return Err(back("/password"));
         }
+        let sign_out = match app.control.proxy_auth().filter(|_| s.user.is_some()) {
+            None => SignOut::Here,
+            Some(proxy) => proxy.sign_out_url.clone().map_or(SignOut::AtProxyElsewhere, SignOut::AtProxy),
+        };
         Ok(UiUser {
             cookie: cookie.to_string(),
             who: s.who,
             csrf: s.csrf,
             user: s.user,
+            sign_out,
             path: parts.uri.path().to_string(),
             done: Done::from_query(parts.uri.query()),
         })
@@ -62,6 +78,12 @@ impl UiUser {
     /// The hidden field every form that changes something carries.
     pub(super) fn csrf_field(&self) -> String {
         format!(r#"<input type="hidden" name="csrf" value="{}">"#, esc(&self.csrf))
+    }
+
+    /// Did an authenticating proxy sign them in, so that its sessions and passwords aren't theirs to
+    /// manage here?
+    pub(super) fn through_proxy(&self) -> bool {
+        !matches!(self.sign_out, SignOut::Here)
     }
 
     /// `self` if an administrator; anyone else goes to their own account page.

@@ -168,12 +168,22 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
         }
     };
     let config = app.control.generated_config(&user.who).unwrap_or_default();
+    let list = table(&[Text("Provider"), Text("Options"), Text("Status"), Actions], &rows, "None yet: people sign in with a password.");
+    let providers = if app.control.proxy_auth().is_some() {
+        // Nothing to add: they aren't offered. Any already here are kept for when that changes.
+        let note = r#"<p class="note below-section">This server signs people in through its proxy (<code>[proxy_auth]</code>), so these aren't offered.</p>"#;
+        if rows.is_empty() { note.to_string() } else { format!("{note}{list}") }
+    } else {
+        format!(
+            r#"{list}
+<p class="note">Try a new provider from a private window. If a sign-in fails, the server's log says why.</p>
+<p class="note spaced">Add a provider:</p><div class="row">{add}</div>"#
+        )
+    };
     let body = format!(
         r#"<h1>Settings</h1><p class="lede">Changes here take effect at once; listeners, domains and TLS stay in the configuration file.</p>
 {err}<div class="section"><h2>Sign-in providers</h2></div>
-{list}
-<p class="note">Try a new provider from a private window. If a sign-in fails, the server's log says why.</p>
-<p class="note spaced">Add a provider:</p><div class="row">{add}</div>
+{providers}
 <div class="section"><h2>Who can sign in</h2></div>
 <div class="card form"><form method="post" action="/settings/sign-in">{csrf}
 <label for="sa">New administrators</label><textarea id="sa" name="bootstrap_admins" rows="3" placeholder="you@example.com" spellcheck="false">{admins}</textarea>
@@ -184,7 +194,6 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
 <div class="section"><h2>Configuration in effect</h2></div>
 <p class="note">Always current, at <code>{path}</code> in the data directory. It holds no secrets. <a href="/settings/export">{DOWNLOAD} Download it</a>.</p>
 <details><summary class="btn small">Show it</summary><pre class="term">{config}</pre></details>"#,
-        list = table(&[Text("Provider"), Text("Options"), Text("Status"), Actions], &rows, "None yet: people sign in with a password."),
         err = alert(error),
         csrf = user.csrf_field(),
         admins = esc(&admins),

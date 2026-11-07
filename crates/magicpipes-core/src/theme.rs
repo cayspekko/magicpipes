@@ -97,7 +97,7 @@ dl>:nth-last-child(-n+2){border-bottom:0}
 .copy{position:absolute;top:12px;right:12px;display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border-radius:10px;border:1px solid #3a3834;background:var(--term);color:#8e8a82;cursor:pointer;transition:color .15s,border-color .15s}
 .copy:hover,.copy:focus-visible{color:var(--term-ink);border-color:#8e8a82;outline:none}
 .copy.done{color:#7cc48e;border-color:#7cc48e}
-.note{margin:16px 0 0;color:var(--muted);font-size:13.5px}.note.or{text-align:center;margin:14px 0}dd .note{margin-top:8px}td .note{margin-top:4px}
+.note{margin:16px 0 0;color:var(--muted);font-size:13.5px}.note.or{text-align:center;margin:14px 0}dd .note{margin-top:8px}td .note{margin-top:4px}.note.below-section{margin:0 0 14px}
 .auth{width:100%;max-width:400px;margin:6vh auto 0}
 .auth .card{margin-top:28px;padding:30px 28px 26px}.auth .stat{padding:0}
 .card.form{padding:22px 24px 24px}

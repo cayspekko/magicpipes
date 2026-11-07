@@ -34,9 +34,134 @@ pub struct Config {
     /// login rate limits and passed on to tunnels) and PROXY headers on port tunnels.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Sign-in through an authenticating proxy in front of the management host. Off unless present.
+    #[serde(default)]
+    pub proxy_auth: Option<ProxyAuthConfig>,
     /// Sign-in with OpenID Connect providers; one button each on the sign-in page.
     #[serde(default)]
     pub oidc: Vec<OidcConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyAuthMode {
+    /// The proxy forwards a signed token, which is checked here. A forged request can't make one.
+    Jwt,
+    /// The proxy names the user in a plain header, believed only from `trusted_proxies` and with
+    /// a shared secret.
+    Headers,
+}
+
+/// An authenticating proxy, such as oauth2-proxy, Authelia, Pomerium or Cloudflare Access, that
+/// signs people in and tells this server who they are (`[proxy_auth]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyAuthConfig {
+    pub mode: ProxyAuthMode,
+    /// `jwt`: the header holding the token, such as `Cf-Access-Jwt-Assertion`.
+    pub jwt_header: Option<String>,
+    /// `jwt`: where the proxy publishes the keys that sign its tokens.
+    pub jwks_url: Option<String>,
+    /// `jwt`: the token's `iss`, exactly.
+    pub issuer: Option<String>,
+    /// `jwt`: a value of the token's `aud`.
+    pub audience: Option<String>,
+    /// `headers`: the header naming the user, such as `X-Forwarded-Email`.
+    pub user_header: Option<String>,
+    /// `headers`: the header the proxy adds with the shared secret.
+    pub secret_header: Option<String>,
+    /// `headers`: a file holding that secret.
+    pub secret_file: Option<PathBuf>,
+    /// Accept the proxy's email addresses even when nothing says they were verified. Off by
+    /// default: anyone who can choose their address behind the proxy could then claim one here.
+    #[serde(default)]
+    pub trust_email: bool,
+    /// With `trust_email`: let such an address reach an administrator's account, through
+    /// `bootstrap_admins` or an existing account. Off by default, so that trusting a proxy's
+    /// addresses can't hand out administrators.
+    #[serde(default)]
+    pub allow_unverified_admin: bool,
+    /// Someone new whose address is accepted gets a member account. Off by default: an
+    /// administrator creates accounts first, or `users.allowed_email_domains` covers them.
+    #[serde(default)]
+    pub auto_create: bool,
+    /// Where "Sign out" leads, such as `https://auth.example.com/logout`. Without it there's no
+    /// such button: signing out here alone would only sign you straight back in.
+    pub sign_out_url: Option<String>,
+}
+
+/// Headers that mean something else to this server or to HTTP.
+const RESERVED_HEADERS: [&str; 6] = ["cookie", "host", "content-length", "transfer-encoding", "connection", "x-forwarded-for"];
+
+impl ProxyAuthConfig {
+    fn header(what: &str, value: &Option<String>) -> Result<http::HeaderName, String> {
+        let raw = value.as_deref().ok_or_else(|| format!("{what} is required in this mode"))?;
+        let name = http::HeaderName::from_bytes(raw.trim().as_bytes()).map_err(|_| format!("{what}: '{raw}' is not a header name"))?;
+        if RESERVED_HEADERS.contains(&name.as_str()) || name.as_str().starts_with("x-magicpipes-") {
+            return Err(format!("{what}: '{raw}' already means something else"));
+        }
+        Ok(name)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let unused = |what: &str, value: bool| if value { Err(format!("{what} doesn't apply in this mode")) } else { Ok(()) };
+        match self.mode {
+            ProxyAuthMode::Jwt => {
+                Self::header("jwt_header", &self.jwt_header)?;
+                if !self.jwks_url.as_deref().is_some_and(crate::oidc::allowed_url) {
+                    return Err("jwks_url must be an https:// URL".into());
+                }
+                if self.issuer.as_deref().is_none_or(|i| i.trim().is_empty() || i.len() > 2048) {
+                    return Err("issuer is required, at most 2048 characters".into());
+                }
+                if self.audience.as_deref().is_none_or(|a| a.trim().is_empty() || a.len() > 2048) {
+                    return Err("audience is required, at most 2048 characters".into());
+                }
+                unused("user_header", self.user_header.is_some())?;
+                unused("secret_header", self.secret_header.is_some())?;
+                unused("secret_file", self.secret_file.is_some())?;
+            }
+            ProxyAuthMode::Headers => {
+                let user = Self::header("user_header", &self.user_header)?;
+                let secret = Self::header("secret_header", &self.secret_header)?;
+                if user == http::header::AUTHORIZATION || secret == http::header::AUTHORIZATION {
+                    return Err("user_header and secret_header can't be Authorization, which applications use".into());
+                }
+                if user == secret {
+                    return Err("user_header and secret_header must differ".into());
+                }
+                if self.secret_file.is_none() {
+                    return Err("secret_file is required in this mode".into());
+                }
+                unused("jwt_header", self.jwt_header.is_some())?;
+                unused("jwks_url", self.jwks_url.is_some())?;
+                unused("issuer", self.issuer.is_some())?;
+                unused("audience", self.audience.is_some())?;
+                // A plain header can't say an address was verified, so nothing would ever match.
+                if self.auto_create && !self.trust_email {
+                    return Err("auto_create needs trust_email in this mode".into());
+                }
+            }
+        }
+        if self.allow_unverified_admin && !self.trust_email {
+            return Err("unverified addresses can only reach administrators' accounts behind a proxy whose addresses are trusted".into());
+        }
+        if self.sign_out_url.as_deref().is_some_and(|u| !crate::oidc::allowed_url(u)) {
+            return Err("sign_out_url must be an https:// URL".into());
+        }
+        Ok(())
+    }
+
+    /// The headers that say who someone is, which never reach a tunnel's application. Except
+    /// `Authorization`: there, an application's own credentials would be lost.
+    pub fn identity_headers(&self) -> Vec<http::HeaderName> {
+        [&self.jwt_header, &self.user_header, &self.secret_header]
+            .into_iter()
+            .flatten()
+            .filter_map(|h| http::HeaderName::from_bytes(h.trim().as_bytes()).ok())
+            .filter(|h| *h != http::header::AUTHORIZATION)
+            .collect()
+    }
 }
 
 /// One OpenID Connect provider (`[[oidc]]`).
@@ -424,6 +549,17 @@ impl Config {
         if proxied && trusted.is_empty() {
             bail!("proxy_protocol requires trusted_proxies (the load balancer's addresses)");
         }
+        if let Some(p) = &self.proxy_auth {
+            p.check().map_err(|m| anyhow::anyhow!("proxy_auth: {m}"))?;
+            if p.mode == ProxyAuthMode::Headers {
+                if trusted.is_empty() {
+                    bail!("proxy_auth: plain headers are only believed from trusted_proxies, so that needs the proxy's address");
+                }
+                if self.management.proxy_protocol {
+                    bail!("proxy_auth: plain headers need to see the proxy's own address, so management.proxy_protocol must be off");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -514,6 +650,53 @@ mod tests {
     }
 
     #[test]
+    fn authenticating_proxy_settings() {
+        let load = |text: &str| {
+            let mut c: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\ntrusted_proxies = [\"10.0.0.1/32\"]\n[management]\nhostname = \"example.com\"\n[proxy_auth]\n{text}")).unwrap();
+            c.validate().map(|_| c).map_err(|e| e.to_string())
+        };
+        let jwt = "mode = \"jwt\"\njwt_header = \"Cf-Access-Jwt-Assertion\"\njwks_url = \"https://t.example.com/certs\"\nissuer = \"https://t.example.com\"\naudience = \"a\"\n";
+        let plain = "mode = \"headers\"\nuser_header = \"X-Forwarded-Email\"\nsecret_header = \"X-Proxy-Secret\"\nsecret_file = \"/s\"\n";
+        let c = load(jwt).unwrap();
+        let p = c.proxy_auth.as_ref().unwrap();
+        assert!(!p.trust_email && !p.allow_unverified_admin && !p.auto_create, "off unless asked for");
+        assert_eq!(p.identity_headers(), ["cf-access-jwt-assertion"]);
+        assert_eq!(load(plain).unwrap().proxy_auth.unwrap().identity_headers(), ["x-forwarded-email", "x-proxy-secret"]);
+
+        // oauth2-proxy can hand over the ID token as a bearer token, but that header isn't ours to strip.
+        let bearer = jwt.replace("Cf-Access-Jwt-Assertion", "Authorization");
+        assert!(load(&bearer).unwrap().proxy_auth.unwrap().identity_headers().is_empty());
+        assert!(load(&plain.replace("X-Proxy-Secret", "Authorization")).is_err());
+
+        for broken in [
+            jwt.replace("jwks_url = \"https://t.example.com/certs\"\n", ""),
+            jwt.replace("https://t.example.com/certs", "http://t.example.com/certs"),
+            jwt.replace("audience = \"a\"\n", ""),
+            jwt.replace("issuer = \"https://t.example.com\"\n", ""),
+            jwt.replace("Cf-Access-Jwt-Assertion", "Cookie"),
+            jwt.replace("Cf-Access-Jwt-Assertion", "not a header"),
+            format!("{jwt}secret_file = \"/s\"\n"),
+            format!("{jwt}allow_unverified_admin = true\n"),
+            format!("{jwt}sign_out_url = \"http://auth.example.com/logout\"\n"),
+            plain.replace("secret_file = \"/s\"\n", ""),
+            plain.replace("X-Proxy-Secret", "X-Forwarded-Email"),
+            plain.replace("X-Forwarded-Email", "X-MagicPipes-User"),
+            format!("{plain}auto_create = true\n"),
+            format!("{plain}issuer = \"x\"\n"),
+        ] {
+            assert!(load(&broken).is_err(), "{broken}");
+        }
+        assert!(load(&format!("{plain}trust_email = true\nauto_create = true\n")).is_ok());
+        assert!(load(&format!("{jwt}auto_create = true\n")).is_ok(), "a token can say an address was verified");
+
+        // Plain headers need to know the proxy's own address.
+        let mut alone: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n[proxy_auth]\n{plain}")).unwrap();
+        assert!(alone.validate().unwrap_err().to_string().contains("trusted_proxies"));
+        let mut behind: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\ntrusted_proxies = [\"10.0.0.1/32\"]\n[management]\nhostname = \"example.com\"\nproxy_protocol = true\n[proxy_auth]\n{plain}")).unwrap();
+        assert!(behind.validate().unwrap_err().to_string().contains("proxy_protocol"));
+    }
+
+    #[test]
     fn a_written_configuration_reads_back_the_same() {
         let full = r#"base_domain = "t.example.com"
 data_dir = "/data"
@@ -539,6 +722,15 @@ tcp_idle_timeout_secs = 600
 bootstrap_admins = ["ann@example.com"]
 allowed_email_domains = ["example.com"]
 max_agents_per_user = 3
+[proxy_auth]
+mode = "jwt"
+jwt_header = "Cf-Access-Jwt-Assertion"
+jwks_url = "https://team.example.com/certs"
+issuer = "https://team.example.com"
+audience = "aud-1"
+trust_email = true
+auto_create = true
+sign_out_url = "https://team.example.com/logout"
 [[oidc]]
 id = "authentik"
 label = "authentik"
@@ -559,7 +751,7 @@ allow_unverified_admin = true
         let mut c: Config = toml::from_str(full).unwrap();
         c.validate().unwrap();
         let written = c.to_toml().unwrap();
-        for line in ["client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3"] {
+        for line in ["client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\""] {
             assert!(written.contains(line), "{line} in {written}");
         }
     }

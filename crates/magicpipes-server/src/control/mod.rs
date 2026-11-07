@@ -47,7 +47,7 @@ use crate::config::Config;
 use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
 pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
-pub use oidc::OidcError;
+pub use oidc::SignInError;
 pub use registry::TunnelSignIn;
 pub use settings::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 pub use tags::EnrollmentOptions;
@@ -73,6 +73,7 @@ pub struct ControlPlane {
     settings_lock: Mutex<()>,
     /// Bounds code exchanges under way with providers.
     oidc_exchanges: Semaphore,
+    proxy_auth: Option<crate::proxy_auth::ProxyAuth>,
 }
 
 #[derive(Default)]
@@ -169,6 +170,7 @@ impl ControlPlane {
             .iter()
             .map(|p| crate::oidc::Provider::load(p).map(Arc::new).with_context(|| format!("oidc provider '{}'", p.id)))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let proxy_auth = cfg.proxy_auth.as_ref().map(|p| crate::proxy_auth::ProxyAuth::load(p, cfg.trusted_proxies())).transpose().context("proxy_auth")?;
         let effective = settings::effective_config(&cfg, &store)?;
         let sign_in = RwLock::new(Arc::new(settings::SignIn::new(&effective, &file_providers)));
         settings::write_generated(&effective);
@@ -186,6 +188,7 @@ impl ControlPlane {
             sign_in,
             settings_lock: Mutex::new(()),
             oidc_exchanges: Semaphore::new(oidc::MAX_EXCHANGES),
+            proxy_auth,
         });
         cp.publish(&cp.state.lock().unwrap());
         Ok(cp)

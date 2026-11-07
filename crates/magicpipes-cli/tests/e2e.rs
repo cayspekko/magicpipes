@@ -19,6 +19,10 @@ fn hostname(public_url: &str) -> String {
     public_url.trim_start_matches("https://").split(':').next().unwrap().to_string()
 }
 
+fn magicpipes_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
 async fn add_json(env: &Env, args: &[&str]) -> Value {
     let mut a = vec!["add"];
     a.extend_from_slice(args);
@@ -2255,6 +2259,201 @@ async fn api_tokens_can_be_revoked() {
 async fn admin_session(env: &Env) -> String {
     let token = env.admin_token();
     env.ui("/login", None, Some(&[("token", token.as_str())])).await.cookie.expect("signed in")
+}
+
+/// Plain headers from an authenticating proxy: believed only with the secret, and only as long as
+/// they keep naming the session's user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxys_plain_headers_sign_people_in() {
+    const SECRET: &str = "a-long-enough-shared-secret";
+    let dir = std::env::temp_dir().join(format!("mp-proxy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret_file = dir.join("proxy-secret");
+    std::fs::write(&secret_file, format!("{SECRET}\n")).unwrap();
+    let extra = format!(
+        "[proxy_auth]\nmode = \"headers\"\nuser_header = \"X-Forwarded-Email\"\nsecret_header = \"X-Proxy-Secret\"\nsecret_file = \"{}\"\ntrust_email = true\nsign_out_url = \"https://auth.example.com/logout\"\n",
+        secret_file.display()
+    );
+    let env = Env::with_settings(Tls::DevCa, "trusted_proxies = [\"127.0.0.1/32\"]", &extra).await;
+    let token = env.admin_token();
+    let as_person = async |path: &str, cookie: Option<&str>, email: &str| env.ui_with(path, cookie, None, &[("x-forwarded-email", email), ("x-proxy-secret", SECRET)]).await;
+    let add_user = async |email: &str| {
+        let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
+        env.api_json("POST", "/api/v1/users", Some(&token), body).await.1["user"]["id"].as_str().unwrap().to_string()
+    };
+
+    // Nobody named: the sign-in page says why, and takes only an admin token.
+    let start = env.ui("/", None, None).await;
+    assert_eq!(start.location.as_deref(), Some("/login"));
+    let login = env.ui("/login", None, None).await;
+    assert!(login.html.contains("signs people in through its proxy") && login.html.contains(r#"name="token""#) && !login.html.contains(r#"name="email""#), "{}", login.html);
+    let password = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", "correct horse battery")])).await;
+    assert_eq!(password.status, StatusCode::FORBIDDEN, "{}", password.html);
+
+    // Without the secret, or with a copy from the client beside the proxy's, nobody is named.
+    add_user("ann@example.com").await;
+    let forged: [&[(&str, &str)]; 3] = [
+        &[("x-forwarded-email", "ann@example.com")],
+        &[("x-forwarded-email", "ann@example.com"), ("x-proxy-secret", "wrong")],
+        &[("x-forwarded-email", "ann@example.com"), ("x-forwarded-email", "bob@example.com"), ("x-proxy-secret", SECRET)],
+    ];
+    for headers in forged {
+        let r = env.ui_with("/", None, None, headers).await;
+        assert!(r.location.as_deref() == Some("/login") && r.cookie.is_none(), "{headers:?}");
+    }
+
+    // Someone the server doesn't know gets a reason, and no account.
+    let stranger = as_person("/", None, "stranger@example.com").await;
+    assert!(stranger.status == StatusCode::FORBIDDEN && stranger.html.contains("stranger@example.com can&#39;t sign in here") && stranger.html.contains(r#"role="alert""#), "{}", stranger.html);
+    assert!(stranger.cookie.is_none());
+    let (_, users) = env.api("GET", "/api/v1/users", Some(&token)).await;
+    assert_eq!(users["users"].as_array().unwrap().len(), 1);
+
+    // Someone an administrator created is in, without the forced change of a password they don't use.
+    let first = as_person("/", None, "Ann@Example.com").await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.html);
+    let cookie = first.cookie.clone().expect("a session");
+    assert!(first.html.contains("ann@example.com") && first.html.contains(r#"href="https://auth.example.com/logout""#) && !first.html.contains(r#"action="/logout""#), "{}", first.html);
+    let account = as_person("/account", Some(&cookie), "ann@example.com").await;
+    assert!(account.status == StatusCode::OK && account.cookie.is_none(), "the same session: {}", account.html);
+    assert!(!account.html.contains("Sign out everywhere") && !account.html.contains(r#"href="/password""#), "the proxy's to manage: {}", account.html);
+
+    // On a sign-in page, someone signed in moves on, unless they asked for the admin token form.
+    assert_eq!(as_person("/login", Some(&cookie), "ann@example.com").await.location.as_deref(), Some("/"));
+    assert_eq!(as_person("/login?next=%2Faccount", Some(&cookie), "ann@example.com").await.location.as_deref(), Some("/account"));
+    assert_eq!(as_person("/login?next=%2F%5Cevil.example", Some(&cookie), "ann@example.com").await.location.as_deref(), Some("/"));
+    assert!(as_person("/login?method=token", Some(&cookie), "ann@example.com").await.html.contains(r#"name="token""#));
+
+    // Naming someone else ends the session, and starts theirs.
+    add_user("bob@example.com").await;
+    let bob = as_person("/", Some(&cookie), "bob@example.com").await;
+    let bobs = bob.cookie.clone().expect("a new session");
+    assert!(bobs != cookie && bob.html.contains("bob@example.com"), "{}", bob.html);
+    assert!(as_person("/", Some(&cookie), "ann@example.com").await.cookie.is_some(), "Ann's old session is gone");
+
+    // Naming nobody ends it too, so signing out at the proxy signs out here.
+    let gone = env.ui("/", Some(&bobs), None).await;
+    assert_eq!(gone.location.as_deref(), Some("/login"));
+    assert!(as_person("/", Some(&bobs), "bob@example.com").await.cookie.is_some(), "that session doesn't come back");
+
+    // A disabled account stays out, whatever the proxy says.
+    let dave = add_user("dave@example.com").await;
+    assert_eq!(as_person("/", None, "dave@example.com").await.status, StatusCode::OK);
+    env.api_json("PATCH", &format!("/api/v1/users/{dave}"), Some(&token), serde_json::json!({ "disabled": true })).await;
+    assert_eq!(as_person("/", None, "dave@example.com").await.status, StatusCode::FORBIDDEN);
+
+    // The admin token doesn't depend on the proxy, whoever it names or if it names nobody.
+    let signed_in = env.ui_with("/login", None, Some(&[("token", token.as_str())]), &[("x-forwarded-email", "ann@example.com"), ("x-proxy-secret", SECRET)]).await;
+    let admin = signed_in.cookie.clone().expect("an admin session");
+    for headers in [&[][..], &[("x-forwarded-email", "ann@example.com"), ("x-proxy-secret", SECRET)][..]] {
+        let users = env.ui_with("/users", Some(&admin), None, headers).await;
+        assert!(users.status == StatusCode::OK && users.cookie.is_none() && users.html.contains("admin token") && users.html.contains(r#"action="/logout""#), "{}", users.html);
+    }
+
+    // Nothing offers what can't work here: passwords, or adding a provider.
+    let users = env.ui("/users", Some(&admin), None).await;
+    assert!(!users.html.contains(r#"name="password""#) && !users.html.contains("Reset password") && users.html.contains("through the proxy"), "{}", users.html);
+    let csrf = users.csrf();
+    let added = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "erin@example.com"), ("role", "member")])).await;
+    assert_eq!(added.location.as_deref(), Some("/users?done=user-added-proxy"), "no password to hand over: {}", added.html);
+    assert_eq!(as_person("/", None, "erin@example.com").await.status, StatusCode::OK);
+
+    // Settings say so, and the configuration in effect holds the path of the secret, not the secret.
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains("signs people in through its proxy") && settings.html.contains("proxy_auth") && !settings.html.contains(SECRET), "{}", settings.html);
+    assert!(!settings.html.contains("Add a provider") && !settings.html.contains("sign in with a password"), "{}", settings.html);
+    let generated = std::fs::read_to_string(env.root.join("server/magicpipesd.generated.toml")).unwrap();
+    assert!(generated.contains("[proxy_auth]") && generated.contains("proxy-secret") && !generated.contains(SECRET), "{generated}");
+
+    // Agents and scripts have their own credentials.
+    let (status, _) = env.api("GET", "/api/v1/tunnels", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string(), "--public", "--name", "open"]).await;
+    assert_eq!(t["status"], "ready", "{t}");
+
+    // None of this reaches an application, even from a client that tries.
+    let host = format!("open.{BASE}");
+    let req = Request::get("/headers")
+        .header(header::HOST, format!("{host}:{}", env.https_port))
+        .header("x-forwarded-email", "ann@example.com")
+        .header("x-proxy-secret", SECRET)
+        .header("x-theirs", "1")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = env.send(&host, env.https_port, req).await;
+    let seen = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+    assert!(seen.contains("x-theirs") && !seen.contains("x-forwarded-email") && !seen.contains("x-proxy-secret"), "{seen}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Signed tokens from an authenticating proxy: the same account rules as a sign-in provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxys_signed_tokens_sign_people_in() {
+    let idp = common::FakeOidc::start().await;
+    let iss = idp.issuer.clone();
+    let extra = format!("[users]\nbootstrap_admins = [\"boss@example.com\"]\n[proxy_auth]\nmode = \"jwt\"\njwt_header = \"X-Proxy-Token\"\njwks_url = \"{iss}/keys\"\nissuer = \"{iss}\"\naudience = \"magicpipes\"\nauto_create = true\n");
+    let env = Env::with_config(Tls::DevCa, &extra).await;
+    let token = env.admin_token();
+    let now = magicpipes_now();
+    let claims = |sub: &str, email: &str, verified: bool| serde_json::json!({ "iss": iss, "aud": ["another-app", "magicpipes"], "sub": sub, "exp": now + 300, "iat": now, "email": email, "email_verified": verified, "name": "Someone" });
+    let with_token = async |path: &str, cookie: Option<&str>, jwt: &str| env.ui_with(path, cookie, None, &[("x-proxy-token", jwt)]).await;
+    let accounts = async || env.api("GET", "/api/v1/users", Some(&token)).await.1["users"].as_array().unwrap().clone();
+
+    // Someone new with a verified address gets a member account, and keeps it under a new address.
+    let first = with_token("/", None, &idp.sign(&claims("sub-1", "ann@example.com", true))).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.html);
+    let cookie = first.cookie.clone().expect("a session");
+    let users = accounts().await;
+    assert_eq!((users.len(), users[0]["email"].as_str(), users[0]["role"].as_str()), (1, Some("ann@example.com"), Some("member")), "{users:?}");
+    let renamed = with_token("/", Some(&cookie), &idp.sign(&claims("sub-1", "ann@elsewhere.example.com", true))).await;
+    assert!(renamed.status == StatusCode::OK && renamed.cookie.is_none(), "the identity is the subject");
+    assert_eq!(accounts().await.len(), 1);
+
+    // The token can also arrive as a bearer token, as oauth2-proxy forwards it.
+    let bearer = format!("Bearer {}", idp.sign(&claims("sub-1", "ann@example.com", true)));
+    assert_eq!(with_token("/", Some(&cookie), &bearer).await.status, StatusCode::OK);
+
+    // An address nobody verified doesn't make an account without `trust_email`, and says why.
+    let unverified = with_token("/", None, &idp.sign(&claims("sub-2", "eve@example.com", false))).await;
+    assert!(unverified.status == StatusCode::FORBIDDEN && unverified.html.contains("didn&#39;t confirm an email address"), "{}", unverified.html);
+    assert_eq!(accounts().await.len(), 1);
+
+    // A bootstrap address makes an administrator, if it's verified.
+    assert_eq!(with_token("/", None, &idp.sign(&claims("sub-3", "boss@example.com", false))).await.status, StatusCode::FORBIDDEN);
+    let boss = with_token("/users", None, &idp.sign(&claims("sub-3", "boss@example.com", true))).await;
+    assert_eq!(boss.status, StatusCode::OK, "{}", boss.html);
+
+    // A token that doesn't pass names nobody, and ends the session it came with.
+    let mut bad: Vec<(&str, String)> = vec![("another key", idp.sign_with_another_key(&claims("sub-1", "ann@example.com", true))), ("rubbish", "a.b.c".to_string())];
+    for (field, value) in [("aud", serde_json::json!("another-app")), ("iss", serde_json::json!("https://other.example.com")), ("exp", serde_json::json!(now - 3600)), ("nbf", serde_json::json!(now + 3600))] {
+        let mut c = claims("sub-1", "ann@example.com", true);
+        c[field] = value;
+        bad.push((field, idp.sign(&c)));
+    }
+    let header = serde_json::json!({ "alg": "none" }).to_string();
+    let payload = claims("sub-1", "ann@example.com", true).to_string();
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    bad.push(("no signature", format!("{}.{}.", b64.encode(header), b64.encode(payload))));
+    for (what, jwt) in &bad {
+        let r = with_token("/", None, jwt).await;
+        assert!(r.location.as_deref() == Some("/login") && r.cookie.is_none(), "{what}: {:?}", r.location);
+    }
+    assert_eq!(with_token("/", Some(&cookie), &bad[0].1).await.location.as_deref(), Some("/login"));
+    assert!(with_token("/", Some(&cookie), &idp.sign(&claims("sub-1", "ann@example.com", true))).await.cookie.is_some(), "that session is gone");
+
+    // Without keys nothing can be said about a token. That's not the same as nobody, and an
+    // administrator can still get in.
+    let dead = common::free_port();
+    let extra = format!("[proxy_auth]\nmode = \"jwt\"\njwt_header = \"X-Proxy-Token\"\njwks_url = \"http://127.0.0.1:{dead}/keys\"\nissuer = \"{iss}\"\naudience = \"magicpipes\"\n");
+    let down = Env::with_config(Tls::DevCa, &extra).await;
+    let refused = down.ui_with("/", None, None, &[("x-proxy-token", &idp.sign(&claims("sub-1", "ann@example.com", true)))]).await;
+    assert!(refused.status == StatusCode::BAD_GATEWAY && refused.html.contains("can&#39;t be fetched"), "{}", refused.html);
+    assert_eq!(down.ui("/", None, None).await.location.as_deref(), Some("/login"), "no token, no keys needed");
+    let admin = admin_session(&down).await;
+    assert_eq!(down.ui("/users", Some(&admin), None).await.status, StatusCode::OK);
 }
 
 /// What every form gets from `Posted` and `AdminPosted`, and where signing in may send a browser.

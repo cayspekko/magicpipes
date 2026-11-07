@@ -8,6 +8,7 @@
 //! Provider metadata (discovery and keys) is fetched on first use, so a provider that is down
 //! doesn't stop the server, and cached. Accounts are decided in `control::oidc`.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -93,13 +94,63 @@ struct JwkSet {
 struct Metadata {
     discovery: Discovery,
     keys: Vec<Jwk>,
-    fetched: Instant,
 }
 
-#[derive(Default)]
-struct Cache {
-    metadata: Option<Arc<Metadata>>,
+struct Cache<T> {
+    latest: Option<(Arc<T>, Instant)>,
     last_attempt: Option<Instant>,
+}
+
+/// Something a provider publishes: fetched on first use and then kept, so one that is down doesn't
+/// stop the server, and never fetched more often than the spacings above, whatever tokens say.
+struct Published<T> {
+    cache: Mutex<Cache<T>>,
+    /// One fetch at a time.
+    fetching: tokio::sync::Mutex<()>,
+}
+
+impl<T> Published<T> {
+    fn new() -> Self {
+        Self { cache: Mutex::new(Cache { latest: None, last_attempt: None }), fetching: tokio::sync::Mutex::new(()) }
+    }
+
+    /// The cached copy, fetched with `fetch` if it's missing, old, or `refresh` asks for a newer one.
+    /// `from` names the source in the log.
+    async fn get(&self, refresh: bool, from: &str, fetch: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<Arc<T>> {
+        let fresh = |c: &Cache<T>| c.latest.as_ref().filter(|(_, at)| !refresh && at.elapsed() < METADATA_MAX_AGE).map(|(v, _)| v.clone());
+        if let Some(v) = fresh(&self.cache.lock().unwrap()) {
+            return Ok(v);
+        }
+        let _one_at_a_time = self.fetching.lock().await;
+        let held = {
+            let mut cache = self.cache.lock().unwrap();
+            // Someone else may have just fetched it.
+            if let Some(v) = fresh(&cache) {
+                return Ok(v);
+            }
+            let held = cache.latest.as_ref().map(|(v, _)| v.clone());
+            let spacing = if held.is_some() { REFRESH_SPACING } else { RETRY_SPACING };
+            if cache.last_attempt.is_some_and(|t| t.elapsed() < spacing) {
+                return held.ok_or_else(|| anyhow!("the provider could not be reached a moment ago"));
+            }
+            cache.last_attempt = Some(Instant::now());
+            held
+        };
+        match fetch.await {
+            Ok(v) => {
+                let v = Arc::new(v);
+                self.cache.lock().unwrap().latest = Some((v.clone(), Instant::now()));
+                Ok(v)
+            }
+            Err(e) => match held {
+                Some(old) => {
+                    tracing::warn!(from, error = %format!("{e:#}"), "could not refresh what a sign-in provider publishes; keeping the old copy");
+                    Ok(old)
+                }
+                None => Err(e),
+            },
+        }
+    }
 }
 
 pub struct Provider {
@@ -113,9 +164,7 @@ pub struct Provider {
     /// Those addresses may also reach administrators' accounts.
     pub allow_unverified_admin: bool,
     client_secret: String,
-    cache: Mutex<Cache>,
-    /// One fetch at a time.
-    refreshing: tokio::sync::Mutex<()>,
+    metadata: Published<Metadata>,
 }
 
 /// What a browser carries to the provider and back, in a signed cookie.
@@ -225,8 +274,7 @@ impl Provider {
             trust_email: cfg.trust_email,
             allow_unverified_admin: cfg.allow_unverified_admin,
             client_secret,
-            cache: Mutex::default(),
-            refreshing: tokio::sync::Mutex::new(()),
+            metadata: Published::new(),
         })
     }
 
@@ -235,44 +283,13 @@ impl Provider {
         if discovery.issuer != self.issuer {
             bail!("the provider calls itself {}, not {}", discovery.issuer, self.issuer);
         }
-        let keys = fetch_keys(&discovery).await?;
-        Ok(Metadata { discovery, keys, fetched: Instant::now() })
+        let keys = fetch_keys(&discovery.jwks_uri).await?;
+        Ok(Metadata { discovery, keys })
     }
 
     /// The cached metadata, fetched if it's missing, old, or `refresh` asks for newer keys.
     async fn metadata(&self, refresh: bool) -> anyhow::Result<Arc<Metadata>> {
-        let fresh = |c: &Cache| c.metadata.clone().filter(|m| !refresh && m.fetched.elapsed() < METADATA_MAX_AGE);
-        if let Some(m) = fresh(&self.cache.lock().unwrap()) {
-            return Ok(m);
-        }
-        let _one_at_a_time = self.refreshing.lock().await;
-        let held = {
-            let mut cache = self.cache.lock().unwrap();
-            // Someone else may have just fetched it.
-            if let Some(m) = fresh(&cache) {
-                return Ok(m);
-            }
-            let spacing = if cache.metadata.is_some() { REFRESH_SPACING } else { RETRY_SPACING };
-            if cache.last_attempt.is_some_and(|t| t.elapsed() < spacing) {
-                return cache.metadata.clone().ok_or_else(|| anyhow!("the provider could not be reached a moment ago"));
-            }
-            cache.last_attempt = Some(Instant::now());
-            cache.metadata.clone()
-        };
-        match self.fetch_metadata().await {
-            Ok(m) => {
-                let m = Arc::new(m);
-                self.cache.lock().unwrap().metadata = Some(m.clone());
-                Ok(m)
-            }
-            Err(e) => match held {
-                Some(old) => {
-                    tracing::warn!(provider = %self.id, error = %format!("{e:#}"), "could not refresh provider metadata; keeping the old copy");
-                    Ok(old)
-                }
-                None => Err(e),
-            },
-        }
+        self.metadata.get(refresh, &self.id, self.fetch_metadata()).await
     }
 
     /// Where to send the browser for this attempt.
@@ -351,8 +368,8 @@ async fn fetch_discovery(issuer: &str) -> anyhow::Result<Discovery> {
     Ok(discovery)
 }
 
-async fn fetch_keys(discovery: &Discovery) -> anyhow::Result<Vec<Jwk>> {
-    let set: JwkSet = get_json(&discovery.jwks_uri, None).await.context("keys")?;
+async fn fetch_keys(url: &str) -> anyhow::Result<Vec<Jwk>> {
+    let set: JwkSet = get_json(url, None).await.context("keys")?;
     if set.keys.len() > MAX_KEYS {
         bail!("the provider publishes {} keys", set.keys.len());
     }
@@ -391,34 +408,51 @@ pub async fn discover(entered: &str) -> anyhow::Result<String> {
         }
         bail!("the provider calls itself {}. Enter that address", discovery.issuer);
     }
-    let keys = fetch_keys(&discovery).await?;
+    let keys = fetch_keys(&discovery.jwks_uri).await?;
     if !signs_usably(&discovery, &keys) {
         bail!("the provider publishes no RS256 or ES256 signing key. In authentik, choose a Signing Key on the provider: without one it signs with the client secret, which isn't accepted here");
     }
     Ok(discovery.issuer)
 }
 
-/// Checks an ID token's signature and claims.
-fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, client_id: &str, nonce: &str, now: i64) -> Result<RawClaims, TokenError> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Audience {
+    fn names(&self, who: &str) -> bool {
+        match self {
+            Audience::One(a) => a == who,
+            Audience::Many(l) => l.iter().any(|a| a == who),
+        }
+    }
+
+    fn several(&self) -> bool {
+        matches!(self, Audience::Many(l) if l.len() > 1)
+    }
+}
+
+/// What every signed token here has to say.
+#[derive(Deserialize)]
+struct Checked {
+    iss: String,
+    aud: Audience,
+    azp: Option<String>,
+    exp: i64,
+    iat: Option<i64>,
+    nbf: Option<i64>,
+    nonce: Option<String>,
+}
+
+/// The claims of a token signed by one of `keys`, not looked at yet.
+fn signed_claims(token: &str, keys: &[Jwk]) -> Result<Vec<u8>, TokenError> {
     #[derive(Deserialize)]
     struct Header {
         alg: String,
         kid: Option<String>,
-    }
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Audience {
-        One(String),
-        Many(Vec<String>),
-    }
-    #[derive(Deserialize)]
-    struct Checked {
-        iss: String,
-        aud: Audience,
-        azp: Option<String>,
-        exp: i64,
-        iat: Option<i64>,
-        nonce: Option<String>,
     }
 
     let decode = |part: &str| URL_SAFE_NO_PAD.decode(part).map_err(|_| TokenError::Invalid("not base64url"));
@@ -475,22 +509,16 @@ fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, client_id: &str, non
         Some(false) => return Err(TokenError::Invalid("signature")),
         Some(true) => {}
     }
+    decode(payload)
+}
 
-    let body = decode(payload)?;
-    let checked: Checked = serde_json::from_slice(&body).map_err(|_| TokenError::Invalid("bad claims"))?;
-    let audience_ok = match &checked.aud {
-        Audience::One(a) => a == client_id,
-        Audience::Many(l) => l.iter().any(|a| a == client_id),
-    };
-    let several = matches!(&checked.aud, Audience::Many(l) if l.len() > 1);
-    let azp_ok = match &checked.azp {
-        Some(azp) => azp == client_id,
-        None => !several,
-    };
+/// Checks what any token has to say: who issued it, for whom, and that it's valid now.
+fn checked_claims(body: &[u8], issuer: &str, audience: &str, now: i64) -> Result<Checked, TokenError> {
+    let checked: Checked = serde_json::from_slice(body).map_err(|_| TokenError::Invalid("bad claims"))?;
     if checked.iss != issuer {
         return Err(TokenError::Invalid("issuer"));
     }
-    if !audience_ok || !azp_ok {
+    if !checked.aud.names(audience) {
         return Err(TokenError::Invalid("audience"));
     }
     if checked.exp <= now - CLOCK_SKEW_SECS {
@@ -499,14 +527,80 @@ fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, client_id: &str, non
     if checked.iat.is_some_and(|iat| iat > now + CLOCK_SKEW_SECS) {
         return Err(TokenError::Invalid("issued in the future"));
     }
-    if !checked.nonce.as_deref().is_some_and(|n| secret::constant_time_eq(n.as_bytes(), nonce.as_bytes())) {
-        return Err(TokenError::Invalid("nonce"));
+    if checked.nbf.is_some_and(|nbf| nbf > now + CLOCK_SKEW_SECS) {
+        return Err(TokenError::Invalid("not valid yet"));
     }
-    let claims: RawClaims = serde_json::from_slice(&body).map_err(|_| TokenError::Invalid("bad claims"))?;
+    Ok(checked)
+}
+
+fn person_claims(body: &[u8]) -> Result<RawClaims, TokenError> {
+    let claims: RawClaims = serde_json::from_slice(body).map_err(|_| TokenError::Invalid("bad claims"))?;
     if claims.sub.is_empty() || claims.sub.len() > MAX_SUBJECT {
         return Err(TokenError::Invalid("subject"));
     }
     Ok(claims)
+}
+
+/// Checks an ID token: one this server asked a provider for, so it also carries our nonce.
+fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, client_id: &str, nonce: &str, now: i64) -> Result<RawClaims, TokenError> {
+    let body = signed_claims(token, keys)?;
+    let checked = checked_claims(&body, issuer, client_id, now)?;
+    let azp_ok = match &checked.azp {
+        Some(azp) => azp == client_id,
+        None => !checked.aud.several(),
+    };
+    if !azp_ok {
+        return Err(TokenError::Invalid("audience"));
+    }
+    if !checked.nonce.as_deref().is_some_and(|n| secret::constant_time_eq(n.as_bytes(), nonce.as_bytes())) {
+        return Err(TokenError::Invalid("nonce"));
+    }
+    person_claims(&body)
+}
+
+/// Checks a token an authenticating proxy forwarded. This server didn't ask for it, so there's no
+/// nonce, and it needn't be the proxy's only audience.
+fn verify_assertion(token: &str, keys: &[Jwk], issuer: &str, audience: &str, now: i64) -> Result<RawClaims, TokenError> {
+    let body = signed_claims(token, keys)?;
+    checked_claims(&body, issuer, audience, now)?;
+    person_claims(&body)
+}
+
+/// Checks the tokens an authenticating proxy forwards (`[proxy_auth]`, mode `jwt`), with the keys
+/// its configuration points at.
+pub struct AssertionChecker {
+    jwks_url: String,
+    issuer: String,
+    audience: String,
+    trust_email: bool,
+    keys: Published<Vec<Jwk>>,
+}
+
+impl AssertionChecker {
+    pub fn new(jwks_url: &str, issuer: &str, audience: &str, trust_email: bool) -> Self {
+        Self { jwks_url: jwks_url.to_string(), issuer: issuer.to_string(), audience: audience.to_string(), trust_email, keys: Published::new() }
+    }
+
+    /// The person in a token, or `None` if it doesn't pass. `Err`: the keys can't be fetched, so
+    /// nothing can be said about it.
+    pub async fn person(&self, token: &str) -> anyhow::Result<Option<Person>> {
+        let keys = self.keys.get(false, "proxy_auth", fetch_keys(&self.jwks_url)).await?;
+        let now = unix_now();
+        let claims = match verify_assertion(token, &keys, &self.issuer, &self.audience, now) {
+            Err(TokenError::UnknownKey) => {
+                let newer = self.keys.get(true, "proxy_auth", fetch_keys(&self.jwks_url)).await?;
+                verify_assertion(token, &newer, &self.issuer, &self.audience, now)
+            }
+            other => other,
+        };
+        Ok(match claims {
+            Ok(c) => Some(c.into_person(self.trust_email)),
+            Err(e) => {
+                tracing::debug!(error = ?e, "ignoring a token that doesn't pass");
+                None
+            }
+        })
+    }
 }
 
 // ---- a small HTTP client ---------------------------------------------------------------------
@@ -687,6 +781,34 @@ mod tests {
         c["aud"] = serde_json::json!([CLIENT, "someone-else"]);
         c["azp"] = CLIENT.into();
         assert!(verify(&key.token(&c), &keys).is_ok());
+    }
+
+    #[test]
+    fn a_proxys_tokens_are_checked_without_the_parts_it_cant_know() {
+        let key = Key::new();
+        let keys = [key.jwk("k1")];
+        let check = |token: &str| verify_assertion(token, &keys, ISS, CLIENT, NOW);
+        let mut claims = claims();
+        claims.as_object_mut().unwrap().remove("nonce");
+        assert_eq!(check(&key.token(&claims)).unwrap().sub, "subject-1", "no nonce: this server didn't ask for it");
+
+        let with = |field: &str, value: serde_json::Value| {
+            let mut c = claims.clone();
+            c[field] = value;
+            key.token(&c)
+        };
+        assert!(check(&with("aud", serde_json::json!(["other", CLIENT]))).is_ok(), "one of several audiences, as Cloudflare sends");
+        assert!(check(&with("azp", "the-proxys-own-client".into())).is_ok());
+        assert_eq!(check(&with("aud", "other".into())).err(), Some(TokenError::Invalid("audience")));
+        assert_eq!(check(&with("iss", "https://other.example.com".into())).err(), Some(TokenError::Invalid("issuer")));
+        assert_eq!(check(&with("exp", (NOW - 3600).into())).err(), Some(TokenError::Invalid("expired")));
+        assert_eq!(check(&with("nbf", (NOW + 3600).into())).err(), Some(TokenError::Invalid("not valid yet")));
+        assert!(check(&with("nbf", NOW.into())).is_ok());
+        assert_eq!(check(&with("sub", "".into())).err(), Some(TokenError::Invalid("subject")));
+        assert_eq!(check(&Key::new().token(&claims)).err(), Some(TokenError::Invalid("signature")));
+        let unsigned = format!("{}.{}.", URL_SAFE_NO_PAD.encode(r#"{"alg":"none","kid":"k1"}"#), URL_SAFE_NO_PAD.encode(claims.to_string()));
+        assert_eq!(check(&unsigned).err(), Some(TokenError::Invalid("algorithm")));
+        assert!(verify_id_token(&key.token(&claims), &keys, ISS, CLIENT, NONCE, NOW).is_err(), "without a nonce it can't pass as an ID token");
     }
 
     #[test]

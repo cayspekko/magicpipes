@@ -4,7 +4,8 @@
 //! * `/api/v1/*` (except enroll/agent connect): `Authorization: Bearer <admin token or a user's
 //!   API token>`.
 //! * UI pages: session cookie created by logging in with an email and password, an OpenID Connect
-//!   provider or an admin token; state-changing forms carry a per-session CSRF token.
+//!   provider, an authenticating proxy or an admin token; state-changing forms carry a per-session
+//!   CSRF token.
 //!
 //! What each caller may do is decided by `authz::authorize`, in the control plane.
 //! * `/api/v1/enroll`: a single-use enrollment token in the body.
@@ -17,6 +18,7 @@ mod html;
 mod icons;
 mod oidc;
 mod picker;
+mod proxy_auth;
 mod settings;
 mod ui;
 
@@ -160,6 +162,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/device/poll", post(api::poll_device))
         .route(magicpipes_core::proto::AGENT_CONNECT_PATH, get(crate::gateway::connect))
         .fallback(ui::not_found)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), proxy_auth::identify))
         .layer(axum::middleware::from_fn(request_deadline))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_host))

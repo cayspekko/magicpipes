@@ -302,6 +302,22 @@ The methods ship in this order, each usable on its own.
 
 ### 2. Authenticating proxy (forward auth)
 
+*Built 2026-11-06, with these differences from the plan below:*
+
+- **Not built:** groups (they feed tag rules, which don't exist yet) and `apply_to_tunnels`.
+- **Added:** `allow_unverified_admin`, the same rule as for a provider, and `sign_out_url`, because
+  a "Sign out" that only ends the session here signs you straight back in.
+- **Who gets in** is the same code as for OIDC. "Unknown users" means no account, no list and no
+  `auto_create`; an administrator's account for an address is linked when that address is verified.
+- **Other ways in close while it's on.** A session has to keep being named by the proxy, so passwords
+  and providers aren't offered. Admin-token sessions don't depend on it.
+- **A header sent twice counts as nobody**, in case a client's copy is beside the proxy's.
+- **Keys that can't be fetched** answer 502 without ending the session, since that says nothing about
+  the person.
+- **`Authorization`** can carry the token, but isn't removed before a tunnel, where it may be the
+  application's own.
+- **Refusals are logged, not audited,** since every page request would otherwise add a row.
+
 This is for servers that already sit behind oauth2-proxy, Authelia, Authentik, Pomerium,
 Cloudflare Access, or Caddy/nginx forward auth. The proxy logs the user in, passes who they are
 to magicpipesd, and magicpipesd turns that into a normal session. It is off unless
@@ -812,12 +828,14 @@ issuer = "https://team.cloudflareaccess.com"
 audience = "…"
 # mode = "headers":
 # user_header = "X-Forwarded-Email"
-# groups_header = "X-Forwarded-Groups"
+# groups_header = "X-Forwarded-Groups"     # not built yet
 # secret_header = "X-MagicPipes-Proxy-Secret"
 # secret_file = "/etc/magicpipes/proxy-secret"
 trust_email = false
+allow_unverified_admin = false
 auto_create = false
-apply_to_tunnels = false
+# sign_out_url = "https://auth.example.com/logout"
+# apply_to_tunnels = false                 # not built yet
 
 [[oidc]]                                  # methods 3 and 4; repeatable
 id = "company"                            # used in URLs and rules
@@ -901,9 +919,10 @@ useful.
    - Discovery filtering in the API, UI and `ls --all`.
 4. **SSO (OIDC)** (method 3). *Done;* claim, group and email-domain rules aren't built (see
    method 3).
-5. **Authenticating proxy** (method 2), with groups-header rules. It moved behind OIDC on
-   2026-11-04: it needs TLS terminated in front of the management host, which a TLS-passthrough
-   deployment can't do, and its signed-assertion mode reuses OIDC's token checks.
+5. **Authenticating proxy** (method 2). *Done;* groups-header rules and `apply_to_tunnels` aren't
+   built (see method 2). It moved behind OIDC on 2026-11-04: it needs TLS terminated in front of the
+   management host, which a TLS-passthrough deployment can't do, and its signed-assertion mode
+   reuses OIDC's token checks.
 6. **Social login** (method 4): presets, plus GitHub's OAuth flow.
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
    (method 6).

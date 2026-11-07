@@ -14,7 +14,7 @@ use magicpipes_core::theme::{GLYPH, STYLE};
 use magicpipes_core::url;
 use serde::Deserialize;
 
-use super::extract::{Fields, NoFields, Posted, UiUser};
+use super::extract::{Fields, NoFields, Posted, SignOut, UiUser};
 use super::html::{self, Actions, Number, Text, alert, back, badge, chips, count, esc, form_alert, menu_post, row_menu, table, tag_chip, title_of, tone, when};
 use super::icons::{self, CHECK, GLOBE, LOCK, OPENS_ELSEWHERE};
 use super::picker::{self, Holder, Submitted};
@@ -53,6 +53,7 @@ done_messages! {
     TokenDeleted "token-deleted" "API token deleted.",
     PasswordChanged "password-changed" "Password changed. Other devices were signed out.",
     UserAdded "user-added" "User added. They replace that password when they first sign in.",
+    UserAddedForProxy "user-added-proxy" "User added.",
     RoleChanged "role-changed" "Role changed.",
     UserDisabled "user-disabled" "User disabled. They were signed out, and their machines stopped serving tunnels.",
     UserEnabled "user-enabled" "User enabled.",
@@ -168,11 +169,12 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
                 })
                 .collect();
             let me = u.user.as_ref().map_or("admin token".to_string(), |v| v.email.clone());
-            format!(
-                r#"<nav class="nav" aria-label="Main">{nav}<span class="sub me" title="{me}">{me}</span><form method="post" action="/logout">{csrf}<button class="btn ghost">Sign out</button></form></nav>"#,
-                me = esc(&me),
-                csrf = u.csrf_field()
-            )
+            let sign_out = match &u.sign_out {
+                SignOut::Here => format!(r#"<form method="post" action="/logout">{}<button class="btn ghost">Sign out</button></form>"#, u.csrf_field()),
+                SignOut::AtProxy(url) => format!(r#"<a class="btn ghost" href="{}">Sign out</a>"#, esc(url)),
+                SignOut::AtProxyElsewhere => String::new(),
+            };
+            format!(r#"<nav class="nav" aria-label="Main">{nav}<span class="sub me" title="{me}">{me}</span>{sign_out}</nav>"#, me = esc(&me))
         })
         .unwrap_or_default();
     let done = user.and_then(|u| u.done).map(|m| format!(r#"<div class="done with-ic" role="status">{CHECK}<span>{m}</span></div>"#)).unwrap_or_default();
@@ -676,6 +678,7 @@ pub async fn create_enrollment(State(app): State<AppState>, Posted(user, fields)
 pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
     let err = alert(error);
     let next = safe_path(next);
+    let proxied = app.control.proxy_auth().is_some();
     let providers = app.control.oidc_providers();
     // One link per provider, above the password form. They carry the destination too.
     let sso = if admin_token || providers.is_empty() {
@@ -693,15 +696,19 @@ pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool,
     // Switching between the two forms keeps the destination.
     let nq = next.map(|n| format!("&amp;next={}", url::encode(n))).unwrap_or_default();
     let next = next.map(|n| format!(r#"<input type="hidden" name="next" value="{}">"#, esc(n))).unwrap_or_default();
-    let form = if admin_token {
-        r#"<form method="post" action="/login">{next}<label for="t">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
-<button class="btn primary block">Sign in</button></form></div>
-<p class="note"><a href="/login?method=password{nq}">Sign in with email and password</a> instead. The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>; create another with <code>magicpipesd admin-token</code>.</p>"#
+    const TOKEN_FORM: &str = r#"<form method="post" action="/login">{next}<label for="t">Admin token</label><input id="t" type="password" name="token" placeholder="mpadm_…" autocomplete="current-password" autofocus required>
+<button class="btn primary block">Sign in</button></form></div>"#;
+    let form = if proxied {
+        format!(r#"{TOKEN_FORM}
+<p class="note">This server signs people in through its proxy, which hasn't said who you are. Administrators can use an admin token here if the proxy is down.</p>"#)
+    } else if admin_token {
+        format!(r#"{TOKEN_FORM}
+<p class="note"><a href="/login?method=password{{nq}}">Sign in with email and password</a> instead. The first admin token is written to <code>&lt;data_dir&gt;/admin-token</code>; create another with <code>magicpipesd admin-token</code>.</p>"#)
     } else {
         r#"<form method="post" action="/login">{next}<label for="e">Email</label><input id="e" type="email" name="email" autocomplete="username" autofocus required>
 <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required>
 <button class="btn primary block">Sign in</button></form></div>
-<p class="note">Administrators create accounts. <a href="/login?method=token{nq}">Use an admin token</a></p>"#
+<p class="note">Administrators create accounts. <a href="/login?method=token{nq}">Use an admin token</a></p>"#.to_string()
     };
     page(
         "Sign in",
@@ -712,8 +719,8 @@ pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool,
 
 #[derive(Deserialize)]
 pub struct LoginQuery {
-    method: Option<String>,
-    next: Option<String>,
+    pub(super) method: Option<String>,
+    pub(super) next: Option<String>,
 }
 
 pub async fn login_form(State(app): State<AppState>, axum::extract::Query(q): axum::extract::Query<LoginQuery>) -> Response {
@@ -802,6 +809,9 @@ pub async fn login(
     // machine approved there would then be enrolled as theirs).
     if cross_site(&headers) {
         return (StatusCode::FORBIDDEN, login_page(&app, Some("Sign in from this page, not from another site."), f.token.is_some(), next)).into_response();
+    }
+    if f.token.is_none() && app.control.proxy_auth().is_some() {
+        return (StatusCode::FORBIDDEN, login_page(&app, Some("This server signs people in through its proxy."), true, next)).into_response();
     }
     if let Some(token) = f.token {
         let checked = match app.control.login_admin_token(token.trim()) {

@@ -138,6 +138,8 @@ pub struct ProxySettings {
     /// Hostnames an application's cookies may not reach (`public.allow_cookie_domain`): everything
     /// under the base domain, and the management host.
     pub shared_domains: Vec<String>,
+    /// What an authenticating proxy may have added, which is no application's business.
+    pub identity_headers: Vec<http::HeaderName>,
     pub signer: Signer,
 }
 
@@ -151,6 +153,7 @@ impl ProxySettings {
             management_url,
             tunnel_cookie_ttl_secs: cfg.users.session_max_age_secs as i64,
             shared_domains: if cfg.public.allow_cookie_domain { Vec::new() } else { vec![cfg.base_domain.clone(), cfg.management.hostname.clone()] },
+            identity_headers: cfg.proxy_auth.as_ref().map(|p| p.identity_headers()).unwrap_or_default(),
             signer,
             upstream_response_timeout: Duration::from_secs(cfg.public.upstream_response_timeout_secs),
             websocket_idle_timeout: Duration::from_secs(cfg.public.websocket_idle_timeout_secs),

@@ -40,6 +40,18 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # trust_email = false
 # allow_unverified_admin = false
 
+# Sign-in through an authenticating proxy that terminates TLS in front of the management host.
+# Passwords and [[oidc]] providers then aren't offered; an admin token still works. See the README.
+# [proxy_auth]
+# mode = "jwt"
+# jwt_header = "Cf-Access-Jwt-Assertion"
+# jwks_url = "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+# issuer = "https://team.cloudflareaccess.com"
+# audience = "your-application-audience"
+# trust_email = false
+# auto_create = false
+# sign_out_url = "https://auth.example.com/logout"
+
 # TCP/UDP port tunnels (`magicpipes add 5432 --tcp`). Also publish the range in
 # docker-compose.yml.
 # [ports]

@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::ui::{logged_in, login_page, server_url};
 use super::{AppState, ClientIp};
-use crate::control::OidcError;
+use crate::control::SignInError;
 use crate::oidc::ATTEMPT_COOKIE_MAX_AGE;
 use crate::tunnel_auth::{cookie, safe_path};
 
@@ -89,19 +89,19 @@ async fn finish(app: &AppState, id: &str, client: Option<std::net::IpAddr>, head
     }
     match app.control.oidc_finish(&provider, &attempt, state, code, q.iss.as_deref(), &redirect_uri(app, id)).await {
         Ok(login) => logged_in(app, login, next),
-        Err(OidcError::Expired) => page(StatusCode::BAD_REQUEST, expired, next),
-        Err(OidcError::Refused) => {
+        Err(SignInError::Expired) => page(StatusCode::BAD_REQUEST, expired, next),
+        Err(SignInError::Refused) => {
             if app.check_credential(Err::<(), ()>(()), client).is_err_and(|r| matches!(r, super::Rejected::RateLimited)) {
                 return page(StatusCode::TOO_MANY_REQUESTS, too_many, next);
             }
             page(StatusCode::UNAUTHORIZED, "The sign-in could not be completed. Try again.", next)
         }
-        Err(OidcError::NotAllowed(Some(email))) => page(StatusCode::FORBIDDEN, &format!("{email} can't sign in here. Ask an administrator."), next),
-        Err(OidcError::NotAllowed(None)) => {
+        Err(SignInError::NotAllowed(Some(email))) => page(StatusCode::FORBIDDEN, &format!("{email} can't sign in here. Ask an administrator."), next),
+        Err(SignInError::NotAllowed(None)) => {
             page(StatusCode::FORBIDDEN, &format!("{} didn't confirm an email address for this account, so it can't sign in here.", provider.label), next)
         }
-        Err(OidcError::Unavailable) => page(StatusCode::BAD_GATEWAY, &format!("{} can't be reached right now. Try again in a moment.", provider.label), next),
-        Err(OidcError::Busy) => page(StatusCode::SERVICE_UNAVAILABLE, "The server is busy. Try again in a moment.", next),
-        Err(OidcError::Internal) => page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", next),
+        Err(SignInError::Unavailable) => page(StatusCode::BAD_GATEWAY, &format!("{} can't be reached right now. Try again in a moment.", provider.label), next),
+        Err(SignInError::Busy) => page(StatusCode::SERVICE_UNAVAILABLE, "The server is busy. Try again in a moment.", next),
+        Err(SignInError::Internal) => page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", next),
     }
 }

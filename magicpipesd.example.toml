@@ -100,3 +100,21 @@ acme_directory = "letsencrypt"
 # link_by_email = false                # a first sign-in with a verified email reaches the account with that email
 # trust_email = false                  # accept addresses it doesn't say it verified: anyone who can choose theirs there can use an address listed above
 # allow_unverified_admin = false       # with trust_email: let those addresses become or take over administrators
+
+# Sign-in through an authenticating proxy that terminates TLS in front of the management host, such
+# as oauth2-proxy, Authelia, Pomerium or Cloudflare Access. Passwords and [[oidc]] providers then
+# aren't offered; an admin token still works. Off unless present.
+# [proxy_auth]
+# mode = "jwt"                         # the proxy forwards a signed token, checked here
+# jwt_header = "Cf-Access-Jwt-Assertion"  # or Authorization, for a bearer token
+# jwks_url = "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+# issuer = "https://team.cloudflareaccess.com"
+# audience = "your-application-audience"
+# mode = "headers"                     # or a plain header, believed only from trusted_proxies
+# user_header = "X-Forwarded-Email"    # with the shared secret, and with proxy_protocol off here
+# secret_header = "X-MagicPipes-Proxy-Secret"
+# secret_file = "/etc/magicpipes/proxy-secret"  # at least 16 characters
+# trust_email = false                  # accept addresses nothing says were verified: plain headers need this
+# allow_unverified_admin = false       # with trust_email: let those addresses become or take over administrators
+# auto_create = false                  # someone new with an accepted address gets a member account
+# sign_out_url = "https://auth.example.com/logout"  # without it, there's no "Sign out" button
