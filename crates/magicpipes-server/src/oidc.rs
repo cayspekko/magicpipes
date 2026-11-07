@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::config::OidcConfig;
+use crate::config::{OidcConfig, ProviderKind};
 use crate::tunnel_auth::Signer;
 
 /// One request to a provider, from connecting to the last byte. Several fit in the management
@@ -155,6 +155,7 @@ impl<T> Published<T> {
 
 pub struct Provider {
     pub id: String,
+    pub kind: ProviderKind,
     pub label: String,
     pub issuer: String,
     pub link_by_email: bool,
@@ -267,6 +268,7 @@ impl Provider {
         anyhow::ensure!(!client_secret.is_empty(), "{} is empty", cfg.client_secret_file.display());
         Ok(Self {
             id: cfg.id.clone(),
+            kind: cfg.kind,
             label: cfg.label.clone(),
             issuer: cfg.issuer.clone(),
             link_by_email: cfg.link_by_email,
@@ -294,6 +296,9 @@ impl Provider {
 
     /// Where to send the browser for this attempt.
     pub async fn authorization_url(&self, attempt: &Attempt, redirect_uri: &str) -> anyhow::Result<String> {
+        if self.kind == ProviderKind::Github {
+            return Ok(crate::github::authorization_url(&self.issuer, &self.client_id, redirect_uri, &attempt.state, &pkce_challenge(&attempt.verifier)));
+        }
         let m = self.metadata(false).await?;
         let endpoint = &m.discovery.authorization_endpoint;
         let sep = if endpoint.contains('?') { '&' } else { '?' };
@@ -309,6 +314,9 @@ impl Provider {
 
     /// Trades the code for tokens and returns the verified person.
     pub async fn finish(&self, attempt: &Attempt, code: &str, redirect_uri: &str) -> anyhow::Result<Person> {
+        if self.kind == ProviderKind::Github {
+            return crate::github::person(&self.issuer, &self.client_id, &self.client_secret, code, redirect_uri, &attempt.verifier).await;
+        }
         let m = self.metadata(false).await?;
         let mut body = format!(
             "grant_type=authorization_code&code={}&redirect_uri={}&code_verifier={}",
@@ -620,14 +628,14 @@ fn tls_config() -> anyhow::Result<Arc<ClientConfig>> {
     Ok(CONFIG.get_or_init(|| Arc::new(cfg)).clone())
 }
 
-async fn get_json<T: DeserializeOwned>(url: &str, auth: Option<&str>) -> anyhow::Result<T> {
+pub(crate) async fn get_json<T: DeserializeOwned>(url: &str, auth: Option<&str>) -> anyhow::Result<T> {
     let bytes = request(Method::GET, url, auth, None).await?;
     serde_json::from_slice(&bytes).context("invalid JSON")
 }
 
 /// One request and its whole answer (at most [`MAX_RESPONSE`] bytes), within [`HTTP_TIMEOUT`].
 /// Redirects are not followed.
-async fn request(method: Method, url: &str, auth: Option<&str>, form: Option<String>) -> anyhow::Result<Bytes> {
+pub(crate) async fn request(method: Method, url: &str, auth: Option<&str>, form: Option<String>) -> anyhow::Result<Bytes> {
     if !allowed_url(url) {
         bail!("refusing to talk to {url}");
     }

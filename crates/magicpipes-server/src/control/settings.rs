@@ -21,7 +21,7 @@ use super::users::clean_name;
 use super::{ControlPlane, err, internal};
 use crate::authz::{self, Action, Principal, Resource};
 use crate::certs::{self, AddError, CertManager, ProvidedCert};
-use crate::config::{Config, OidcConfig, clean_bootstrap_admin, clean_email_domain};
+use crate::config::{Config, OidcConfig, ProviderKind, clean_bootstrap_admin, clean_email_domain};
 use crate::oidc::Provider;
 use crate::store::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules, Store};
 
@@ -65,6 +65,7 @@ fn secret_path(cfg: &Config, id: &str) -> PathBuf {
 fn row_config(cfg: &Config, row: &OidcProviderRow) -> OidcConfig {
     OidcConfig {
         id: row.id.clone(),
+        kind: row.kind,
         label: row.label.clone(),
         issuer: row.issuer.clone(),
         client_id: row.client_id.clone(),
@@ -134,6 +135,7 @@ fn clean_secret(raw: &str) -> Result<&str, ErrorBody> {
 #[derive(Debug, Clone)]
 pub struct ProviderView {
     pub id: String,
+    pub kind: ProviderKind,
     pub label: String,
     pub issuer: String,
     pub client_id: String,
@@ -157,6 +159,7 @@ pub struct SignInRulesView {
 
 pub struct NewProvider<'a> {
     pub id: &'a str,
+    pub kind: ProviderKind,
     pub label: &'a str,
     /// What the administrator entered; the provider's own discovery document settles the rest.
     pub issuer: &'a str,
@@ -214,6 +217,7 @@ impl ControlPlane {
             .map(|p| {
                 Ok(ProviderView {
                     id: p.id.clone(),
+                    kind: p.kind,
                     label: p.label.clone(),
                     issuer: p.issuer.clone(),
                     client_id: p.client_id.clone(),
@@ -262,6 +266,7 @@ impl ControlPlane {
         }
         let mut row = OidcProviderRow {
             id: new.id.to_string(),
+            kind: new.kind,
             label: clean_name(new.label, 60),
             issuer: new.issuer.trim().to_string(),
             client_id: new.client_id.trim().to_string(),
@@ -278,7 +283,11 @@ impl ControlPlane {
             return Err(err(ErrorCode::InvalidRequest, format!("'{}' is in the configuration file", row.id)));
         }
         let _permit = self.oidc_exchanges.try_acquire().map_err(|_| err(ErrorCode::InvalidRequest, "the server is busy; try again in a moment"))?;
-        row.issuer = crate::oidc::discover(&row.issuer).await.map_err(|e| err(ErrorCode::InvalidRequest, format!("That provider can't be used: {e:#}")))?;
+        let checked = match row.kind {
+            ProviderKind::Oidc => crate::oidc::discover(&row.issuer).await,
+            ProviderKind::Github => crate::github::check(&row.issuer).await,
+        };
+        row.issuer = checked.map_err(|e| err(ErrorCode::InvalidRequest, format!("That provider can't be used: {e:#}")))?;
         row_config(&self.cfg, &row).check().map_err(|m| err(ErrorCode::InvalidRequest, m))?;
         if self.cfg.oidc.iter().any(|f| f.issuer == row.issuer) {
             return Err(err(ErrorCode::InvalidRequest, "that provider is in the configuration file"));

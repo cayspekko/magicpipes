@@ -269,6 +269,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE oidc_providers ADD COLUMN allow_unverified_admin INTEGER NOT NULL DEFAULT 0;
     "#,
+    // 6: GitHub isn't OpenID Connect, so a provider says what it speaks.
+    r#"
+    ALTER TABLE oidc_providers ADD COLUMN kind TEXT NOT NULL DEFAULT 'oidc';
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {

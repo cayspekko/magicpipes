@@ -756,7 +756,9 @@ impl OidcPerson {
 /// A small OpenID Connect provider on plain HTTP on this machine: discovery, keys, an
 /// authorization endpoint that signs in `person` at once, a token endpoint and UserInfo. It checks
 /// what a real provider checks: the client's credentials, one use of a code, the redirect URI and
-/// PKCE.
+/// PKCE. It's also a GitHub Enterprise Server, at its OAuth and `/api/v3` addresses, answering as
+/// GitHub does: a refused code gets a 200, and a request without a User-Agent a 403. `person.sub`
+/// is then the numeric user id.
 pub struct FakeOidc {
     pub issuer: String,
     pub person: Arc<std::sync::Mutex<OidcPerson>>,
@@ -799,6 +801,7 @@ impl FakeOidc {
                             let path = req.uri().path().to_string();
                             let query: std::collections::HashMap<String, String> = parse_form(req.uri().query().unwrap_or(""));
                             let auth = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+                            let has_agent = req.headers().contains_key(header::USER_AGENT);
                             let body = String::from_utf8_lossy(&req.into_body().collect().await.unwrap().to_bytes()).into_owned();
                             let json = |status: StatusCode, v: Value| Response::builder().status(status).header(header::CONTENT_TYPE, "application/json").body(Full::new(Bytes::from(v.to_string()))).unwrap();
                             let refuse = || json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "invalid_grant" }));
@@ -815,9 +818,9 @@ impl FakeOidc {
                                     let p = key.public_key().as_ref();
                                     json(StatusCode::OK, serde_json::json!({ "keys": [{ "kty": "EC", "kid": "k1", "use": "sig", "crv": "P-256", "x": B64.encode(&p[1..33]), "y": B64.encode(&p[33..65]) }] }))
                                 }
-                                "/authorize" => {
+                                "/authorize" | "/login/oauth/authorize" => {
                                     let code = format!("code-{}", magicpipes_core_rand());
-                                    let entry = (query["nonce"].clone(), who.lock().unwrap().clone(), query["code_challenge"].clone(), query["redirect_uri"].clone());
+                                    let entry = (query.get("nonce").cloned().unwrap_or_default(), who.lock().unwrap().clone(), query["code_challenge"].clone(), query["redirect_uri"].clone());
                                     assert_eq!(query["code_challenge_method"], "S256");
                                     assert_eq!(query["client_id"], OIDC_CLIENT);
                                     codes.lock().unwrap().insert(code.clone(), entry);
@@ -851,6 +854,39 @@ impl FakeOidc {
                                             json(StatusCode::OK, serde_json::json!({ "id_token": format!("{msg}.{}", B64.encode(sig.as_ref())), "access_token": p.sub, "token_type": "Bearer" }))
                                         }
                                         _ => refuse(),
+                                    }
+                                }
+                                "/login/oauth/access_token" => {
+                                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    let form = parse_form(&body);
+                                    let entry = codes.lock().unwrap().remove(form.get("code").map_or("", |c| c.as_str()));
+                                    match entry {
+                                        Some((_, p, challenge, redirect))
+                                            if form.get("client_id").map(String::as_str) == Some(OIDC_CLIENT)
+                                                && form.get("client_secret").map(String::as_str) == Some(OIDC_SECRET)
+                                                && form.get("redirect_uri") == Some(&redirect)
+                                                && B64.encode(sha2::Sha256::digest(form["code_verifier"].as_bytes())) == challenge =>
+                                        {
+                                            json(StatusCode::OK, serde_json::json!({ "access_token": format!("gho_{}", p.sub), "token_type": "bearer", "scope": "user:email" }))
+                                        }
+                                        _ => json(StatusCode::OK, serde_json::json!({ "error": "bad_verification_code", "error_description": "The code passed is incorrect or expired." })),
+                                    }
+                                }
+                                "/api/v3/" => json(StatusCode::OK, serde_json::json!({ "current_user_url": format!("{iss}/api/v3/user") })),
+                                "/api/v3/user" | "/api/v3/user/emails" => {
+                                    let p = who.lock().unwrap().clone();
+                                    if !has_agent {
+                                        json(StatusCode::FORBIDDEN, Value::Null)
+                                    } else if auth.as_deref() != Some(&format!("Bearer gho_{}", p.sub)) {
+                                        json(StatusCode::UNAUTHORIZED, Value::Null)
+                                    } else if path.ends_with("/emails") {
+                                        // An address it didn't verify comes first, so taking the first would be wrong.
+                                        json(StatusCode::OK, serde_json::json!([
+                                            { "email": "never-verified@example.com", "primary": false, "verified": false, "visibility": null },
+                                            { "email": p.email, "primary": true, "verified": p.verified, "visibility": "public" },
+                                        ]))
+                                    } else {
+                                        json(StatusCode::OK, serde_json::json!({ "login": "someone", "id": p.sub.parse::<u64>().unwrap_or(0), "name": null, "email": null }))
                                     }
                                 }
                                 "/userinfo" => {

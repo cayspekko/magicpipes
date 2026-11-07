@@ -164,12 +164,47 @@ impl ProxyAuthConfig {
     }
 }
 
-/// One OpenID Connect provider (`[[oidc]]`).
+/// What a sign-in provider speaks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    #[default]
+    Oidc,
+    /// GitHub or GitHub Enterprise Server: OAuth 2, not OpenID Connect.
+    Github,
+}
+
+impl ProviderKind {
+    pub fn is_oidc(&self) -> bool {
+        *self == Self::Oidc
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Oidc => "oidc",
+            Self::Github => "github",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "oidc" => Some(Self::Oidc),
+            "github" => Some(Self::Github),
+            _ => None,
+        }
+    }
+}
+
+/// One sign-in provider (`[[oidc]]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// Lowercase letters, digits and dashes; part of the callback URL registered at the provider.
     pub id: String,
+    /// `github` for GitHub or a GitHub Enterprise Server, whose `issuer` is its address, such as
+    /// `https://github.com`.
+    #[serde(default, skip_serializing_if = "ProviderKind::is_oidc")]
+    pub kind: ProviderKind,
     /// The button says "Continue with <label>".
     pub label: String,
     /// The provider's issuer URL, exactly as it states it in its discovery document.
@@ -208,6 +243,9 @@ impl OidcConfig {
         }
         if self.allow_unverified_admin && !self.trust_email {
             return Err("unverified addresses can only reach administrators' accounts on a provider whose addresses are trusted".into());
+        }
+        if self.kind == ProviderKind::Github && self.trust_email {
+            return Err("GitHub says which addresses it verified, so trust_email doesn't apply".into());
         }
         Ok(())
     }
@@ -660,6 +698,11 @@ mod tests {
         assert!(load("[users]\nallowed_email_domains = [\"*.example.com\"]").is_err(), "no wildcards");
         assert!(load("[users]\nallowed_email_domains = [\"a@example.com\"]").is_err());
         assert!(!c.oidc[0].trust_email && !c.oidc[0].allow_unverified_admin, "trusting addresses is off unless asked for");
+        assert_eq!(c.oidc[0].kind, ProviderKind::Oidc, "as it was before providers had a kind");
+
+        let github = format!("{}kind = \"github\"\n", provider("github", "https://github.com"));
+        assert_eq!(load(&github).unwrap().oidc[0].kind, ProviderKind::Github);
+        assert!(load(&format!("{github}trust_email = true\n")).is_err(), "it says which it verified");
     }
 
     #[test]
@@ -752,6 +795,13 @@ client_id = "c"
 client_secret_file = "/data/oidc-secrets/authentik"
 trust_email = true
 allow_unverified_admin = true
+[[oidc]]
+id = "github"
+kind = "github"
+label = "GitHub"
+issuer = "https://github.com"
+client_id = "g"
+client_secret_file = "/data/oidc-secrets/github"
 [[tls.certificates]]
 cert_file = "/etc/magicpipes/shop.crt"
 key_file = "/etc/magicpipes/shop.key"
@@ -771,8 +821,9 @@ key_file = "/data/provided-certs/abc.key"
         c.validate().unwrap();
         let written = c.to_toml().unwrap();
         assert_eq!(c.tls.certificates.len(), 2);
-        for line in ["[[tls.certificates]]", "cert_file = \"/data/provided-certs/abc.crt\"", "client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\""] {
+        for line in ["kind = \"github\"", "[[tls.certificates]]", "cert_file = \"/data/provided-certs/abc.crt\"", "client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\""] {
             assert!(written.contains(line), "{line} in {written}");
         }
+        assert_eq!(written.matches("kind = ").count(), 1, "a provider that speaks OpenID Connect doesn't say so: {written}");
     }
 }

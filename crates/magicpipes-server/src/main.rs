@@ -12,6 +12,7 @@ mod control;
 mod data;
 mod forwarded;
 mod gateway;
+mod github;
 mod listen;
 mod proxy_header;
 mod mgmt;

@@ -252,10 +252,9 @@ The defaults are the safe ones. These turn something on, or tighten it further, 
 
 ### Single sign-on
 
-People can sign in through any OpenID Connect provider: Google, Microsoft Entra, GitLab, Okta,
-authentik, Keycloak, Authelia, Dex and others. Each provider adds a "Continue with ..." button
-to the sign-in page, next to the password form. GitHub isn't OpenID Connect and isn't supported
-yet.
+People can sign in through any OpenID Connect provider: Google, Microsoft (directories and personal
+accounts), GitLab, Okta, authentik, Keycloak, Authelia, Dex and others, and through GitHub. Each
+provider adds a "Continue with ..." button to the sign-in page, next to the password form.
 
 **On the Settings page** (administrators), choose **Add** and a kind of provider. The page says
 what to do at the provider and shows the redirect URI to register:
@@ -286,6 +285,13 @@ address can't sign in here. To let in one person with an address outside your do
 under **Users** and turn on that linking option; only do so for a provider that doesn't let people
 choose or reuse addresses (Google and most company directories are fine; check first for a
 self-hosted one where people edit their own email).
+
+**GitHub and other public services.** Anyone can have a Google or GitHub account, so signing in with
+one creates nothing unless the rules above say so. GitHub works like the others on the Settings page,
+with an OAuth App instead of a discovery document, and with GitHub Enterprise Server if you change its
+address. Someone is recognized by their numeric GitHub id, and only an address GitHub says is verified
+counts. An address stays verified there after someone leaves a company, so think before listing a
+domain under **New members**, or linking accounts by address.
 
 **Providers that don't verify addresses.** Microsoft Entra never states `email_verified`, and
 authentik since 2025.10 says `false` by default, so new people can't get in until you turn on
@@ -320,6 +326,18 @@ client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = true
 # trust_email = true
 # allow_unverified_admin = true            # needs trust_email
+```
+
+GitHub isn't OpenID Connect, so it says so, and its issuer is its address:
+
+```toml
+[[oidc]]
+id = "github"
+kind = "github"
+label = "GitHub"
+issuer = "https://github.com"              # or a GitHub Enterprise Server's address
+client_id = "Iv1.0123456789abcdef"
+client_secret_file = "/etc/magicpipes/github-secret"
 ```
 
 ### Authenticating proxy

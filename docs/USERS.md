@@ -415,8 +415,14 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
 
 ### 4. Social login
 
+*Built 2026-11-06. Not built: `/user/orgs` and `/user/teams`, which would feed tag rules that don't
+exist yet. A provider's `kind = "github"` takes the place of the `preset` below, and also covers GitHub
+Enterprise Server, whose `issuer` is its address.*
+
 - **Google, Microsoft personal accounts and GitLab are OIDC.** They are presets of method 3
-  with the issuer filled in.
+  with the issuer filled in. Microsoft personal accounts are that preset with the tenant ID
+  `9188040d-6c67-4c5b-b112-36a304b66dad`, and need `trust_email`, since they never state
+  `email_verified`.
 - **GitHub isn't OIDC.**
   - It uses the OAuth 2 code flow, then `GET /user` and `GET /user/emails`, keeping only
     verified emails.
@@ -848,10 +854,12 @@ client_secret_file = "/etc/magicpipes/company-oidc-secret"
 # link_by_email = false
 
 [[oidc]]
-id = "google"
-preset = "google"                         # google, microsoft, gitlab, github
+id = "github"
+kind = "github"                           # not OpenID Connect
+label = "GitHub"
+issuer = "https://github.com"             # or a GitHub Enterprise Server's address
 client_id = "…"
-client_secret_file = "/etc/magicpipes/google-secret"
+client_secret_file = "/etc/magicpipes/github-secret"
 
 [smtp]                                    # methods 5 and 6; off unless present
 host = "smtp.example.com"
@@ -923,7 +931,8 @@ useful.
    built (see method 2). It moved behind OIDC on 2026-11-04: it needs TLS terminated in front of the
    management host, which a TLS-passthrough deployment can't do, and its signed-assertion mode
    reuses OIDC's token checks.
-6. **Social login** (method 4): presets, plus GitHub's OAuth flow.
+6. **Social login** (method 4): presets, plus GitHub's OAuth flow. *Done;* GitHub organizations and
+   teams aren't built (see method 4).
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
    (method 6).
 8. **`magicpipes connect`** for private TCP and UDP tunnels.

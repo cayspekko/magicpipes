@@ -121,8 +121,9 @@ impl ControlPlane {
         if !secret::constant_time_eq(state.as_bytes(), attempt.state.as_bytes()) {
             return Err(SignInError::Expired);
         }
-        // RFC 9207: a mix-up with another provider shows here, if this one says who it is.
-        if iss.is_some_and(|i| i != provider.issuer) {
+        // RFC 9207: a mix-up with another provider shows here, if this one says who it is. GitHub's
+        // address isn't a promise of what it would call itself, and its callback has its own attempt.
+        if provider.kind.is_oidc() && iss.is_some_and(|i| i != provider.issuer) {
             return Err(SignInError::Refused);
         }
         let _permit = self.oidc_exchanges.try_acquire().map_err(|_| SignInError::Busy)?;

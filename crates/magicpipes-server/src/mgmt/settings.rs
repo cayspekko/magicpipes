@@ -12,6 +12,7 @@ use super::html::{Actions, Text, alert, back, badge, esc, table, title_of};
 use super::icons::DOWNLOAD;
 use super::oidc::redirect_uri;
 use super::ui::{Done, done, failed, page};
+use crate::config::ProviderKind;
 use crate::control::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
 
 /// A kind of provider: all an administrator needs to know to add one. Only `issuer` matters to
@@ -20,6 +21,7 @@ use crate::control::{GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderVie
 struct Preset {
     key: &'static str,
     name: &'static str,
+    kind: ProviderKind,
     issuer: &'static str,
     /// Label, placeholder and starting value.
     url: Option<(&'static str, &'static str, &'static str)>,
@@ -29,10 +31,11 @@ struct Preset {
     steps: &'static str,
 }
 
-const PRESETS: [Preset; 6] = [
+const PRESETS: [Preset; 7] = [
     Preset {
         key: "google",
         name: "Google",
+        kind: ProviderKind::Oidc,
         issuer: "https://accounts.google.com",
         url: None,
         part: None,
@@ -41,14 +44,16 @@ const PRESETS: [Preset; 6] = [
     Preset {
         key: "microsoft",
         name: "Microsoft",
+        kind: ProviderKind::Oidc,
         issuer: "https://login.microsoftonline.com/{part}/v2.0",
         url: None,
         part: Some(("Directory (tenant) ID", "00000000-0000-0000-0000-000000000000")),
-        steps: "In the Microsoft Entra admin center, open <b>App registrations</b> and add one, with the redirect URI below under <b>Web</b>. Create a secret under <b>Certificates &amp; secrets</b> and copy its value, along with the <b>Application (client) ID</b>. Add the <b>email</b> claim under <b>Token configuration</b>. Entra never says an address is verified, so new people can only get in with <b>Trust this provider's email addresses</b> on, and new administrators also need the option below it; check first who can change addresses in your directory.",
+        steps: "In the Microsoft Entra admin center, open <b>App registrations</b> and add one, with the redirect URI below under <b>Web</b>. Create a secret under <b>Certificates &amp; secrets</b> and copy its value, along with the <b>Application (client) ID</b>. Add the <b>email</b> claim under <b>Token configuration</b>. For personal Microsoft accounts rather than a directory, the tenant ID is <code>9188040d-6c67-4c5b-b112-36a304b66dad</code>. Entra never says an address is verified, so new people can only get in with <b>Trust this provider's email addresses</b> on, and new administrators also need the option below it; check first who can change addresses in your directory.",
     },
     Preset {
         key: "authentik",
         name: "authentik",
+        kind: ProviderKind::Oidc,
         issuer: "{url}/application/o/{part}/",
         url: Some(("authentik address", "https://auth.example.com", "")),
         part: Some(("Application slug", "magicpipes")),
@@ -57,14 +62,25 @@ const PRESETS: [Preset; 6] = [
     Preset {
         key: "keycloak",
         name: "Keycloak",
+        kind: ProviderKind::Oidc,
         issuer: "{url}/realms/{part}",
         url: Some(("Keycloak address", "https://keycloak.example.com", "")),
         part: Some(("Realm", "main")),
         steps: "In the realm, open <b>Clients</b> and create an <b>OpenID Connect</b> client with <b>Client authentication</b> on and the standard flow. Add the redirect URI below, then copy the client ID and, from <b>Credentials</b>, the secret.",
     },
     Preset {
+        key: "github",
+        name: "GitHub",
+        kind: ProviderKind::Github,
+        issuer: "{url}",
+        url: Some(("GitHub address", "https://github.com", "https://github.com")),
+        part: None,
+        steps: "In your profile's or organization's settings, open <b>Developer settings → OAuth Apps</b> and choose <b>New OAuth App</b>. Set the <b>Authorization callback URL</b> to the redirect URI below, then copy the client ID and generate a client secret. For GitHub Enterprise Server, change the address. Anyone can have a GitHub account, and an address stays verified there after someone leaves a company, so think before listing a domain under New members.",
+    },
+    Preset {
         key: "gitlab",
         name: "GitLab",
+        kind: ProviderKind::Oidc,
         issuer: "{url}",
         url: Some(("GitLab address", "https://gitlab.com", "https://gitlab.com")),
         part: None,
@@ -73,6 +89,7 @@ const PRESETS: [Preset; 6] = [
     Preset {
         key: "oidc",
         name: "Another OpenID Connect provider",
+        kind: ProviderKind::Oidc,
         issuer: "{url}",
         url: Some(("Issuer or discovery URL", "https://login.example.com", "")),
         part: None,
@@ -240,18 +257,25 @@ pub async fn save_rules(State(app): State<AppState>, AdminPosted(user, f): Admin
     }
 }
 
-fn toggles(trust_email: bool, allow_unverified_admin: bool, link_by_email: bool) -> String {
+fn toggles(kind: ProviderKind, trust_email: bool, allow_unverified_admin: bool, link_by_email: bool) -> String {
     let on = |b: bool| if b { " checked" } else { "" };
+    let link = format!(
+        r#"<label><input type="checkbox" name="link_by_email"{}> Let a first sign-in use an existing account with the same address</label>
+<p class="note">Off: someone who already has an account here is refused. Only turn this on for a provider that doesn't let people choose or reuse addresses, because it hands over the existing account.</p>"#,
+        on(link_by_email)
+    );
+    // GitHub says which addresses it verified, so there's nothing to trust.
+    if kind == ProviderKind::Github {
+        return link;
+    }
     format!(
         r#"<label><input type="checkbox" name="trust_email"{trust}> Trust this provider's email addresses</label>
 <p class="note">Accept an address even if the provider doesn't say it verified it. Leave this off if you can. <b>Anyone who can choose their address at the provider could use an address listed under New members, or an existing member's.</b></p>
 <label><input type="checkbox" name="allow_unverified_admin"{admin}> Let those addresses reach administrators' accounts too</label>
 <p class="note">Needs the option above. Off: an address the provider didn't verify can't become or take over an administrator. <b>On: anyone who can choose their address there can become one.</b> Only for a provider where you control every address.</p>
-<label><input type="checkbox" name="link_by_email"{link}> Let a first sign-in use an existing account with the same address</label>
-<p class="note">Off: someone who already has an account here is refused. Only turn this on for a provider that doesn't let people choose or reuse addresses, because it hands over the existing account.</p>"#,
+{link}"#,
         trust = on(trust_email),
         admin = on(allow_unverified_admin),
-        link = on(link_by_email),
     )
 }
 
@@ -315,7 +339,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
         id = esc(id),
         label = esc(typed.map_or(p.label(), |f| &f.label)),
         client_id = esc(typed.map_or("", |f| &f.client_id)),
-        toggles = toggles(typed.is_some_and(|f| f.trust_email.is_some()), typed.is_some_and(|f| f.allow_unverified_admin.is_some()), typed.is_some_and(|f| f.link_by_email.is_some())),
+        toggles = toggles(p.kind, typed.is_some_and(|f| f.trust_email.is_some()), typed.is_some_and(|f| f.allow_unverified_admin.is_some()), typed.is_some_and(|f| f.link_by_email.is_some())),
     );
     page(&title_of(&format!("Add {}", p.name), error.is_some()), Some(user), &body)
 }
@@ -334,6 +358,7 @@ pub async fn create_provider(State(app): State<AppState>, AdminPosted(user, f): 
         Ok(issuer) => {
             let new = NewProvider {
                 id: &f.id,
+                kind: p.kind,
                 label: &f.label,
                 issuer: &issuer,
                 client_id: &f.client_id,
@@ -376,8 +401,8 @@ fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, typed: Op
         typed_label = esc(typed.map_or(p.label.as_str(), |f| &f.label)),
         client_id = esc(typed.map_or(p.client_id.as_str(), |f| &f.client_id)),
         toggles = match typed {
-            Some(f) => toggles(f.trust_email.is_some(), f.allow_unverified_admin.is_some(), f.link_by_email.is_some()),
-            None => toggles(p.trust_email, p.allow_unverified_admin, p.link_by_email),
+            Some(f) => toggles(p.kind, f.trust_email.is_some(), f.allow_unverified_admin.is_some(), f.link_by_email.is_some()),
+            None => toggles(p.kind, p.trust_email, p.allow_unverified_admin, p.link_by_email),
         },
     );
     page(&title_of(&p.label, error.is_some()), Some(user), &body)
@@ -425,6 +450,9 @@ mod tests {
         assert_eq!(issuer("authentik", "https://auth.example.com/", "/mp/").unwrap(), "https://auth.example.com/application/o/mp/");
         assert_eq!(issuer("keycloak", "https://kc.example.com", "main").unwrap(), "https://kc.example.com/realms/main");
         assert_eq!(issuer("gitlab", "https://gitlab.com", "").unwrap(), "https://gitlab.com");
+        assert_eq!(issuer("github", "https://github.com/", "").unwrap(), "https://github.com");
+        assert_eq!(issuer("github", "https://git.example.com", "").unwrap(), "https://git.example.com", "GitHub Enterprise Server");
+        assert!(issuer("github", "http://github.com", "").is_err(), "not over plain HTTP");
         assert_eq!(issuer("oidc", "https://login.example.com/x", "").unwrap(), "https://login.example.com/x");
 
         assert!(issuer("authentik", "http://auth.example.com", "mp").is_err(), "not over plain HTTP");

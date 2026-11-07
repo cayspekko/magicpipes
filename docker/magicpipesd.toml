@@ -44,6 +44,7 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # link_by_email = false
 # trust_email = false
 # allow_unverified_admin = false
+# kind = "github"     # for GitHub, with issuer = "https://github.com"
 
 # Sign-in through an authenticating proxy that terminates TLS in front of the management host.
 # Passwords and [[oidc]] providers then aren't offered; an admin token still works. See the README.

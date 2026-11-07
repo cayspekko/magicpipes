@@ -519,8 +519,10 @@ a connection to the public port that must arrive back at the agent (a warning, n
     request to a provider has 4 s and 256 KiB, redirects aren't followed, at most 16 code
     exchanges run at once, and a failed exchange counts against the client's failure limit, which
     is checked before the next one. Providers must be HTTPS (plain HTTP to this machine only, for
-    tests). This is control-plane work; nothing here is on the data path. Who gets in is
-    described in the README: accounts are keyed by `(issuer, subject)`, and only a verified
+    tests). GitHub (`github.rs`) is the same flow without the OpenID Connect parts: there's no ID
+    token, so who someone is comes from its API over TLS with the token the code buys, which isn't
+    kept. A provider's `kind` says which it speaks. This is control-plane work; nothing here is on
+    the data path. Who gets in is described in the README: accounts are keyed by `(issuer, subject)`, and only a verified
     email (any address, on a provider an administrator marked `trust_email`) can create or link
     one;
   * **an authenticating proxy** (`proxy_auth.rs`, `mgmt/proxy_auth.rs`), if configured: a signed

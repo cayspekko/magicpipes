@@ -2261,6 +2261,126 @@ async fn admin_session(env: &Env) -> String {
     env.ui("/login", None, Some(&[("token", token.as_str())])).await.cookie.expect("signed in")
 }
 
+/// GitHub isn't OpenID Connect, but who gets in is decided the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn github_sign_in_admits_only_who_it_should() {
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-github-{}", std::process::id()));
+    let users = r#"bootstrap_admins = ["boss@example.com"]
+allowed_email_domains = ["team.example.com"]"#;
+    let config = format!("{}kind = \"github\"\n", idp.config(&dir, users, true));
+    let env = Env::with_config(Tls::DevCa, &config).await;
+    let admin = env.admin_token();
+    let set = |p: common::OidcPerson| *idp.person.lock().unwrap() = p;
+    let accounts = async || env.api("GET", "/api/v1/users", Some(&admin)).await.1["users"].as_array().unwrap().clone();
+
+    // The browser goes to GitHub's own address, asking for no more than it needs.
+    let start = env.ui("/auth/oidc/fake?next=/account", None, None).await;
+    let to = start.location.clone().expect("sent to GitHub");
+    assert!(to.starts_with(&format!("{}/login/oauth/authorize?", idp.issuer)) && to.contains("scope=user%3Aemail") && to.contains("code_challenge_method=S256"), "{to}");
+
+    // Having a GitHub account gets nobody in.
+    set(common::OidcPerson::new("101", "stranger@example.org"));
+    let r = oidc_sign_in(&env, None).await;
+    assert!(r.status == StatusCode::FORBIDDEN && r.html.contains("stranger@example.org can&#39;t sign in here") && r.cookie.is_none(), "{}", r.html);
+    assert!(accounts().await.is_empty());
+
+    // A verified address in an allowed domain makes a member, named by the numeric id.
+    set(common::OidcPerson::new("102", "dev@team.example.com"));
+    let r = oidc_sign_in(&env, None).await;
+    assert_eq!(r.location.as_deref(), Some("/"), "{}", r.html);
+    let cookie = session_of(&r);
+    let users = accounts().await;
+    assert_eq!((users.len(), users[0]["email"].as_str(), users[0]["role"].as_str()), (1, Some("dev@team.example.com"), Some("member")));
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.status, StatusCode::OK);
+    assert!(env.ui("/account", Some(&cookie), None).await.html.contains("someone"), "the login, for someone without a public name");
+
+    // Changing the address at GitHub changes nothing here: the account follows the id.
+    set(common::OidcPerson::new("102", "new-address@elsewhere.example.org"));
+    assert_eq!(oidc_sign_in(&env, None).await.location.as_deref(), Some("/"));
+    assert_eq!(accounts().await.len(), 1);
+
+    // Only an address GitHub verified counts, whatever else the account lists.
+    let mut unverified = common::OidcPerson::new("103", "other@team.example.com");
+    unverified.verified = false;
+    set(unverified.clone());
+    let r = oidc_sign_in(&env, None).await;
+    assert!(r.status == StatusCode::FORBIDDEN && r.html.contains("confirm an email address"), "{}", r.html);
+    assert_eq!(accounts().await.len(), 1);
+
+    // A bootstrap address needs the same.
+    unverified.sub = "104".into();
+    unverified.email = "boss@example.com".into();
+    set(unverified);
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+    set(common::OidcPerson::new("104", "boss@example.com"));
+    assert_eq!(oidc_sign_in(&env, None).await.location.as_deref(), Some("/"));
+    assert!(accounts().await.iter().any(|u| u["email"] == "boss@example.com" && u["role"] == "admin"));
+
+    // A code that doesn't pass gets the 200 GitHub answers with, and no session.
+    let start = env.ui("/auth/oidc/fake", None, None).await;
+    let attempt = start.cookie.clone().expect("attempt cookie");
+    let state = start.location.as_deref().unwrap().split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let refused = env.ui(&format!("/auth/oidc/fake/callback?code=made-up&state={state}"), Some(&attempt), None).await;
+    assert!(refused.status == StatusCode::UNAUTHORIZED && refused.cookie.is_none(), "{}", refused.html);
+    assert!(env.server_log().contains("bad_verification_code"), "the log says why");
+
+    // Another browser's answer, or none at all, gets as far as for any provider.
+    let forged = env.ui("/auth/oidc/fake/callback?code=x&state=wrong", Some(&attempt), None).await;
+    assert!(forged.status == StatusCode::BAD_REQUEST && forged.cookie.is_none(), "{}", forged.html);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Adding GitHub on the Settings page, without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_page_adds_github() {
+    let idp = common::FakeOidc::start().await;
+    let env = Env::with_config(Tls::DevCa, "[users]\nallowed_email_domains = [\"team.example.com\"]\n").await;
+    let admin = admin_session(&env).await;
+
+    let form = env.ui("/settings/providers/new?type=github", Some(&admin), None).await;
+    assert!(form.html.contains("OAuth Apps") && form.html.contains(r#"value="https://github.com""#), "{}", form.html);
+    assert!(form.html.contains("/auth/oidc/github/callback"), "the callback to register: {}", form.html);
+    assert!(!form.html.contains(r#"name="trust_email""#) && form.html.contains(r#"name="link_by_email""#), "it says which addresses it verified: {}", form.html);
+    let csrf = form.csrf();
+    let add = async |url: &str, extra: &[(&str, &str)]| {
+        let mut fields = vec![("csrf", csrf.as_str()), ("type", "github"), ("id", "github"), ("url", url), ("label", "GitHub"), ("client_id", common::OIDC_CLIENT), ("client_secret", common::OIDC_SECRET)];
+        fields.extend_from_slice(extra);
+        env.ui("/settings/providers/new", Some(&admin), Some(&fields)).await
+    };
+
+    // An address that isn't GitHub shows up now, and the form comes back as typed.
+    let wrong = add(&format!("{}/nothing-here", idp.issuer), &[]).await;
+    assert!(wrong.status == StatusCode::BAD_REQUEST && wrong.html.contains("doesn&#39;t look like GitHub") && wrong.html.contains(common::OIDC_CLIENT) && !wrong.html.contains(common::OIDC_SECRET), "{}", wrong.html);
+    let forced = add(&idp.issuer, &[("trust_email", "on")]).await;
+    assert_eq!(forced.status, StatusCode::BAD_REQUEST, "{}", forced.html);
+
+    let added = add(&format!("{}/", idp.issuer), &[]).await;
+    assert_eq!(added.location.as_deref(), Some("/settings?done=provider-added"), "{}", added.html);
+    let login = env.ui("/login", None, None).await;
+    assert!(login.html.contains("Continue with GitHub"), "{}", login.html);
+
+    idp.person.lock().unwrap().sub = "7".into();
+    idp.person.lock().unwrap().email = "dev@team.example.com".into();
+    let r = oidc_sign_in_at(&env, "github", None).await;
+    assert_eq!(r.location.as_deref(), Some("/"), "{}", r.html);
+
+    // What's there can be changed, and stays GitHub. The configuration in effect says so.
+    let page = env.ui("/settings/providers/github", Some(&admin), None).await;
+    assert!(page.status == StatusCode::OK && !page.html.contains(r#"name="trust_email""#), "{}", page.html);
+    let saved = env.ui("/settings/providers/github", Some(&admin), Some(&[("csrf", &csrf), ("label", "GitHub at work"), ("client_id", common::OIDC_CLIENT), ("client_secret", "")])).await;
+    assert_eq!(saved.location.as_deref(), Some("/settings?done=provider-saved"), "{}", saved.html);
+    assert_eq!(oidc_sign_in_at(&env, "github", None).await.location.as_deref(), Some("/"));
+    let generated = std::fs::read_to_string(env.root.join("server/magicpipesd.generated.toml")).unwrap();
+    assert!(generated.contains("kind = \"github\"") && !generated.contains(common::OIDC_SECRET), "{generated}");
+
+    // After a restart too: it's the database's word.
+    let mut env = env;
+    env.stop_server().await;
+    env.start_server().await;
+    assert_eq!(oidc_sign_in_at(&env, "github", None).await.location.as_deref(), Some("/"));
+}
+
 /// Plain headers from an authenticating proxy: believed only with the secret, and only as long as
 /// they keep naming the session's user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

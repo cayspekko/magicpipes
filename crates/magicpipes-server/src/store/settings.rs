@@ -6,6 +6,7 @@ use rusqlite::params;
 
 use super::Store;
 use super::users::{DEFAULT_ORG, LOCAL_ISSUER};
+use crate::config::ProviderKind;
 
 /// Each is a button on the sign-in page.
 pub const MAX_OIDC_PROVIDERS: usize = 32;
@@ -15,6 +16,7 @@ pub const MAX_SIGN_IN_RULES: usize = 500;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OidcProviderRow {
     pub id: String,
+    pub kind: ProviderKind,
     pub label: String,
     pub issuer: String,
     pub client_id: String,
@@ -31,13 +33,24 @@ pub struct SignInRules {
 }
 
 impl Store {
+    /// A provider of a kind this version doesn't know is left out, with a line in the log: signing
+    /// someone in with the wrong protocol is worse than a button that's missing.
     pub fn oidc_provider_rows(&self) -> anyhow::Result<Vec<OidcProviderRow>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin FROM oidc_providers WHERE org_id = ?1 ORDER BY created_at, id")?;
-            st.query_map([DEFAULT_ORG], |r| {
-                Ok(OidcProviderRow { id: r.get(0)?, label: r.get(1)?, issuer: r.get(2)?, client_id: r.get(3)?, link_by_email: r.get(4)?, trust_email: r.get(5)?, allow_unverified_admin: r.get(6)? })
-            })?
-            .collect()
+            let mut st = c.prepare("SELECT id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, kind FROM oidc_providers WHERE org_id = ?1 ORDER BY created_at, id")?;
+            let rows = st.query_map([DEFAULT_ORG], |r| {
+                let kind: String = r.get(7)?;
+                Ok((kind, OidcProviderRow { id: r.get(0)?, kind: ProviderKind::Oidc, label: r.get(1)?, issuer: r.get(2)?, client_id: r.get(3)?, link_by_email: r.get(4)?, trust_email: r.get(5)?, allow_unverified_admin: r.get(6)? }))
+            })?;
+            let mut known = Vec::new();
+            for row in rows {
+                let (kind, row) = row?;
+                match ProviderKind::parse(&kind) {
+                    Some(kind) => known.push(OidcProviderRow { kind, ..row }),
+                    None => tracing::error!(provider = %row.id, kind, "this sign-in provider is of an unknown kind, so it's off"),
+                }
+            }
+            Ok(known)
         })
     }
 
@@ -49,10 +62,10 @@ impl Store {
                 return Ok(0);
             }
             c.execute(
-                "INSERT INTO oidc_providers (id, org_id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO oidc_providers (id, org_id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, created_at, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT DO NOTHING",
-                params![p.id, DEFAULT_ORG, p.label, p.issuer, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, unix_now()],
+                params![p.id, DEFAULT_ORG, p.label, p.issuer, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, unix_now(), p.kind.as_str()],
             )
         })?;
         Ok(n == 1)
@@ -127,7 +140,7 @@ mod tests {
     use crate::authz::Role;
 
     fn provider(id: &str, issuer: &str) -> OidcProviderRow {
-        OidcProviderRow { id: id.into(), label: "L".into(), issuer: issuer.into(), client_id: "c".into(), link_by_email: false, trust_email: true, allow_unverified_admin: false }
+        OidcProviderRow { id: id.into(), kind: ProviderKind::Oidc, label: "L".into(), issuer: issuer.into(), client_id: "c".into(), link_by_email: false, trust_email: true, allow_unverified_admin: false }
     }
 
     #[test]
@@ -189,6 +202,35 @@ mod tests {
         }
         let row = Store::open(&path).unwrap().oidc_provider_rows().unwrap().remove(0);
         assert!(row.trust_email && !row.allow_unverified_admin);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A database from before providers had a kind keeps them as what they were, and a kind this
+    /// version doesn't know turns that provider off, not the others.
+    #[test]
+    fn a_providers_kind_is_kept_and_an_unknown_one_is_off() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            for m in &MIGRATIONS[..5] {
+                c.execute_batch(m).unwrap();
+            }
+            c.pragma_update(None, "user_version", 5).unwrap();
+            c.execute("INSERT INTO oidc_providers (id, label, issuer, client_id, created_at) VALUES ('a', 'A', 'https://a.example.com', 'c', 1)", []).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.oidc_provider_rows().unwrap()[0].kind, ProviderKind::Oidc);
+
+        let github = OidcProviderRow { kind: ProviderKind::Github, ..provider("gh", "https://github.com") };
+        assert!(s.create_oidc_provider(&github).unwrap());
+        assert_eq!(s.oidc_provider_rows().unwrap().iter().map(|r| r.kind).collect::<Vec<_>>(), [ProviderKind::Oidc, ProviderKind::Github]);
+        assert!(s.update_oidc_provider(&OidcProviderRow { label: "New".into(), ..github }).unwrap());
+        assert_eq!(s.oidc_provider_rows().unwrap()[1].kind, ProviderKind::Github, "changing a provider keeps its kind");
+
+        s.with(|c| c.execute("UPDATE oidc_providers SET kind = 'from-the-future' WHERE id = 'gh'", [])).unwrap();
+        assert_eq!(s.oidc_provider_rows().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["a"]);
         std::fs::remove_dir_all(dir).ok();
     }
 
