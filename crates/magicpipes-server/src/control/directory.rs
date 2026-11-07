@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::ControlPlane;
-use crate::store::{AgentRow, HostnameRow, Store, TagRow, UserRow};
+use crate::store::{AgentRow, HostnameRow, SshKeyRow, Store, TagRow, UserRow};
 
 #[derive(Default)]
 pub(super) struct Directory {
@@ -16,6 +16,7 @@ pub(super) struct Directory {
     users: HashMap<String, UserRow>,
     tags: HashMap<String, TagRow>,
     hostnames: HashMap<String, HostnameRow>,
+    ssh_keys: Vec<SshKeyRow>,
 }
 
 impl Directory {
@@ -27,7 +28,13 @@ impl Directory {
             users: store.users()?.into_iter().map(|u| (u.id.clone(), u)).collect(),
             tags: store.tags()?.into_iter().map(|t| (t.name.clone(), t)).collect(),
             hostnames: store.hostnames()?.into_iter().map(|h| (h.hostname.clone(), h)).collect(),
+            ssh_keys: store.ssh_keys()?,
         })
+    }
+
+    /// Every public key for the SSH gateway.
+    pub(super) fn ssh_keys(&self) -> &[SshKeyRow] {
+        &self.ssh_keys
     }
 
     /// A registered custom hostname.

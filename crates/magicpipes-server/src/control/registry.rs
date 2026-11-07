@@ -44,12 +44,17 @@ impl ControlPlane {
                     "this machine's tunnels are private by default, which this version of magicpipes doesn't support; upgrade magicpipes on it",
                 ));
             }
+            // The gateway only lets people in through a tag.
+            (None, None) if req.kind == Kind::Ssh => (Visibility::Private, Vec::new()),
             // Raw ports can't ask anyone to sign in yet, so they stay public by default.
             (None, None) if default_private && req.kind.is_http() => (Visibility::Private, Vec::new()),
             (None, None) => (Visibility::Public, Vec::new()),
             (Some(v), _) => (v, tags::normalize_list(&req.tags).map_err(invalid)?),
         };
         match visibility {
+            Visibility::Public if req.kind == Kind::Ssh => {
+                return Err(err(ErrorCode::InvalidRequest, "SSH tunnels are always private. For a port anyone can reach, use --tcp"));
+            }
             Visibility::Public if members_may_not => {
                 return Err(err(ErrorCode::PublicNotAllowed, "members' machines may only publish private tunnels on this server"));
             }
@@ -59,7 +64,7 @@ impl ControlPlane {
             Visibility::Public if !requested.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "tags apply only to private tunnels"));
             }
-            Visibility::Private if !req.kind.is_http() => {
+            Visibility::Private if req.kind.has_port() => {
                 return Err(err(ErrorCode::Unsupported, "TCP and UDP tunnels can't be private yet: people can't sign in to a raw port"));
             }
             _ => {}
@@ -94,11 +99,14 @@ impl ControlPlane {
             Some(h) => Some(h.trim().trim_end_matches('.').to_ascii_lowercase()),
         };
         let range = match req.kind {
-            Kind::Http if req.remote_port.is_some() || !allow.is_empty() => {
+            Kind::Http | Kind::Ssh if req.remote_port.is_some() || !allow.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "a remote port and an allow-list apply only to TCP and UDP tunnels"));
             }
-            Kind::Http => None,
-            _ => Some(self.cfg.port_range().ok_or_else(|| {
+            Kind::Ssh if self.cfg.ssh.is_none() => {
+                return Err(err(ErrorCode::SshDisabled, "this server does not offer SSH (its configuration has no [ssh] gateway)"));
+            }
+            Kind::Http | Kind::Ssh => None,
+            Kind::Tcp | Kind::Udp => Some(self.cfg.port_range().ok_or_else(|| {
                 err(ErrorCode::PortsDisabled, "this server does not offer TCP or UDP ports (its configuration has no [ports] range)")
             })?),
         };
@@ -276,6 +284,10 @@ impl ControlPlane {
 
     pub(super) fn public_url(&self, row: &TunnelRow) -> String {
         match (row.kind, row.public_port) {
+            (Kind::Ssh, _) => match self.cfg.ssh_address() {
+                Some(gateway) => format!("ssh -J {gateway} {}", row.name),
+                None => row.name.clone(),
+            },
             (Kind::Http, _) | (_, None) => self.cfg.public_url(&row.hostname),
             (kind, Some(port)) => self.cfg.port_url(kind, port),
         }

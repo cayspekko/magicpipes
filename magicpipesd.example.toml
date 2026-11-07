@@ -92,6 +92,16 @@ acme_directory = "letsencrypt"
 # udp_idle_timeout_secs = 60
 # udp_max_flows = 128                  # UDP clients tracked at once per tunnel; one address may hold an eighth
 
+# The SSH gateway, for `magicpipes add 22 --ssh`: people reach machines with `ssh -J`. Off unless this
+# is here. It must be reachable from the internet, and its host key is <data_dir>/ssh-host-key.
+# [ssh]
+# listen = "0.0.0.0:2222"
+# public_host = "example.com"          # host in the commands people see (default: management.hostname)
+# public_port = 2222                   # port in them, if a router maps it (default: the one in listen)
+# proxy_protocol = false               # as in [public]; the proxy must be in trusted_proxies
+# max_connections = 1024
+# max_connections_per_client = 32
+
 # Single sign-on: one section per OpenID Connect provider, one button each on the sign-in page.
 # Register https://<management hostname>/auth/oidc/<id>/callback at the provider. Administrators can
 # also add providers, and the two [users] lists above, on the Settings page; those are kept in the

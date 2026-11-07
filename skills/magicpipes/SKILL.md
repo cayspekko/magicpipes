@@ -70,6 +70,11 @@ prefer `--private`. `invalid_socket` means the path isn't a socket, or is one th
 machine or the user's keys (Docker's, an SSH agent's). Only pass `--allow-sensitive-socket` if the
 user asked for that exact socket after being told what it gives away.
 
+To reach this machine's sshd through the server, use `magicpipes add 22 --ssh --json`. It is always
+private, and `public_url` is the `ssh -J` command to give people. They also need a public key on their
+account, and the machine's own `authorized_keys` still applies. `ssh_disabled` means the server has no
+gateway: tell the user, and don't fall back to `--tcp --allow-any` unless they ask.
+
 ## Other commands
 
 ```bash

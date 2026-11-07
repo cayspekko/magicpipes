@@ -91,6 +91,7 @@ enum Command {
   magicpipes add --serve ./public             Share a folder
   magicpipes add --shell -- htop              Let people watch a program
   magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24
+  magicpipes add 22 --ssh --tag team:dev      Log in with `ssh -J`, with people sharing that tag
 
 Run it again with other options to change a tunnel.")]
     Add {
@@ -109,6 +110,10 @@ Run it again with other options to change a tunnel.")]
         /// game servers, anything that speaks TCP.
         #[arg(long, conflicts_with_all = ["serve", "shell", "udp"])]
         tcp: bool,
+        /// Reach this machine's sshd through the server's SSH gateway (`ssh -J`). Always private:
+        /// you, and people sharing a --tag with it, who then log in to sshd as usual.
+        #[arg(long, conflicts_with_all = ["serve", "shell", "udp", "tcp", "unix", "public", "hostname", "no_verify"])]
+        ssh: bool,
         /// Publish a UDP port (udp://host:port); datagrams go to the local UDP port.
         #[arg(long, conflicts_with_all = ["serve", "shell"])]
         udp: bool,
@@ -265,7 +270,7 @@ fn main() -> ExitCode {
 fn check_add_args(cmd: &Command) {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
-    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
+    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, ssh, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
     else {
         return;
     };
@@ -277,6 +282,9 @@ fn check_add_args(cmd: &Command) {
     };
     if port.is_none() && unix.is_none() && serve.is_none() && !shell {
         fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --unix <PATH>, --serve <DIR> or --shell");
+    }
+    if *ssh && port.is_none() {
+        fail(ErrorKind::MissingRequiredArgument, "--ssh needs the local port of sshd, usually: magicpipes add 22 --ssh");
     }
     if unix.is_none() && *allow_sensitive_socket {
         fail(ErrorKind::ArgumentConflict, "--allow-sensitive-socket can only be used with --unix");
@@ -339,6 +347,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
             allow_sensitive_socket,
             tcp,
             udp,
+            ssh,
             remote_port,
             allow_cidr,
             allow_any,
@@ -367,9 +376,10 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 (_, true) => Some(Visibility::Public),
                 _ => None,
             };
-            let kind = match (tcp, udp) {
-                (true, _) => Kind::Tcp,
-                (_, true) => Kind::Udp,
+            let kind = match (tcp, udp, ssh) {
+                (true, ..) => Kind::Tcp,
+                (_, true, _) => Kind::Udp,
+                (.., true) => Kind::Ssh,
                 _ => Kind::Http,
             };
             let req = AddRequest {
@@ -687,7 +697,8 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         println!();
         println!("Tunnel ready");
         println!();
-        println!("  URL:    {}", data["share_url"].as_str().or(data["public_url"].as_str()).unwrap_or_default());
+        let address = if kind == Kind::Ssh { "SSH:   " } else { "URL:   " };
+        println!("  {address} {}", data["share_url"].as_str().or(data["public_url"].as_str()).unwrap_or_default());
         match (&serving, &shell) {
             (Some(dir), _) => println!("  Serving: {}", state::display_path(dir)),
             (_, Some((cmd, writable, cwd))) => {
@@ -718,7 +729,11 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
                     who.push(format!("people with {}", groups.join(" or ")));
                 }
                 let who = if who.is_empty() { "nobody (give it a --tag)".to_string() } else { who.join(", ") };
-                println!("Tunnel active in background. Private: only {who} can open it, after signing in.");
+                if kind == Kind::Ssh {
+                    println!("Tunnel active in background. Private: only {who} can reach it, using an SSH key on an account.");
+                } else {
+                    println!("Tunnel active in background. Private: only {who} can open it, after signing in.");
+                }
             }
             Some((_, true, _)) => println!("Tunnel active in background. Anyone with this link can type into the terminal."),
             Some((_, false, _)) => println!("Tunnel active in background. Anyone with the URL can watch; each visitor gets their own copy."),

@@ -17,6 +17,7 @@ mod io;
 mod pool;
 mod ports;
 mod proxy;
+pub mod ssh;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -27,7 +28,7 @@ use std::time::Duration;
 use magicpipes_core::cidr::{self, Cidr};
 use magicpipes_core::mux::{MuxHandle, MuxStream};
 use magicpipes_core::proto::Kind;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::authz::{self, Action, Principal, Resource, TunnelAuthz};
@@ -111,8 +112,19 @@ pub struct RouteTable {
     pub by_host: HashMap<String, Arc<Route>>,
     /// Port tunnels, by protocol and public port.
     pub by_port: HashMap<(Kind, u16), Arc<Route>>,
+    /// SSH tunnels, by name.
+    pub by_ssh: HashMap<String, Arc<Route>>,
     /// Active users, by id, for private tunnels: who a tunnel cookie stands for now.
     pub users: HashMap<String, TunnelUser>,
+    /// Public keys for the SSH gateway, by SHA-256 fingerprint.
+    pub ssh_keys: HashMap<String, GatewayKey>,
+}
+
+/// A public key the SSH gateway knows, and whose it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayKey {
+    pub id: String,
+    pub user_id: String,
 }
 
 /// A user as private tunnels see them: current role and tags, and the time before which their
@@ -130,6 +142,10 @@ pub struct ProxySettings {
     pub websocket_idle_timeout: Duration,
     pub stream_open_timeout: Duration,
     pub ports: PortSettings,
+    /// Names under this domain mean the same to the SSH gateway as the bare name.
+    pub base_domain: String,
+    /// Where people reach the SSH gateway (`Config::ssh_address`).
+    pub ssh_address: Option<String>,
     pub trusted_proxies: TrustedProxies,
     /// Where private tunnels send browsers to sign in, e.g. `https://example.com:8443`.
     pub management_url: String,
@@ -159,6 +175,8 @@ impl ProxySettings {
             websocket_idle_timeout: Duration::from_secs(cfg.public.websocket_idle_timeout_secs),
             stream_open_timeout: Duration::from_secs(10),
             ports: PortSettings::from_config(&cfg.ports),
+            base_domain: cfg.base_domain.clone(),
+            ssh_address: cfg.ssh_address(),
             trusted_proxies: cfg.trusted_proxies(),
         }
     }
@@ -184,12 +202,19 @@ pub struct DataPlane {
     pool: pool::Pool<proxy::Progress<hyper::body::Incoming>>,
     /// The threads that carry traffic. `None` only in unit tests without a runtime.
     traffic: Option<tokio::runtime::Handle>,
+    /// What the SSH gateway reports to the control plane, which is free to write it down. Traffic
+    /// doesn't wait for this: when it's full, reports are dropped.
+    ssh_reports: mpsc::Sender<ssh::Connected>,
+    ssh_reports_rx: Mutex<Option<mpsc::Receiver<ssh::Connected>>>,
+    /// The fingerprint of the SSH gateway's host key, once it has one.
+    ssh_fingerprint: std::sync::OnceLock<String>,
 }
 
 impl DataPlane {
     /// Call on the threads that are to carry traffic.
     pub fn new(settings: ProxySettings, shutdown: CancellationToken) -> Arc<Self> {
         let traffic = tokio::runtime::Handle::try_current().ok();
+        let (ssh_reports, ssh_reports_rx) = mpsc::channel(ssh::REPORT_QUEUE);
         let dp = Arc::new_cyclic(|me| Self {
             routes: RwLock::new(Arc::new(RouteTable::default())),
             tcp_permits: Arc::new(Semaphore::new(settings.ports.max_connections)),
@@ -202,6 +227,9 @@ impl DataPlane {
             used_codes: Mutex::default(),
             pool: pool::Pool::default(),
             traffic,
+            ssh_reports,
+            ssh_reports_rx: Mutex::new(Some(ssh_reports_rx)),
+            ssh_fingerprint: std::sync::OnceLock::new(),
         });
         // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in
         // unit tests, nothing is pooled anyway.)
@@ -221,6 +249,16 @@ impl DataPlane {
             });
         }
         dp
+    }
+
+    /// The SSH gateway's reports, for the control plane; `None` after the first call.
+    pub fn take_ssh_reports(&self) -> Option<mpsc::Receiver<ssh::Connected>> {
+        self.ssh_reports_rx.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// The fingerprint of the SSH gateway's host key; `None` unless it's on.
+    pub fn ssh_fingerprint(&self) -> Option<&str> {
+        self.ssh_fingerprint.get().map(String::as_str)
     }
 
     pub fn signer(&self) -> &Signer {

@@ -2,7 +2,7 @@
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
-# terminal, echoes through TCP and UDP port tunnels, reaches an application on a Unix socket (or, on
+# terminal, echoes through TCP and UDP port tunnels, registers an SSH tunnel, reaches an application on a Unix socket (or, on
 # Windows, is told that isn't supported), and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
@@ -79,6 +79,8 @@ mode = "dev-ca"
 range = "39500-39503"
 bind = "127.0.0.1"
 public_host = "localhost"
+[ssh]
+listen = "127.0.0.1:39510"
 EOF
 
 export MAGICPIPES_HOME
@@ -279,6 +281,15 @@ run "$PY" ports.py tcp "$PTCP" "smoke over tcp"
 run "$MP" add "$ECHO_UDP" --udp --allow-any --name pudp --json --timeout 60
 PUDP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
 run "$PY" ports.py udp "$PUDP" "smoke over udp"
+
+step "ssh tunnel"
+# Registered and checked through the agent, with the echo service standing in for sshd: logging in
+# needs a key on an account, which the end-to-end tests do. This is for what differs by platform.
+run "$MP" add "$ECHO_TCP" --ssh --name smoke-box --json --timeout 60
+grep -q '"kind": "ssh"' cmd.out
+grep -q 'ssh -J localhost:39510 smoke-box' cmd.out
+"$PY" -c "import socket; s = socket.create_connection(('127.0.0.1', 39510), 5); s.settimeout(5); assert s.recv(32).startswith(b'SSH-2.0-')"
+run "$MP" remove smoke-box --json
 
 step "unix socket"
 if [[ -n "$WINDOWS" ]]; then

@@ -11,8 +11,8 @@ import pathlib
 import re
 import sys
 
-LOWER_IS_BETTER = {"p50", "p99", "mb", "us_per_req"}
-UNITS = {"rps": "req/s", "mb_s": "MB/s", "gbit": "Gbit/s", "p50": "ms median", "p99": "ms p99", "mb": "MB", "us_per_req": "CPU µs/req"}
+LOWER_IS_BETTER = {"p50", "p99", "mb", "ms", "us_per_req"}
+UNITS = {"rps": "req/s", "mb_s": "MB/s", "gbit": "Gbit/s", "p50": "ms median", "p99": "ms p99", "mb": "MB", "ms": "ms", "us_per_req": "CPU µs/req"}
 
 
 def read(path):

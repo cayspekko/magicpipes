@@ -298,6 +298,31 @@ pub async fn delete_token(Caller(who): Caller, State(app): State<AppState>, Path
     }
 }
 
+pub async fn list_ssh_keys(Caller(who): Caller, State(app): State<AppState>) -> impl IntoResponse {
+    Json(json!({ "ssh_keys": app.control.ssh_keys(&who) }))
+}
+
+#[derive(Deserialize)]
+pub struct NewSshKey {
+    #[serde(default)]
+    name: String,
+    public_key: String,
+}
+
+/// Adds a public key for the SSH gateway to the calling user.
+pub async fn add_ssh_key(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewSshKey>) -> Result<impl IntoResponse, ApiError> {
+    let key = app.control.add_ssh_key(&who, &req.name, &req.public_key).map_err(ApiError)?;
+    Ok((StatusCode::CREATED, Json(json!({ "ssh_key": key }))))
+}
+
+pub async fn delete_ssh_key(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.control.delete_ssh_key(&who, &id) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(api_err(ErrorCode::NotFound, "no such SSH key")),
+        Err(e) => Err(ApiError(e)),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct AuditQuery {
     limit: Option<u32>,

@@ -102,7 +102,7 @@ pub async fn change_password(State(app): State<AppState>, Posted(user, f): Poste
 
 const BAD_EXPIRY: &str = "The expiry must be a whole number of days, or empty for a token that never expires.";
 
-fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str)>) -> Response {
+pub(super) fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str)>, key_attempt: Option<(&str, &str, &str)>) -> Response {
     let Some(me) = &user.user else {
         let body = r#"<div class="eyebrow">Account</div><h1>Admin <em>token</em></h1>
 <p class="lede">You are signed in with an admin token, which has no account of its own. Keep it for emergencies, and use an account of your own day to day.</p>
@@ -126,6 +126,7 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
     let body = format!(
         r#"<div class="eyebrow">Account</div><h1>{name}</h1><p class="lede">{email} · {role}</p>
 {password}{confirm}
+{ssh_keys}
 <div class="section"><h2>API tokens</h2></div>
 {list}
 <div class="card form spaced">{form_error}<form method="post" action="/account/tokens">{csrf}
@@ -135,6 +136,7 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
 <p class="note">Use it as <code>Authorization: Bearer &lt;token&gt;</code>. It acts as you, with your current role.</p></div>
 {sign_out_everywhere}"#,
         confirm = super::email::confirm_panel(app, user),
+        ssh_keys = super::ssh::section(user, app, key_attempt),
         name = esc(if me.display_name.is_empty() { &me.email } else { &me.display_name }),
         email = esc(&me.email),
         role = me.role.as_str(),
@@ -162,11 +164,11 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
             ""
         },
     );
-    page(&title_of("Account", error.is_some()), Some(user), &body)
+    page(&title_of("Account", error.is_some() || key_attempt.is_some()), Some(user), &body)
 }
 
 pub async fn account(user: UiUser, State(app): State<AppState>) -> Response {
-    account_page(&user, &app, None)
+    account_page(&user, &app, None, None)
 }
 
 #[derive(Deserialize)]
@@ -177,7 +179,7 @@ pub struct TokenForm {
 }
 
 pub async fn create_token(State(app): State<AppState>, Posted(user, f): Posted<TokenForm>) -> Response {
-    let refused = |message: &str| (StatusCode::BAD_REQUEST, account_page(&user, &app, Some((&f, message)))).into_response();
+    let refused = |message: &str| (StatusCode::BAD_REQUEST, account_page(&user, &app, Some((&f, message)), None)).into_response();
     let days = match f.expires_in_days.trim() {
         "" => None,
         days => match days.parse::<u32>() {

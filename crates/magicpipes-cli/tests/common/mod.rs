@@ -1283,3 +1283,103 @@ impl TunnelResponse {
         self.set_cookies.iter().find(|c| c.starts_with(prefix)).cloned()
     }
 }
+
+/// A real sshd on a free port, run as this user, and keys and client settings for `ssh`.
+pub struct Sshd {
+    pub port: u16,
+    pub dir: PathBuf,
+    child: tokio::process::Child,
+}
+
+impl Sshd {
+    /// `None` where this machine has no OpenSSH server or client to test with.
+    pub async fn start(root: &Path) -> Option<Sshd> {
+        let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().find(|p| Path::new(p).exists())?;
+        which("ssh")?;
+        which("ssh-keygen")?;
+        let dir = root.join("sshd");
+        std::fs::create_dir_all(&dir).unwrap();
+        Self::keygen(&dir.join("host_key")).await;
+        std::fs::write(dir.join("authorized_keys"), "").unwrap();
+        let port = free_port();
+        let config = dir.join("sshd_config");
+        std::fs::write(
+            &config,
+            format!(
+                "Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nAuthorizedKeysFile {authorized}\nStrictModes no\nUsePAM no\nPidFile none\n\
+                 PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nSubsystem sftp internal-sftp\nLogLevel ERROR\n",
+                host = dir.join("host_key").display(),
+                authorized = dir.join("authorized_keys").display(),
+            ),
+        )
+        .unwrap();
+        let child = tokio::process::Command::new(sshd).arg("-D").arg("-e").arg("-f").arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().ok()?;
+        let this = Sshd { port, dir, child };
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return Some(this);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("sshd didn't start");
+    }
+
+    async fn keygen(path: &Path) {
+        let ok = tokio::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(path).output().await.unwrap();
+        assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    }
+
+    pub async fn stop(&mut self) {
+        let _ = self.child.kill().await;
+    }
+
+    /// A new key allowed to log in to this sshd (unless `log_in` is false). Returns someone's `ssh`
+    /// settings for it, reaching machines through the gateway on `gateway`, and the public key.
+    pub async fn person(&self, name: &str, gateway: u16, log_in: bool) -> SshClient {
+        let key = self.dir.join(format!("{name}_key"));
+        Self::keygen(&key).await;
+        let public = std::fs::read_to_string(key.with_extension("pub").as_path()).unwrap_or_else(|_| std::fs::read_to_string(format!("{}.pub", key.display())).unwrap());
+        if log_in {
+            let file = self.dir.join("authorized_keys");
+            let all = std::fs::read_to_string(&file).unwrap();
+            std::fs::write(&file, format!("{all}{public}")).unwrap();
+        }
+        let config = self.dir.join(format!("{name}_config"));
+        std::fs::write(
+            &config,
+            format!(
+                "Host gw\n  HostName 127.0.0.1\n  Port {gateway}\nHost * !gw\n  ProxyJump gw\nHost *\n  IdentityFile {key}\n  IdentitiesOnly yes\n  \
+                 UserKnownHostsFile {known}\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n  ConnectTimeout 15\n  ControlMaster no\n",
+                key = key.display(),
+                known = self.dir.join(format!("{name}_known_hosts")).display(),
+            ),
+        )
+        .unwrap();
+        SshClient { config, public: public.trim().to_string() }
+    }
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).map(|p| p.join(program)).find(|p| p.exists()))
+}
+
+/// Someone's `ssh`: their key, and a configuration that goes through the gateway.
+pub struct SshClient {
+    pub config: PathBuf,
+    pub public: String,
+}
+
+impl SshClient {
+    pub fn command(&self, program: &str) -> tokio::process::Command {
+        let mut c = tokio::process::Command::new(program);
+        c.arg("-F").arg(&self.config).stdin(Stdio::null()).kill_on_drop(true);
+        c
+    }
+
+    /// Runs `ssh <args>`: stdout, stderr and whether it succeeded.
+    pub async fn ssh(&self, args: &[&str]) -> (String, String, bool) {
+        let run = self.command("ssh").args(args).output();
+        let out = tokio::time::timeout(Duration::from_secs(30), run).await.unwrap_or_else(|_| panic!("ssh {args:?} took too long")).unwrap();
+        (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned(), out.status.success())
+    }
+}

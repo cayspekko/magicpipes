@@ -41,6 +41,9 @@ pub struct Config {
     /// Settings page.
     #[serde(default)]
     pub smtp: Option<SmtpConfig>,
+    /// The SSH gateway (`ssh -J`). Off unless present.
+    #[serde(default)]
+    pub ssh: Option<SshConfig>,
     /// Sign-in with OpenID Connect providers; one button each on the sign-in page.
     #[serde(default)]
     pub oidc: Vec<OidcConfig>,
@@ -563,6 +566,37 @@ impl Default for UsersConfig {
     }
 }
 
+/// The SSH gateway: a jump host for `magicpipes add 22 --ssh` tunnels (`[ssh]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshConfig {
+    /// Where it listens, e.g. `"0.0.0.0:2222"`.
+    pub listen: SocketAddr,
+    /// Host in the commands people are shown. Defaults to `management.hostname`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<String>,
+    /// Port in those commands, if a router or container maps it. Defaults to the one in `listen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+    /// Connections from `trusted_proxies` start with a PROXY protocol header (v1 or v2).
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    /// Open connections to the gateway.
+    #[serde(default = "default_ssh_connections")]
+    pub max_connections: usize,
+    /// Open connections per client (see `forwarded::client_key`).
+    #[serde(default = "default_ssh_connections_per_client")]
+    pub max_connections_per_client: usize,
+}
+
+fn default_ssh_connections() -> usize {
+    1024
+}
+
+fn default_ssh_connections_per_client() -> usize {
+    32
+}
+
 /// Raw TCP and UDP port tunnels (`magicpipes add 5432 --tcp`). Off unless `range` is set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -743,6 +777,18 @@ impl Config {
         let host = self.ports.public_host.as_deref().unwrap_or(&self.management.hostname);
         let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
         format!("{kind}://{host}:{port}")
+    }
+
+    /// Where people reach the SSH gateway, as `ssh -J` wants it: `host`, or `host:port` unless the
+    /// port is 22.
+    pub fn ssh_address(&self) -> Option<String> {
+        let ssh = self.ssh.as_ref()?;
+        let host = ssh.public_host.as_deref().unwrap_or(&self.management.hostname);
+        let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+        Some(match ssh.public_port.unwrap_or(ssh.listen.port()) {
+            22 => host,
+            port => format!("{host}:{port}"),
+        })
     }
 
     pub fn url_port(&self) -> u16 {

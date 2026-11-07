@@ -411,7 +411,7 @@ a certificate or an HTTP route.
   checks the kind echoed in `TunnelInfo` (absent = `http`) and fails with `server_outdated`.
   Old agents never send `kind` and keep getting HTTP tunnels.
 
-Planned ingress kinds (SSH gateway, browser desktop) are described in [ROADMAP.md](ROADMAP.md).
+Planned ingress kinds (browser desktop) are described in [ROADMAP.md](ROADMAP.md).
 
 ## Unix socket targets (`add --unix`)
 
@@ -444,6 +444,53 @@ full path can name the local user.
   has none. Downloads on a Mac stay at about 650 MB/s, against 2,100 for a port, because there the
   application is the sender: a 256 KiB send buffer in the test application alone took them to 1,200 to
   1,900. An application can set that itself; the agent can't do it for one.
+
+## SSH gateway (`add --ssh`, `data/ssh.rs`)
+
+A jump host, written with `russh`. `ssh -J` authenticates to it, then asks for a `direct-tcpip` channel
+to a tunnel's name; the channel is piped into an ordinary `ServerOpen::Data` stream, and the client's
+real SSH session runs inside. So the agent needs no change beyond accepting the kind, the server sees
+only ciphertext and holds nothing that logs in to a machine, and everything SSH does works. The other
+design, terminating SSH and replaying sessions, would have the server read every session and hold a
+credential for every machine.
+
+* **The server still names a tunnel, never an address.** The host a client asks for only picks a
+  tunnel by name, and the port is ignored. The agent dials what its own user configured. It's a tunnel
+  kind of its own, not a local target, because what differs is how people get in.
+* **One access rule.** The check is `authorize(user, Connect, tunnel)`, through the same
+  `AccessPolicy::admits` as everything else, so tunnels are always private and the public-tunnel paths
+  never see them. Refusals read like "no such machine".
+* **The key decides who, and only after it has signed.** `auth_publickey_offered` is left accepting
+  everything, so a client must prove it has the private half before the key is looked up. Answering
+  the offer would tell anyone holding a public key, and GitHub publishes those, whether it's registered
+  here. The cost is a signature per key offered, and `MAX_AUTH_ATTEMPTS` bounds those.
+* **No database on the path.** Keys are in the published `RouteTable` (`ssh_keys`, `users`, `by_ssh`). What's
+  worth keeping (`last_used_at`, the audit entry) goes through a bounded queue to the control threads,
+  which write it at most once a minute per key and machine; when the queue is full it's dropped.
+* **A slow agent holds up nothing.** A channel is answered from its own task once the agent has
+  connected, so the client sees a real error, and the session's loop keeps running in the meantime.
+* **Ending a connection** means shutting down its socket. `russh` runs the session in a task of its own
+  that can't be aborted from outside, and this works whatever that task waits for and costs nothing per
+  read. That's how the sign-in time limit, shutdown and revocation all work. Each connection watches
+  its key, and each channel its tunnel, on every publish.
+* **Bounds:** connections in all and per client (`[ssh]`); unauthenticated connections in all (128) and
+  per client (8), 60 s to sign in; 10 keys per connection; 16 channels per connection; streams through
+  `open_data` like other public traffic. A dead client is found by keepalives, not an idle limit, since a
+  quiet shell is normal.
+* **The CLI can't add keys.** It holds only the machine's credential, and if that could add a key, a stolen
+  agent token would become its owner's access to everything. A `magicpipes ssh-key add` would need a
+  browser approval like `login`.
+* **Host key:** Ed25519, `<data_dir>/ssh-host-key` in OpenSSH's format, 0600. A damaged one stops the
+  server rather than being replaced, because a new key makes every client warn about an attack.
+* **What it costs** (`scripts/bench --suite ssh`, 1 GiB through the same `ssh`, three rounds, upload and
+  download in MB/s, on one machine). The session is encrypted twice through the gateway, once for the
+  gateway and once inside. Static Linux in a VM: directly to sshd 652 and 695, a raw port 470 and 548, the
+  gateway 339 and 390. macOS: 462 and 471, 444 and 451, 416 and 412. A login took 147 ms on Linux whichever
+  way it went, and on macOS 60 ms directly and 87 ms through the gateway. The server's binary grew from
+  16.4 to 18.8 MB, and the agent's didn't change.
+* **`russh` is built with `ring`**, not its default `aws-lc-rs`, and without `rsa`, which is why RSA keys
+  aren't taken. It brings RustCrypto's Ed25519, ECDSA and AES into the server only; the agent doesn't
+  link it.
 
 ## Wire protocol
 

@@ -3938,3 +3938,169 @@ async fn unix_socket_tunnels() {
     assert_eq!(get(&host).await.0, StatusCode::NOT_FOUND);
     env.cli_ok(&["agent", "stop"]).await;
 }
+
+/// A person's public key, added on the Account page.
+async fn add_ssh_key(env: &Env, cookie: &str, name: &str, key: &str) -> common::UiResponse {
+    let account = env.ui("/account", Some(cookie), None).await;
+    env.ui("/account/ssh-keys", Some(cookie), Some(&[("csrf", &account.csrf()), ("name", name), ("public_key", key)])).await
+}
+
+/// A real sshd and a real `ssh -J`, through the gateway and a tunnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_gateway() {
+    let gateway = common::free_port();
+    let env = Env::with_config(Tls::DevCa, &format!("[ssh]\nlisten = \"127.0.0.1:{gateway}\"\n")).await;
+    let Some(mut sshd) = common::Sshd::start(&env.root).await else {
+        return eprintln!("no OpenSSH here: skipping");
+    };
+    let admin = env.admin_token();
+    env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:dev" })).await;
+    let mut ids = std::collections::HashMap::new();
+    for (email, tags) in [("ann@example.com", vec!["team:dev"]), ("bob@example.com", vec![]), ("cy@example.com", vec!["team:dev"])] {
+        let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
+        let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+        let id = v["user"]["id"].as_str().unwrap().to_string();
+        env.api_json("PATCH", &format!("/api/v1/users/{id}"), Some(&admin), serde_json::json!({ "tags": tags })).await;
+        ids.insert(email, id);
+    }
+    let ann_cookie = sign_in(&env, "ann@example.com", "correct horse battery").await;
+    let bob_cookie = sign_in(&env, "bob@example.com", "correct horse battery").await;
+    let cy_cookie = sign_in(&env, "cy@example.com", "correct horse battery").await;
+    let (ann, bob, cy, stranger) = (
+        sshd.person("ann", gateway, true).await,
+        sshd.person("bob", gateway, true).await,
+        sshd.person("cy", gateway, true).await,
+        sshd.person("stranger", gateway, true).await,
+    );
+
+    // Keys go on the Account page. What can't be used is explained, and a private key isn't repeated.
+    let page = env.ui("/account", Some(&ann_cookie), None).await;
+    assert!(page.html.contains("No SSH keys yet") && page.html.contains(&format!("ssh -J localhost:{gateway}")), "{}", page.html);
+    let private = "-----BEGIN OPENSSH PRIVATE KEY-----\nc2VjcmV0LWtleS1ib2R5\n-----END OPENSSH PRIVATE KEY-----\n";
+    let refused = add_ssh_key(&env, &ann_cookie, "oops", private).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(refused.html.contains("private key") && !refused.html.contains("c2VjcmV0"), "{}", refused.html);
+    let refused = add_ssh_key(&env, &ann_cookie, "typo", "ssh-ed25519 nonsense").await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(refused.html.contains("ssh-ed25519 nonsense"), "the form keeps what was typed: {}", refused.html);
+    assert_eq!(add_ssh_key(&env, &ann_cookie, "laptop", &ann.public).await.status, StatusCode::SEE_OTHER);
+    let refused = add_ssh_key(&env, &bob_cookie, "mine", &ann.public).await;
+    assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("already on an account"), "{}", refused.html);
+    assert_eq!(add_ssh_key(&env, &bob_cookie, "", &bob.public).await.status, StatusCode::SEE_OTHER);
+    assert_eq!(add_ssh_key(&env, &cy_cookie, "cy", &cy.public).await.status, StatusCode::SEE_OTHER);
+    assert!(env.ui("/account", Some(&ann_cookie), None).await.html.contains("SHA256:"));
+
+    // Ann's machine. The options that don't apply are refused before anything happens.
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"] });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "dev"]).await;
+    let port = sshd.port.to_string();
+    for args in [vec!["add", "--ssh"], vec!["add", &port, "--ssh", "--public"], vec!["add", &port, "--ssh", "--tcp"], vec!["add", &port, "--ssh", "--allow-any"]] {
+        assert_eq!(env.cli(&args).await.status.code(), Some(2), "{args:?}");
+    }
+    let t = add_json(&env, &[&port, "--ssh", "--name", "dev-box", "--tag", "team:dev"]).await;
+    assert_eq!((t["status"].as_str(), t["kind"].as_str(), t["visibility"].as_str()), (Some("ready"), Some("ssh"), Some("private")), "{t}");
+    assert_eq!(t["public_url"], format!("ssh -J localhost:{gateway} dev-box"), "{t}");
+    assert_eq!(env.cli_json(&["list", "--json"]).await["tunnels"][0]["kind"], "ssh");
+    let solo = add_json(&env, &[&port, "--ssh", "--name", "anns-only"]).await;
+    assert_eq!(solo["visibility"], "private", "with no options, still private: {solo}");
+
+    // The owner, and someone sharing the tag, log in to the real sshd. The bare name and the full
+    // hostname both work.
+    let (out, err, ok) = ann.ssh(&["dev-box", "echo hello from sshd"]).await;
+    assert!(ok && out == "hello from sshd\n", "{out} {err}");
+    let (out, err, ok) = cy.ssh(&[&format!("dev-box.{BASE}"), "echo hello again"]).await;
+    assert!(ok && out == "hello again\n", "{out} {err}");
+    assert!(ann.ssh(&["anns-only", "true"]).await.2);
+
+    // Nobody can tell a machine they can't reach from one that doesn't exist.
+    let (_, shared_not, ok) = bob.ssh(&["dev-box", "true"]).await;
+    assert!(!ok && shared_not.contains("no such machine"), "{shared_not}");
+    let (_, no_such, ok) = bob.ssh(&["ghost", "true"]).await;
+    assert!(!ok && no_such.contains("no such machine"), "{no_such}");
+    assert!(!cy.ssh(&["anns-only", "true"]).await.2, "her personal tag isn't Cy's");
+    // A key nobody registered gets no further, though sshd itself would have taken it.
+    let (_, err, ok) = stranger.ssh(&["dev-box", "true"]).await;
+    assert!(!ok && err.contains("Permission denied"), "{err}");
+
+    // Data in both directions, a half-close, and file copies, which is what -J is for.
+    let big = env.root.join("big.bin");
+    let contents: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+    std::fs::write(&big, &contents).unwrap();
+    let copy = env.root.join("copied.bin");
+    let copied = ann.command("scp").arg(&big).arg(format!("dev-box:{}", copy.display())).output().await.unwrap();
+    assert!(copied.status.success(), "{}", String::from_utf8_lossy(&copied.stderr));
+    assert!(std::fs::read(&copy).unwrap() == contents, "scp changed the file");
+    let piped = ann.command("ssh").args(["dev-box", "cat"]).stdin(std::fs::File::open(&big).unwrap()).output().await.unwrap();
+    assert!(piped.status.success() && piped.stdout == contents, "{} bytes back: {}", piped.stdout.len(), String::from_utf8_lossy(&piped.stderr));
+
+    // The gateway itself runs nothing, says what you can reach and writes the configuration.
+    let (out, err, ok) = cy.ssh(&["gw"]).await;
+    assert!(ok && out.contains("dev-box") && !out.contains("anns-only"), "{out} {err}");
+    assert!(out.contains(&format!("ssh -J localhost:{gateway} dev-box")), "{out}");
+    let (out, _, ok) = bob.ssh(&["gw"]).await;
+    assert!(ok && out.contains("No machines are shared with you"), "{out}");
+    let (out, _, ok) = cy.ssh(&["gw", "config"]).await;
+    assert!(ok && out == format!("Host dev-box\n    ProxyJump localhost:{gateway}\n\n"), "{out}");
+    let (out, _, ok) = cy.ssh(&["gw", "cat /etc/passwd"]).await;
+    assert!(!ok && out.contains("runs no commands"), "{out}");
+    let (_, err, ok) = cy.ssh(&["-N", "-o", "ExitOnForwardFailure=yes", "-R", "127.0.0.1:9:127.0.0.1:9", "gw"]).await;
+    assert!(!ok, "no forwarding back in: {err}");
+
+    // It's written down, and the key shows when it was used.
+    env.eventually("the audit log says who connected", Duration::from_secs(5), async || {
+        env.api("GET", "/api/v1/audit", Some(&admin)).await.1.to_string().contains("ssh.connect")
+    })
+    .await;
+    assert!(!env.ui("/account", Some(&ann_cookie), None).await.html.contains(">never<"), "last used");
+
+    // A session ends as soon as the tag that let them in goes.
+    let mut held = cy.command("ssh").args(["dev-box", "sleep 300"]).spawn().unwrap();
+    let cy_id = ids["cy@example.com"].clone();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(held.try_wait().unwrap().is_none(), "the session is open");
+    env.api_json("PATCH", &format!("/api/v1/users/{cy_id}"), Some(&admin), serde_json::json!({ "tags": [] })).await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), held.wait()).await;
+    assert!(ended.is_ok(), "the session outlived the tag");
+    let (_, err, ok) = cy.ssh(&["dev-box", "true"]).await;
+    assert!(!ok && err.contains("no such machine"), "{err}");
+
+    // So does one whose key is deleted, and the key is no use after that.
+    let mut held = ann.command("ssh").args(["dev-box", "sleep 300"]).spawn().unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(held.try_wait().unwrap().is_none(), "the session is open");
+    let account = env.ui("/account", Some(&ann_cookie), None).await;
+    let id = account.html.split("/account/ssh-keys/").nth(1).and_then(|s| s.split('/').next()).expect("a key to delete").to_string();
+    let gone = env.ui(&format!("/account/ssh-keys/{id}/delete"), Some(&ann_cookie), Some(&[("csrf", &account.csrf())])).await;
+    assert_eq!(gone.status, StatusCode::SEE_OTHER);
+    let ended = tokio::time::timeout(Duration::from_secs(10), held.wait()).await;
+    assert!(ended.is_ok(), "the session outlived the key");
+    let (_, err, ok) = ann.ssh(&["dev-box", "true"]).await;
+    assert!(!ok && err.contains("Permission denied"), "{err}");
+    assert_eq!(add_ssh_key(&env, &ann_cookie, "again", &ann.public).await.status, StatusCode::SEE_OTHER);
+
+    // Someone who may reach a machine hears why they can't.
+    sshd.stop().await;
+    let (_, err, ok) = ann.ssh(&["dev-box", "true"]).await;
+    assert!(!ok && err.contains("did not answer"), "{err}");
+    let (code, error, _) = add_fails(&env, &[&port, "--ssh", "--name", "dev-box"]).await;
+    assert_eq!((code, error.as_str()), (4, "local_unreachable"));
+    env.cli_ok(&["agent", "stop"]).await;
+    env.eventually("the machine shows as offline", Duration::from_secs(10), async || ann.ssh(&["dev-box", "true"]).await.1.contains("dev-box is offline")).await;
+}
+
+/// A server without a gateway says so, and offers no keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_tunnels_need_a_gateway() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::tcp_echo_app().await;
+    let (code, error, message) = add_fails(&env, &[&app.port.to_string(), "--ssh"]).await;
+    assert_eq!((code, error.as_str()), (6, "ssh_disabled"), "{message}");
+    let admin = env.admin_token();
+    let body = serde_json::json!({ "email": "ann@example.com", "password": "correct horse battery" });
+    env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    let cookie = sign_in(&env, "ann@example.com", "correct horse battery").await;
+    assert!(!env.ui("/account", Some(&cookie), None).await.html.contains("SSH keys"));
+}

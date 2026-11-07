@@ -12,6 +12,7 @@
 //! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
+//! * `ssh` — public keys for the SSH gateway, and what it reports back;
 //! * `settings` — sign-in settings and certificates made on the Settings page, and the generated
 //!   configuration;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
@@ -26,6 +27,7 @@ mod oidc;
 mod registry;
 mod sessions;
 mod settings;
+mod ssh;
 mod tags;
 mod users;
 mod views;
@@ -47,13 +49,14 @@ use tokio_util::sync::CancellationToken;
 use crate::authz::{self, Action, AgentAuthz, Principal, Resource, TunnelAuthz};
 use crate::certs::CertManager;
 use crate::config::Config;
-use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable, TunnelUser};
+use crate::data::{AccessPolicy, DataPlane, GatewayKey, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
 pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
 pub use email::{AcceptError, INVITATION_DAYS, InvitationView, LinkError, OpenInvitation, SIGN_IN_LINK_MINUTES};
 pub use oidc::SignInError;
 pub use registry::TunnelSignIn;
 pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, NewSmtp, ProviderChanges, ProviderView, SmtpView};
+pub use ssh::looks_private as looks_like_private_key;
 pub use tags::EnrollmentOptions;
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
@@ -230,6 +233,7 @@ impl ControlPlane {
             self.certs.ensure(&h);
         }
         self.start_mail_queue(shutdown.clone());
+        self.start_gateway_reports(shutdown.clone());
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -252,6 +256,9 @@ impl ControlPlane {
             let principal = Principal::User { id: u.id.clone(), role: u.role, tags: st.dir.user_tags(&u.id) };
             table.users.insert(u.id.clone(), TunnelUser { email: u.email.clone(), principal, valid_after: u.sessions_valid_after });
         }
+        for k in st.dir.ssh_keys() {
+            table.ssh_keys.insert(k.fingerprint.clone(), GatewayKey { id: k.id.clone(), user_id: k.user_id.clone() });
+        }
         for t in st.tunnels.values() {
             // A disabled owner's agents serve nothing.
             if !st.dir.agent_active(&t.row.agent_id) {
@@ -272,6 +279,9 @@ impl ControlPlane {
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {
                     table.by_host.insert(t.row.hostname.clone(), route);
+                }
+                (Kind::Ssh, _) => {
+                    table.by_ssh.insert(t.row.name.clone(), route);
                 }
                 // The [ports] range may have been narrowed or removed since: then the port stays
                 // closed (the tunnel shows as offline) rather than reopening outside it.

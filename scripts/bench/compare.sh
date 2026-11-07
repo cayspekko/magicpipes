@@ -2,7 +2,7 @@
 # Runs a suite on several builds in turn, several rounds, and prints a table. Taking turns matters:
 # a machine drifts, and a single run on a VM can be 10-20% off.
 #
-# Usage: compare.sh [--suite traffic|control|memory|wan|unix] [--rounds N] <build> [<build>...]
+# Usage: compare.sh [--suite traffic|control|memory|wan|unix|ssh] [--rounds N] <build> [<build>...]
 #
 # Builds are names in target/bench (or BENCH_DIR, on a machine without the repository's target
 # folder). The first is what the others are compared with. Raw results stay in <that>/results.

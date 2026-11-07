@@ -2,7 +2,7 @@
 # One run of one benchmark suite against one build, on this machine. Prints one line per
 # measurement. `compare.sh` is usually what you want; see README.md here.
 #
-# Usage: bench.sh <traffic|control|memory|wan|unix> <build dir>
+# Usage: bench.sh <traffic|control|memory|wan|unix|ssh> <build dir>
 #
 # A build dir holds magicpipes and magicpipesd; `build.sh` makes them. Settings, all optional:
 #   BENCH_TOOLS            folder with mp-bench-load and mp-bench-app (default: <build dir>/../tools)
@@ -12,7 +12,7 @@
 #   BENCH_KEEP             set to keep the run's folder, with the server's log
 set -uo pipefail
 
-USAGE="usage: bench.sh <traffic|control|memory|wan|unix> <build dir>"
+USAGE="usage: bench.sh <traffic|control|memory|wan|unix|ssh> <build dir>"
 SUITE=${1:?$USAGE}
 BIN=$(cd "${2:?$USAGE}" && pwd) || exit 2
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -25,8 +25,8 @@ for need in "$BIN/magicpipes" "$BIN/magicpipesd" "$LOAD" "$TOOLS/mp-bench-app"; 
 done
 
 # MGMT carries the agent's session, which is what wan.sh shapes.
-HTTPS=21443 HTTP=21080 MGMT=21844 APP=21900 IPERF=21901 IPERF_PUBLIC=21951
-for port in $HTTPS $HTTP $MGMT $APP $IPERF $IPERF_PUBLIC; do
+HTTPS=21443 HTTP=21080 MGMT=21844 APP=21900 IPERF=21901 IPERF_PUBLIC=21951 SSHD=21902 GATEWAY=21960
+for port in $HTTPS $HTTP $MGMT $APP $IPERF $IPERF_PUBLIC $SSHD $GATEWAY; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     echo "port $port is in use; is another benchmark running?" >&2
     exit 2
@@ -42,13 +42,13 @@ CA=$RUN/server/dev-ca/ca.crt
 export MAGICPIPES_HOME=$RUN/home MAGICPIPES_PROBE_ADDR=127.0.0.1 MAGICPIPES_NO_BROWSER=1
 mkdir -p "$MAGICPIPES_HOME"
 
-SERVER="" APP_PID="" IPERF_PID="" AGENT=""
+SERVER="" APP_PID="" IPERF_PID="" AGENT="" SSHD_PID=""
 cleanup() {
   trap - EXIT
   [ -f home/agent.pid ] && AGENT=$(cat home/agent.pid)
   # Only what this run started: a real agent on this machine has another home.
   # shellcheck disable=SC2086
-  kill $AGENT $SERVER $APP_PID $IPERF_PID 2>/dev/null
+  kill $AGENT $SERVER $APP_PID $IPERF_PID $SSHD_PID 2>/dev/null
   if [ -n "$SERVER" ]; then
     grep -E "panicked| ERROR " server.log | head -5 >&2
   fi
@@ -183,6 +183,100 @@ suite_unix() {
     measure "${name}_download_4" mb_s "$host" --conc 4 --path /big/2048
     measure "${name}_upload_1gib" p50 "$host" --conc 1 --reqs 1 --post 1073741824
   done
+}
+
+# A person with a key on their account, and their machine enrolled, for the ssh suite.
+ssh_person() {
+  local admin url=https://localhost:$MGMT jar=cookies.txt email=bench@example.com password csrf id token
+  admin=$(cat server/admin-token)
+  password=correct-horse-battery-staple
+  local curl="curl -sS --cacert $CA"
+  id=$($curl -H "Authorization: Bearer $admin" -H 'content-type: application/json' -d "{\"email\":\"$email\",\"password\":\"$password\"}" "$url/api/v1/users" |
+    sed -E 's/.*"id":"(us_[^"]+)".*/\1/')
+  $curl -c "$jar" -o /dev/null --data-urlencode "email=$email" --data-urlencode "password=$password" "$url/login"
+  csrf=$($curl -b "$jar" "$url/password" | sed -nE 's/.*name="csrf" value="([^"]+)".*/\1/p' | head -1)
+  $curl -b "$jar" -c "$jar" -o /dev/null --data-urlencode "csrf=$csrf" --data-urlencode "current=$password" --data-urlencode "new=$password again" --data-urlencode "repeat=$password again" "$url/password"
+  csrf=$($curl -b "$jar" "$url/account" | sed -nE 's/.*name="csrf" value="([^"]+)".*/\1/p' | head -1)
+  $curl -b "$jar" -o /dev/null --data-urlencode "csrf=$csrf" --data-urlencode "public_key=$(cat ssh/client.pub)" "$url/account/ssh-keys"
+  token=$($curl -H "Authorization: Bearer $admin" -H 'content-type: application/json' -d "{\"owner_user_id\":\"$id\"}" "$url/api/v1/enrollments" |
+    sed -E 's/.*"enrollment_token":"([^"]+)".*/\1/')
+  "$BIN/magicpipes" login --server "$url" --token "$token" --ca-cert "$CA" --name bench > login.out 2>&1 || fail "login failed" login.out
+}
+
+now() {
+  perl -MTime::HiRes=time -e 'printf "%.3f\n", time'
+}
+
+# What the gateway costs: the same 1 GiB and the same logins directly to sshd, through a raw port
+# tunnel, and through the gateway, with the same ssh, in the same run.
+suite_ssh() {
+  "$BIN/magicpipes" add --help | grep -q -- '--ssh' || fail "this build has no --ssh"
+  local sshd=/usr/sbin/sshd
+  [ -x "$sshd" ] && command -v ssh > /dev/null || fail "this needs OpenSSH's sshd and ssh"
+  printf '[ssh]\nlisten = "127.0.0.1:%s"\n' "$GATEWAY" >> server.toml
+  mkdir -p ssh
+  ssh-keygen -q -t ed25519 -N '' -f ssh/host
+  ssh-keygen -q -t ed25519 -N '' -f ssh/client
+  cp ssh/client.pub ssh/authorized_keys
+  cat > ssh/sshd_config <<EOF
+Port $SSHD
+ListenAddress 127.0.0.1
+HostKey $RUN/ssh/host
+AuthorizedKeysFile $RUN/ssh/authorized_keys
+StrictModes no
+UsePAM no
+PidFile none
+PasswordAuthentication no
+LogLevel ERROR
+EOF
+  "$sshd" -D -e -f "$RUN/ssh/sshd_config" >> sshd.log 2>&1 &
+  SSHD_PID=$!
+  disown "$SSHD_PID"
+  start_server
+  ssh_person
+  add "$SSHD" --ssh --name box
+  add "$SSHD" --tcp --allow-any --name raw --remote-port 21959
+  AGENT=$(cat home/agent.pid)
+  cat > ssh/config <<EOF
+Host direct
+  HostName 127.0.0.1
+  Port $SSHD
+Host port
+  HostName 127.0.0.1
+  Port 21959
+Host gw
+  HostName 127.0.0.1
+  Port $GATEWAY
+Host box
+  ProxyJump gw
+Host *
+  IdentityFile $RUN/ssh/client
+  IdentitiesOnly yes
+  UserKnownHostsFile /dev/null
+  StrictHostKeyChecking no
+  LogLevel ERROR
+  BatchMode yes
+EOF
+  local path start end size=1073741824
+  for path in direct port box; do
+    local name=$path
+    [ "$path" = box ] && name=gateway
+    ssh -F ssh/config "$path" true || fail "ssh to $path failed" sshd.log
+    start=$(now)
+    for _ in 1 2 3 4 5 6 7 8; do ssh -F ssh/config "$path" true; done
+    end=$(now)
+    printf 'test=%s_login key=ms ms=%s\n' "$name" "$(awk "BEGIN {print ($end - $start) * 1000 / 8}")"
+    start=$(now)
+    head -c "$size" /dev/zero | ssh -F ssh/config "$path" 'cat > /dev/null'
+    end=$(now)
+    printf 'test=%s_upload_1gib key=mb_s mb_s=%s\n' "$name" "$(awk "BEGIN {print 1024 / ($end - $start)}")"
+    start=$(now)
+    ssh -F ssh/config "$path" "head -c $size /dev/zero" > /dev/null
+    end=$(now)
+    printf 'test=%s_download_1gib key=mb_s mb_s=%s\n' "$name" "$(awk "BEGIN {print 1024 / ($end - $start)}")"
+  done
+  printf 'test=server_rss_after key=mb mb=%s\n' "$(ps -o rss= -p "$SERVER" | awk '{print $1 / 1024}')"
+  printf 'test=agent_rss_after key=mb mb=%s\n' "$(ps -o rss= -p "$AGENT" | awk '{print $1 / 1024}')"
 }
 
 suite_traffic() {
@@ -320,5 +414,6 @@ case $SUITE in
   memory) suite_memory ;;
   wan) suite_wan ;;
   unix) suite_unix ;;
+  ssh) suite_ssh ;;
   *) echo "$USAGE" >&2; exit 2 ;;
 esac

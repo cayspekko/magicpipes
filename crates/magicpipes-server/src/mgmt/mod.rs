@@ -22,6 +22,7 @@ mod oidc;
 mod picker;
 mod proxy_auth;
 mod settings;
+mod ssh;
 mod ui;
 
 use std::collections::HashMap;
@@ -128,6 +129,8 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/account/tokens", post(accounts::create_token))
         .route("/account/tokens/{id}/delete", post(accounts::delete_token))
         .route("/account/logout-everywhere", post(accounts::logout_everywhere))
+        .route("/account/ssh-keys", post(ssh::add_key))
+        .route("/account/ssh-keys/{id}/delete", post(ssh::delete_key))
         .route("/account/address", post(email::request_confirmation))
         .route("/account/address/confirm", get(email::confirm_form).post(email::confirm))
         .route("/users", get(accounts::users).post(accounts::create_user))
@@ -175,6 +178,8 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/invitations/{id}/resend", post(api::resend_invitation))
         .route("/api/v1/tokens", get(api::list_tokens).post(api::create_token))
         .route("/api/v1/tokens/{id}", axum::routing::delete(api::delete_token))
+        .route("/api/v1/ssh-keys", get(api::list_ssh_keys).post(api::add_ssh_key))
+        .route("/api/v1/ssh-keys/{id}", axum::routing::delete(api::delete_ssh_key))
         .route("/api/v1/audit", get(api::audit))
         .route("/api/v1/enroll", post(api::enroll))
         .route("/api/v1/device", post(api::start_device))

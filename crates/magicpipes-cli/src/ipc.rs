@@ -16,7 +16,7 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// `agent.ipc_version`; one that doesn't is older than 2. 3: `access` became `tags`. 4:
 /// `hostname` and `no_verify`, and the step state `skipped`. 5: `keep_list`, `site`,
 /// `allow_sensitive_root` and `allow_any`. 6: `unix` and `allow_sensitive_socket`.
-pub const IPC_VERSION: u32 = 6;
+pub const IPC_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -240,6 +240,7 @@ mod tests {
             serde_json::json!({ "visibility": "private" }),
             serde_json::json!({ "tags": ["dev"] }),
             serde_json::json!({ "kind": "tcp" }),
+            serde_json::json!({ "kind": "ssh" }),
             serde_json::json!({ "allow": ["10.0.0.0/8"] }),
         ] {
             assert!(req(extra.clone()).needs_current_agent(), "{extra}");

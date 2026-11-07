@@ -70,3 +70,7 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # docker-compose.yml.
 # [ports]
 # range = "65500-65535"
+
+# The SSH gateway (`magicpipes add 22 --ssh`, `ssh -J`). Also publish the port in docker-compose.yml.
+# [ssh]
+# listen = "0.0.0.0:2222"

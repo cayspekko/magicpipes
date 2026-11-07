@@ -47,7 +47,9 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   [`TunnelInfo`] echoes them.
 /// * 4: custom hostnames. [`RegisterTunnel`] carries `hostname`; an older server would ignore
 ///   it and serve the tunnel at `<name>.<base_domain>`.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// * 5: SSH tunnels. [`RegisterTunnel`] may carry the kind [`Kind::Ssh`], which an older server
+///   can't read, so the agent checks this version first.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -115,6 +117,8 @@ pub enum Kind {
     Tcp,
     /// A UDP port from the server's port range.
     Udp,
+    /// A name on the server's SSH gateway (`ssh -J`). Protocol 5.
+    Ssh,
 }
 
 impl Kind {
@@ -122,11 +126,17 @@ impl Kind {
         *self == Kind::Http
     }
 
+    /// Does it take a port from the server's port range?
+    pub fn has_port(&self) -> bool {
+        matches!(self, Kind::Tcp | Kind::Udp)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Http => "http",
             Kind::Tcp => "tcp",
             Kind::Udp => "udp",
+            Kind::Ssh => "ssh",
         }
     }
 
@@ -135,6 +145,7 @@ impl Kind {
             "http" => Some(Kind::Http),
             "tcp" => Some(Kind::Tcp),
             "udp" => Some(Kind::Udp),
+            "ssh" => Some(Kind::Ssh),
             _ => None,
         }
     }
@@ -240,7 +251,8 @@ pub struct TunnelInfo {
     pub id: String,
     pub name: String,
     pub hostname: String,
-    /// `https://…`, or `tcp://host:port` / `udp://host:port` for port tunnels.
+    /// `https://…`, `tcp://host:port` / `udp://host:port` for port tunnels, or the `ssh -J` command
+    /// for an SSH tunnel.
     pub public_url: String,
     /// `true` if this call created the tunnel, `false` if it already existed.
     pub created: bool,
@@ -444,6 +456,10 @@ mod tests {
         });
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""visibility":"private""#) && json.contains(r#""tags":["dev"]"#), "{json}");
+        // Protocol 5: an older peer can't read this kind, so the agent checks the version first.
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x","kind":"ssh"}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Ssh, .. })));
+        assert!(serde_json::to_string(&Kind::Ssh).unwrap() == r#""ssh""# && Kind::parse("ssh") == Some(Kind::Ssh) && !Kind::Ssh.has_port() && !Kind::Ssh.is_http());
     }
 
     #[test]

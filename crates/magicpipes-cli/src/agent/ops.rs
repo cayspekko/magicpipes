@@ -155,7 +155,7 @@ impl Agent {
             // A datagram service cannot be checked end to end (it need not answer anything).
             Kind::Udp => out["verified"] = json!(false),
             Kind::Http if req.no_verify => out["verified"] = json!(false),
-            Kind::Http => {}
+            Kind::Http | Kind::Ssh => {}
         }
         Ok(out)
     }
@@ -200,6 +200,10 @@ impl Agent {
         if hostname.is_some() && self.session.server_protocol().is_some_and(|v| v < 4) {
             return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support custom hostnames; it needs a newer magicpipesd"));
         }
+        // An older server can't read this kind of tunnel at all.
+        if req.kind == Kind::Ssh && self.session.server_protocol().is_some_and(|v| v < 5) {
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support SSH tunnels; it needs a newer magicpipesd"));
+        }
         // A writable shell keeps its key across re-adds, so links already shared keep working.
         if let Target::Shell { writable: true, key, .. } = &mut target {
             let old = existing.as_ref().and_then(|t| match &t.target {
@@ -220,7 +224,7 @@ impl Agent {
             .map(ToString::to_string)
             .collect();
         let allow = match &existing {
-            _ if !asked.is_empty() || req.allow_any || req.kind.is_http() => asked,
+            _ if !asked.is_empty() || req.allow_any || !req.kind.has_port() => asked,
             Some(t) => t.allow.clone(),
             // A raw port has nothing in front of it but the service itself, so this is asked for.
             None => {
@@ -550,8 +554,8 @@ impl Agent {
 async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
     if let Some(path) = &req.unix {
         // A socket here is a stream: UDP has nothing to send datagrams to.
-        if req.kind == Kind::Udp {
-            return Err(ErrorInfo::new(ErrorCode::InvalidRequest, "--udp needs a local port"));
+        if matches!(req.kind, Kind::Udp | Kind::Ssh) {
+            return Err(ErrorInfo::new(ErrorCode::InvalidRequest, format!("--{} needs a local port", req.kind)));
         }
         cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?;
         return Ok(Target::Unix { unix: unix::check(path, req.allow_sensitive_socket).await? });

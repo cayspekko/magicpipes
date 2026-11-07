@@ -252,6 +252,7 @@ The defaults are the safe ones. These turn something on, or tighten it further, 
 | `[ports] tcp_idle_timeout_secs` | off | The same for raw TCP ports |
 | `[public] max_connections_per_client` | 64 | Open HTTPS connections per client address |
 | `[management] max_connections`, `max_connections_per_client` | 1024, 64 | The same for the management listener. An agent's session stops counting once it has signed in |
+| `[ssh] max_connections`, `max_connections_per_client` | 1024, 32 | Open connections to the SSH gateway |
 | `[users] max_agents_per_user` | 25 | Machines a member may enroll themself (0: no limit) |
 
 ### Single sign-on
@@ -767,6 +768,51 @@ UDP needs a port, and Windows isn't supported yet: `--unix` fails there with `un
 
 Socket paths are limited to about 100 bytes by the operating system.
 
+### SSH
+
+With `[ssh]` in the server's configuration, a machine's sshd can be reached through the server, from
+anywhere, with nothing else opened to the internet:
+
+```console
+$ magicpipes add 22 --ssh --name dev-box --tag team:dev
+Checking local service...     ✓
+Connecting to server...       ✓
+Registering tunnel...         ✓
+Checking tunnel...            ✓
+
+Tunnel ready
+
+  SSH:    ssh -J mp.example.com:2222 dev-box
+  Local:  ssh://127.0.0.1:22
+```
+
+Whoever connects needs a public key on their account, under **Account → SSH keys**, or
+`POST /api/v1/ssh-keys`. Then:
+
+```console
+$ ssh -J mp.example.com:2222 doug@dev-box
+```
+
+* **There are two locks.** The gateway checks that your key is on an account that shares a tag with
+  the tunnel; owners get in through their personal tag. Then the machine's own sshd logs you in as usual,
+  with its `authorized_keys`. Neither replaces the other. The same key can do both, but needn't.
+* **The server can't read the session.** Your `ssh` talks to the real sshd inside the tunnel, so scp,
+  rsync, git and port forwarding all work, the server holds no credentials for your machines, and it
+  sees only encrypted traffic. Your `ssh` checks the machine's host key as it would anywhere, so the
+  first connection asks about it. The gateway's own key is on the Account page.
+* **It's always private.** `--public` is refused. For a port anyone can reach, use `--tcp`.
+* **The gateway does nothing else.** It runs no commands and forwards nothing back in. Plain
+  `ssh -p 2222 mp.example.com` lists the machines you can reach, and
+  `ssh -p 2222 mp.example.com config >> ~/.ssh/config` makes plain `ssh dev-box` work. A machine you
+  can't reach gets the same answer as one that doesn't exist.
+* **Access follows your account.** Losing the tag, deleting the key, or being disabled ends sessions
+  at once. Keys don't expire, and signing out everywhere leaves them alone.
+* **Keys are Ed25519 or ECDSA**, up to 20 per account, and each can be on only one account. RSA and
+  hardware (`sk-`) keys aren't taken yet: make one with `ssh-keygen -t ed25519`.
+
+`--host` reaches an sshd elsewhere on the machine's network. Connections appear in the audit log as
+`ssh.connect`, once a minute per key and machine at most.
+
 ### TCP and UDP ports
 
 For anything that is not HTTP (databases, SSH, game servers, MQTT, DNS), `--tcp` or `--udp`
@@ -865,7 +911,7 @@ On failure:
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden`, `unauthenticated` | Enrollment, credentials or local configuration |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `invalid_socket`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, `--unix` path not a socket or refused, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated`, `mail_failed` | Cannot reach server or agent, or the running agent (or, for the server, the machine's magicpipes) is too old for the request |
-| 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr`, `mail_not_configured` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
+| 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `ssh_disabled`, `ssh_key_taken`, `server_outdated`, `unsupported`, `invalid_cidr`, `mail_not_configured` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
 | 8 | `probe_failed` | Public URL did not reach the application |
 
@@ -957,6 +1003,9 @@ administrators answer `403 forbidden` to members.
 | GET | `/api/v1/tokens` | Your API tokens (never their secrets) |
 | POST | `/api/v1/tokens` | 201 `{"api_token", "token"}`; body `{"name", "expires_in_days"?}`; the secret is returned once; at most 20 per user |
 | DELETE | `/api/v1/tokens/{id}` | 204 |
+| GET | `/api/v1/ssh-keys` | Your public keys for the SSH gateway |
+| POST | `/api/v1/ssh-keys` | 201 `{"ssh_key"}`; body `{"public_key", "name"?}`; `invalid_ssh_key` (400), `ssh_key_taken` (409), or `limit_reached` (409) past 20 |
+| DELETE | `/api/v1/ssh-keys/{id}` | 204; connections using it end |
 | GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 

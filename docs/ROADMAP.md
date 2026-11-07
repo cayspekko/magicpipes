@@ -39,7 +39,7 @@ What you expose, and every way people can reach it:
 | Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
 | Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP) | — | — |
 | Any UDP service | `add 53 --udp` | — | ✅ today (UDP) | — | — |
-| SSH | `add 22 --ssh` | — | ✅ TCP (optional) | ✅ end-to-end | 🖥 terminal (server-side SSH client) |
+| SSH | `add 22 --ssh` | — | ✅ TCP (`add 22 --tcp`) | ✅ today | 🖥 terminal (server-side SSH client) |
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP for native clients | — | 🖥 desktop (IronRDP) |
 | VNC | `add 5900 --vnc` | — | ✅ TCP | — | 🖥 desktop (noVNC) |
@@ -132,6 +132,12 @@ Our design:
   port (Postgres, MQTT, any TLS-speaking service). The data plane already reads SNI.
 
 ## SSH gateway
+
+**Shipped** as `add --ssh` (see ARCHITECTURE.md, "SSH gateway"). It follows the design below, except
+that keys are added on the Account page or through the API, since a `magicpipes ssh-key add` would let a
+stolen agent token add keys; and the gateway itself writes the `~/.ssh/config` entries
+(`ssh -p 2222 host config`), since it knows what a person can reach and the CLI on their machine doesn't.
+Only Ed25519 and ECDSA keys so far, and the web terminal is still to come.
 
 The original idea was "the key decides which machine you reach, and the server mirrors the
 client's ssh commands". That cannot be done transparently: the key only appears during user
@@ -259,7 +265,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | none for sockets | done |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in and email done) |
-| 5 | SSH gateway + SSH web terminal | yes | planned |
+| 5 | SSH gateway + SSH web terminal | yes | gateway done; web terminal planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |

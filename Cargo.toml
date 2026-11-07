@@ -55,4 +55,5 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 portable-pty = "0.9"
 socket2 = { version = "0.6", features = ["all"] }
+russh = { version = "0.65", default-features = false, features = ["ring"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }

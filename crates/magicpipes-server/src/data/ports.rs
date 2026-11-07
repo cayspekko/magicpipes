@@ -82,7 +82,7 @@ pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: Cancellati
             let socket = Arc::new(UdpSocket::from_std(std)?);
             tokio::spawn(serve_udp(dp, port, socket, stop));
         }
-        Kind::Http => return Err(io::Error::other("HTTP tunnels have no port of their own")),
+        Kind::Http | Kind::Ssh => return Err(io::Error::other("this kind of tunnel has no port of its own")),
     }
     Ok(())
 }
@@ -119,7 +119,7 @@ async fn revoked(dp: &DataPlane, kind: Kind, port: u16, peer: IpAddr, tunnel_id:
 }
 
 /// Opens a data stream to the agent for `client` and waits for its status byte.
-async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
+pub(super) async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
     let timeout = dp.settings.stream_open_timeout;
     let key = client_key(client);
     let mut stream = match dp.with_room(session, || session.open_data(timeout, key)).await {

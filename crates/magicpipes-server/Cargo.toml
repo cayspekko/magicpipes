@@ -45,6 +45,7 @@ ring.workspace = true
 base64.workspace = true
 webpki-roots.workspace = true
 lettre.workspace = true
+russh.workspace = true
 tower = { version = "0.5", features = ["util"] }
 
 # musl's allocator takes a global lock. See "Threads and memory" in docs/ARCHITECTURE.md.

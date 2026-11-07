@@ -105,13 +105,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
 
 /// Open connections per client key.
 #[derive(Default)]
-struct PerClient(Mutex<HashMap<IpAddr, usize>>);
+pub(crate) struct PerClient(Mutex<HashMap<IpAddr, usize>>);
 
 /// One counted connection; released on drop.
-struct ClientSlot(Arc<PerClient>, IpAddr);
+pub(crate) struct ClientSlot(Arc<PerClient>, IpAddr);
 
 impl PerClient {
-    fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<ClientSlot> {
+    pub(crate) fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<ClientSlot> {
         let key = client_key(ip);
         let mut map = self.0.lock().unwrap();
         let n = map.entry(key).or_insert(0);

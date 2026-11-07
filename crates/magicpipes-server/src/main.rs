@@ -232,6 +232,10 @@ async fn run(cfg: Config, control_rt: tokio::runtime::Handle) -> anyhow::Result<
         None => None,
     };
     let mgmt = bind(cfg.management.listen, "management").await?;
+    let ssh = match &cfg.ssh {
+        Some(s) => Some((bind(s.listen, "SSH gateway").await?, data::ssh::load_host_key(&cfg.data_dir)?, s.clone())),
+        None => None,
+    };
 
     let tracker = TaskTracker::new();
 
@@ -274,6 +278,9 @@ async fn run(cfg: Config, control_rt: tokio::runtime::Handle) -> anyhow::Result<
     ));
     if let Some(l) = public_http {
         tasks.spawn(data::ingress::serve_http(l, certs.challenges(), cfg.url_port(), shutdown.clone(), tracker.clone()));
+    }
+    if let Some((listener, key, settings)) = ssh {
+        tasks.spawn(data::ssh::serve(listener, key, data.clone(), settings, shutdown.clone()));
     }
     tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), control_rt, shutdown.clone(), tracker.clone()));
 

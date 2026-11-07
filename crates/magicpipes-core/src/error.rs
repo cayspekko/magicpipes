@@ -118,6 +118,12 @@ codes! {
     PortUnavailable = "port_unavailable", http 409, exit 6;
     KindMismatch = "kind_mismatch", http 409, exit 6;
     PortsDisabled = "ports_disabled", http 409, exit 6;
+    /// `add --ssh`: this server's configuration has no `[ssh]` gateway.
+    SshDisabled = "ssh_disabled", http 409, exit 6;
+    /// Not a public key this server can use (the Account page and `/api/v1/ssh-keys`).
+    InvalidSshKey = "invalid_ssh_key", http 400, exit 1;
+    /// That public key is already on an account: a key stands for one person.
+    SshKeyTaken = "ssh_key_taken", http 409, exit 6;
     /// The server is older than this request requires.
     ServerOutdated = "server_outdated", http 501, exit 6;
 
@@ -183,7 +189,7 @@ mod tests {
             (4, &["local_unreachable", "invalid_port", "invalid_host", "invalid_directory", "invalid_command", "invalid_socket", "spawn_failed"]),
             (5, &["server_unreachable", "agent_unavailable", "agent_start_failed", "agent_not_running", "agent_protocol", "agent_outdated", "mail_failed"]),
             (6, &["name_conflict", "name_taken", "email_taken", "tag_unknown", "public_not_allowed", "invalid_name", "limit_reached", "not_found", "port_unavailable", "kind_mismatch",
-                  "ports_disabled", "server_outdated", "invalid_cidr", "unsupported", "mail_not_configured"]),
+                  "ports_disabled", "ssh_disabled", "ssh_key_taken", "server_outdated", "invalid_cidr", "unsupported", "mail_not_configured"]),
             (7, &["tls_failed", "tls_timeout"]),
             (8, &["probe_failed"]),
         ];

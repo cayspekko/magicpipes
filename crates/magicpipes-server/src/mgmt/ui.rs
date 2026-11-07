@@ -51,6 +51,8 @@ done_messages! {
     MachineRevoked "machine-revoked" "Machine revoked, and its tunnels deleted.",
     TagsSaved "tags-saved" "Tags saved.",
     TokenDeleted "token-deleted" "API token deleted.",
+    SshKeyAdded "ssh-key-added" "SSH key added.",
+    SshKeyDeleted "ssh-key-deleted" "SSH key deleted.",
     PasswordChanged "password-changed" "Password changed. Other devices were signed out.",
     UserAdded "user-added" "User added. They replace that password when they first sign in.",
     UserAddedForProxy "user-added-proxy" "User added.",
@@ -457,7 +459,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     dl.push_str(&field("Who can open it", &format!("{}{change}", access_cell(t, people, false))));
     if t.kind.is_http() {
         dl.push_str(&field("TLS certificate", &badge(t.tls)));
-    } else {
+    } else if t.kind.has_port() {
         let allow = if t.allow.is_empty() { "anyone".to_string() } else { esc(&t.allow.join(", ")) };
         dl.push_str(&field("Allowed clients", &allow));
     }

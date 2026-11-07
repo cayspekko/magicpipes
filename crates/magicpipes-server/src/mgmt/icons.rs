@@ -42,6 +42,7 @@ pub fn tunnel_kind(kind: magicpipes_core::proto::Kind, target: &str) -> (&'stati
     match kind {
         Kind::Tcp => (PLUG, "TCP port"),
         Kind::Udp => (RADIO, "UDP port"),
+        Kind::Ssh => (TERMINAL, "SSH"),
         Kind::Http if target.starts_with("static:") => (FOLDER, "Shared files"),
         Kind::Http if target.starts_with("shell:") => (TERMINAL, "Web terminal"),
         Kind::Http => (APP_WINDOW, "Web app"),

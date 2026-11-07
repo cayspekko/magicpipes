@@ -7,11 +7,13 @@
 mod email;
 mod hostnames;
 mod settings;
+mod ssh_keys;
 mod tags;
 mod users;
 
 pub use email::{AcceptWith, Accepted, InvitationRow, Invited, LinkPurpose, NewInvitation, SmtpRow};
 pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
+pub use ssh_keys::{AddedSshKey, NewSshKey, SshKeyRow};
 pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
 pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
@@ -313,6 +315,21 @@ const MIGRATIONS: &[&str] = &[
         username     TEXT,
         from_address TEXT NOT NULL
     );
+    "#,
+    // 8: public keys for the SSH gateway. The fingerprint is unique: a key stands for one person.
+    r#"
+    CREATE TABLE ssh_keys (
+        id           TEXT PRIMARY KEY,
+        user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        org_id       TEXT NOT NULL DEFAULT 'org_default',
+        name         TEXT NOT NULL,
+        algorithm    TEXT NOT NULL,
+        fingerprint  TEXT NOT NULL UNIQUE,
+        public_key   TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        last_used_at INTEGER
+    );
+    CREATE INDEX ssh_keys_user ON ssh_keys(user_id);
     "#,
 ];
 
@@ -709,6 +726,60 @@ mod tests {
             let e = Store::open(&old).err().expect("refused");
             assert!(format!("{e:#}").contains("delete it"), "{e:#}");
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_database_from_before_ssh_keys_gets_them_and_keeps_its_rows() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(7) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        c.execute("INSERT INTO agents (id, name, token_hash, created_at) VALUES ('ag_a', 'old', 'x', 0)", []).unwrap();
+        drop(c);
+
+        let store = Store::open(&path).unwrap();
+        assert!(store.agents().unwrap().iter().any(|a| a.id == "ag_a"), "kept");
+        assert!(store.ssh_keys().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ssh_keys_stand_for_one_person_and_are_limited() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("db.sqlite")).unwrap();
+        let mut users = Vec::new();
+        for email in ["a@example.com", "b@example.com"] {
+            let id = store.create_user(email, "", crate::authz::Role::Member, "not a real hash").unwrap().unwrap();
+            users.push(id);
+        }
+        fn key<'a>(user_id: &'a str, fingerprint: &'a str) -> NewSshKey<'a> {
+            NewSshKey { user_id, name: "k", algorithm: "ssh-ed25519", fingerprint, public_key: "ssh-ed25519 AAAA" }
+        }
+        let AddedSshKey::Added(first) = store.add_ssh_key(&key(&users[0], "SHA256:one")).unwrap() else { panic!("added") };
+        assert!(matches!(store.add_ssh_key(&key(&users[1], "SHA256:one")).unwrap(), AddedSshKey::Taken));
+        assert!(matches!(store.add_ssh_key(&key(&users[0], "SHA256:one")).unwrap(), AddedSshKey::Taken));
+        for i in 1..ssh_keys::MAX_SSH_KEYS_PER_USER {
+            assert!(matches!(store.add_ssh_key(&key(&users[0], &format!("SHA256:{i}"))).unwrap(), AddedSshKey::Added(_)));
+        }
+        assert!(matches!(store.add_ssh_key(&key(&users[0], "SHA256:more")).unwrap(), AddedSshKey::Full));
+        assert!(matches!(store.add_ssh_key(&key(&users[1], "SHA256:more")).unwrap(), AddedSshKey::Added(_)), "the limit is per person");
+
+        // Only its owner deletes a key.
+        assert!(!store.delete_ssh_key(&users[1], &first.id).unwrap());
+        assert!(store.delete_ssh_key(&users[0], &first.id).unwrap());
+        assert!(!store.delete_ssh_key(&users[0], &first.id).unwrap());
+        // And it goes with its owner.
+        store.with(|c| c.execute("DELETE FROM users WHERE id = ?1", [&users[1]])).unwrap();
+        assert!(store.ssh_keys().unwrap().iter().all(|k| k.user_id == users[0]));
         std::fs::remove_dir_all(dir).ok();
     }
 
