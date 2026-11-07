@@ -43,18 +43,23 @@ pub fn bin(name: &str) -> PathBuf {
 }
 
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    free_port_range(1).0
 }
 
 /// `n` consecutive ports free for TCP and UDP, below the ephemeral ranges (Linux's starts at 32768),
-/// or another test's outgoing connection could take one between here and the server opening it.
+/// or another test's outgoing connection could take one between here and the server opening it. No
+/// port is handed out twice, since nothing holds it until then.
 pub fn free_port_range(n: u16) -> (u16, u16) {
+    static HANDED_OUT: std::sync::Mutex<Option<std::collections::HashSet<u16>>> = std::sync::Mutex::new(None);
     loop {
         let first = 20_000 + (magicpipes_core_rand_u16() % 12_000);
+        let mut handed_out = HANDED_OUT.lock().unwrap();
+        let handed_out = handed_out.get_or_insert_default();
         let free = (first..first + n).all(|p| {
-            std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
+            !handed_out.contains(&p) && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
         });
         if free {
+            handed_out.extend(first..first + n);
             return (first, first + n - 1);
         }
     }

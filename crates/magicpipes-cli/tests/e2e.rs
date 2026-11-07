@@ -3951,6 +3951,8 @@ async fn ssh_gateway() {
     let gateway = common::free_port();
     let env = Env::with_config(Tls::DevCa, &format!("[ssh]\nlisten = \"127.0.0.1:{gateway}\"\n")).await;
     let Some(mut sshd) = common::Sshd::start(&env.root).await else {
+        // CI must really run this: a skipped test looks the same as a passing one there.
+        assert!(std::env::var_os("CI").is_none(), "CI needs OpenSSH's server and client for this test");
         return eprintln!("no OpenSSH here: skipping");
     };
     let admin = env.admin_token();
