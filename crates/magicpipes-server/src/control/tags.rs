@@ -66,7 +66,7 @@ fn changed(current: Vec<String>, add: &[String], remove: &[String]) -> Result<Ve
 impl ControlPlane {
     /// Normalized, registered tags that can be assigned to a user or agent (not personal);
     /// `tag_unknown` names the first unregistered one.
-    pub(super) fn registered(&self, list: &[String]) -> Result<Vec<String>, ErrorBody> {
+    pub fn registered(&self, list: &[String]) -> Result<Vec<String>, ErrorBody> {
         self.known_tags(list, false)
     }
 

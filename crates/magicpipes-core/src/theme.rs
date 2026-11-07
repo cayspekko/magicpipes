@@ -46,7 +46,7 @@ main{flex:1;padding-top:44px;padding-bottom:72px}
 h1{font:400 clamp(34px,5.4vw,48px)/1.05 var(--serif);letter-spacing:-.022em;margin:10px 0 12px}
 h1 em{font-style:italic;color:var(--accent)}
 h2{font:400 23px/1.2 var(--serif);letter-spacing:-.01em;margin:0}
-.lede{color:var(--muted);max-width:62ch;margin:0}
+.lede{color:var(--muted);max-width:62ch;margin:0;overflow-wrap:anywhere}
 .head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .section{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:52px 0 14px}
 .count{font:13.5px var(--sans);color:var(--muted);margin-left:8px;letter-spacing:0}
@@ -84,7 +84,7 @@ form{margin:0}
 .btn.danger:hover{border-color:var(--bad);background:color-mix(in srgb,var(--bad) 7%,var(--surface));color:var(--bad)}
 .btn.small{padding:7px 11px;font-size:12.5px}.btn.block{width:100%}
 .panel{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;padding:22px 24px}
-.panel h2,.panel h3{font:400 19px/1.25 var(--serif);margin:0 0 4px}.panel p{margin:0;color:var(--muted);max-width:56ch}
+.panel h2,.panel h3{font:400 19px/1.25 var(--serif);margin:0 0 4px}.panel p{margin:0;color:var(--muted);max-width:56ch;overflow-wrap:anywhere}
 .panel.danger{border-color:color-mix(in srgb,var(--bad) 30%,var(--line))}
 .crumb{display:inline-flex;gap:6px;padding:2px 0;font-size:13.5px;color:var(--muted);text-decoration:none}
 dl{display:grid;grid-template-columns:200px 1fr;margin:0}
@@ -103,7 +103,7 @@ dl>:nth-last-child(-n+2){border-bottom:0}
 .card.form{padding:22px 24px 24px}
 label{display:block;font-size:13.5px;font-weight:500;color:var(--ink-2);margin:22px 0 8px}
 .card.form>:first-child,form>label:first-of-type,.alert+.note{margin-top:0}.note+form>label:first-of-type{margin-top:22px}
-form>.btn.primary{margin-top:18px}.btn.sso{margin-bottom:10px}
+form>.btn.primary{margin-top:18px}.btn.sso{margin-bottom:10px;white-space:normal;overflow-wrap:anywhere;line-height:1.3;text-align:center}
 input:not([type]),input[type=text],input[type=email],input[type=password],input[type=search],select,textarea{width:100%;font:15px var(--sans);padding:12px 14px;border-radius:10px;border:1px solid var(--field);background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
 input[type=password],textarea{font-family:var(--mono)}textarea{font-size:13.5px;line-height:1.5}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent)}

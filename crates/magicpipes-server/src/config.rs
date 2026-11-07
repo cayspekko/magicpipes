@@ -37,6 +37,10 @@ pub struct Config {
     /// Sign-in through an authenticating proxy in front of the management host. Off unless present.
     #[serde(default)]
     pub proxy_auth: Option<ProxyAuthConfig>,
+    /// The mail server for invitations and sign-in links. Off unless present here or on the
+    /// Settings page.
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
     /// Sign-in with OpenID Connect providers; one button each on the sign-in page.
     #[serde(default)]
     pub oidc: Vec<OidcConfig>,
@@ -161,6 +165,100 @@ impl ProxyAuthConfig {
             .filter_map(|h| http::HeaderName::from_bytes(h.trim().as_bytes()).ok())
             .filter(|h| *h != http::header::AUTHORIZATION)
             .collect()
+    }
+}
+
+/// How a connection to the mail server is protected.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTls {
+    /// Upgrade with STARTTLS, and send nothing to a server that doesn't offer it.
+    Starttls,
+    /// TLS from the first byte.
+    Implicit,
+    /// None at all, for a relay on this machine or a network you trust.
+    None,
+}
+
+impl SmtpTls {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starttls => "starttls",
+            Self::Implicit => "implicit",
+            Self::None => "none",
+        }
+    }
+
+    pub fn usual_port(self) -> u16 {
+        match self {
+            Self::Starttls => 587,
+            Self::Implicit => 465,
+            Self::None => 25,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "starttls" => Some(Self::Starttls),
+            "implicit" => Some(Self::Implicit),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// Where this server sends email (`[smtp]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpConfig {
+    pub host: String,
+    /// Default: 587 with STARTTLS, 465 with implicit TLS, 25 with none.
+    pub port: Option<u16>,
+    /// Default: `implicit` on port 465, otherwise `starttls`.
+    pub tls: Option<SmtpTls>,
+    pub username: Option<String>,
+    /// A file holding the password that goes with `username`.
+    pub password_file: Option<PathBuf>,
+    /// Who messages come from, such as `MagicPipes <magicpipes@example.com>`.
+    pub from: String,
+    /// PEM certificates to trust as well as the public CAs, for a mail server with a private CA.
+    pub ca_file: Option<PathBuf>,
+}
+
+impl SmtpConfig {
+    pub fn tls_mode(&self) -> SmtpTls {
+        self.tls.unwrap_or(if self.port == Some(465) { SmtpTls::Implicit } else { SmtpTls::Starttls })
+    }
+
+    pub fn port_number(&self) -> u16 {
+        self.port.unwrap_or(self.tls_mode().usual_port())
+    }
+
+    /// The checks every mail server passes, from the configuration file or the Settings page.
+    pub fn check(&self) -> Result<(), String> {
+        let host = self.host.trim();
+        if host.is_empty() || host.len() > 253 || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:_".contains(&b)) {
+            return Err(format!("'{host}' is not a host name"));
+        }
+        if self.port == Some(0) {
+            return Err("the port can't be 0".into());
+        }
+        if self.from.parse::<lettre::message::Mailbox>().is_err() {
+            return Err(format!("'{}' is not an address to send from, such as MagicPipes <magicpipes@example.com>", self.from));
+        }
+        match (&self.username, &self.password_file) {
+            (Some(name), Some(_)) => {
+                if name.trim().is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
+                    return Err("that username can't be used".into());
+                }
+                if self.tls_mode() == SmtpTls::None {
+                    return Err("a password is never sent without encryption, so a username needs STARTTLS or implicit TLS".into());
+                }
+            }
+            (None, None) => {}
+            _ => return Err("a username and a password go together".into()),
+        }
+        Ok(())
     }
 }
 
@@ -600,6 +698,9 @@ impl Config {
         if proxied && trusted.is_empty() {
             bail!("proxy_protocol requires trusted_proxies (the load balancer's addresses)");
         }
+        if let Some(s) = &self.smtp {
+            s.check().map_err(|m| anyhow::anyhow!("smtp: {m}"))?;
+        }
         if let Some(p) = &self.proxy_auth {
             p.check().map_err(|m| anyhow::anyhow!("proxy_auth: {m}"))?;
             if p.mode == ProxyAuthMode::Headers {
@@ -617,6 +718,15 @@ impl Config {
     /// This configuration as a file `load` reads back.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         toml::to_string_pretty(self).context("writing the configuration as TOML")
+    }
+
+    /// This server's own address, for links in email and for `magicpipes login`. Always from here,
+    /// never a request's `Host`.
+    pub fn management_url(&self) -> String {
+        match self.management.listen.port() {
+            443 => format!("https://{}", self.management.hostname),
+            port => format!("https://{}:{port}", self.management.hostname),
+        }
     }
 
     pub fn trusted_proxies(&self) -> TrustedProxies {
@@ -802,6 +912,11 @@ label = "GitHub"
 issuer = "https://github.com"
 client_id = "g"
 client_secret_file = "/data/oidc-secrets/github"
+[smtp]
+host = "smtp.example.com"
+username = "magicpipes@example.com"
+password_file = "/data/smtp-password"
+from = "MagicPipes <magicpipes@example.com>"
 [[tls.certificates]]
 cert_file = "/etc/magicpipes/shop.crt"
 key_file = "/etc/magicpipes/shop.key"
@@ -821,7 +936,7 @@ key_file = "/data/provided-certs/abc.key"
         c.validate().unwrap();
         let written = c.to_toml().unwrap();
         assert_eq!(c.tls.certificates.len(), 2);
-        for line in ["kind = \"github\"", "[[tls.certificates]]", "cert_file = \"/data/provided-certs/abc.crt\"", "client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\""] {
+        for line in ["kind = \"github\"", "[[tls.certificates]]", "cert_file = \"/data/provided-certs/abc.crt\"", "client_secret_file = \"/data/oidc-secrets/authentik\"", "trust_email = true", "allow_unverified_admin = true", "body_idle_timeout_secs = 90", "allow_cookie_domain = true", "max_connections = 100", "max_connections_per_client = 10", "tcp_idle_timeout_secs = 600", "max_agents_per_user = 3", "jwks_url = \"https://team.example.com/certs\"", "auto_create = true", "sign_out_url = \"https://team.example.com/logout\"", "[smtp]", "password_file = \"/data/smtp-password\""] {
             assert!(written.contains(line), "{line} in {written}");
         }
         assert_eq!(written.matches("kind = ").count(), 1, "a provider that speaks OpenID Connect doesn't say so: {written}");

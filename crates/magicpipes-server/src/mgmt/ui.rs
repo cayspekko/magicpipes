@@ -71,6 +71,15 @@ done_messages! {
     ProviderRemoved "provider-removed" "Provider removed.",
     CertificateAdded "certificate-added" "Certificate added. Its names use it now.",
     CertificateRemoved "certificate-removed" "Certificate removed.",
+    InvitationSent "invitation-sent" "Invitation sent.",
+    InvitationResent "invitation-resent" "Invitation sent again. The earlier link no longer works.",
+    InvitationRevoked "invitation-revoked" "Invitation revoked. Its link no longer works.",
+    Welcome "welcome" "Welcome. Your account is ready.",
+    ConfirmationSent "confirmation-sent" "Check your email for a link to confirm your address.",
+    AddressConfirmed "address-confirmed" "Address confirmed. You can get a sign-in link if you forget your password.",
+    EmailSaved "email-saved" "Email settings saved. Send a test message to make sure mail arrives.",
+    EmailRemoved "email-removed" "Email settings removed.",
+    TestMessageSent "test-message-sent" "Test message sent. Check that it arrived.",
 }
 
 /// The address of `to`, saying what a change did.
@@ -141,7 +150,7 @@ fn nav_section(path: &str) -> &'static str {
     match path.split('/').nth(1).unwrap_or("") {
         "" | "tunnels" => "/",
         "machines" | "agents" | "enrollments" => "/machines",
-        "users" => "/users",
+        "users" | "invitations" => "/users",
         "tags" => "/tags",
         "hostnames" => "/hostnames",
         "audit" => "/audit",
@@ -234,11 +243,7 @@ fn public_address(t: &TunnelView, class: &str) -> String {
 
 /// The management URL agents and `magicpipes login` use.
 pub(super) fn server_url(app: &AppState) -> String {
-    let cfg = app.control.config();
-    match cfg.management.listen.port() {
-        443 => format!("https://{}", cfg.management.hostname),
-        port => format!("https://{}:{port}", cfg.management.hostname),
-    }
+    app.control.config().management_url()
 }
 
 /// How many of a tunnel's `total` tags its row in the list shows. The list is for scanning, and the
@@ -718,8 +723,9 @@ pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool,
     } else {
         r#"<form method="post" action="/login">{next}<label for="e">Email</label><input id="e" type="email" name="email" autocomplete="username" autofocus required>
 <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required>
-<button class="btn primary block">Sign in</button></form></div>
-<p class="note">Administrators create accounts. <a href="/login?method=token{nq}">Use an admin token</a></p>"#.to_string()
+<button class="btn primary block">Sign in</button></form>{forgot}</div>
+<p class="note">Administrators create accounts. <a href="/login?method=token{nq}">Use an admin token</a></p>"#
+            .replace("{forgot}", if app.control.mail_on() { r#"<p class="note"><a href="/login/email">Forgot your password?</a></p>"# } else { "" })
     };
     page(
         "Sign in",
@@ -792,11 +798,25 @@ fn continue_page(to: &str) -> Response {
     resp
 }
 
+/// "Continuing to X": the same, for leaving to a sign-in provider from a form.
+pub(super) fn leaving_page(to: &str, label: &str) -> Response {
+    let body = format!(
+        r#"<div class="auth"><h1>Continuing to <em>{label}</em></h1><p class="lede"><a href="{to}">Continue</a> if nothing happens.</p></div>"#,
+        label = esc(label),
+        to = esc(to),
+    );
+    let mut resp = page("Continuing", None, &body);
+    if let Ok(v) = HeaderValue::from_str(&format!("0;url={to}")) {
+        resp.headers_mut().insert("refresh", v);
+    }
+    resp
+}
+
 /// Was this request sent by a page on another site? Browsers say so in `Sec-Fetch-Site`, and
 /// older ones only in `Origin`. Our pages send `Referrer-Policy: no-referrer`, which makes even a
 /// same-origin form post say `Origin: null`, so that value proves nothing. A client that sends
 /// neither header (a script, curl) is not a browser being tricked.
-fn cross_site(headers: &http::HeaderMap) -> bool {
+pub(super) fn cross_site(headers: &http::HeaderMap) -> bool {
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(site) = get("sec-fetch-site") {
         return site != "same-origin" && site != "none";

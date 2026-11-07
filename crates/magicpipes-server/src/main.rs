@@ -14,6 +14,7 @@ mod forwarded;
 mod gateway;
 mod github;
 mod listen;
+mod mail;
 mod proxy_header;
 mod mgmt;
 mod oidc;

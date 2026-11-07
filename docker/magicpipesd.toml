@@ -46,6 +46,14 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # allow_unverified_admin = false
 # kind = "github"     # for GitHub, with issuer = "https://github.com"
 
+# A mail server, for inviting people by email and for sign-in links; mount the password into the
+# container. Or set it on the Settings page, which keeps the password in the data volume.
+# [smtp]
+# host = "smtp.example.com"
+# username = "magicpipes@example.com"
+# password_file = "/etc/magicpipes/smtp-password"
+# from = "MagicPipes <magicpipes@example.com>"
+
 # Sign-in through an authenticating proxy that terminates TLS in front of the management host.
 # Passwords and [[oidc]] providers then aren't offered; an admin token still works. See the README.
 # [proxy_auth]

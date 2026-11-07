@@ -7,6 +7,7 @@
 //!
 //! * `device` — `magicpipes login` approved in the browser;
 //! * `directory` — owners, tags and custom hostnames, kept in memory for access decisions;
+//! * `email` — invitations, sign-in links and confirming an address;
 //! * `hostnames` — custom hostnames and who may serve them;
 //! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
@@ -19,6 +20,7 @@
 
 mod device;
 mod directory;
+mod email;
 mod hostnames;
 mod oidc;
 mod registry;
@@ -48,9 +50,10 @@ use crate::config::Config;
 use crate::data::{AccessPolicy, DataPlane, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
 pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
+pub use email::{AcceptError, INVITATION_DAYS, InvitationView, LinkError, OpenInvitation, SIGN_IN_LINK_MINUTES};
 pub use oidc::SignInError;
 pub use registry::TunnelSignIn;
-pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, ProviderChanges, ProviderView};
+pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, NewSmtp, ProviderChanges, ProviderView, SmtpView};
 pub use tags::EnrollmentOptions;
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
@@ -68,13 +71,16 @@ pub struct ControlPlane {
     devices: device::DeviceLogins,
     /// The configuration file's providers, read once.
     file_providers: Vec<Arc<crate::oidc::Provider>>,
-    /// Providers and sign-in rules in effect; replaced whole when settings change.
+    /// The configuration file's mail server, read once.
+    file_mailer: Option<Arc<crate::mail::Mailer>>,
+    /// Providers, sign-in rules and the mail server in effect; replaced whole when settings change.
     sign_in: RwLock<Arc<settings::SignIn>>,
     /// Puts settings changes in effect one at a time, so the last one holds.
     settings_lock: Mutex<()>,
     /// Bounds code exchanges under way with providers.
     oidc_exchanges: Semaphore,
     proxy_auth: Option<crate::proxy_auth::ProxyAuth>,
+    mail: email::MailState,
 }
 
 #[derive(Default)]
@@ -172,8 +178,9 @@ impl ControlPlane {
             .map(|p| crate::oidc::Provider::load(p).map(Arc::new).with_context(|| format!("oidc provider '{}'", p.id)))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let proxy_auth = cfg.proxy_auth.as_ref().map(|p| crate::proxy_auth::ProxyAuth::load(p, cfg.trusted_proxies())).transpose().context("proxy_auth")?;
+        let file_mailer = cfg.smtp.as_ref().map(|s| crate::mail::Mailer::load(s, &cfg.management.hostname).map(Arc::new)).transpose().context("smtp")?;
         let effective = settings::effective_config(&cfg, &store, &certs)?;
-        let sign_in = RwLock::new(Arc::new(settings::SignIn::new(&effective, &file_providers)));
+        let sign_in = RwLock::new(Arc::new(settings::SignIn::new(&effective, &file_providers, file_mailer.as_ref())));
         settings::write_generated(&effective);
         let cp = Arc::new(Self {
             cfg,
@@ -186,10 +193,12 @@ impl ControlPlane {
             accounts: users::AccountLimiter::default(),
             devices: device::DeviceLogins::default(),
             file_providers,
+            file_mailer,
             sign_in,
             settings_lock: Mutex::new(()),
             oidc_exchanges: Semaphore::new(oidc::MAX_EXCHANGES),
             proxy_auth,
+            mail: email::MailState::default(),
         });
         cp.publish(&cp.state.lock().unwrap());
         Ok(cp)
@@ -204,8 +213,9 @@ impl ControlPlane {
         self.data.on_traffic_threads(f)
     }
 
-    /// Starts certificate provisioning for known hostnames, the stale-session reaper and hourly
-    /// pruning of the audit log and expired UI sessions.
+    /// Starts certificate provisioning for known hostnames, the stale-session reaper, the queue of
+    /// requests for sign-in links, and hourly pruning of the audit log, expired UI sessions and
+    /// emailed links.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) {
         let hosts: Vec<String> = self
             .state
@@ -219,6 +229,7 @@ impl ControlPlane {
         for h in hosts {
             self.certs.ensure(&h);
         }
+        self.start_mail_queue(shutdown.clone());
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));

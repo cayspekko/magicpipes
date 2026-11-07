@@ -33,10 +33,10 @@ pub(super) const MAX_EXCHANGES: usize = 16;
 const FINISH_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// What the account rules need to know about where a person comes from.
-struct Source<'a> {
+pub(super) struct Source<'a> {
     /// For the audit log and the server's log.
-    name: String,
-    issuer: &'a str,
+    pub(super) name: String,
+    pub(super) issuer: &'a str,
     link_by_email: bool,
     allow_unverified_admin: bool,
     auto_create: bool,
@@ -65,6 +65,12 @@ pub enum SignInError {
     /// A real person, whom this server doesn't admit. `None`: no verified email to show.
     NotAllowed(Option<String>),
     Busy,
+    /// The invitation being accepted is unknown, expired or already used.
+    InvitationGone,
+    /// The invitation's address got an account some other way meanwhile.
+    AccountExists,
+    /// This identity at the provider already signs in to another account here.
+    IdentityTaken,
     Internal,
 }
 
@@ -97,12 +103,23 @@ impl ControlPlane {
         if current == Some(user.id.as_str()) {
             return Ok(None);
         }
-        self.sso_session(&source, &user).map(Some)
+        self.sso_session(&source, &user, person).map(Some)
     }
 
     /// Starts a sign-in: where to send the browser, and the cookie to set for the way back.
     pub async fn oidc_start(&self, provider: &Provider, next: Option<&str>, redirect_uri: &str) -> Result<(String, String), SignInError> {
-        let attempt = Attempt::new(&provider.id, next);
+        self.leave_for(provider, Attempt::new(&provider.id, next), redirect_uri).await
+    }
+
+    /// As [`Self::oidc_start`], to accept the invitation a code opens with this provider's identity.
+    pub async fn oidc_start_invited(&self, provider: &Provider, code: &str, redirect_uri: &str) -> Result<(String, String), SignInError> {
+        let invite = self.invitation_digest(code).ok_or(SignInError::InvitationGone)?;
+        let mut attempt = Attempt::new(&provider.id, None);
+        attempt.invite = Some(invite);
+        self.leave_for(provider, attempt, redirect_uri).await
+    }
+
+    async fn leave_for(&self, provider: &Provider, attempt: Attempt, redirect_uri: &str) -> Result<(String, String), SignInError> {
         let url = provider.authorization_url(&attempt, redirect_uri).await.map_err(|e| {
             tracing::warn!(provider = %provider.id, error = %format!("{e:#}"), "could not start a sign-in");
             SignInError::Unavailable
@@ -137,16 +154,26 @@ impl ControlPlane {
             Err(_) => return Err(SignInError::Unavailable),
         };
         let source = Source::from(provider);
+        // An invitation's code is the proof here, and what the provider says about the address
+        // doesn't matter: it goes to the address the invitation went to.
+        if let Some(invite) = &attempt.invite {
+            let user = self.accept_invitation_with(invite, &source, &person)?;
+            return self.sso_session(&source, &user, &person);
+        }
         let user = self.sso_account(&source, &person).inspect_err(|e| {
             if let SignInError::NotAllowed(email) = e {
                 self.audit(&Principal::Anonymous, "login.failed", &source.name, email.as_deref().unwrap_or(""));
             }
         })?;
-        self.sso_session(&source, &user)
+        self.sso_session(&source, &user, &person)
     }
 
-    /// A new session for someone a single sign-on vouched for.
-    fn sso_session(&self, source: &Source, user: &UserRow) -> Result<Login, SignInError> {
+    /// A new session for someone a single sign-on vouched for. Where it vouched for the account's own
+    /// address, that address counts as verified from now on.
+    fn sso_session(&self, source: &Source, user: &UserRow, person: &Person) -> Result<Login, SignInError> {
+        if person.vouched_for && !user.email_verified && person.verified_email.as_deref().and_then(normalize_email).as_deref() == Some(user.email.as_str()) {
+            self.store.mark_email_verified(&user.id).map_err(logged(SignInError::Internal))?;
+        }
         self.store.finish_sso_login(&user.id, source.issuer).map_err(logged(SignInError::Internal))?;
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(SignInError::Internal))?;
         let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };

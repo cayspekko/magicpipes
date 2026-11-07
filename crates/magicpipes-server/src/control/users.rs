@@ -114,6 +114,8 @@ pub struct UserView {
     pub must_change_password: bool,
     /// False for someone who only signs in with single sign-on.
     pub has_password: bool,
+    /// They proved the address is theirs. An address an administrator typed in hasn't been.
+    pub email_verified: bool,
     /// Tags assigned by administrators.
     pub tags: Vec<String>,
     /// The tag the server made with the account and puts on the tunnels of their machines.
@@ -134,6 +136,7 @@ impl From<UserRow> for UserView {
             disabled: u.disabled,
             must_change_password: u.must_change_password,
             has_password: u.has_password,
+            email_verified: u.email_verified,
             tags: Vec::new(),
             personal_tag: None,
             created_at: rfc3339(u.created_at),
@@ -188,7 +191,7 @@ pub fn normalize_email(email: &str) -> Option<String> {
     ok.then_some(e)
 }
 
-fn check_password(password: &str, email: &str) -> Result<(), ErrorBody> {
+pub(super) fn check_password(password: &str, email: &str) -> Result<(), ErrorBody> {
     if password.chars().count() < MIN_PASSWORD_CHARS {
         return Err(err(ErrorCode::InvalidRequest, format!("passwords need at least {MIN_PASSWORD_CHARS} characters")));
     }
@@ -206,7 +209,7 @@ pub(super) fn clean_name(s: &str, max: usize) -> String {
 }
 
 /// Refusal for a principal that may not do something: `forbidden` when logged in.
-fn denied(who: &Principal) -> ErrorBody {
+pub(super) fn denied(who: &Principal) -> ErrorBody {
     match who {
         Principal::Anonymous => err(ErrorCode::Unauthorized, "log in first"),
         _ => err(ErrorCode::Forbidden, "only administrators can do this"),
@@ -214,7 +217,7 @@ fn denied(who: &Principal) -> ErrorBody {
 }
 
 impl ControlPlane {
-    async fn hash_password(&self, password: String) -> Result<String, ErrorBody> {
+    pub(super) async fn hash_password(&self, password: String) -> Result<String, ErrorBody> {
         let _permit = self.hashing.acquire().await.map_err(|_| err(ErrorCode::Internal, "server is shutting down"))?;
         tokio::task::spawn_blocking(move || argon2().hash_password(password.as_bytes()).map(|h| h.to_string()))
             .await

@@ -179,8 +179,9 @@ The decision table, evaluated in this order; the first matching row wins:
 An email counts as verified in these cases:
 - the IdP says `email_verified: true`;
 - GitHub lists it as verified;
-- the proxy is trusted for email (`trust_email = true`);
-- the user proved it by accepting an invitation or using an emailed link.
+- the proxy is trusted for email (`trust_email = true`), for rules that need one; email isn't
+  offered behind a proxy, so nothing else asks;
+- the user proved it by accepting an invitation or following a link sent there, in their own session.
 
 An email typed in by an admin is not verified.
 
@@ -435,6 +436,22 @@ Enterprise Server, whose `issuer` is its address.*
 
 ### 5. Email invitations
 
+*Built 2026-11-06, with these differences from the plan below:*
+
+- **The mail server can also be set on the Settings page,** like providers and certificates. A
+  mail server in the file is locked there.
+- **A code is in the link's `#fragment`,** as CLAUDE.md requires of secrets in addresses, not in its
+  path or query. So the server first sees it when a form is posted, which also means a link can't
+  show who it's for until then: opening one is a page with one button, and that page shows the rest.
+  Without scripts, it's pasted from the message.
+- **Accepting with a provider takes any identity at it,** not one with the same address. The code is
+  the proof, and the account gets the invited address. An identity that's someone else's is refused,
+  and the invitation survives for another way in.
+- **An invitation ends with its sender's powers:** when they're disabled or stop being an
+  administrator.
+- **A used code is deleted,** so `email_tokens` has no `used_at`, and an invitation is a table of its
+  own (see "Schema"). The audit log says what happened.
+
 - **SMTP** is configured in `[smtp]` and sent with `lettre` (MIT/Apache-2.0), using its rustls
   transport.
 - **An admin invites an email** with a role and tags. The recipient gets a link with a
@@ -446,6 +463,24 @@ Enterprise Server, whose `issuer` is its address.*
 - **Sending is rate-limited** per admin and per server per hour.
 
 ### 6. Emailed sign-in links
+
+*Built 2026-11-06, with these differences from the plan below:*
+
+- **It needs a password as well as a verified address.** An account that only signs in with a
+  provider gets no link, since that would be a way around the provider's own checks, such as a second
+  factor.
+- **Forgetting a password and asking for a link are one thing.** The sign-in page has "Forgot your
+  password?", and the page a link opens offers a new password as well as signing in. That also needs
+  no current password, which a forced change would. Someone whose password an administrator set has
+  to choose one there.
+- **Someone can confirm their own address,** from the Account page, with a link that only works in
+  their own session. Getting the message doesn't prove the account is yours: whoever owns a mistyped
+  address could otherwise confirm it, and then get links to it. Accounts from before this have no
+  verified address, unless a provider vouches for it at their next sign-in.
+- **A link doesn't return to where you were.** It may be opened anywhere, and a destination chosen by
+  whoever asked for a link is one more thing to attack someone with.
+- **Not offered behind an authenticating proxy,** where a `trust_email` address therefore doesn't need
+  to count as verified.
 
 - **"Email me a sign-in link"** sends a single-use token valid for 15 minutes, stored hashed.
   It works only for existing users with a verified email.
@@ -593,10 +628,10 @@ New entries are appended from there, one per implementation step:
   passwords, sessions, API tokens, the audit log, ownership columns, the tag registry and the
   tag assignments;
 - **rules** (steps 4 and 5): tag rules and their matches;
-- **email** (step 7): email tokens.
+- **email** (step 7): invitations, email tokens and the mail server's settings.
 
-Migration 1 creates the default org. The whole target schema (`tag_rules`,
-`user_rule_matches` and `email_tokens` come with later steps):
+Migration 1 creates the default org. The whole target schema (`tag_rules` and
+`user_rule_matches` come with a later step):
 
 ```sql
 CREATE TABLE orgs (
@@ -738,24 +773,37 @@ CREATE TABLE api_tokens (
     expires_at  INTEGER,
     last_used_at INTEGER
 );
-CREATE TABLE email_tokens (                 -- invitations and sign-in links
-    token_hash  TEXT PRIMARY KEY,
-    purpose     TEXT NOT NULL CHECK (purpose IN ('invite', 'login')),
-    org_id      TEXT NOT NULL,
-    email       TEXT NOT NULL,
-    user_id     TEXT REFERENCES users(id) ON DELETE CASCADE,   -- 'login': the account
-    role        TEXT CHECK (role IN ('admin', 'member')),      -- 'invite': role to grant
-    created_by  TEXT,
-    created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL,
-    used_at     INTEGER
+CREATE TABLE invitations (                  -- one per address; gone once used
+    id           TEXT PRIMARY KEY,             -- inv_…
+    token_hash   TEXT NOT NULL UNIQUE,
+    org_id       TEXT NOT NULL DEFAULT 'org_default',
+    email        TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+    created_by   TEXT NOT NULL,                -- us_… or 'admin-token'
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
 );
-CREATE TABLE invite_tags (
-    token_hash  TEXT NOT NULL REFERENCES email_tokens(token_hash) ON DELETE CASCADE,
-    org_id      TEXT NOT NULL,
-    tag         TEXT NOT NULL,
-    PRIMARY KEY (token_hash, tag),
+CREATE TABLE invitation_tags (
+    invitation_id TEXT NOT NULL REFERENCES invitations(id) ON DELETE CASCADE,
+    org_id        TEXT NOT NULL DEFAULT 'org_default',
+    tag           TEXT NOT NULL,
+    PRIMARY KEY (invitation_id, tag),
     FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+);
+CREATE TABLE email_tokens (                 -- links to an account; gone once used
+    token_hash TEXT PRIMARY KEY,
+    purpose    TEXT NOT NULL CHECK (purpose IN ('sign_in', 'confirm')),
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE smtp_settings (                -- the mail server, if set on the Settings page
+    org_id       TEXT PRIMARY KEY DEFAULT 'org_default',
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    tls          TEXT NOT NULL,
+    username     TEXT,                      -- the password is <data_dir>/smtp-password
+    from_address TEXT NOT NULL
 );
 CREATE TABLE audit_log (
     id          INTEGER PRIMARY KEY,
@@ -861,12 +909,14 @@ issuer = "https://github.com"             # or a GitHub Enterprise Server's addr
 client_id = "…"
 client_secret_file = "/etc/magicpipes/github-secret"
 
-[smtp]                                    # methods 5 and 6; off unless present
+[smtp]                                    # methods 5 and 6; off unless here or on the Settings page
 host = "smtp.example.com"
-port = 587                                # STARTTLS; 465 = implicit TLS
 username = "magicpipes@example.com"
 password_file = "/etc/magicpipes/smtp-password"
 from = "MagicPipes <magicpipes@example.com>"
+# port = 587                              # the usual one: 587 with STARTTLS, 465 with TLS, 25 with none
+# tls = "starttls"                        # or "implicit" (the default on port 465), or "none" with no password
+# ca_file = "/etc/magicpipes/smtp-ca.pem" # a private CA, as well as the public ones
 ```
 
 All secrets are read from files, never written inline. With none of these sections, the
@@ -883,7 +933,7 @@ identity services, and every one goes through `cargo deny check`.
 | Password hashing | `argon2` (RustCrypto) | MIT/Apache-2.0 | Argon2id, PHC strings |
 | JWT verification (proxy assertions, ID tokens) | `ring`, directly | ISC-style, already in the tree | RS256 and ES256 with `ring::signature`. `jsonwebtoken` was approved, but its current versions offer only `aws-lc-rs` or the RustCrypto `rsa` crate (which has an open timing advisory) as backends. |
 | HMAC for tunnel cookies and codes | `hmac` (RustCrypto) | MIT/Apache-2.0 | Approved; uses the existing `sha2` |
-| SMTP | `lettre` | MIT/Apache-2.0 | rustls transport; confirm it can use the `ring` provider, per the TLS rule in CLAUDE.md |
+| SMTP | `lettre` | MIT | rustls with the `ring` provider, per the TLS rule in CLAUDE.md; no connection pool |
 | TOTP (later) | `totp-rs` | MIT | not in this phase |
 
 **Not used:**
@@ -934,7 +984,7 @@ useful.
 6. **Social login** (method 4): presets, plus GitHub's OAuth flow. *Done;* GitHub organizations and
    teams aren't built (see method 4).
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
-   (method 6).
+   (method 6). *Done,* with the differences listed under those methods.
 8. **`magicpipes connect`** for private TCP and UDP tunnels.
 9. **SSH gateway and web terminals** on the same rule; then RDP/VNC, then the VPN.
 
@@ -956,8 +1006,8 @@ End-to-end tests, at minimum:
 - Step 4: plain identity headers from a peer outside `trusted_proxies`, or without the secret
   header, are ignored; a JWT with the wrong audience is rejected; neither header reaches a
   tunnel app.
-- Steps 5–7: covered by a local test IdP (Dex in Docker, like the Pebble ACME test) and a
-  local SMTP catcher.
+- Steps 5–7: covered by a small test provider and a small mail server in the test harness, with
+  real STARTTLS, rather than Dex in Docker.
 
 ## Known limitations
 

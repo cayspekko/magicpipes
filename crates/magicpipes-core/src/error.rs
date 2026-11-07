@@ -124,6 +124,12 @@ codes! {
     TlsTimeout = "tls_timeout", http 504, exit 7;
     ProbeFailed = "probe_failed", http 502, exit 8;
 
+    // ---- email -------------------------------------------------------------------------------
+    /// This server has no mail server to send through, or signs people in through a proxy.
+    MailNotConfigured = "mail_not_configured", http 409, exit 6;
+    /// The mail server can't be reached, or refused the message.
+    MailFailed = "mail_failed", http 502, exit 5;
+
     // ---- public traffic (server-generated pages) ---------------------------------------------
     TunnelNotFound = "tunnel_not_found", http 404, exit 1;
     AgentOffline = "agent_offline", http 502, exit 1;
@@ -173,9 +179,9 @@ mod tests {
         let table: &[(u8, &[&str])] = &[
             (3, &["not_logged_in", "unauthorized", "invalid_enrollment_token", "config_error", "forbidden", "unauthenticated"]),
             (4, &["local_unreachable", "invalid_port", "invalid_host", "invalid_directory", "invalid_command", "spawn_failed"]),
-            (5, &["server_unreachable", "agent_unavailable", "agent_start_failed", "agent_not_running", "agent_protocol", "agent_outdated"]),
+            (5, &["server_unreachable", "agent_unavailable", "agent_start_failed", "agent_not_running", "agent_protocol", "agent_outdated", "mail_failed"]),
             (6, &["name_conflict", "name_taken", "email_taken", "tag_unknown", "public_not_allowed", "invalid_name", "limit_reached", "not_found", "port_unavailable", "kind_mismatch",
-                  "ports_disabled", "server_outdated", "invalid_cidr", "unsupported"]),
+                  "ports_disabled", "server_outdated", "invalid_cidr", "unsupported", "mail_not_configured"]),
             (7, &["tls_failed", "tls_timeout"]),
             (8, &["probe_failed"]),
         ];

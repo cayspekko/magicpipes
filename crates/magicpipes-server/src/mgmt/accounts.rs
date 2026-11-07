@@ -1,5 +1,5 @@
 //! UI pages for accounts: changing your password, your API tokens and sessions, user
-//! administration, tags, custom hostnames and the audit log.
+//! administration and invitations, tags, custom hostnames and the audit log.
 
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -8,12 +8,12 @@ use magicpipes_core::url;
 use serde::Deserialize;
 
 use super::AppState;
-use super::extract::{AdminUser, Fields, NoFields, Posted, UiUser};
+use super::extract::{AdminPosted, AdminUser, Fields, NoFields, Posted, UiUser};
 use super::html::{Actions, Text, alert, back, badge, chips, count, esc, form_alert, invalid, menu_post, row_menu, table, title_of, when};
 use super::picker::{self, Holder, Submitted};
 use super::ui::{Done, done, done_url, failed, logged_in_to, not_there, outcome, page, server_url};
 use crate::authz::{Principal, Role};
-use crate::control::{MIN_PASSWORD_CHARS, TunnelSignIn};
+use crate::control::{InvitationView, MIN_PASSWORD_CHARS, TunnelSignIn, UserView};
 use crate::tunnel_auth::safe_path;
 
 /// A page that shows a secret once, with a way back. `more`: HTML to follow it.
@@ -125,7 +125,7 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
     let bad_expiry = error == Some(BAD_EXPIRY);
     let body = format!(
         r#"<div class="eyebrow">Account</div><h1>{name}</h1><p class="lede">{email} · {role}</p>
-{password}
+{password}{confirm}
 <div class="section"><h2>API tokens</h2></div>
 {list}
 <div class="card form spaced">{form_error}<form method="post" action="/account/tokens">{csrf}
@@ -134,6 +134,7 @@ fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&TokenForm, &str
 <button class="btn primary">Create API token</button></form>
 <p class="note">Use it as <code>Authorization: Bearer &lt;token&gt;</code>. It acts as you, with your current role.</p></div>
 {sign_out_everywhere}"#,
+        confirm = super::email::confirm_panel(app, user),
         name = esc(if me.display_name.is_empty() { &me.email } else { &me.display_name }),
         email = esc(&me.email),
         role = me.role.as_str(),
@@ -211,12 +212,49 @@ pub async fn logout_everywhere(State(app): State<AppState>, Posted(user, _): Pos
 
 // ---- users -----------------------------------------------------------------------------------
 
+/// Who invitations have gone to, for as long as they can be used or sent again. Nothing when there
+/// are none.
+fn invitations_section(user: &UiUser, invitations: &[InvitationView], users: &[UserView]) -> String {
+    if invitations.is_empty() {
+        return String::new();
+    }
+    let rows: String = invitations
+        .iter()
+        .map(|i| {
+            let by = users.iter().find(|u| u.id == i.invited_by).map_or("an administrator", |u| u.email.as_str());
+            let name = if i.display_name.is_empty() { String::new() } else { format!("{} · ", esc(&i.display_name)) };
+            let url = |action: &str| format!("/invitations/{}/{action}", i.id);
+            let menu = row_menu(&i.email, &[
+                menu_post(&url("resend"), &user.csrf_field(), &[], "Send again", false, None),
+                "<hr>".into(),
+                menu_post(&url("revoke"), &user.csrf_field(), &[], "Revoke", true, Some(&format!("Revoke the invitation for {}? Its link stops working.", i.email))),
+            ]);
+            let state = if i.expired { r#"<span class="status bad">expired</span>"#.to_string() } else { when(&i.expires_at) };
+            format!(
+                r#"<tr><td class="wrap"><span class="name">{email}</span><span class="sub">{name}from {by}</span></td><td>{role}</td><td><div class="tagcell"><span class="tagchips">{tags}</span></div></td><td>{state}</td><td class="num">{menu}</td></tr>"#,
+                email = esc(&i.email),
+                by = esc(by),
+                role = i.role.as_str(),
+                tags = chips(&i.tags),
+            )
+        })
+        .collect();
+    format!(
+        r#"<div class="section"><h2>Invitations<span class="count">{n}</span></h2></div>
+{list}"#,
+        n = invitations.len(),
+        list = table(&[Text("Invited"), Text("Role"), Text("Tags"), Text("Expires"), Actions], &rows, ""),
+    )
+}
+
 /// `error`: about the list. `attempt`: the form that came back, and why.
-fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option<(&NewUserForm, &str)>) -> Response {
+fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option<(&Submitted, &str)>) -> Response {
     let users = app.control.users(&user.who);
     let reach = app.control.private_reach(&user.who);
+    let invitations = app.control.invitations(&user.who).unwrap_or_default();
     // Behind an authenticating proxy, nobody signs in with a password.
     let passwords = app.control.proxy_auth().is_none();
+    let mail = app.control.mail_on();
     let mut rows = String::new();
     for u in &users {
         let state = match (u.disabled, u.must_change_password) {
@@ -240,7 +278,9 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
         let mut items = vec![edit.link(user, "menu-item", "Edit tags", &format!("Edit tags of {}", u.email))];
         if !me {
             items.push(if u.role == Role::Admin {
-                post("member", "Make member", false, None)
+                let sent = invitations.iter().filter(|i| i.invited_by == u.id).count();
+                let question = (sent > 0).then(|| format!("Make {} a member? The {} they sent end.", u.email, count(sent, "invitation", "invitations")));
+                post("member", "Make member", false, question)
             } else {
                 post("admin", "Make admin", false, Some(format!("Make {} an administrator? They can see and change everything here.", u.email)))
             });
@@ -254,7 +294,9 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
             items.push(if u.disabled {
                 post("enable", "Enable", false, None)
             } else {
-                post("disable", "Disable", true, Some(format!("Disable {}? They are signed out, and their machines stop serving tunnels.", u.email)))
+                let sent = invitations.iter().filter(|i| i.invited_by == u.id).count();
+                let also = if sent > 0 { format!(" {} they sent end.", count(sent, "invitation", "invitations")) } else { String::new() };
+                post("disable", "Disable", true, Some(format!("Disable {}? They are signed out, and their machines stop serving tunnels.{also}", u.email)))
             });
         }
         let you = if me { r#"<span class="sub you">you</span>"# } else { "" };
@@ -270,40 +312,56 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
     }
     let form_error = attempt.map(|(_, m)| m);
     let bad_password = form_error.is_some_and(|m| m.contains("password"));
-    let typed = |value: fn(&NewUserForm) -> &str| esc(attempt.map_or("", |(f, _)| value(f)));
-    let admin_role = attempt.is_some_and(|(f, _)| f.role == "admin");
+    let typed = |name: &str| esc(attempt.and_then(|(f, _)| f.get(name)).unwrap_or(""));
+    let admin_role = attempt.is_some_and(|(f, _)| f.get("role") == Some("admin"));
+    let all_tags: Vec<(String, String)> = app.control.tags(&user.who).into_iter().map(|t| (t.name, t.description)).collect();
+    let tags_field = picker::fieldset("Tags", &all_tags, attempt.map_or(&[], |(f, _)| &f.want), Some("For the new user"));
+    let password_field = |label: &str| {
+        format!(
+            r#"<label for="up">{label}</label><input id="up" type="password" name="password" autocomplete="new-password" minlength="{MIN_PASSWORD_CHARS}"{}>
+"#,
+            invalid(bad_password)
+        )
+    };
+    // With email, an invitation is the usual way, and a password is for someone without an inbox here.
+    let (submit, how_they_sign_in) = if mail {
+        (
+            format!(
+                r#"<button class="btn primary spaced" name="how" value="invite">Send invitation</button>
+<details class="more"{open}><summary>Set a password yourself instead</summary><div>{field}<button class="btn spaced" name="how" value="password">Add with a password</button></div></details>"#,
+                open = if bad_password { " open" } else { "" },
+                field = password_field("Password (empty = generate one)"),
+            ),
+            super::email::invitation_note(),
+        )
+    } else if passwords {
+        (
+            format!(r#"{}<button class="btn primary spaced">Add user</button>"#, password_field("Password (empty = generate one)")),
+            "They replace a password you set here when they first sign in. With a single sign-on provider, they can sign in with that instead.".to_string(),
+        )
+    } else {
+        (r#"<button class="btn primary spaced">Add user</button>"#.to_string(), "They sign in through the proxy, once it vouches for this address.".to_string())
+    };
     let body = format!(
         r#"<h1>Users</h1><p class="lede">People who can sign in, and the tags that decide which private tunnels they reach.</p>
 {err}<div class="spaced">{list}</div>
+{invitations}
 <div class="section" id="add"><h2>Add a user</h2></div>
 <div class="card form">{form_error}<form method="post" action="/users">{csrf}
 <label for="ue">Email</label><input id="ue" type="email" name="email" value="{email}"{email_invalid} required>
 <label for="un">Name</label><input id="un" name="display_name" value="{name}" maxlength="100">
 <label for="ur">Role</label><select id="ur" name="role"><option value="member">Member</option><option value="admin"{admin_selected}>Administrator</option></select>
-{password_field}<button class="btn primary">Add user</button></form>
+{tags_field}{submit}</form>
 <p class="note">{how_they_sign_in}</p></div>{registry}"#,
         registry = picker::registry(app, user),
         list = table(&[Text("User"), Text("Role"), Text("Tags"), Text("Status"), Text("Last sign-in"), Actions], &rows, "No users yet. Add the first one below."),
+        invitations = invitations_section(user, &invitations, &users),
         err = alert(error),
         form_error = form_alert(form_error),
-        email = typed(|f| &f.email),
-        name = typed(|f| &f.display_name),
+        email = typed("email"),
+        name = typed("display_name"),
         admin_selected = if admin_role { " selected" } else { "" },
         email_invalid = invalid(form_error.is_some() && !bad_password),
-        password_field = if passwords {
-            format!(
-                r#"<label for="up">Password (empty = generate one)</label><input id="up" type="password" name="password" autocomplete="new-password" minlength="{MIN_PASSWORD_CHARS}"{}>
-"#,
-                invalid(bad_password)
-            )
-        } else {
-            String::new()
-        },
-        how_they_sign_in = if passwords {
-            "They replace a password you set here when they first sign in. With a single sign-on provider, they can sign in with that instead."
-        } else {
-            "They sign in through the proxy, once it vouches for this address."
-        },
         csrf = user.csrf_field(),
     );
     page(&title_of("Users", form_error.is_some()), Some(user), &body)
@@ -313,23 +371,42 @@ pub async fn users(AdminUser(user): AdminUser, State(app): State<AppState>) -> R
     users_page(&user, &app, None, None)
 }
 
-#[derive(Deserialize)]
-pub struct NewUserForm {
-    email: String,
-    #[serde(default)]
-    display_name: String,
-    role: String,
-    #[serde(default)]
-    password: String,
-}
-
-pub async fn create_user(State(app): State<AppState>, Posted(user, f): Posted<NewUserForm>) -> Response {
-    let role = Role::parse(&f.role).unwrap_or(Role::Member);
-    let password = (!f.password.is_empty()).then_some(f.password.as_str());
-    match app.control.create_user(&user.who, &f.email, &f.display_name, role, password).await {
+pub async fn create_user(State(app): State<AppState>, Posted(user, fields): Posted<Fields>) -> Response {
+    let form = match Submitted::parse(fields) {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e), None)).into_response(),
+    };
+    let refused = |message: &str| (StatusCode::BAD_REQUEST, users_page(&user, &app, None, Some((&form, message)))).into_response();
+    if let Err(e) = form.create_missing(&app, &user.who) {
+        return refused(&e);
+    }
+    let tags = match app.control.registered(&form.want) {
+        Ok(tags) => tags,
+        Err(e) => return refused(&e.message),
+    };
+    let (email, name, password) = (form.get("email").unwrap_or(""), form.get("display_name").unwrap_or(""), form.get("password").unwrap_or(""));
+    let role = form.get("role").and_then(Role::parse).unwrap_or(Role::Member);
+    if app.control.mail_on() && password.is_empty() && form.get("how") != Some("password") {
+        return match app.control.invite(&user.who, email, name, role, &tags).await {
+            Ok(_) => done("/users", Done::InvitationSent),
+            Err(e) => refused(&e.message),
+        };
+    }
+    let created = app.control.create_user(&user.who, email, name, role, (!password.is_empty()).then_some(password)).await;
+    let (u, generated) = match created {
+        Ok(created) => created,
+        Err(e) => return refused(&e.message),
+    };
+    // The tags were checked above, and a generated password must reach the page whatever happens.
+    if !tags.is_empty()
+        && let Err(e) = app.control.set_user_tags(&user.who, &u.id, &tags)
+    {
+        tracing::error!(user = %u.id, error = %e.message, "could not give a new user their tags");
+    }
+    match generated {
         // It can't be used here, and its first sign-in through the proxy removes it.
-        Ok(_) if app.control.proxy_auth().is_some() => done("/users", Done::UserAddedForProxy),
-        Ok((u, Some(generated))) => shown_once(
+        _ if app.control.proxy_auth().is_some() => done("/users", Done::UserAddedForProxy),
+        Some(generated) => shown_once(
             &user,
             &format!("Password for {}", u.email),
             "Give it to them over a channel you trust. They must replace it when they first sign in.",
@@ -337,9 +414,21 @@ pub async fn create_user(State(app): State<AppState>, Posted(user, f): Posted<Ne
             &invitation(&app, &u.email, &generated),
             "/users",
         ),
-        Ok(_) => done("/users", Done::UserAdded),
-        Err(e) => (StatusCode::BAD_REQUEST, users_page(&user, &app, None, Some((&f, &e.message)))).into_response(),
+        None => done("/users", Done::UserAdded),
     }
+}
+
+/// Sends an invitation again. The old link keeps working if this one can't be sent.
+pub async fn resend_invitation(State(app): State<AppState>, Path(id): Path<String>, AdminPosted(user, _): AdminPosted<NoFields>) -> Response {
+    match app.control.resend_invitation(&user.who, &id).await {
+        Ok(Some(_)) => done("/users", Done::InvitationResent),
+        Ok(None) => failed(&user, StatusCode::NOT_FOUND, "/users", "Users", "That invitation is already gone."),
+        Err(e) => (StatusCode::BAD_GATEWAY, users_page(&user, &app, Some(&e.message), None)).into_response(),
+    }
+}
+
+pub async fn revoke_invitation(State(app): State<AppState>, Path(id): Path<String>, AdminPosted(user, _): AdminPosted<NoFields>) -> Response {
+    outcome(&user, app.control.revoke_invitation(&user.who, &id), "/users", "Users", Done::InvitationRevoked, "That invitation is already gone.")
 }
 
 #[derive(Deserialize)]

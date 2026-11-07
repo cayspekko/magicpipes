@@ -5,6 +5,17 @@ if (new URLSearchParams(location.search).has('done')) {
   history.replaceState(null, '', here);
 }
 
+// An emailed link carries its code in the fragment, which only the browser sees. It goes into the
+// form, out of sight, and out of the address and the browser's history.
+(() => {
+  const field = document.querySelector('input[data-code]');
+  const code = /^#code=([A-Za-z0-9_-]{1,128})$/.exec(location.hash)?.[1];
+  if (!field || !code) return;
+  field.value = code;
+  field.closest('[data-code-field]').hidden = true;
+  history.replaceState(null, '', location.pathname);
+})();
+
 // Asks before a change that can't be undone. A dialog rather than `confirm()`, so that its button
 // says what it does; Escape and Cancel, which has the focus, say no. Answers with a promise.
 const ask = (() => {

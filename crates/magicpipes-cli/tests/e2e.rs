@@ -3068,3 +3068,704 @@ async fn acme_with_pebble() {
     assert_eq!(env.server_log().matches("obtaining certificate host=acme-test").count(), 1, "no reissue on restart");
     env.cli_ok(&["agent", "stop"]).await;
 }
+
+// ---- email ------------------------------------------------------------------------------------
+
+/// A new account, through a real invitation. Returns its password and session.
+async fn invited_account(env: &Env, smtp: &common::FakeSmtp, email: &str) -> (String, String) {
+    let body = serde_json::json!({ "email": email });
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&env.admin_token()), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let code = smtp.wait_for(email, 1).await.code();
+    let password = format!("a long password for {email}");
+    let r = env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("display_name", ""), ("password", password.as_str()), ("repeat", password.as_str())])).await;
+    (password, r.cookie.unwrap_or_else(|| panic!("no session: {}", r.html)))
+}
+
+async fn user_named(env: &Env, email: &str) -> Value {
+    let (_, list) = env.api("GET", "/api/v1/users", Some(&env.admin_token())).await;
+    list["users"].as_array().unwrap().iter().find(|u| u["email"] == email).cloned().unwrap_or_else(|| panic!("no account for {email}: {list}"))
+}
+
+/// How many accounts there are.
+async fn user_count(env: &Env) -> usize {
+    env.api("GET", "/api/v1/users", Some(&env.admin_token())).await.1["users"].as_array().unwrap().len()
+}
+
+/// Inviting someone: the message, the page it opens, the account it makes, and that it does so once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invitations_bring_people_in_once() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    let admin = admin_session(&env).await;
+    let token = env.admin_token();
+    env.api_json("POST", "/api/v1/tags", Some(&token), serde_json::json!({ "name": "team:dev", "access": true })).await;
+
+    let users = env.ui("/users", Some(&admin), None).await;
+    assert!(users.html.contains("Send invitation") && users.html.contains("Set a password yourself instead"), "{}", users.html);
+    assert!(!users.html.contains("<h2>Invitations"), "nothing to list yet");
+    let csrf = users.csrf();
+    let sent = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "Ann@Example.com"), ("display_name", "Ann"), ("role", "member"), ("tag", "team:dev"), ("how", "invite")])).await;
+    assert_eq!(sent.location.as_deref(), Some("/users?done=invitation-sent"), "{}", sent.html);
+
+    let mail = smtp.wait_for("ann@example.com", 1).await;
+    let code = mail.code();
+    assert_eq!(mail.from, "mp@example.com");
+    assert!(mail.text.contains("You're invited to MagicPipes") && mail.text.contains("An administrator invited you"), "{}", mail.text);
+    assert!(mail.text.contains(&format!("https://localhost:{}/invite#code={code}", env.mgmt_port)), "from the configuration, in the fragment: {}", mail.text);
+    assert!(!env.server_log().contains(&code), "codes stay out of the log");
+
+    // Administrators see who's invited, and never the code.
+    let users = env.ui("/users", Some(&admin), None).await;
+    assert!(users.html.contains("<h2>Invitations") && users.html.contains("ann@example.com") && users.html.contains("team:dev") && !users.html.contains(&code), "{}", users.html);
+    let (_, list) = env.api("GET", "/api/v1/invitations", Some(&token)).await;
+    assert_eq!((list["invitations"][0]["email"].as_str(), list["invitations"][0]["role"].as_str(), list["invitations"][0]["expired"].as_bool()), (Some("ann@example.com"), Some("member"), Some(false)), "{list}");
+    assert!(!list.to_string().contains(&code));
+
+    // The page a link opens needs nothing from the server, and without scripts asks for the code.
+    let page = env.ui("/invite", None, None).await;
+    assert!(page.status == StatusCode::OK && page.html.contains("<div data-code-field>"), "{}", page.html);
+
+    let wrong = env.ui("/invite", None, Some(&[("code", "mpi_wrong")])).await;
+    assert!(wrong.status == StatusCode::UNAUTHORIZED && wrong.html.contains("expired or was already used"), "{}", wrong.html);
+
+    // Another site's form can't open it or use it.
+    let elsewhere = [("sec-fetch-site", "cross-site")];
+    assert_eq!(env.ui_with("/invite", None, Some(&[("code", code.as_str())]), &elsewhere).await.status, StatusCode::FORBIDDEN);
+    let fields = [("code", code.as_str()), ("password", "a long enough password"), ("repeat", "a long enough password")];
+    let refused = env.ui_with("/invite/accept", None, Some(&fields), &elsewhere).await;
+    assert!(refused.status == StatusCode::FORBIDDEN && refused.cookie.is_none(), "{}", refused.html);
+
+    // Opening it says who it's for and uses nothing up.
+    for _ in 0..2 {
+        let open = env.ui("/invite", None, Some(&[("code", code.as_str())])).await;
+        assert!(open.status == StatusCode::OK && open.html.contains("ann@example.com") && open.html.contains("a member") && open.html.contains(r#"value="Ann""#), "{}", open.html);
+    }
+
+    // A password that can't be used brings the form back, as typed, and without the password.
+    let short = env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("display_name", "Ann B"), ("password", "short"), ("repeat", "short")])).await;
+    assert!(short.status == StatusCode::BAD_REQUEST && short.html.contains("at least 12") && short.html.contains(r#"value="Ann B""#) && short.cookie.is_none(), "{}", short.html);
+    let differ = env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("display_name", "Ann B"), ("password", "a long enough password"), ("repeat", "another long password")])).await;
+    assert!(differ.status == StatusCode::BAD_REQUEST && differ.html.contains("don&#39;t match") && !differ.html.contains("a long enough password"), "{}", differ.html);
+    assert_eq!(user_count(&env).await, 0);
+
+    let password = "a long enough password";
+    let accepted = env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("display_name", "Ann B"), ("password", password), ("repeat", password)])).await;
+    assert_eq!(accepted.location.as_deref(), Some("/?done=welcome"), "{}", accepted.html);
+    let session = accepted.cookie.expect("signed in");
+    assert!(env.ui("/?done=welcome", Some(&session), None).await.html.contains("Your account is ready"));
+
+    // The account is what the invitation promised, and the address counts as proved.
+    let ann = user_named(&env, "ann@example.com").await;
+    assert_eq!((ann["role"].as_str(), ann["display_name"].as_str(), ann["email_verified"].as_bool(), ann["must_change_password"].as_bool()), (Some("member"), Some("Ann B"), Some(true), Some(false)), "{ann}");
+    assert_eq!(ann["tags"], serde_json::json!(["team:dev"]), "{ann}");
+    let signed_in = env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", password)])).await;
+    assert_eq!(signed_in.location.as_deref(), Some("/"), "no forced change: they chose it");
+
+    // Once.
+    assert_eq!(env.ui("/invite", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED);
+    let again = env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("password", password), ("repeat", password)])).await;
+    assert!(again.status == StatusCode::UNAUTHORIZED && again.cookie.is_none(), "{}", again.html);
+    let (_, list) = env.api("GET", "/api/v1/invitations", Some(&token)).await;
+    assert_eq!(list["invitations"], serde_json::json!([]));
+    assert_eq!(user_count(&env).await, 1);
+
+    // Someone with an account isn't invited again, and the form says so as typed.
+    let csrf = env.ui("/users", Some(&admin), None).await.csrf();
+    let taken = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "ann@example.com"), ("role", "admin"), ("how", "invite")])).await;
+    assert!(taken.status == StatusCode::BAD_REQUEST && taken.html.contains("already exists") && taken.html.contains(r#"value="ann@example.com""#) && taken.html.contains(r#"value="admin" selected"#), "{}", taken.html);
+    assert_eq!(smtp.sent_to("ann@example.com").len(), 1, "no second message");
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": "ann@example.com" })).await;
+    assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("email_taken")));
+
+    // A password set by hand is still there for someone without an inbox here, with their tags.
+    let by_hand = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "pat@example.com"), ("role", "member"), ("tag", "team:dev"), ("how", "password"), ("password", "")])).await;
+    assert!(by_hand.status == StatusCode::OK && by_hand.html.contains("Password for pat@example.com"), "{}", by_hand.html);
+    assert_eq!(user_named(&env, "pat@example.com").await["tags"], serde_json::json!(["team:dev"]));
+    assert!(smtp.sent_to("pat@example.com").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invitations_can_be_sent_again_revoked_or_refused() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    let admin = admin_session(&env).await;
+    let token = env.admin_token();
+    let opens = async |code: &str| env.ui("/invite", None, Some(&[("code", code)])).await.status == StatusCode::OK;
+
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": "a@example.com", "role": "admin" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let id = v["invitation"]["id"].as_str().unwrap().to_string();
+    let first = smtp.wait_for("a@example.com", 1).await.code();
+    assert!(!v.to_string().contains(&first), "the API never gives the code");
+    assert!(opens(&first).await);
+
+    // Sending again ends the old link, once the new one has gone out.
+    let csrf = env.ui("/users", Some(&admin), None).await.csrf();
+    let resent = env.ui(&format!("/invitations/{id}/resend"), Some(&admin), Some(&[("csrf", &csrf)])).await;
+    assert_eq!(resent.location.as_deref(), Some("/users?done=invitation-resent"), "{}", resent.html);
+    let second = smtp.wait_for("a@example.com", 2).await.code();
+    assert!(second != first && !opens(&first).await && opens(&second).await);
+
+    // When the mail server refuses, the page says why, and the link that's out keeps working.
+    smtp.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+    let failed = env.ui(&format!("/invitations/{id}/resend"), Some(&admin), Some(&[("csrf", &csrf)])).await;
+    assert!(failed.status == StatusCode::BAD_GATEWAY && failed.html.contains("couldn&#39;t be sent") && failed.html.contains("no such mailbox"), "{}", failed.html);
+    assert!(opens(&second).await);
+    let refused = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "b@example.com"), ("display_name", "Bea"), ("role", "member"), ("how", "invite")])).await;
+    assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("no such mailbox") && refused.html.contains(r#"value="b@example.com""#) && refused.html.contains(r#"value="Bea""#), "{}", refused.html);
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": "b@example.com" })).await;
+    assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("mail_failed")), "{v}");
+    assert_eq!(env.api("GET", "/api/v1/invitations", Some(&token)).await.1["invitations"].as_array().unwrap().len(), 1, "nothing to show for it");
+    smtp.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Revoking ends the link, and the API can do both.
+    let (status, v) = env.api_json("POST", &format!("/api/v1/invitations/{id}/resend"), Some(&token), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let third = smtp.wait_for("a@example.com", 3).await.code();
+    let revoked = env.ui(&format!("/invitations/{id}/revoke"), Some(&admin), Some(&[("csrf", &csrf)])).await;
+    assert_eq!(revoked.location.as_deref(), Some("/users?done=invitation-revoked"), "{}", revoked.html);
+    assert!(!opens(&third).await);
+    assert_eq!(env.api("DELETE", &format!("/api/v1/invitations/{id}"), Some(&token)).await.0, StatusCode::NOT_FOUND);
+
+    // Someone who isn't an administrator can't invite, or see who's invited.
+    let (_, member) = invited_account(&env, &smtp, "m@example.com").await;
+    let member_csrf = env.ui("/account", Some(&member), None).await.csrf();
+    let (_, v) = env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": "n@example.com" })).await;
+    let n = v["invitation"]["id"].as_str().unwrap().to_string();
+    assert_eq!(env.ui(&format!("/invitations/{n}/revoke"), Some(&member), Some(&[("csrf", &member_csrf)])).await.location.as_deref(), Some("/account"));
+    assert!(env.api("GET", "/api/v1/invitations", Some(&token)).await.1["invitations"].as_array().unwrap().iter().any(|i| i["id"] == n.as_str()));
+
+    // An administrator's invitations end with their powers.
+    let (_, boss_session) = invited_account(&env, &smtp, "boss@example.com").await;
+    let boss = user_named(&env, "boss@example.com").await["id"].as_str().unwrap().to_string();
+    env.api_json("PATCH", &format!("/api/v1/users/{boss}"), Some(&token), serde_json::json!({ "role": "admin" })).await;
+    let boss_csrf = env.ui("/users", Some(&boss_session), None).await.csrf();
+    env.ui("/users", Some(&boss_session), Some(&[("csrf", &boss_csrf), ("email", "friend@example.com"), ("role", "admin"), ("how", "invite")])).await;
+    let friend = smtp.wait_for("friend@example.com", 1).await.code();
+    assert!(smtp.wait_for("friend@example.com", 1).await.text.contains("boss@example.com invited you"));
+    assert!(opens(&friend).await);
+    env.api_json("PATCH", &format!("/api/v1/users/{boss}"), Some(&token), serde_json::json!({ "disabled": true })).await;
+    assert!(!opens(&friend).await, "the administrator who sent it was disabled");
+}
+
+/// A server with no mail server shows none of this, and the API says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_mail_server_nothing_offers_email() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = admin_session(&env).await;
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&env.admin_token()), serde_json::json!({ "email": "a@example.com" })).await;
+    assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("mail_not_configured")), "{v}");
+    let login = env.ui("/login", None, None).await;
+    assert!(!login.html.contains("Forgot your password"), "{}", login.html);
+    assert_eq!(env.ui("/login/email", None, None).await.location.as_deref(), Some("/login"));
+    let users = env.ui("/users", Some(&admin), None).await;
+    assert!(users.html.contains("Add user") && !users.html.contains("Send invitation"), "{}", users.html);
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains("Set up email"));
+
+    // Adding someone by hand works as ever, without naming how.
+    let added = env.ui("/users", Some(&admin), Some(&[("csrf", &users.csrf()), ("email", "pat@example.com"), ("role", "member"), ("password", "a long enough password")])).await;
+    assert_eq!(added.location.as_deref(), Some("/users?done=user-added"), "{}", added.html);
+}
+
+/// An invitation is the proof, so the provider's own idea of the address doesn't matter. The form
+/// can't redirect to another site (`form-action 'self'`), so a page moves on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_can_be_accepted_with_a_provider() {
+    let idp = common::FakeOidc::start().await;
+    let smtp = common::FakeSmtp::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-invite-oidc-{}", std::process::id()));
+    let env = Env::with_config(Tls::DevCa, &format!("{}{}", idp.config(&dir, "", false), smtp.config())).await;
+    let token = env.admin_token();
+    let invite = async |email: &str, role: &str| {
+        let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": email, "role": role })).await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        smtp.wait_for(email, 1).await.code()
+    };
+    // Leaves for the provider from the invitation; the attempt cookie and the way back.
+    let leave = async |code: &str| {
+        let start = env.ui("/invite/provider/fake", None, Some(&[("code", code)])).await;
+        assert!(start.status == StatusCode::OK && start.location.is_none(), "{}", start.html);
+        let attempt = start.cookie.clone().expect("attempt cookie");
+        let to = start.refresh.clone().expect("a page that moves on");
+        let to = to.strip_prefix("0;url=").expect("at once").to_string();
+        assert!(to.starts_with(&idp.issuer) && start.html.contains(&format!(r#"href="{}""#, to.replace('&', "&amp;"))), "{to}");
+        assert!(!to.contains(code), "the code never goes to the provider: {to}");
+        let (status, back) = plain_get(&to).await;
+        assert_eq!(status, StatusCode::FOUND);
+        (attempt, back.strip_prefix(&format!("https://localhost:{}", env.mgmt_port)).expect("back to the management host").to_string())
+    };
+
+    // Ann's address at the provider isn't the invited one, and isn't anywhere in the sign-in rules.
+    *idp.person.lock().unwrap() = common::OidcPerson::new("sub-ann", "ann.personal@elsewhere.example.org");
+    let code = invite("ann@example.com", "admin").await;
+    let open = env.ui("/invite", None, Some(&[("code", code.as_str())])).await;
+    assert!(open.html.contains(r#"action="/invite/provider/fake""#) && open.html.contains("Continue with Fake ID") && open.html.contains("an administrator"), "{}", open.html);
+    let (attempt, callback) = leave(&code).await;
+    let r = env.ui(&callback, Some(&attempt), None).await;
+    assert_eq!(r.location.as_deref(), Some("/"), "{}", r.html);
+    assert_eq!(env.ui("/account", r.cookie.as_deref(), None).await.status, StatusCode::OK);
+
+    let ann = user_named(&env, "ann@example.com").await;
+    assert_eq!((ann["role"].as_str(), ann["email_verified"].as_bool(), ann["has_password"].as_bool()), (Some("admin"), Some(true), Some(false)), "{ann}");
+    assert_eq!(env.ui("/invite", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED, "used up");
+
+    // From now on that identity is her way in, and it makes no second account.
+    assert_eq!(oidc_sign_in(&env, None).await.location.as_deref(), Some("/"));
+    assert_eq!(user_count(&env).await, 1);
+
+    // Her identity can't become someone else's account. Their invitation survives for another way.
+    let code = invite("bob@example.com", "member").await;
+    let (attempt, callback) = leave(&code).await;
+    let r = env.ui(&callback, Some(&attempt), None).await;
+    assert!(r.status == StatusCode::CONFLICT && r.html.contains("already signs in to another account") && r.cookie.is_none(), "{}", r.html);
+    assert_eq!(user_count(&env).await, 1);
+    assert_eq!(env.ui("/invite", None, Some(&[("code", code.as_str())])).await.status, StatusCode::OK);
+
+    // An invitation used up while the browser is away at the provider gets nobody in.
+    *idp.person.lock().unwrap() = common::OidcPerson::new("sub-bob", "bob@elsewhere.example.org");
+    let (attempt, callback) = leave(&code).await;
+    let password = "a long enough password";
+    env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("password", password), ("repeat", password)])).await.cookie.expect("accepted with a password");
+    let r = env.ui(&callback, Some(&attempt), None).await;
+    assert!(r.status == StatusCode::BAD_REQUEST && r.html.contains("expired or was already used") && r.cookie.is_none(), "{}", r.html);
+    assert_eq!(user_count(&env).await, 2);
+
+    // An unknown code goes nowhere near the provider.
+    let requests = idp.token_requests.load(std::sync::atomic::Ordering::Relaxed);
+    let r = env.ui("/invite/provider/fake", None, Some(&[("code", "mpi_made_up")])).await;
+    assert!(r.status == StatusCode::UNAUTHORIZED && r.refresh.is_none() && r.cookie.is_none(), "{}", r.html);
+    assert_eq!(idp.token_requests.load(std::sync::atomic::Ordering::Relaxed), requests);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The answer never depends on who has an account, and the messages only go where they should.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_in_links_tell_nobody_who_has_an_account() {
+    let idp = common::FakeOidc::start().await;
+    let smtp = common::FakeSmtp::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-links-{}", std::process::id()));
+    let env = Env::with_config(Tls::DevCa, &format!("{}{}", idp.config(&dir, r#"allowed_email_domains = ["example.com"]"#, false), smtp.config())).await;
+    let token = env.admin_token();
+
+    let (password, first_session) = invited_account(&env, &smtp, "ann@example.com").await;
+    // Typed in by an administrator, so nothing shows the address is theirs.
+    let body = serde_json::json!({ "email": "typed@example.com", "password": "a long enough password" });
+    env.api_json("POST", "/api/v1/users", Some(&token), body).await;
+    sign_in(&env, "typed@example.com", "a long enough password").await;
+    // Only ever signs in with a provider, which vouches for the address.
+    *idp.person.lock().unwrap() = common::OidcPerson::new("sub-sso", "sso@example.com");
+    oidc_sign_in(&env, None).await.cookie.expect("signed in");
+    assert_eq!(user_named(&env, "sso@example.com").await["email_verified"].as_bool(), Some(true), "the provider vouched for it");
+    // Disabled.
+    invited_account(&env, &smtp, "off@example.com").await;
+    let off = user_named(&env, "off@example.com").await["id"].as_str().unwrap().to_string();
+    env.api_json("PATCH", &format!("/api/v1/users/{off}"), Some(&token), serde_json::json!({ "disabled": true })).await;
+
+    let login = env.ui("/login", None, None).await;
+    assert!(login.html.contains(r#"href="/login/email""#) && login.html.contains("Forgot your password"), "{}", login.html);
+    assert!(env.ui("/login/email", None, None).await.html.contains(r#"action="/login/email""#));
+
+    let ask = async |address: &str| env.ui("/login/email", None, Some(&[("email", address)])).await;
+    let before = smtp.messages.lock().unwrap().len();
+    let answers = [ask("nobody@example.com").await, ask("typed@example.com").await, ask("sso@example.com").await, ask("off@example.com").await, ask("not an address").await];
+    let shown = |r: &common::UiResponse, address: &str| r.html.replace(address, "ADDRESS");
+    for (answer, address) in answers.iter().zip(["nobody@example.com", "typed@example.com", "sso@example.com", "off@example.com", "not an address"]) {
+        assert_eq!((answer.status, answer.cookie.as_deref()), (StatusCode::OK, None), "{}", answer.html);
+        assert_eq!(shown(answer, address), shown(&answers[0], "nobody@example.com"), "the same page for {address}");
+    }
+    assert!(answers[0].html.contains("If nobody@example.com has an account"), "{}", answers[0].html);
+
+    // Requests are answered in order, so once this one's message is here, those were looked at.
+    let answer = ask("ANN@example.com ").await;
+    assert_eq!(shown(&answer, "ANN@example.com"), shown(&answers[0], "nobody@example.com"), "and for someone who has one");
+    let mail = smtp.wait_for("ann@example.com", 2).await;
+    assert_eq!(smtp.messages.lock().unwrap().len(), before + 1, "nothing went to the others: {:?}", smtp.messages.lock().unwrap());
+    assert!(mail.text.contains("Your MagicPipes sign-in link") && mail.text.contains(&format!("https://localhost:{}/login/link#code=", env.mgmt_port)), "{}", mail.text);
+    let code = mail.code();
+    assert!(!env.server_log().contains(&code));
+
+    // Opening the page uses nothing up, whoever opens it; a scanner sees a form.
+    let page = env.ui("/login/link", None, None).await;
+    assert!(page.status == StatusCode::OK && page.cookie.is_none() && page.html.contains("data-code-field"), "{}", page.html);
+    assert_eq!(env.ui("/login/link", None, Some(&[("code", "mpl_wrong")])).await.status, StatusCode::UNAUTHORIZED);
+    let elsewhere = env.ui_with("/login/link", None, Some(&[("code", code.as_str())]), &[("sec-fetch-site", "cross-site")]).await;
+    assert!(elsewhere.status == StatusCode::FORBIDDEN && elsewhere.cookie.is_none(), "signing someone in to another account");
+    assert_eq!(env.ui_with("/login/email", None, Some(&[("email", "ann@example.com")]), &[("sec-fetch-site", "cross-site")]).await.status, StatusCode::FORBIDDEN);
+
+    let used = env.ui("/login/link", None, Some(&[("code", code.as_str())])).await;
+    assert_eq!(used.location.as_deref(), Some("/"), "{}", used.html);
+    let session = used.cookie.expect("signed in");
+    assert_eq!(env.ui("/account", Some(&session), None).await.status, StatusCode::OK);
+    assert_eq!(env.ui("/account", Some(&first_session), None).await.status, StatusCode::OK, "other sessions carry on");
+    assert_eq!(env.ui("/login/link", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED, "once");
+    assert_eq!(env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", &password)])).await.location.as_deref(), Some("/"), "the password still works");
+    let (_, audit) = env.api("GET", "/api/v1/audit?limit=20", Some(&token)).await;
+    assert!(audit["entries"].as_array().unwrap().iter().any(|e| e["action"] == "session.login" && e["detail"] == "email link"), "{audit}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Forgetting a password: the link, a new one, and what that ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_link_can_replace_a_forgotten_password() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    let token = env.admin_token();
+    let (old, session) = invited_account(&env, &smtp, "ann@example.com").await;
+    let ask_for_a_link = async |email: &str, nth: usize| {
+        env.ui("/login/email", None, Some(&[("email", email)])).await;
+        smtp.wait_for(email, nth).await.code()
+    };
+
+    let code = ask_for_a_link("ann@example.com", 2).await;
+    let new = "my new and much longer password";
+    let differ = env.ui("/login/link", None, Some(&[("code", code.as_str()), ("new", new), ("repeat", "something else")])).await;
+    assert!(differ.status == StatusCode::BAD_REQUEST && differ.html.contains("don&#39;t match") && differ.html.contains(&format!(r#"value="{code}""#)) && !differ.html.contains(new) && differ.html.contains("<details class=\"more\" open"), "{}", differ.html);
+    let short = env.ui("/login/link", None, Some(&[("code", code.as_str()), ("new", "short"), ("repeat", "short")])).await;
+    assert!(short.status == StatusCode::BAD_REQUEST && short.html.contains("at least 12") && short.cookie.is_none(), "{}", short.html);
+    assert_eq!(env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", &old)])).await.location.as_deref(), Some("/"), "nothing has changed yet");
+
+    let done = env.ui("/login/link", None, Some(&[("code", code.as_str()), ("new", new), ("repeat", new)])).await;
+    assert_eq!(done.location.as_deref(), Some("/?done=password-changed"), "{}", done.html);
+    let current = done.cookie.expect("signed in");
+    assert_eq!(env.ui("/account", Some(&current), None).await.status, StatusCode::OK);
+    assert_eq!(env.ui("/account", Some(&session), None).await.status, StatusCode::SEE_OTHER, "other sessions ended");
+    assert_eq!(env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", &old)])).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(env.ui("/login", None, Some(&[("email", "ann@example.com"), ("password", new)])).await.location.as_deref(), Some("/"));
+
+    // Changing a password ends the links out there too.
+    let code = ask_for_a_link("ann@example.com", 3).await;
+    let form = env.ui("/password", Some(&current), None).await;
+    let newer = "yet another much longer password";
+    env.ui("/password", Some(&current), Some(&[("csrf", &form.csrf()), ("current", new), ("new", newer), ("repeat", newer)])).await.cookie.expect("changed");
+    assert_eq!(env.ui("/login/link", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED);
+
+    // An administrator's reset is a way to take an account back, so a link has to choose a new
+    // password, which the temporary one can't be kept around for. It's still good afterwards.
+    let (_, _) = invited_account(&env, &smtp, "bob@example.com").await;
+    let bob = user_named(&env, "bob@example.com").await["id"].as_str().unwrap().to_string();
+    let (status, _) = env.api_json("POST", &format!("/api/v1/users/{bob}/password"), Some(&token), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = ask_for_a_link("bob@example.com", 2).await;
+    let must = env.ui("/login/link", None, Some(&[("code", code.as_str())])).await;
+    assert!(must.status == StatusCode::BAD_REQUEST && must.html.contains("choose your own") && must.cookie.is_none(), "{}", must.html);
+    let chosen = env.ui("/login/link", None, Some(&[("code", code.as_str()), ("new", new), ("repeat", new)])).await;
+    assert_eq!(chosen.location.as_deref(), Some("/?done=password-changed"), "{}", chosen.html);
+    assert_eq!(user_named(&env, "bob@example.com").await["must_change_password"].as_bool(), Some(false));
+
+    // Disabling someone ends their links.
+    let (_, _) = invited_account(&env, &smtp, "cy@example.com").await;
+    let code = ask_for_a_link("cy@example.com", 2).await;
+    let cy = user_named(&env, "cy@example.com").await["id"].as_str().unwrap().to_string();
+    env.api_json("PATCH", &format!("/api/v1/users/{cy}"), Some(&token), serde_json::json!({ "disabled": true })).await;
+    assert_eq!(env.ui("/login/link", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// A public page that sends mail needs limits of its own: per address and per client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_in_links_are_limited() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    invited_account(&env, &smtp, "ann@example.com").await;
+    invited_account(&env, &smtp, "bob@example.com").await;
+    let ask = async |address: &str| env.ui("/login/email", None, Some(&[("email", address)])).await;
+
+    for _ in 0..5 {
+        assert_eq!(ask("ann@example.com").await.status, StatusCode::OK, "the answer doesn't change");
+    }
+    assert_eq!(ask("bob@example.com").await.status, StatusCode::OK);
+    smtp.wait_for("bob@example.com", 2).await;
+    assert_eq!(smtp.sent_to("ann@example.com").len(), 4, "an invitation and three links, however many were asked for");
+
+    for _ in 0..4 {
+        assert_eq!(ask("nobody@example.com").await.status, StatusCode::OK);
+    }
+    let too_many = ask("nobody@example.com").await;
+    assert!(too_many.status == StatusCode::TOO_MANY_REQUESTS && too_many.html.contains("Too many requests from here"), "{}", too_many.html);
+    let elsewhere = env.ui_with("/login/link", None, None, &[]).await;
+    assert_eq!(elsewhere.status, StatusCode::OK, "someone with a link already can still use it");
+}
+
+/// Getting a message doesn't prove an account is yours: if an administrator mistyped the address,
+/// whoever owns the typo must not be able to confirm it and then ask for sign-in links to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirming_an_address_takes_the_accounts_own_session() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    let token = env.admin_token();
+    let (_, other) = invited_account(&env, &smtp, "ann@example.com").await;
+    let password = "a long enough password";
+    env.api_json("POST", "/api/v1/users", Some(&token), serde_json::json!({ "email": "pat@example.com", "password": password })).await;
+    let pat = sign_in(&env, "pat@example.com", password).await;
+
+    // Nothing shows the address is Pat's yet, so no sign-in link goes there.
+    assert_eq!(user_named(&env, "pat@example.com").await["email_verified"].as_bool(), Some(false));
+    env.ui("/login/email", None, Some(&[("email", "pat@example.com")])).await;
+    env.ui("/login/email", None, Some(&[("email", "ann@example.com")])).await;
+    smtp.wait_for("ann@example.com", 2).await;
+    assert!(smtp.sent_to("pat@example.com").is_empty());
+
+    // Someone who has already proved theirs isn't asked to.
+    assert!(!env.ui("/account", Some(&other), None).await.html.contains("Confirm your address"));
+    let account = env.ui("/account", Some(&pat), None).await;
+    assert!(account.html.contains("Confirm your address") && account.html.contains(r#"action="/account/address""#), "{}", account.html);
+    let sent = env.ui("/account/address", Some(&pat), Some(&[("csrf", &account.csrf())])).await;
+    assert_eq!(sent.location.as_deref(), Some("/account?done=confirmation-sent"), "{}", sent.html);
+    let mail = smtp.wait_for("pat@example.com", 1).await;
+    assert!(mail.text.contains(&format!("https://localhost:{}/account/address/confirm#code=", env.mgmt_port)), "{}", mail.text);
+    let code = mail.code();
+
+    // Not signed in: to the sign-in page. Signed in as someone else: refused, and it isn't used up.
+    assert_eq!(env.ui("/account/address/confirm", None, None).await.status, StatusCode::SEE_OTHER);
+    let form = env.ui("/account/address/confirm", Some(&other), None).await;
+    assert!(form.status == StatusCode::OK && form.html.contains("data-code-field"), "{}", form.html);
+    let wrong_person = env.ui("/account/address/confirm", Some(&other), Some(&[("csrf", &form.csrf()), ("code", code.as_str())])).await;
+    assert!(wrong_person.status == StatusCode::BAD_REQUEST && wrong_person.html.contains("for another account"), "{}", wrong_person.html);
+    assert_eq!(user_named(&env, "pat@example.com").await["email_verified"].as_bool(), Some(false));
+    // A link for this can't sign anyone in either.
+    assert_eq!(env.ui("/login/link", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED);
+
+    let csrf = env.ui("/account/address/confirm", Some(&pat), None).await.csrf();
+    let done = env.ui("/account/address/confirm", Some(&pat), Some(&[("csrf", &csrf), ("code", code.as_str())])).await;
+    assert_eq!(done.location.as_deref(), Some("/account?done=address-confirmed"), "{}", done.html);
+    assert_eq!(user_named(&env, "pat@example.com").await["email_verified"].as_bool(), Some(true));
+    assert!(!env.ui("/account", Some(&pat), None).await.html.contains("Confirm your address"));
+
+    // Now one goes there.
+    env.ui("/login/email", None, Some(&[("email", "pat@example.com")])).await;
+    assert!(smtp.wait_for("pat@example.com", 2).await.text.contains("/login/link#code="));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_page_sets_up_email() {
+    let smtp = common::FakeSmtp::start().await;
+    let mut env = Env::new(Tls::DevCa).await;
+    let token = env.admin_token();
+    let admin = admin_session(&env).await;
+    let port = smtp.port.to_string();
+
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains(r#"id="email""#) && settings.html.contains(r#"href="/settings/email""#) && settings.html.contains("Set up email"), "{}", settings.html);
+    let form = env.ui("/settings/email", Some(&admin), None).await;
+    assert!(form.html.contains(r#"action="/settings/email""#) && form.html.contains("Check and save"), "{}", form.html);
+    let csrf = form.csrf();
+    let save = async |fields: &[(&str, &str)]| {
+        let mut all = vec![("csrf", csrf.as_str())];
+        all.extend_from_slice(fields);
+        env.ui("/settings/email", Some(&admin), Some(&all)).await
+    };
+
+    // What can't work is refused and the form comes back as typed, without the password.
+    let secret = "the-password-nobody-should-see";
+    let plain_with_password = save(&[("host", "127.0.0.1"), ("port", &port), ("tls", "none"), ("username", "u"), ("password", secret), ("from", "a@example.com")]).await;
+    assert!(plain_with_password.status == StatusCode::BAD_REQUEST && plain_with_password.html.contains("never sent without encryption") && plain_with_password.html.contains(r#"value="u""#) && !plain_with_password.html.contains(secret), "{}", plain_with_password.html);
+    let bad_from = save(&[("host", "127.0.0.1"), ("port", &port), ("tls", "none"), ("from", "nobody")]).await;
+    assert!(bad_from.status == StatusCode::BAD_REQUEST && bad_from.html.contains("not an address to send from"), "{}", bad_from.html);
+    let bad_port = save(&[("host", "127.0.0.1"), ("port", "seventy"), ("tls", "none"), ("from", "a@example.com")]).await;
+    assert!(bad_port.status == StatusCode::BAD_REQUEST && bad_port.html.contains("port must be a number"), "{}", bad_port.html);
+    // Checked for real: nothing is listening there.
+    let dead = common::free_port().to_string();
+    let nothing_there = save(&[("host", "127.0.0.1"), ("port", &dead), ("tls", "none"), ("from", "MagicPipes <a@example.com>")]).await;
+    assert!(nothing_there.status == StatusCode::BAD_REQUEST && nothing_there.html.contains("can&#39;t be used") && nothing_there.html.contains(&format!(r#"value="{dead}""#)), "{}", nothing_there.html);
+    // A certificate nobody vouches for, and a password that goes nowhere.
+    let (_, chain, key) = common::own_certificate(&["localhost"], None);
+    let untrusted = common::FakeSmtp::offering(common::SmtpTlsOffer::Starttls { cert_pem: chain, key_pem: key }).await;
+    let cert_refused = save(&[("host", "localhost"), ("port", &untrusted.port.to_string()), ("tls", "starttls"), ("username", "u"), ("password", secret), ("from", "a@example.com")]).await;
+    assert!(cert_refused.status == StatusCode::BAD_REQUEST && cert_refused.html.contains("can&#39;t be used") && !cert_refused.html.contains(secret), "{}", cert_refused.html);
+    assert!(untrusted.commands.lock().unwrap().is_empty(), "{:?}", untrusted.commands.lock().unwrap());
+    assert!(!env.root.join("server/smtp-password").exists(), "a password is only kept once it has worked");
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains("Set up email"), "nothing saved");
+
+    let saved = save(&[("host", "127.0.0.1"), ("port", &port), ("tls", "none"), ("from", "MagicPipes <mp@example.com>")]).await;
+    assert_eq!(saved.location.as_deref(), Some("/settings?done=email-saved"), "{}", saved.html);
+    let settings = env.ui(saved.location.as_deref().unwrap(), Some(&admin), None).await;
+    assert!(settings.html.contains("Send a test message") && settings.html.contains(&format!("127.0.0.1:{port}")) && settings.html.contains("Send test message"), "{}", settings.html);
+    assert!(settings.html.contains("[smtp]") && settings.html.contains(r#"host = &quot;127.0.0.1&quot;"#), "the configuration in effect: {}", settings.html);
+    assert!(env.ui("/login", None, None).await.html.contains("Forgot your password"), "in effect at once");
+    let edit = env.ui("/settings/email", Some(&admin), None).await;
+    assert!(edit.html.contains(&format!(r#"value="{port}""#)) && edit.html.contains(r#"value="none" selected"#) && edit.html.contains("Leave it empty to keep"), "{}", edit.html);
+
+    // A test message says whether mail gets out.
+    let csrf_now = settings.csrf();
+    let test = env.ui("/settings/email/test", Some(&admin), Some(&[("csrf", &csrf_now), ("to", "me@example.com")])).await;
+    assert_eq!(test.location.as_deref(), Some("/settings?done=test-message-sent"), "{}", test.html);
+    assert!(smtp.wait_for("me@example.com", 1).await.text.contains("so email works"));
+    smtp.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+    let refused = env.ui("/settings/email/test", Some(&admin), Some(&[("csrf", &csrf_now), ("to", "me@example.com")])).await;
+    assert!(refused.status == StatusCode::BAD_GATEWAY && refused.html.contains("no such mailbox"), "{}", refused.html);
+    smtp.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // It survives a restart, and an invitation sent before it's removed can still be accepted.
+    env.stop_server().await;
+    env.start_server().await;
+    assert!(env.ui("/login", None, None).await.html.contains("Forgot your password"));
+    let (status, _) = env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": "a@example.com" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let code = smtp.wait_for("a@example.com", 1).await.code();
+
+    let admin = admin_session(&env).await;
+    let csrf_now = env.ui("/settings", Some(&admin), None).await.csrf();
+    let removed = env.ui("/settings/email/delete", Some(&admin), Some(&[("csrf", &csrf_now)])).await;
+    assert_eq!(removed.location.as_deref(), Some("/settings?done=email-removed"), "{}", removed.html);
+    assert!(!env.ui("/login", None, None).await.html.contains("Forgot your password"));
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains("Set up email"));
+    assert_eq!(env.ui("/invite", None, Some(&[("code", code.as_str())])).await.status, StatusCode::OK);
+
+    // A member can't get at any of it.
+    let password = "a long enough password";
+    env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("password", password), ("repeat", password)])).await.cookie.expect("accepted");
+    let member = env.ui("/login", None, Some(&[("email", "a@example.com"), ("password", password)])).await.cookie.expect("signed in");
+    assert_eq!(env.ui("/settings/email", Some(&member), None).await.location.as_deref(), Some("/account"));
+}
+
+/// In the configuration file it's locked on the page, like a provider there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mail_server_in_the_configuration_file_is_locked_on_the_page() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    let admin = admin_session(&env).await;
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains("in the configuration file") && settings.html.contains("Send test message") && !settings.html.contains(r#"action="/settings/email/delete""#), "{}", settings.html);
+    assert_eq!(env.ui("/settings/email", Some(&admin), None).await.location.as_deref(), Some("/settings"));
+    let fields = [("csrf", settings.csrf()), ("host", "other.example.com".to_string()), ("tls", "none".to_string()), ("from", "a@example.com".to_string())];
+    let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    assert_eq!(env.ui("/settings/email", Some(&admin), Some(&fields)).await.location.as_deref(), Some("/settings"));
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains(&format!("127.0.0.1:{}", smtp.port)));
+}
+
+/// With STARTTLS, the password and the message go over TLS to a server whose certificate checks out,
+/// or nowhere at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mail_is_encrypted_or_not_sent() {
+    let dir = std::env::temp_dir().join(format!("mp-smtp-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ca, chain, key) = common::own_certificate(&["localhost"], None);
+    let (ca_file, password_file) = (dir.join("ca.pem"), dir.join("password"));
+    std::fs::write(&ca_file, &ca).unwrap();
+    std::fs::write(&password_file, "smtp secret\n").unwrap();
+    let config = |port: u16, trusted: bool| {
+        let ca = if trusted { format!("ca_file = \"{}\"\n", ca_file.display()) } else { String::new() };
+        format!("[smtp]\nhost = \"localhost\"\nport = {port}\nusername = \"mp@example.com\"\npassword_file = \"{}\"\nfrom = \"MagicPipes <mp@example.com>\"\n{ca}", password_file.display())
+    };
+    let invite = async |env: &Env| env.api_json("POST", "/api/v1/invitations", Some(&env.admin_token()), serde_json::json!({ "email": "ann@example.com" })).await;
+    let offer = common::SmtpTlsOffer::Starttls { cert_pem: chain, key_pem: key };
+
+    let good = common::FakeSmtp::offering(offer.clone()).await;
+    let env = Env::with_config(Tls::DevCa, &config(good.port, true)).await;
+    let (status, v) = invite(&env).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let mail = good.wait_for("ann@example.com", 1).await;
+    assert!(mail.encrypted, "{mail:?}");
+    assert_eq!(mail.auth.as_deref(), Some("\0mp@example.com\0smtp secret"), "{mail:?}");
+    drop(env);
+
+    // A server that doesn't offer STARTTLS is told nothing, not even who it's for.
+    let no_tls = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &config(no_tls.port, true)).await;
+    let (status, v) = invite(&env).await;
+    assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("mail_failed")), "{v}");
+    assert!(no_tls.commands.lock().unwrap().is_empty() && no_tls.messages.lock().unwrap().is_empty(), "{:?}", no_tls.commands.lock().unwrap());
+    assert!(!env.server_log().contains("smtp secret"));
+    drop(env);
+
+    // Nor one whose certificate nobody vouches for.
+    let untrusted = common::FakeSmtp::offering(offer).await;
+    let env = Env::with_config(Tls::DevCa, &config(untrusted.port, false)).await;
+    let (status, v) = invite(&env).await;
+    assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("mail_failed")), "{v}");
+    assert!(untrusted.commands.lock().unwrap().is_empty(), "{:?}", untrusted.commands.lock().unwrap());
+    drop(env);
+
+    // A password that can't be read stops a server from starting with half its settings.
+    let missing = config(no_tls.port, true).replace(&password_file.display().to_string(), "/no/such/password");
+    let root = std::env::temp_dir().join(format!("mp-smtp-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("server.toml");
+    let text = format!("base_domain = \"{BASE}\"\ndata_dir = \"{}\"\n[management]\nlisten = \"127.0.0.1:{}\"\nhostname = \"localhost\"\n[tls]\nmode = \"dev-ca\"\n{missing}", root.join("data").display(), common::free_port());
+    std::fs::write(&path, text).unwrap();
+    let out = std::process::Command::new(common::bin("magicpipesd")).arg("--config").arg(&path).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && said.contains("/no/such/password"), "{said}");
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Behind an authenticating proxy, people sign in and get in there: email has nothing to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn behind_an_authenticating_proxy_nothing_offers_email() {
+    let smtp = common::FakeSmtp::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-proxy-mail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("proxy-secret");
+    std::fs::write(&secret, "a shared secret for the proxy\n").unwrap();
+    let proxy = format!("[proxy_auth]\nmode = \"headers\"\nuser_header = \"X-Forwarded-Email\"\nsecret_header = \"X-Proxy-Secret\"\nsecret_file = \"{}\"\ntrust_email = true\nauto_create = true\n", secret.display());
+    let env = Env::with_settings(Tls::DevCa, "trusted_proxies = [\"127.0.0.1/32\"]\n", &format!("{proxy}{}", smtp.config())).await;
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&env.admin_token()), serde_json::json!({ "email": "a@example.com" })).await;
+    assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("mail_not_configured")), "{v}");
+    assert!(!env.ui("/login", None, None).await.html.contains("Forgot your password"));
+    for path in ["/login/email"] {
+        assert_eq!(env.ui(path, None, Some(&[("email", "a@example.com")])).await.location.as_deref(), Some("/login"), "{path}");
+    }
+    for path in ["/invite", "/invite/accept", "/login/link"] {
+        assert_eq!(env.ui(path, None, Some(&[("code", "c")])).await.location.as_deref(), Some("/"), "{path}");
+    }
+    let admin = admin_session(&env).await;
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains("no use for email") && !settings.html.contains("Set up email"), "{}", settings.html);
+    assert!(smtp.messages.lock().unwrap().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// What only a browser does: moving a code from the fragment into the form and out of the address,
+/// and leaving for a provider from a form under `form-action 'self'`. Run it like
+/// `browser_signs_in_to_private_tunnels`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Chrome and Node"]
+async fn browser_signs_in_with_emailed_links() {
+    let chrome = std::env::var("MAGICPIPES_CHROME").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") { "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() } else { "google-chrome".into() }
+    });
+    let idp = common::FakeOidc::start().await;
+    let smtp = common::FakeSmtp::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-links-browser-{}", std::process::id()));
+    let env = Env::with_config(Tls::DevCa, &format!("{}{}", idp.config(&dir, "", false), smtp.config())).await;
+    let token = env.admin_token();
+
+    invited_account(&env, &smtp, "ann@example.com").await;
+    env.ui("/login/email", None, Some(&[("email", "ann@example.com")])).await;
+    let sign_in_link = smtp.wait_for("ann@example.com", 2).await.code();
+    env.api_json("POST", "/api/v1/invitations", Some(&token), serde_json::json!({ "email": "bob@example.com" })).await;
+    let invitation = smtp.wait_for("bob@example.com", 1).await.code();
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/browser-email-links.mjs");
+    let profile = std::env::temp_dir().join(format!("mp-chrome-links-{}", std::process::id()));
+    let opts = serde_json::json!({
+        "chrome": chrome,
+        "sign_in_link": format!("{}/login/link#code={sign_in_link}", env.server_url()),
+        "invitation": format!("{}/invite#code={invitation}", env.server_url()),
+        "provider": "Continue with Fake ID",
+        "resolve": format!("MAP *.{BASE} 127.0.0.1"),
+        "profile": profile,
+    });
+    let out = tokio::process::Command::new("node").arg(&script).arg(opts.to_string()).output().await.expect("run node");
+    std::fs::remove_dir_all(&profile).ok();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+
+    // The code went into the form, out of sight, and out of the address.
+    for page in ["sign_in_page", "invitation_page"] {
+        assert_eq!(result[page]["hash"], "", "{result}");
+        assert_eq!(result[page]["field_hidden"], true, "{result}");
+    }
+    assert_eq!(result["sign_in_page"]["field_value"], sign_in_link.as_str(), "{result}");
+    assert_eq!(result["invitation_page"]["field_value"], invitation.as_str(), "{result}");
+    // Pressing the button signed in.
+    assert_eq!(result["signed_in"]["path"], "/", "{result}");
+    assert!(result["signed_in"]["text"].as_str().unwrap_or("").contains("ann@example.com"), "{result}");
+    // Leaving for the provider from a form got there and back, and made the account.
+    assert!(result["invitation_opened"]["text"].as_str().unwrap_or("").contains("invited you"), "{result}");
+    assert_eq!(result["joined"]["path"], "/", "{result}");
+    assert!(result["joined"]["text"].as_str().unwrap_or("").contains("bob@example.com"), "{result}");
+    assert_eq!(user_named(&env, "bob@example.com").await["has_password"].as_bool(), Some(false));
+    assert!(result["errors"].as_array().unwrap().is_empty(), "the browser reported errors: {result}");
+    std::fs::remove_dir_all(&dir).ok();
+}

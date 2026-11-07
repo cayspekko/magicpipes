@@ -3,9 +3,9 @@
 //! Authentication boundaries:
 //! * `/api/v1/*` (except enroll/agent connect): `Authorization: Bearer <admin token or a user's
 //!   API token>`.
-//! * UI pages: session cookie created by logging in with an email and password, an OpenID Connect
-//!   provider, an authenticating proxy or an admin token; state-changing forms carry a per-session
-//!   CSRF token.
+//! * UI pages: session cookie created by logging in with an email and password, an emailed link, an
+//!   OpenID Connect provider, an authenticating proxy or an admin token; state-changing forms carry
+//!   a per-session CSRF token.
 //!
 //! What each caller may do is decided by `authz::authorize`, in the control plane.
 //! * `/api/v1/enroll`: a single-use enrollment token in the body.
@@ -14,6 +14,7 @@
 mod accounts;
 mod api;
 mod certificates;
+mod email;
 mod extract;
 mod html;
 mod icons;
@@ -105,6 +106,11 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
     router
         .route("/", get(ui::index))
         .route("/login", get(ui::login_form).post(ui::login))
+        .route("/login/email", get(email::ask_form).post(email::ask))
+        .route("/login/link", get(email::link_form).post(email::use_link))
+        .route("/invite", get(email::invitation_form).post(email::open_invitation))
+        .route("/invite/accept", post(email::accept_invitation))
+        .route("/invite/provider/{id}", post(email::invitation_provider))
         .route("/logout", post(ui::logout))
         .route("/machines", get(ui::machines))
         .route("/tunnels/{id}", get(ui::tunnel_detail))
@@ -122,7 +128,11 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/account/tokens", post(accounts::create_token))
         .route("/account/tokens/{id}/delete", post(accounts::delete_token))
         .route("/account/logout-everywhere", post(accounts::logout_everywhere))
+        .route("/account/address", post(email::request_confirmation))
+        .route("/account/address/confirm", get(email::confirm_form).post(email::confirm))
         .route("/users", get(accounts::users).post(accounts::create_user))
+        .route("/invitations/{id}/resend", post(accounts::resend_invitation))
+        .route("/invitations/{id}/revoke", post(accounts::revoke_invitation))
         .route("/users/{id}", post(accounts::update_user))
         .route("/users/{id}/tags", get(accounts::user_tags_page).post(accounts::user_tags))
         .route("/audit", get(accounts::audit))
@@ -132,6 +142,9 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/settings/providers/new", get(settings::new_provider).post(settings::create_provider))
         .route("/settings/providers/{id}", get(settings::edit_provider).post(settings::update_provider))
         .route("/settings/providers/{id}/delete", post(settings::delete_provider))
+        .route("/settings/email", get(email::email_form).post(email::save_email))
+        .route("/settings/email/delete", post(email::delete_email))
+        .route("/settings/email/test", post(email::test_email))
         .route("/settings/certificates/new", get(certificates::new_certificate).post(certificates::add_certificate))
         .route("/settings/certificates/{id}/delete", post(certificates::delete_certificate))
         .route("/cli", get(accounts::device).post(accounts::answer_device))
@@ -157,6 +170,9 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/users/{id}", get(api::get_user).patch(api::update_user))
         .route("/api/v1/users/{id}/password", post(api::reset_password))
         .route("/api/v1/users/{id}/tokens", axum::routing::delete(api::revoke_user_tokens))
+        .route("/api/v1/invitations", get(api::list_invitations).post(api::create_invitation))
+        .route("/api/v1/invitations/{id}", axum::routing::delete(api::delete_invitation))
+        .route("/api/v1/invitations/{id}/resend", post(api::resend_invitation))
         .route("/api/v1/tokens", get(api::list_tokens).post(api::create_token))
         .route("/api/v1/tokens/{id}", axum::routing::delete(api::delete_token))
         .route("/api/v1/audit", get(api::audit))

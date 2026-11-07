@@ -185,7 +185,8 @@ emergencies.
 
 Under **Users**, administrators add people with an email address, a role and a password (or
 let the server generate one, shown once). Everyone must replace a password set by an
-administrator when they first sign in.
+administrator when they first sign in. With a mail server, they're invited by email instead: see
+[Email](#email).
 
 * **Roles**: *administrators* manage tunnels, agents, users, tags, enrollment tokens and the
   audit log; *members* manage their own account (password, API tokens, sessions) and their own
@@ -244,6 +245,8 @@ The defaults are the safe ones. These turn something on, or tighten it further, 
 | `[proxy_auth] trust_email` | off | Accepts addresses nothing says were verified |
 | `[proxy_auth] allow_unverified_admin` | off | Lets those addresses reach administrators' accounts |
 | `[proxy_auth] auto_create` | off | Gives anyone new with an accepted address a member account |
+| `[smtp] tls = "none"` | off | Sends mail unencrypted, for a relay on this machine or a network you trust. A password is never sent this way |
+| `[smtp] ca_file` | none | Trusts a private CA for the mail server, as well as the public ones |
 | `[public] body_idle_timeout_secs` | off | Closes a connection after this long with no byte moving; breaks long polling and server-sent events if set below their quiet periods |
 | `[ports] tcp_idle_timeout_secs` | off | The same for raw TCP ports |
 | `[public] max_connections_per_client` | 64 | Open HTTPS connections per client address |
@@ -403,11 +406,61 @@ because agents and scripts have their own credentials: everything under `/api/`,
 Tunnels aren't covered: this signs people in to the management host, and private tunnels then work
 as usual.
 
+### Email
+
+With a mail server, administrators can invite people by email, and people can get a link to sign in
+if they forget their password. Set it up under **Settings → Email**, which connects and signs in
+before saving, or in the configuration file, where it's then locked on the page:
+
+```toml
+[smtp]
+host = "smtp.example.com"
+username = "magicpipes@example.com"
+password_file = "/etc/magicpipes/smtp-password"
+from = "MagicPipes <magicpipes@example.com>"
+# port = 587                               # the usual one: 587 with STARTTLS, 465 with TLS, 25 with none
+# tls = "starttls"                         # or "implicit" (the default on port 465), or "none"
+# ca_file = "/etc/magicpipes/smtp-ca.pem"  # a private CA, as well as the public ones
+```
+
+With STARTTLS or TLS, the certificate has to check out and nothing is sent otherwise: not the
+password, not who the message is for. Messages link to `management.hostname`, never to whatever a
+request's `Host` said. **Send a test message** on the Settings page shows whether mail arrives.
+
+**Invitations.** On the Users page, **Send invitation** emails a link with the role and tags you
+chose. It works once, for 7 days. Whoever opens it chooses a password or any sign-in provider, and
+the account is created then. Having the link is the proof, so a provider's own idea of their address
+doesn't matter and the account gets the invited address, verified. Pending invitations are listed on
+the same page, where you can send one again (the old link stops working) or revoke it. One from an
+administrator who is disabled or made a member ends with that. Adding someone with a password is
+still there under **Set a password yourself instead**.
+
+**Sign-in links.** **Forgot your password?** on the sign-in page emails a link that works once, for
+15 minutes. Whoever uses it can also choose a new password, which ends their other sessions. A link
+only goes to an account with a password and a confirmed address:
+
+* An address an administrator typed in isn't confirmed, since it could be someone else's. A person
+  confirms theirs from the Account page, and the link has to be opened while signed in to that account.
+  Accepting an invitation confirms it, and so does signing in with a provider that verified it.
+* An account that only signs in with a provider gets none, since a link would be a way around that
+  provider's own checks, such as a second factor.
+
+The page answers the same way in the same time whether or not an account exists: requests are only
+queued there, and everything else happens in the background. Each address gets at most 3 links per 15
+minutes, each client may ask 10 times an hour, and the server sends at most 500 messages an hour
+(100 per administrator). A code stays out of every server's logs because it's in the link's `#fragment`,
+and only pressing the page's button uses it, so a mail scanner opening the link changes nothing.
+Without scripts, the page asks for the code, which the message also gives on its own line.
+
+Behind an [authenticating proxy](#authenticating-proxy), none of this is offered: people sign in
+there, and an administrator adding them is what lets them in.
+
 ### Settings and the generated configuration
 
 Listeners, domains, TLS and other startup settings stay in your configuration file. Sign-in
-providers and the lists above can also be set on the Settings page, which keeps them in the
-database and their client secrets in `<data_dir>/oidc-secrets/` (mode 0600).
+providers, the mail server and the lists above can also be set on the Settings page, which keeps them
+in the database, their client secrets in `<data_dir>/oidc-secrets/` and the mail server's password in
+`<data_dir>/smtp-password` (mode 0600).
 
 The settings in effect, from both places, are always on disk at
 `<data_dir>/magicpipesd.generated.toml`, rewritten at startup and after every change. The Settings
@@ -769,8 +822,8 @@ On failure:
 | 2 | | Invalid command-line usage |
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden`, `unauthenticated` | Enrollment, credentials or local configuration |
 | 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
-| 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated` | Cannot reach server or agent, or the running agent (or, for the server, the machine's magicpipes) is too old for the request |
-| 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
+| 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated`, `mail_failed` | Cannot reach server or agent, or the running agent (or, for the server, the machine's magicpipes) is too old for the request |
+| 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr`, `mail_not_configured` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
 | 8 | `probe_failed` | Public URL did not reach the application |
 
@@ -855,6 +908,10 @@ administrators answer `403 forbidden` to members.
 | PATCH | `/api/v1/users/{id}` | `{"role"?: "admin" \| "member", "disabled"?: bool, "tags"?: [...]}`; role and status not for your own account |
 | POST | `/api/v1/users/{id}/password` | `{"password"}`: a new generated password the user must change; ends their sessions and revokes their API tokens |
 | DELETE | `/api/v1/users/{id}/tokens` | `{"revoked": n}`: revokes all of a user's API tokens (your own, or anyone's for an administrator) |
+| GET | `/api/v1/invitations` | `{"invitations": [...]}`, newest first (administrators) |
+| POST | `/api/v1/invitations` | 201 `{"invitation"}`, once the mail server has taken the message; body `{"email", "display_name"?, "role"?, "tags"?}`. Replaces any invitation for that address. `409 email_taken`, `409 mail_not_configured`, `502 mail_failed` |
+| POST | `/api/v1/invitations/{id}/resend` | `{"invitation"}`: sends it again with a new link, for another 7 days. The old link stops working once this one has gone out |
+| DELETE | `/api/v1/invitations/{id}` | 204; its link stops working |
 | GET | `/api/v1/tokens` | Your API tokens (never their secrets) |
 | POST | `/api/v1/tokens` | 201 `{"api_token", "token"}`; body `{"name", "expires_in_days"?}`; the secret is returned once; at most 20 per user |
 | DELETE | `/api/v1/tokens/{id}` | 204 |
@@ -862,8 +919,11 @@ administrators answer `403 forbidden` to members.
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 
 User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`,
-`has_password` (false for someone who only signs in with single sign-on), `tags` (assigned),
-`personal_tag`, `created_at`, `last_login_at`.
+`has_password` (false for someone who only signs in with single sign-on), `email_verified` (they
+proved the address is theirs), `tags` (assigned), `personal_tag`, `created_at`, `last_login_at`.
+
+Invitation object: `id`, `email`, `display_name`, `role`, `tags`, `invited_by` (a user's id or
+`admin-token`), `created_at`, `expires_at`, `expired`. Never its code.
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
 agent's protocol version), `owner_user_id`, `owner_email`, `tags` (what it publishes with: its owner's, or a service agent's own),

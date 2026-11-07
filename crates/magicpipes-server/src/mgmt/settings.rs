@@ -1,5 +1,6 @@
 //! The Settings page: sign-in providers, who a first sign-in may create an account for, and the
-//! configuration in effect. The decisions are in `control::settings`.
+//! configuration in effect, with email in `email` and certificates in `certificates`. The decisions
+//! are in `control::settings`.
 
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -208,7 +209,7 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
 <label for="sd">New members, by email domain</label><textarea id="sd" name="email_domains" rows="3" placeholder="example.com" spellcheck="false">{domains}</textarea>
 {locked_domains}<p class="note">One domain per line, exact, no subdomains. Empty: nobody gets an account just for being at a provider.</p>
 <button class="btn primary">Save</button></form></div>
-{certificates}
+{email}{certificates}
 <div class="section"><h2>Configuration in effect</h2></div>
 <p class="note">Always current, at <code>{path}</code> in the data directory. It holds no secrets. <a href="/settings/export">{DOWNLOAD} Download it</a>.</p>
 <details><summary class="btn small">Show it</summary><pre class="term">{config}</pre></details>"#,
@@ -218,6 +219,7 @@ fn settings_page(user: &UiUser, app: &AppState, error: Option<&str>, typed: Opti
         domains = esc(&domains),
         locked_admins = locked(&rules.from_file.bootstrap_admins),
         locked_domains = locked(&rules.from_file.email_domains),
+        email = super::email::section(user, app),
         certificates = super::certificates::section(user, app),
         path = GENERATED_CONFIG,
         config = esc(&config),

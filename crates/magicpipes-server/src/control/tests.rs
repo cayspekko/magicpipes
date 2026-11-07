@@ -604,3 +604,63 @@ async fn members_have_a_limited_number_of_machines() {
     let opts = EnrollmentOptions { owner_user_id: Some(ann.id.clone()), ..Default::default() };
     assert!(f.cp.create_enrollment(&admin, opts).is_ok());
 }
+
+/// Passing the live check needs a certificate from a public CA, which tests don't have, so this
+/// starts where that check ends: e2e covers the check, and TLS with a CA of its own.
+#[tokio::test]
+async fn the_mail_servers_password_stays_in_a_private_file() {
+    use crate::config::SmtpTls;
+    use crate::store::SmtpRow;
+
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    let path = f.dir.join("smtp-password");
+    let secret = "a secret password";
+    assert!(!f.cp.mail_on() && f.cp.smtp_settings(&admin).unwrap().is_none());
+    let row = SmtpRow { host: "smtp.example.com".into(), port: 587, tls: SmtpTls::Starttls, username: Some("mp@example.com".into()), from: "MagicPipes <mp@example.com>".into() };
+
+    let member = Principal::User { id: "us_x".into(), role: crate::authz::Role::Member, tags: vec![] };
+    assert!(f.cp.smtp_settings(&member).is_err() && f.cp.delete_smtp(&member).is_err());
+
+    f.cp.save_smtp(&admin, &row, secret).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{secret}\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert!(f.cp.mail_on(), "in effect at once");
+    let view = f.cp.smtp_settings(&admin).unwrap().unwrap();
+    assert_eq!(view.config.password_file.as_deref(), Some(path.as_path()));
+    assert!(view.available && !view.from_file);
+
+    // Nothing but that file holds it: not the generated configuration, nor the database.
+    let generated = f.cp.generated_config(&admin).unwrap();
+    assert!(generated.contains("[smtp]") && generated.contains("smtp-password") && !generated.contains(secret), "{generated}");
+    let database = std::fs::read(f.dir.join("db.sqlite")).unwrap();
+    assert!(!database.windows(secret.len()).any(|w| w == secret.as_bytes()));
+
+    // Saving other changes keeps it.
+    f.cp.save_smtp(&admin, &SmtpRow { port: 2525, ..row.clone() }, "").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{secret}\n"));
+    assert_eq!(f.cp.smtp_settings(&admin).unwrap().unwrap().config.port, Some(2525));
+
+    // If it goes missing, email stops rather than signing in without it, and the page can say so.
+    std::fs::remove_file(&path).unwrap();
+    f.cp.save_smtp(&admin, &row, "").unwrap();
+    let view = f.cp.smtp_settings(&admin).unwrap().unwrap();
+    assert!(!view.available && !f.cp.mail_on());
+    let e = f.cp.invite(&admin, "a@example.com", "", crate::authz::Role::Member, &[]).await.unwrap_err();
+    assert_eq!(e.code, "mail_not_configured");
+
+    // Without a username, nothing signs in, and nothing is kept for it.
+    f.cp.save_smtp(&admin, &row, secret).unwrap();
+    let no_login = SmtpRow { username: None, tls: SmtpTls::None, port: 25, ..row.clone() };
+    f.cp.save_smtp(&admin, &no_login, "").unwrap();
+    assert!(!path.exists());
+    assert_eq!(f.cp.smtp_settings(&admin).unwrap().unwrap().config.password_file, None);
+
+    f.cp.save_smtp(&admin, &row, secret).unwrap();
+    assert!(f.cp.delete_smtp(&admin).unwrap() && !path.exists() && !f.cp.mail_on());
+    assert!(!f.cp.delete_smtp(&admin).unwrap());
+}

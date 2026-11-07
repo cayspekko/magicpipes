@@ -4,11 +4,13 @@
 //! All queries are short; callers hold the connection mutex only for the duration of one
 //! statement or transaction. Users, sessions, API tokens and the audit log are in [`users`].
 
+mod email;
 mod hostnames;
 mod settings;
 mod tags;
 mod users;
 
+pub use email::{AcceptWith, Accepted, InvitationRow, Invited, LinkPurpose, NewInvitation, SmtpRow};
 pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
 pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
@@ -272,6 +274,45 @@ const MIGRATIONS: &[&str] = &[
     // 6: GitHub isn't OpenID Connect, so a provider says what it speaks.
     r#"
     ALTER TABLE oidc_providers ADD COLUMN kind TEXT NOT NULL DEFAULT 'oidc';
+    "#,
+    // 7: email. Only digests of codes are stored, and a used one is deleted. One invitation per
+    // address; a tag it names goes with the tag, like any other assignment. The mail server's
+    // password stays out of the database, in `<data_dir>/smtp-password`.
+    r#"
+    CREATE TABLE invitations (
+        id           TEXT PRIMARY KEY,
+        token_hash   TEXT NOT NULL UNIQUE,
+        org_id       TEXT NOT NULL DEFAULT 'org_default',
+        email        TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL DEFAULT '',
+        role         TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+        created_by   TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        expires_at   INTEGER NOT NULL
+    );
+    CREATE INDEX invitations_created_by ON invitations(created_by);
+    CREATE TABLE invitation_tags (
+        invitation_id TEXT NOT NULL REFERENCES invitations(id) ON DELETE CASCADE,
+        org_id        TEXT NOT NULL DEFAULT 'org_default',
+        tag           TEXT NOT NULL,
+        PRIMARY KEY (invitation_id, tag),
+        FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    CREATE TABLE email_tokens (
+        token_hash TEXT PRIMARY KEY,
+        purpose    TEXT NOT NULL CHECK (purpose IN ('sign_in', 'confirm')),
+        user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX email_tokens_user ON email_tokens(user_id);
+    CREATE TABLE smtp_settings (
+        org_id       TEXT PRIMARY KEY DEFAULT 'org_default',
+        host         TEXT NOT NULL,
+        port         INTEGER NOT NULL,
+        tls          TEXT NOT NULL,
+        username     TEXT,
+        from_address TEXT NOT NULL
+    );
     "#,
 ];
 

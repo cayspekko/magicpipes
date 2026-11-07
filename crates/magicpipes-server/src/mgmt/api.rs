@@ -200,6 +200,44 @@ pub async fn create_user(Caller(who): Caller, State(app): State<AppState>, Json(
     Ok((StatusCode::CREATED, Json(body)))
 }
 
+pub async fn list_invitations(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let invitations = app.control.invitations(&who).map_err(ApiError)?;
+    Ok(Json(json!({ "invitations": invitations })))
+}
+
+#[derive(Deserialize)]
+pub struct NewInvitation {
+    email: String,
+    #[serde(default)]
+    display_name: String,
+    role: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+pub async fn create_invitation(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewInvitation>) -> Result<impl IntoResponse, ApiError> {
+    let role = parse_role(req.role.as_deref())?.unwrap_or(Role::Member);
+    let invitation = app.control.invite(&who, &req.email, &req.display_name, role, &req.tags).await.map_err(ApiError)?;
+    Ok((StatusCode::CREATED, Json(json!({ "invitation": invitation }))))
+}
+
+fn no_invitation() -> ApiError {
+    api_err(ErrorCode::NotFound, "no such invitation")
+}
+
+pub async fn resend_invitation(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
+    let invitation = app.control.resend_invitation(&who, &id).await.map_err(ApiError)?.ok_or_else(no_invitation)?;
+    Ok(Json(json!({ "invitation": invitation })))
+}
+
+pub async fn delete_invitation(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.control.revoke_invitation(&who, &id) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(no_invitation()),
+        Err(e) => Err(ApiError(e)),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct UserChange {
     role: Option<String>,

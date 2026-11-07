@@ -108,6 +108,17 @@ acme_directory = "letsencrypt"
 # kind = "github"                     # GitHub isn't OpenID Connect: its issuer is its address, such as
 #                                      # https://github.com or a GitHub Enterprise Server's
 
+# A mail server, for inviting people by email and for sign-in links when a password is forgotten. Or
+# set it on the Settings page, which keeps the password in <data_dir>/smtp-password. Off unless present.
+# [smtp]
+# host = "smtp.example.com"
+# username = "magicpipes@example.com"
+# password_file = "/etc/magicpipes/smtp-password"
+# from = "MagicPipes <magicpipes@example.com>"
+# port = 587                           # the usual one: 587 with STARTTLS, 465 with TLS, 25 with none
+# tls = "starttls"                     # or "implicit" (the default on port 465), or "none" for a relay on a network you trust, with no password
+# ca_file = "/etc/magicpipes/smtp-ca.pem"  # a private CA, as well as the public ones
+
 # Sign-in through an authenticating proxy that terminates TLS in front of the management host, such
 # as oauth2-proxy, Authelia, Pomerium or Cloudflare Access. Passwords and [[oidc]] providers then
 # aren't offered; an admin token still works. Off unless present.

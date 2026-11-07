@@ -34,11 +34,14 @@ pub struct UserRow {
     pub last_login_at: Option<i64>,
     /// False for someone who only signs in with single sign-on.
     pub has_password: bool,
+    /// They proved the address is theirs: through a provider that vouched for it, an invitation or
+    /// a link sent there. An address an administrator typed in hasn't been proved.
+    pub email_verified: bool,
 }
 
 const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
     u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id),
-    p.user_id IS NOT NULL
+    p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL
     FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = 'org_default'
     LEFT JOIN passwords p ON p.user_id = u.id";
 
@@ -58,6 +61,7 @@ fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         created_at: r.get(7)?,
         last_login_at: r.get(8)?,
         has_password: r.get(9)?,
+        email_verified: r.get(10)?,
     })
 }
 
@@ -88,10 +92,11 @@ pub struct AuditRow {
 }
 
 /// The rows every account has: the user, their membership, and their personal tag, which they
-/// hold from the start.
-fn insert_user(tx: &rusqlite::Transaction<'_>, email: &str, display_name: &str, role: Role) -> rusqlite::Result<String> {
+/// hold from the start. An invitation for that address has nothing left to do.
+pub(super) fn insert_user(tx: &rusqlite::Transaction<'_>, email: &str, display_name: &str, role: Role) -> rusqlite::Result<String> {
     let id = secret::new_id("us");
     let now = unix_now();
+    tx.execute("DELETE FROM invitations WHERE email = ?1", [email])?;
     tx.execute("INSERT INTO users (id, email, display_name, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, email, display_name, now])?;
     tx.execute("INSERT INTO memberships (org_id, user_id, role, created_at) VALUES (?1, ?2, ?3, ?4)", params![DEFAULT_ORG, id, role.as_str(), now])?;
     let tag = personal_tag_name(tx)?;
@@ -243,17 +248,26 @@ impl Store {
         Ok(true)
     }
 
+    /// Someone who stops being an administrator takes the invitations they sent with them: those
+    /// were theirs to give.
     pub fn set_role(&self, user_id: &str, role: Role) -> anyhow::Result<bool> {
         let n = self.with(|c| {
+            if role != Role::Admin {
+                c.execute("DELETE FROM invitations WHERE created_by = ?1", [user_id])?;
+            }
             c.execute("UPDATE memberships SET role = ?1 WHERE user_id = ?2 AND org_id = ?3", params![role.as_str(), user_id, DEFAULT_ORG])
         })?;
         Ok(n == 1)
     }
 
-    /// Disabling also ends every session; the user's API tokens stop working while disabled.
+    /// Disabling also ends every session and the invitations they sent; the user's API tokens stop
+    /// working while disabled.
     pub fn set_disabled(&self, user_id: &str, disabled: bool) -> anyhow::Result<bool> {
         let n = self.with(|c| {
             let at = disabled.then(unix_now);
+            if disabled {
+                c.execute("DELETE FROM invitations WHERE created_by = ?1", [user_id])?;
+            }
             c.execute("UPDATE users SET disabled_at = ?1 WHERE id = ?2", params![at, user_id])
         })?;
         if disabled {
@@ -262,10 +276,12 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// Ends every UI session of a user ("log out everywhere", password changes).
+    /// Ends every UI session of a user ("log out everywhere", password changes), and the emailed
+    /// links that would start another.
     pub fn end_sessions(&self, user_id: &str) -> anyhow::Result<()> {
         self.with(|c| {
             c.execute("UPDATE users SET sessions_valid_after = ?1 WHERE id = ?2", params![unix_now(), user_id])?;
+            c.execute("DELETE FROM email_tokens WHERE user_id = ?1", [user_id])?;
             c.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])
         })?;
         Ok(())
@@ -404,7 +420,7 @@ impl Store {
             c.execute("DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - ?1", [MAX_AUDIT_ROWS])?;
             c.execute("DELETE FROM sessions WHERE expires_at < ?1", [unix_now()])
         })?;
-        Ok(())
+        self.prune_email()
     }
 }
 

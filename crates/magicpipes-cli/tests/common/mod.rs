@@ -444,10 +444,11 @@ udp_idle_timeout_secs = 5
         let resp = self.send("localhost", self.mgmt_port, b.body(Full::new(Bytes::from(body))).unwrap()).await;
         let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         let location = header(header::LOCATION);
+        let refresh = header(http::HeaderName::from_static("refresh"));
         let cookie = header(header::SET_COOKIE).and_then(|c| c.split(';').next().map(str::to_string)).filter(|c| !c.ends_with('='));
         let status = resp.status();
         let html = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
-        UiResponse { status, location, cookie, html }
+        UiResponse { status, location, refresh, cookie, html }
     }
 
     pub async fn api(&self, method: &str, path: &str, token: Option<&str>) -> (StatusCode, Value) {
@@ -932,6 +933,230 @@ impl FakeOidc {
     }
 }
 
+/// A message a [`FakeSmtp`] accepted.
+#[derive(Debug, Clone)]
+pub struct SmtpMessage {
+    pub to: String,
+    pub from: String,
+    pub text: String,
+    /// Was the connection encrypted when the message came?
+    pub encrypted: bool,
+    /// What `AUTH PLAIN` said, decoded: `\0user\0password`.
+    pub auth: Option<String>,
+}
+
+impl SmtpMessage {
+    /// The code in the message's link.
+    pub fn code(&self) -> String {
+        let at = self.text.find("#code=").unwrap_or_else(|| panic!("no code in {}", self.text)) + "#code=".len();
+        self.text[at..].split_whitespace().next().unwrap().to_string()
+    }
+}
+
+/// What a [`FakeSmtp`] does about TLS.
+#[derive(Clone)]
+pub enum SmtpTlsOffer {
+    /// Doesn't offer STARTTLS.
+    Plain,
+    /// Offers STARTTLS with this certificate for `localhost`.
+    Starttls { cert_pem: String, key_pem: String },
+}
+
+/// A small mail server on this machine: it takes messages the way a real one does, and keeps them.
+/// It asks for a password only when it can be sent encrypted, and takes any it's given.
+pub struct FakeSmtp {
+    pub port: u16,
+    pub messages: Arc<std::sync::Mutex<Vec<SmtpMessage>>>,
+    /// Refuse recipients with a permanent error.
+    pub refuse: Arc<std::sync::atomic::AtomicBool>,
+    /// Every `AUTH` and `MAIL` line seen, for asserting what was never sent.
+    pub commands: Arc<std::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FakeSmtp {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FakeSmtp {
+    pub async fn start() -> FakeSmtp {
+        Self::offering(SmtpTlsOffer::Plain).await
+    }
+
+    pub async fn offering(offer: SmtpTlsOffer) -> FakeSmtp {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let messages: Arc<std::sync::Mutex<Vec<SmtpMessage>>> = Arc::default();
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let commands: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (kept, refusing, seen) = (messages.clone(), refuse.clone(), commands.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let (kept, refusing, seen, offer) = (kept.clone(), refusing.clone(), seen.clone(), offer.clone());
+                tokio::spawn(async move {
+                    let _ = serve_smtp(stream, offer, kept, refusing, seen).await;
+                });
+            }
+        });
+        FakeSmtp { port, messages, refuse, commands, task }
+    }
+
+    /// `[smtp]`, without encryption or a password.
+    pub fn config(&self) -> String {
+        format!("[smtp]\nhost = \"127.0.0.1\"\nport = {}\ntls = \"none\"\nfrom = \"MagicPipes <mp@example.com>\"\n", self.port)
+    }
+
+    pub fn sent_to(&self, address: &str) -> Vec<SmtpMessage> {
+        self.messages.lock().unwrap().iter().filter(|m| m.to == address).cloned().collect()
+    }
+
+    /// Waits for `count` messages to `address`, and returns the last.
+    pub async fn wait_for(&self, address: &str, count: usize) -> SmtpMessage {
+        let start = Instant::now();
+        loop {
+            let sent = self.sent_to(address);
+            if sent.len() >= count {
+                return sent.last().unwrap().clone();
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "{count} messages to {address} never came: {:?}", self.messages.lock().unwrap());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// A message as a mail client shows it: long lines arrive quoted-printable.
+fn decode_message(text: &str) -> String {
+    let Some((head, body)) = text.split_once("\r\n\r\n") else { return text.to_string() };
+    if !head.to_ascii_lowercase().contains("content-transfer-encoding: quoted-printable") {
+        return text.to_string();
+    }
+    let joined = body.replace("=\r\n", "");
+    let bytes = joined.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < bytes.len() {
+        if bytes[i] == b'=' && i + 2 < bytes.len() {
+            out.push(u8::from_str_radix(&joined[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    format!("{head}\r\n\r\n{}", String::from_utf8(out).unwrap())
+}
+
+async fn serve_smtp(
+    stream: TcpStream,
+    offer: SmtpTlsOffer,
+    messages: Arc<std::sync::Mutex<Vec<SmtpMessage>>>,
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+    commands: Arc<std::sync::Mutex<Vec<String>>>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut plain = Some(BufReader::new(stream));
+    let mut tls: Option<BufReader<tokio_rustls::server::TlsStream<TcpStream>>> = None;
+    let mut mail = SmtpMessage { to: String::new(), from: String::new(), text: String::new(), encrypted: false, auth: None };
+    macro_rules! say {
+        ($text:expr) => {{
+            let text: String = $text;
+            match (&mut plain, &mut tls) {
+                (_, Some(t)) => t.get_mut().write_all(text.as_bytes()).await?,
+                (Some(p), _) => p.get_mut().write_all(text.as_bytes()).await?,
+                _ => unreachable!(),
+            }
+        }};
+    }
+    macro_rules! read_line {
+        () => {{
+            let mut line = String::new();
+            let n = match (&mut plain, &mut tls) {
+                (_, Some(t)) => t.read_line(&mut line).await?,
+                (Some(p), _) => p.read_line(&mut line).await?,
+                _ => unreachable!(),
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            line
+        }};
+    }
+    say!("220 fake ESMTP\r\n".to_string());
+    loop {
+        let line = read_line!();
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("AUTH") || upper.starts_with("MAIL") {
+            commands.lock().unwrap().push(line.trim().to_string());
+        }
+        if upper.starts_with("EHLO") {
+            let encrypted = tls.is_some();
+            let mut lines = vec!["250-fake".to_string()];
+            if !encrypted && matches!(offer, SmtpTlsOffer::Starttls { .. }) {
+                lines.push("250-STARTTLS".to_string());
+            }
+            if encrypted {
+                lines.push("250-AUTH PLAIN".to_string());
+            }
+            lines.push("250 8BITMIME".to_string());
+            say!(format!("{}\r\n", lines.join("\r\n")));
+        } else if upper.starts_with("STARTTLS") {
+            let SmtpTlsOffer::Starttls { cert_pem, key_pem } = &offer else {
+                say!("502 not offered\r\n".to_string());
+                continue;
+            };
+            say!("220 go ahead\r\n".to_string());
+            let certs: Vec<CertificateDer> = CertificateDer::pem_slice_iter(cert_pem.as_bytes()).map(Result::unwrap).collect();
+            let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let stream = plain.take().unwrap().into_inner();
+            tls = Some(BufReader::new(acceptor.accept(stream).await?));
+        } else if upper.starts_with("AUTH PLAIN") {
+            use base64::Engine;
+            let given = line.split_whitespace().nth(2).unwrap_or("");
+            let decoded = base64::engine::general_purpose::STANDARD.decode(given).unwrap_or_default();
+            mail.auth = Some(String::from_utf8_lossy(&decoded).into_owned());
+            say!("235 ok\r\n".to_string());
+        } else if upper.starts_with("MAIL FROM") {
+            mail.from = line.split(['<', '>']).nth(1).unwrap_or("").to_string();
+            say!("250 ok\r\n".to_string());
+        } else if upper.starts_with("RCPT TO") {
+            if refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                say!("550 5.1.1 no such mailbox\r\n".to_string());
+                continue;
+            }
+            mail.to = line.split(['<', '>']).nth(1).unwrap_or("").to_string();
+            say!("250 ok\r\n".to_string());
+        } else if upper.starts_with("DATA") {
+            say!("354 go on\r\n".to_string());
+            let mut text = String::new();
+            loop {
+                let l = read_line!();
+                if l == ".\r\n" {
+                    break;
+                }
+                text.push_str(l.strip_prefix('.').unwrap_or(&l));
+            }
+            mail.text = decode_message(&text);
+            mail.encrypted = tls.is_some();
+            messages.lock().unwrap().push(mail.clone());
+            say!("250 kept\r\n".to_string());
+        } else if upper.starts_with("QUIT") {
+            say!("221 bye\r\n".to_string());
+            return Ok(());
+        } else {
+            say!("250 ok\r\n".to_string());
+        }
+    }
+}
+
 fn sign_es256(key: &ring::signature::EcdsaKeyPair, claims: &Value) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -970,6 +1195,8 @@ fn parse_form(s: &str) -> std::collections::HashMap<String, String> {
 pub struct UiResponse {
     pub status: StatusCode,
     pub location: Option<String>,
+    /// Where a page moves on to by itself.
+    pub refresh: Option<String>,
     /// `name=value` of a session cookie the response set.
     pub cookie: Option<String>,
     pub html: String,

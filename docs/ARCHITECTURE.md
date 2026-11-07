@@ -26,6 +26,7 @@ streams *inside* the session the agent established.
 | ACME | instant-acme 0.8 | Low-level async ACME client: lets us control which hostnames get ordered, report per-hostname readiness and back off on failure. `rustls-acme` manages a fixed domain list, which does not fit tunnels being created at runtime. |
 | Management API/UI | axum 0.8 | Same hyper stack; server-rendered HTML, no frontend build. |
 | Persistence | rusqlite (bundled SQLite) | One file, no service; used only by the control plane. |
+| Email | lettre 0.11 (SMTP, rustls with ring) | Dot-stuffing, header encoding and STARTTLS are easy to get subtly wrong. No connection pool: a connection per message, since there are few. Its `idna` brings the ICU tables, which is most of what it adds to the server's size. |
 | Allocator (server, static Linux builds) | mimalloc, `secure` | musl's allocator takes a global lock; see "Threads and memory". |
 | CLI | clap 4 | |
 
@@ -274,6 +275,13 @@ named by the provider's validated id. They're never shown again, and aren't in t
 generated copy. A saved provider whose secret can't be read is left out with an error in the log,
 and the page says so; a file's provider with a missing secret stops startup, as a configuration
 mistake.
+
+**The mail server on the page** is one row, and its password is `<data_dir>/smtp-password` (0600),
+named as `password_file` in the generated copy like any other secret file. Saving connects, starts TLS
+and signs in first, and a password that was typed is only kept once that has worked. One saved whose
+password can't be read leaves email off, and the page says so; one in the configuration file stops
+startup, as a configuration mistake. A private CA (`ca_file`) can only come from the file, since the
+page has no way to put one on the server.
 
 **Certificates added on the page** are files under `<data_dir>/provided-certs/` (0600 in 0700), named
 by a digest of the certificate, and the directory is the only record of them. A private key is never
@@ -525,6 +533,21 @@ a connection to the public port that must arrive back at the agent (a warning, n
     the data path. Who gets in is described in the README: accounts are keyed by `(issuer, subject)`, and only a verified
     email (any address, on a provider an administrator marked `trust_email`) can create or link
     one;
+  * **invitations and emailed links** (`mail.rs`, `control/email.rs`, `mgmt/email.rs`), if there's
+    a mail server: 256-bit codes, of which only digests are stored and a used one is deleted. A code
+    is in the link's `#fragment`, so it reaches no server's logs, and only a POST uses it, so a mail
+    scanner opening a link changes nothing. An invitation becomes an account in one transaction, with
+    a password or a provider's identity; the code is the proof, so a provider's own idea of the address
+    doesn't matter. A sign-in link needs a password and a verified address: an address an
+    administrator typed could be someone else's, and on an account that only uses a provider a link
+    would get around that provider's checks. So a person proves their address with a link that only
+    works in their own session, or else the owner of a mistyped address could confirm it. Asking for a
+    link joins a queue and returns, and the lookup, the code and the mail server are all in the
+    background, so neither the answer nor its timing says who has an account. Ending someone's
+    sessions ends their links, and invitations end when whoever sent them is disabled or demoted.
+    Public forms are refused from other sites (`Sec-Fetch-Site`), since signing a browser in to the
+    wrong account is as bad here as at the password form. None of it is offered behind an
+    authenticating proxy;
   * **an authenticating proxy** (`proxy_auth.rs`, `mgmt/proxy_auth.rs`), if configured: a signed
     token, checked as an ID token is but without a nonce, or a plain header from a
     `trusted_proxies` address with a shared secret. A header sent twice counts as nobody. A layer
@@ -607,7 +630,11 @@ a connection to the public port that must arrive back at the agent (a warning, n
   session of which public traffic may use 224 (64 streams or in-flight requests per client;
   idle pooled HTTP connections count toward the 224, see "Upstream connection reuse"), so pings and RPCs always get
   through; one 64 KiB write batch per session and 64 KiB copy buffers per direction per connection; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
-  concurrent ACME orders, per-hostname failure backoff (renewals included); at most 8 archive
+  concurrent ACME orders, per-hostname failure backoff (renewals included); for email, 4 messages
+  being sent at once (8 s per step and 12 s per message), a queue of 256 requests for sign-in links
+  answered one at a time, 3 links per account per 15 minutes, 10 requests per client per hour, 100
+  messages per administrator and 500 per server per hour (counters in memory, at most 10,000 keys
+  each), 1,000 waiting invitations and 8 open links per account; at most 8 archive
   downloads at once per agent, each dropped after 30 s without reading or, after its first 30 s,
   when it averages under 16 KiB/s; at most 5000 names in a selection. Upgraded (WebSocket)
   connections keep their listener's connection slots until they close. Used private-tunnel

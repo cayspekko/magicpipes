@@ -15,7 +15,7 @@ use crate::tunnel_auth::{cookie, safe_path};
 /// `SameSite=Lax`: the way back from the provider is a navigation from another site.
 const ATTEMPT_COOKIE: &str = "__Host-mp_oidc";
 
-fn attempt_cookie(value: &str, max_age: i64) -> HeaderValue {
+pub(super) fn attempt_cookie(value: &str, max_age: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("{ATTEMPT_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}")).expect("cookie is ASCII")
 }
 
@@ -102,6 +102,13 @@ async fn finish(app: &AppState, id: &str, client: Option<std::net::IpAddr>, head
         }
         Err(SignInError::Unavailable) => page(StatusCode::BAD_GATEWAY, &format!("{} can't be reached right now. Try again in a moment.", provider.label), next),
         Err(SignInError::Busy) => page(StatusCode::SERVICE_UNAVAILABLE, "The server is busy. Try again in a moment.", next),
+        Err(SignInError::InvitationGone) => page(StatusCode::BAD_REQUEST, "That invitation has expired or was already used. Ask an administrator for a new one.", next),
+        Err(SignInError::AccountExists) => page(StatusCode::CONFLICT, "That address already has an account. Sign in instead.", next),
+        Err(SignInError::IdentityTaken) => page(
+            StatusCode::CONFLICT,
+            &format!("That {} account already signs in to another account here. Open the invitation's link again, and use a different one or choose a password.", provider.label),
+            next,
+        ),
         Err(SignInError::Internal) => page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", next),
     }
 }

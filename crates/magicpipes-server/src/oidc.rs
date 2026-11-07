@@ -177,6 +177,8 @@ pub struct Attempt {
     verifier: String,
     /// The path to continue to afterwards. Unchecked: callers pass it through `safe_path`.
     pub next: Option<String>,
+    /// The digest of the invitation code this sign-in accepts, if it accepts one.
+    pub invite: Option<String>,
 }
 
 impl Attempt {
@@ -187,19 +189,27 @@ impl Attempt {
             nonce: secret::random_string(32),
             verifier: secret::random_string(64),
             next: next.map(str::to_string),
+            invite: None,
         }
     }
 
     pub fn seal(&self, signer: &Signer) -> String {
         let next = URL_SAFE_NO_PAD.encode(self.next.as_deref().unwrap_or(""));
         let expires = unix_now() + ATTEMPT_TTL_SECS;
-        signer.seal(&format!("o~{expires}~{}~{}~{}~{}~{next}", self.provider, self.state, self.nonce, self.verifier))
+        let invite = self.invite.as_deref().unwrap_or("");
+        signer.seal(&format!("o~{expires}~{}~{}~{}~{}~{next}~{invite}", self.provider, self.state, self.nonce, self.verifier))
     }
 
     pub fn open(signer: &Signer, cookie: &str) -> Option<Self> {
         let payload = signer.open(cookie)?;
         let parts: Vec<&str> = payload.split('~').collect();
-        let ["o", expires, provider, state, nonce, verifier, next] = parts.as_slice() else { return None };
+        // One from before invitations has nothing after `next`, for the minutes it can still be in use.
+        let ["o", expires, provider, state, nonce, verifier, next, rest @ ..] = parts.as_slice() else { return None };
+        let invite = match rest {
+            [] => "",
+            [invite] => invite,
+            _ => return None,
+        };
         if expires.parse::<i64>().ok()? < unix_now() {
             return None;
         }
@@ -210,6 +220,7 @@ impl Attempt {
             nonce: nonce.to_string(),
             verifier: verifier.to_string(),
             next: (!next.is_empty()).then_some(next),
+            invite: (!invite.is_empty()).then(|| invite.to_string()),
         })
     }
 }
@@ -885,6 +896,15 @@ mod tests {
         assert!(Attempt::open(&signer, &signer.cookie("us_x", "h.t", 60)).is_none());
         let expired = signer.seal("o~1~google~s~n~v~");
         assert!(Attempt::open(&signer, &expired).is_none());
+
+        // An invitation comes along, and a cookie from before there were any still opens.
+        let mut invited = Attempt::new("google", None);
+        invited.invite = Some("abc123".into());
+        assert_eq!(Attempt::open(&signer, &invited.seal(&signer)).unwrap().invite.as_deref(), Some("abc123"));
+        assert_eq!(Attempt::open(&signer, &none.seal(&signer)).unwrap().invite, None);
+        let older = signer.seal(&format!("o~{}~google~s~n~v~", unix_now() + 60));
+        assert!(Attempt::open(&signer, &older).is_some_and(|a| a.invite.is_none()));
+        assert!(Attempt::open(&signer, &signer.seal(&format!("o~{}~google~s~n~v~~a~b", unix_now() + 60))).is_none());
     }
 
     #[test]
@@ -895,6 +915,10 @@ mod tests {
         let cookie = Attempt::new(&"p".repeat(40), Some(&longest)).seal(&signer);
         assert!(format!("__Host-mp_oidc={cookie}").len() < 4096, "{}", cookie.len());
         assert_eq!(Attempt::open(&signer, &cookie).unwrap().next.as_deref(), Some(longest.as_str()));
+        // An invitation's digest is short, and never comes with a destination.
+        let mut invited = Attempt::new(&"p".repeat(40), None);
+        invited.invite = Some(magicpipes_core::secret::sha256_hex("code"));
+        assert!(format!("__Host-mp_oidc={}", invited.seal(&signer)).len() < 4096);
     }
 
     #[test]
