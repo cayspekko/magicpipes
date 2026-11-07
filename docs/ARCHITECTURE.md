@@ -411,8 +411,39 @@ a certificate or an HTTP route.
   checks the kind echoed in `TunnelInfo` (absent = `http`) and fails with `server_outdated`.
   Old agents never send `kind` and keep getting HTTP tunnels.
 
-Planned target and ingress kinds (Unix sockets, SSH gateway, browser desktop) are described in
-[ROADMAP.md](ROADMAP.md).
+Planned ingress kinds (SSH gateway, browser desktop) are described in [ROADMAP.md](ROADMAP.md).
+
+## Unix socket targets (`add --unix`)
+
+A socket is a local target, not a tunnel kind: `kind` says how the public side looks (`http`, or `tcp`
+with `--tcp`), and the server doesn't know the difference. `ServerOpen::Data` still names a tunnel id,
+and `agent/forward.rs` looks the path up in the agent's own table. So there's no protocol or schema
+change, and any server works. All the server gets is `unix:<file name>` as a description, because the
+full path can name the local user.
+
+* **The path stays as given** (absolute, made so by the CLI, which knows the working directory), with
+  links unresolved, and the agent connects anew per stream. A deploy that points `current` at a new
+  release therefore takes effect under a running tunnel. Resolving it once, as `--serve` does for a
+  folder, would keep a tunnel on the old release after every deploy.
+* **File permissions don't carry through.** The agent connects as its own user, whoever opened the
+  tunnel, which is what a tunnel is for. For a few kinds of socket that amounts to handing over the
+  machine or the user's keys, so `agent/unix.rs` refuses those without `--allow-sensitive-socket`,
+  recognizing them on the canonical path, and before connecting, since merely connecting can make a
+  service act. The list is by name and place, and can't be complete: the README and the CLI say what the
+  person publishing one is taking on.
+* **The data path is the same as a port's**: `copy_bidirectional_with_sizes` with `COPY_BUFFER`,
+  with the same end when the tunnel's settings change. `set_nodelay` has no meaning here. `tokio` has no
+  `UnixStream` on Windows, so `platform.rs` keeps that behind `unix_connect`, and the CLI answers
+  `unsupported` there. `tunnels.json` gains `{"unix": path}`; older files load as before.
+* **What it costs** (`scripts/bench/compare.sh --suite unix`, 3 to 5 rounds). On static Linux a socket
+  matches a port: about 1,100 MB/s for a download, 74,000 requests a second against 62,000, and 970 ms
+  against 1,040 for a 1 GiB upload. macOS starts a socket's buffers at 8 KiB, and there the sender's
+  buffer is the one that counts. So the agent gives its own 256 KiB, which took that upload from
+  1,630 ms to 481 ms (a port takes about 600), measured with one binary choosing at runtime so that
+  code layout couldn't explain it. A larger receive buffer on the agent's side added nothing, so it
+  has none. Downloads on a Mac stay at about 650 MB/s, against 2,100 for a port, because there the
+  application is the sender: a 256 KiB send buffer in the test application alone took them to 1,200 to
+  1,900. An application can set that itself; the agent can't do it for one.
 
 ## Wire protocol
 

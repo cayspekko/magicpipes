@@ -30,6 +30,7 @@ use super::serve;
 use super::session::{ConnState, RpcError, Session};
 use super::shell;
 use super::tunnels::{Registration, Tunnels};
+use super::unix;
 use crate::ipc::{AddRequest, ErrorInfo, IpcEvent, Step, StepState};
 use crate::state::{LocalTunnel, Target, address, target_url};
 
@@ -426,7 +427,15 @@ impl Agent {
             .tunnels
             .list()
             .into_iter()
-            .filter(|t| t.name == selector || t.id == selector || matches!(&t.target, Target::Port { port: p, .. } if port == Some(*p)))
+            .filter(|t| {
+                t.name == selector
+                    || t.id == selector
+                    || match &t.target {
+                        Target::Port { port: p, .. } => port == Some(*p),
+                        Target::Unix { unix } => unix.as_os_str() == selector,
+                        _ => false,
+                    }
+            })
             .collect();
         let t = match matches.as_slice() {
             [] => return Err(ErrorInfo::new(ErrorCode::NotFound, format!("no tunnel named '{selector}'"))),
@@ -536,9 +545,17 @@ impl Agent {
     }
 }
 
-/// Checks the local side of an `add`: a listening port, a directory to serve, or a program to
-/// run in a web terminal.
+/// Checks the local side of an `add`: a listening port or Unix socket, a directory to serve, or a
+/// program to run in a web terminal.
 async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
+    if let Some(path) = &req.unix {
+        // A socket here is a stream: UDP has nothing to send datagrams to.
+        if req.kind == Kind::Udp {
+            return Err(ErrorInfo::new(ErrorCode::InvalidRequest, "--udp needs a local port"));
+        }
+        cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?;
+        return Ok(Target::Unix { unix: unix::check(path, req.allow_sensitive_socket).await? });
+    }
     if let Some(command) = &req.shell {
         let cwd = req.cwd.clone().ok_or_else(|| ErrorInfo::new(ErrorCode::InvalidRequest, "--shell needs a working directory"))?;
         shell::check(command, &cwd)?;
@@ -565,7 +582,7 @@ async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
             Ok(Target::Port { host, port })
         }
         (None, Some(port)) => Ok(Target::Port { host: resolve_local(req.host.as_deref(), port, req.kind).await?, port }),
-        (None, None) => Err(ErrorInfo::new(ErrorCode::InvalidRequest, "give a local port, --serve <dir> or --shell")),
+        (None, None) => Err(ErrorInfo::new(ErrorCode::InvalidRequest, "give a local port, --unix <socket>, --serve <dir> or --shell")),
     }
 }
 

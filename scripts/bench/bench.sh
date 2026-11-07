@@ -2,7 +2,7 @@
 # One run of one benchmark suite against one build, on this machine. Prints one line per
 # measurement. `compare.sh` is usually what you want; see README.md here.
 #
-# Usage: bench.sh <traffic|control|memory|wan> <build dir>
+# Usage: bench.sh <traffic|control|memory|wan|unix> <build dir>
 #
 # A build dir holds magicpipes and magicpipesd; `build.sh` makes them. Settings, all optional:
 #   BENCH_TOOLS            folder with mp-bench-load and mp-bench-app (default: <build dir>/../tools)
@@ -12,7 +12,7 @@
 #   BENCH_KEEP             set to keep the run's folder, with the server's log
 set -uo pipefail
 
-USAGE="usage: bench.sh <traffic|control|memory|wan> <build dir>"
+USAGE="usage: bench.sh <traffic|control|memory|wan|unix> <build dir>"
 SUITE=${1:?$USAGE}
 BIN=$(cd "${2:?$USAGE}" && pwd) || exit 2
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -109,7 +109,7 @@ login() {
 }
 
 start_app() {
-  "$TOOLS/mp-bench-app" "$APP" > /dev/null 2>&1 &
+  "$TOOLS/mp-bench-app" "$APP" "$RUN/app.sock" > /dev/null 2>&1 &
   APP_PID=$!
   disown "$APP_PID"
   sleep 0.3
@@ -163,6 +163,28 @@ small_during_downloads() {
   sleep 1
 }
 
+# A Unix socket beside a port, in one build: what does the socket cost?
+suite_unix() {
+  "$BIN/magicpipes" add --help | grep -q -- '--unix' || fail "this build has no --unix"
+  start_server
+  login
+  start_app
+  add "$APP" --public --name web
+  add --unix "$RUN/app.sock" --public --name sock
+  AGENT=$(cat home/agent.pid)
+  sleep 0.5
+  local name host
+  for name in port socket; do
+    host=web.t.test
+    [ "$name" = socket ] && host=sock.t.test
+    measure "${name}_small_c16" rps "$host" --conc 16
+    measure "${name}_new_connections_c16" rps "$host" --conc 16 --close
+    measure "${name}_download_1" mb_s "$host" --conc 1 --path /big/2048
+    measure "${name}_download_4" mb_s "$host" --conc 4 --path /big/2048
+    measure "${name}_upload_1gib" p50 "$host" --conc 1 --reqs 1 --post 1073741824
+  done
+}
+
 suite_traffic() {
   start_server
   login
@@ -190,7 +212,11 @@ suite_traffic() {
     iperf3 -s -p "$IPERF" > /dev/null 2>&1 &
     IPERF_PID=$!
     disown "$IPERF_PID"
-    sleep 0.3
+    # Right after a big upload, it can take longer to start than a fixed wait allows.
+    for _ in $(seq 1 50); do
+      (exec 3<>"/dev/tcp/127.0.0.1/$IPERF") 2>/dev/null && break
+      sleep 0.1
+    done
     add "$IPERF" --tcp --allow-any --name iperf --remote-port "$IPERF_PUBLIC"
     printf 'test=iperf_1 key=gbit gbit=%s\n' "$(iperf)"
     printf 'test=iperf_reverse key=gbit gbit=%s\n' "$(iperf -R)"
@@ -293,5 +319,6 @@ case $SUITE in
   control) suite_control ;;
   memory) suite_memory ;;
   wan) suite_wan ;;
+  unix) suite_unix ;;
   *) echo "$USAGE" >&2; exit 2 ;;
 esac

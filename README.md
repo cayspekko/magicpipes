@@ -237,6 +237,7 @@ The defaults are the safe ones. These turn something on, or tighten it further, 
 | `add --allow-any` | off | Opens a raw port to the whole internet |
 | `add --site` | off | Lets HTML and SVG in a served folder run scripts |
 | `add --allow-sensitive-root` | off | Serves a home folder, a hidden folder in it, or the filesystem root |
+| `add --allow-sensitive-socket` | off | Publishes a Unix socket that usually hands over the machine or your keys, such as Docker's or your SSH agent's |
 | `add --write` | off | Lets anyone with a terminal's link, and whoever controls the server, run commands as you |
 | `[public] allow_cookie_domain` | off | Lets applications set cookies for the whole base domain, which reach other tunnels and the management host |
 | `[[oidc]] trust_email` | off | Accepts addresses the provider didn't verify |
@@ -725,6 +726,47 @@ Checking program...           ✓
 > commands as you. Only use `--write` through a server you trust, and your own SSH for anything the
 > server operator should not see.
 
+### Unix sockets
+
+An application that listens on a Unix socket gets an address the same way, on macOS and Linux:
+
+```console
+$ magicpipes add --unix /run/app.sock --private --name app
+Checking socket...            ✓
+Connecting to server...       ✓
+Registering tunnel...         ✓
+Checking HTTPS certificate... ✓
+Checking tunnel...            ✓
+
+Tunnel ready
+
+  URL:    https://app.mp.example.com
+  Local:  unix:/run/app.sock
+```
+
+Everything else works as it does for a port: `--name`, `--private`, `--tag`, `--hostname`, re-running
+the command, and `--tcp` for a raw port in front of a socket. `magicpipes remove` also takes the path.
+UDP needs a port, and Windows isn't supported yet: `--unix` fails there with `unsupported`.
+
+* **Connections reach the socket as you.** That's what the agent runs as, so the socket's file
+  permissions say nothing about who gets through the tunnel, and whoever does gets anything the service
+  behind it trusts your user for. A database that lets its local users in without a password (peer
+  authentication) lets them in too. So think about `--private`, or `--allow-cidr` with `--tcp`.
+* **Some sockets need `--allow-sensitive-socket`**, because publishing one usually hands over more
+  than anyone means to: Docker, Podman, containerd and other container or virtual machine engines
+  (root on the machine, in effect), the system's services (D-Bus, systemd), your SSH or GPG agent,
+  SSH's shared connections, tmux and screen sessions, and this agent's own socket. They're recognized
+  by name and place, through any links, so this can't catch everything: it's a seatbelt, not a
+  promise. Think of it before publishing a socket you don't know.
+* **The path is kept as you gave it** (made absolute), and links are followed each time it connects. A
+  deploy can point `current` at a new release under a running tunnel. A connection already open keeps
+  going until the old release stops, as it would with a port.
+* **Your server sees only the file's name** (`unix:app.sock`), since the full path can name you.
+* **The application may restart.** A new socket file at the same path just works. While nothing
+  answers, the tunnel says `local_unreachable`, as it does for a port.
+
+Socket paths are limited to about 100 bytes by the operating system.
+
 ### TCP and UDP ports
 
 For anything that is not HTTP (databases, SSH, game servers, MQTT, DNS), `--tcp` or `--udp`
@@ -774,7 +816,7 @@ psql -h example.com -p 65507 -U me mydb
 ### `add` semantics
 
 * The local service must already be accepting connections. The agent tries `127.0.0.1` and then
-  `::1`; `--host` picks another local address.
+  `::1`; `--host` picks another local address, and `--unix` a socket.
 * **Idempotent:** running `add <port>` again for a port that already has a tunnel returns the
   existing tunnel (`"created": false`) after re-verifying it. `add <port> --name X` reuses
   tunnel `X` if it already points at that port, and fails with `name_conflict` if it points
@@ -821,7 +863,7 @@ On failure:
 | 1 | `internal`, `invalid_request`, `bad_request`, `protocol`, `busy`, `rate_limited`, `invalid_server`, ... | Unexpected error, or a request that can't be served as it is |
 | 2 | | Invalid command-line usage |
 | 3 | `not_logged_in`, `unauthorized`, `invalid_enrollment_token`, `config_error`, `forbidden`, `unauthenticated` | Enrollment, credentials or local configuration |
-| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, or `--shell` program not found |
+| 4 | `local_unreachable`, `invalid_port`, `invalid_host`, `invalid_directory`, `invalid_command`, `invalid_socket`, `spawn_failed` | Nothing listening locally, `--serve` directory missing, `--unix` path not a socket or refused, or `--shell` program not found |
 | 5 | `server_unreachable`, `agent_unavailable`, `agent_start_failed`, `agent_not_running`, `agent_protocol`, `agent_outdated`, `mail_failed` | Cannot reach server or agent, or the running agent (or, for the server, the machine's magicpipes) is too old for the request |
 | 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `server_outdated`, `unsupported`, `invalid_cidr`, `mail_not_configured` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |

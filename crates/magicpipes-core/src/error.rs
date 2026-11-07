@@ -82,6 +82,8 @@ codes! {
     InvalidHost = "invalid_host", http 400, exit 4;
     InvalidDirectory = "invalid_directory", http 400, exit 4;
     InvalidCommand = "invalid_command", http 400, exit 4;
+    /// `--unix`: not a socket, or one that needs `--allow-sensitive-socket`.
+    InvalidSocket = "invalid_socket", http 400, exit 4;
     /// The web terminal could not start its program.
     SpawnFailed = "spawn_failed", http 500, exit 4;
 
@@ -178,7 +180,7 @@ mod tests {
         // The CLI's exit statuses are an API (README "JSON output and exit codes").
         let table: &[(u8, &[&str])] = &[
             (3, &["not_logged_in", "unauthorized", "invalid_enrollment_token", "config_error", "forbidden", "unauthenticated"]),
-            (4, &["local_unreachable", "invalid_port", "invalid_host", "invalid_directory", "invalid_command", "spawn_failed"]),
+            (4, &["local_unreachable", "invalid_port", "invalid_host", "invalid_directory", "invalid_command", "invalid_socket", "spawn_failed"]),
             (5, &["server_unreachable", "agent_unavailable", "agent_start_failed", "agent_not_running", "agent_protocol", "agent_outdated", "mail_failed"]),
             (6, &["name_conflict", "name_taken", "email_taken", "tag_unknown", "public_not_allowed", "invalid_name", "limit_reached", "not_found", "port_unavailable", "kind_mismatch",
                   "ports_disabled", "server_outdated", "invalid_cidr", "unsupported", "mail_not_configured"]),

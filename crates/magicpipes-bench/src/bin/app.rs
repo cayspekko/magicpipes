@@ -1,12 +1,13 @@
 //! Test application for `scripts/bench`: answers HTTP/1.1 as cheaply as it can, so that what gets
 //! measured is the tunnel. `GET /big/<MiB>`, `/64k`, `/1k`, and 13 bytes for anything else; a POST's
-//! body (`Content-Length` only) is read and discarded first.
+//! body (`Content-Length` only) is read and discarded first. It listens on a port, and with a path,
+//! on that Unix socket as well.
 
 use std::io;
 
 use anyhow::Context;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const THREADS: usize = 4;
 const KIB: u64 = 1024;
@@ -25,8 +26,7 @@ fn response_length(path: &str) -> u64 {
     }
 }
 
-async fn serve(mut tcp: TcpStream) -> io::Result<()> {
-    tcp.set_nodelay(true)?;
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut tcp: S) -> io::Result<()> {
     let mut buf = vec![0u8; CHUNK];
     let mut have = 0;
     loop {
@@ -78,12 +78,26 @@ async fn serve(mut tcp: TcpStream) -> io::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let port: u16 = std::env::args().nth(1).context("usage: mp-bench-app <port>")?.parse().context("the port")?;
+    let mut args = std::env::args().skip(1);
+    let port: u16 = args.next().context("usage: mp-bench-app <port> [unix socket]")?.parse().context("the port")?;
+    let socket = args.next();
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(THREADS).enable_all().build()?;
     runtime.block_on(async {
+        #[cfg(unix)]
+        if let Some(path) = socket {
+            let listener = tokio::net::UnixListener::bind(path)?;
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(serve(stream));
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        anyhow::ensure!(socket.is_none(), "no Unix sockets here");
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         loop {
             let (tcp, _) = listener.accept().await?;
+            tcp.set_nodelay(true)?;
             tokio::spawn(serve(tcp));
         }
     })

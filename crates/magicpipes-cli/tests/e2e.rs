@@ -3769,3 +3769,172 @@ async fn browser_signs_in_with_emailed_links() {
     assert!(result["errors"].as_array().unwrap().is_empty(), "the browser reported errors: {result}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- Unix sockets -------------------------------------------------------------------------------
+
+/// What a failing `add --json` said: its exit code, error code and message.
+async fn add_fails(env: &Env, args: &[&str]) -> (i32, String, String) {
+    let mut a = vec!["add"];
+    a.extend_from_slice(args);
+    a.push("--json");
+    let out = env.cli(&a).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{args:?}: {}", String::from_utf8_lossy(&out.stderr)));
+    (out.status.code().unwrap_or(-1), v["error"]["code"].as_str().unwrap_or("").to_string(), v["error"]["message"].as_str().unwrap_or("").to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unix_socket_tunnels() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let path = env.root.join("app.sock");
+    let p = path.to_str().unwrap();
+
+    // Options that make no sense together are refused before anything happens.
+    for args in [
+        vec!["add", "--unix", p, "--udp"],
+        vec!["add", "8080", "--unix", p],
+        vec!["add", "--unix", p, "--host", "other"],
+        vec!["add", "--unix", p, "--serve", "."],
+        vec!["add", "--unix", p, "--shell"],
+        vec!["add", "8080", "--allow-sensitive-socket"],
+    ] {
+        assert_eq!(env.cli(&args).await.status.code(), Some(2), "{args:?}");
+    }
+
+    // Nothing there, as with a port nothing listens on. Nothing gets registered.
+    let (code, error, message) = add_fails(&env, &["--unix", p, "--name", "sock"]).await;
+    assert_eq!((code, error.as_str()), (4, "local_unreachable"), "{message}");
+    assert!(message.contains("Start your application") && message.contains(p), "{message}");
+
+    // A file that isn't a socket.
+    let file = env.root.join("plain.txt");
+    std::fs::write(&file, "not a socket").unwrap();
+    let (code, error, message) = add_fails(&env, &["--unix", file.to_str().unwrap()]).await;
+    assert_eq!((code, error.as_str()), (4, "invalid_socket"), "{message}");
+
+    // A socket file an application left behind, with nothing accepting on it.
+    let stale = common::unix_echo_app(&path);
+    stale.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (code, error, message) = add_fails(&env, &["--unix", p]).await;
+    assert_eq!((code, error.as_str()), (4, "local_unreachable"), "{message}");
+    assert_eq!(env.cli_json(&["list", "--json"]).await["tunnels"], serde_json::json!([]));
+
+    // An application there is verified end to end, like any other.
+    let app = common::unix_http_app(&path, "the first socket");
+    let out = env.cli_ok(&["add", "--unix", p, "--name", "sock"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Checking socket...") && stderr.contains("Verifying public endpoint...  ✓"), "{stderr}");
+    assert!(stderr.contains("Connections reach this socket as you"), "says what that means: {stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("Local:  unix:{p}")), "{}", String::from_utf8_lossy(&out.stdout));
+    let t = add_json(&env, &["--unix", p, "--name", "sock"]).await;
+    assert_eq!((t["created"].as_bool(), t["status"].as_str(), t["kind"].as_str()), (Some(false), Some("ready"), Some("http")), "running it again changes nothing: {t}");
+    assert_eq!(t["target"], format!("unix:{p}"), "{t}");
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let get = async |h: &str| env.get_public(h, "/").await;
+    let (status, error, body) = get(&host).await;
+    assert_eq!((status, error, body.as_str()), (StatusCode::OK, None, "hello over the first socket"));
+
+    // A body too big for the socket's buffers comes back whole.
+    let big = "0123456789abcdef".repeat(128 * 1024);
+    let echoed = env.tunnel_post(&host, "/echo", "", &big).await;
+    assert!(echoed.status == StatusCode::OK && echoed.body == big, "{} bytes back", echoed.body.len());
+
+    // The server sees the tunnel, and the file's name, not the path that says whose machine it is.
+    let (_, tunnels) = env.api("GET", "/api/v1/tunnels", Some(&env.admin_token())).await;
+    assert_eq!(tunnels["tunnels"][0]["target"], "unix:app.sock", "{tunnels}");
+    assert!(!tunnels.to_string().contains(env.root.to_str().unwrap()), "{tunnels}");
+    let listed = env.cli_json(&["list", "--json"]).await;
+    assert_eq!((listed["tunnels"][0]["target"].as_str(), listed["tunnels"][0]["status"].as_str()), (Some(format!("unix:{p}").as_str()), Some("connected")), "{listed}");
+
+    // One name, one target.
+    let other = env.root.join("other.sock");
+    let other_app = common::unix_http_app(&other, "the other socket");
+    let (code, error, message) = add_fails(&env, &["--unix", other.to_str().unwrap(), "--name", "sock"]).await;
+    assert_eq!((code, error.as_str()), (6, "name_conflict"), "{message}");
+
+    // The application going away looks the same as a port's, and the tunnel stays.
+    app.stop();
+    env.eventually("the tunnel says it can't reach the application", Duration::from_secs(5), async || {
+        get(&host).await.1.as_deref() == Some("local_unreachable")
+    })
+    .await;
+    // It comes back, with a new socket file at the same path, and nobody has to do anything.
+    let app = common::unix_http_app(&path, "the restarted socket");
+    env.eventually("the tunnel reaches the application again", Duration::from_secs(5), async || get(&host).await.2 == "hello over the restarted socket").await;
+
+    // Tunnels come back with the agent, from what it saved.
+    env.cli_ok(&["agent", "stop"]).await;
+    env.cli_ok(&["agent", "start"]).await;
+    env.eventually("the tunnel is back", Duration::from_secs(10), async || get(&host).await.2 == "hello over the restarted socket").await;
+    drop(app);
+
+    // Links are followed when connecting, so a deploy can repoint one under a running tunnel. A
+    // connection already open keeps going until the old release stops, as it would with a port.
+    let link = env.root.join("current.sock");
+    let (one, two) = (env.root.join("release-1.sock"), env.root.join("release-2.sock"));
+    let first = common::unix_http_app(&one, "release 1");
+    let _second = common::unix_http_app(&two, "release 2");
+    std::os::unix::fs::symlink(&one, &link).unwrap();
+    let t = add_json(&env, &["--unix", link.to_str().unwrap(), "--name", "linked"]).await;
+    assert_eq!(t["target"], format!("unix:{}", link.display()), "kept as given: {t}");
+    let linked = hostname(t["public_url"].as_str().unwrap());
+    assert_eq!(get(&linked).await.2, "hello over release 1");
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&two, &link).unwrap();
+    first.stop();
+    env.eventually("the new release answers", Duration::from_secs(5), async || get(&linked).await.2 == "hello over release 2").await;
+
+    // A relative path means where the command was run, not where the agent runs.
+    let sub = env.root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let _rel = common::unix_http_app(&sub.join("r.sock"), "a relative path");
+    let out = env.cli_in(&sub, &["add", "--unix", "./r.sock", "--name", "rel", "--json"]).await;
+    let t: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+    assert_eq!(get(&hostname(t["public_url"].as_str().unwrap())).await.2, "hello over a relative path", "{t}");
+
+    // Private works the same way: no public probe, and a sign-in in front of it.
+    let t = add_json(&env, &["--unix", other.to_str().unwrap(), "--name", "secret", "--private"]).await;
+    assert_eq!((t["visibility"].as_str(), t["status"].as_str()), (Some("private"), Some("ready")), "{t}");
+    let anonymous = env.tunnel_get(&hostname(t["public_url"].as_str().unwrap()), "/", "", true).await;
+    assert_eq!(anonymous.status, StatusCode::SEE_OTHER, "{}", anonymous.body);
+    let out = env.cli_ok(&["add", "--unix", other.to_str().unwrap(), "--name", "secret", "--private"]).await;
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("Connections reach this socket as you"), "signing in is what it would suggest");
+    drop(other_app);
+
+    // A raw port in front of a socket: asked for like any other, and the bytes get through.
+    let echo = env.root.join("echo.sock");
+    let _echo_app = common::unix_echo_app(&echo);
+    let e = echo.to_str().unwrap();
+    let (code, error, message) = add_fails(&env, &["--unix", e, "--tcp"]).await;
+    assert_eq!((code, error.as_str()), (1, "invalid_request"), "{message}");
+    assert!(message.contains("--allow-any"), "{message}");
+    let t = add_json(&env, &["--unix", e, "--tcp", "--allow-any", "--name", "echo"]).await;
+    assert_eq!((t["kind"].as_str(), t["reachable"].as_bool()), (Some("tcp"), Some(true)), "{t}");
+    let port = t["public_port"].as_u64().unwrap() as u16;
+    assert_eq!(tcp_roundtrip(port, b"over a raw port").await, b"over a raw port");
+
+    // Sockets that would hand over the machine, or this agent, need saying twice.
+    let docker = env.root.join("docker.sock");
+    let _docker = common::unix_http_app(&docker, "docker");
+    let d = docker.to_str().unwrap();
+    let (code, error, message) = add_fails(&env, &["--unix", d, "--name", "docker"]).await;
+    assert_eq!((code, error.as_str()), (4, "invalid_socket"), "{message}");
+    assert!(message.contains("--allow-sensitive-socket") && message.contains("containers"), "{message}");
+    let own = env.root.join("a.sock");
+    let (code, error, message) = add_fails(&env, &["--unix", own.to_str().unwrap()]).await;
+    assert_eq!((code, error.as_str()), (4, "invalid_socket"), "the agent's own control socket: {message}");
+    assert!(message.contains("this agent"), "{message}");
+    // Through a link it's the same socket.
+    let hidden = env.root.join("harmless.sock");
+    std::os::unix::fs::symlink(&docker, &hidden).unwrap();
+    assert_eq!(add_fails(&env, &["--unix", hidden.to_str().unwrap()]).await.1, "invalid_socket");
+    let t = add_json(&env, &["--unix", d, "--name", "docker", "--allow-sensitive-socket", "--private"]).await;
+    assert_eq!(t["status"], "ready", "{t}");
+
+    // Removed by name, or by the path it was added with.
+    let out = env.cli_ok(&["remove", p]).await;
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Removed tunnel sock"), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(get(&host).await.0, StatusCode::NOT_FOUND);
+    env.cli_ok(&["agent", "stop"]).await;
+}

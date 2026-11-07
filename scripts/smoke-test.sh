@@ -2,7 +2,8 @@
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
-# terminal, echoes through TCP and UDP port tunnels, and stops the agent.
+# terminal, echoes through TCP and UDP port tunnels, reaches an application on a Unix socket (or, on
+# Windows, is told that isn't supported), and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -84,7 +85,7 @@ export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID="" ECHOPID=""
+SRV="" APPPID="" ECHOPID="" SOCKPID=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -92,6 +93,7 @@ cleanup() {
   stop_pid "$SRV"
   stop_pid "$APPPID"
   stop_pid "$ECHOPID"
+  stop_pid "$SOCKPID"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
@@ -277,6 +279,40 @@ run "$PY" ports.py tcp "$PTCP" "smoke over tcp"
 run "$MP" add "$ECHO_UDP" --udp --allow-any --name pudp --json --timeout 60
 PUDP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
 run "$PY" ports.py udp "$PUDP" "smoke over udp"
+
+step "unix socket"
+if [[ -n "$WINDOWS" ]]; then
+  # It says so, rather than doing something else.
+  rc=0
+  run "$MP" add --unix nowhere.sock --json || rc=$?
+  [[ $rc -eq 6 ]] || { echo "expected exit code 6, got $rc"; exit 1; }
+  grep -q '"unsupported"' cmd.out
+else
+  cat > sock.py <<'PYEOF'
+import http.server, socketserver, sys
+class Hello(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"hello over a socket\n"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def address_string(self): return "unix"
+    def log_message(self, *args): pass
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+Server(sys.argv[1], Hello).serve_forever()
+PYEOF
+  "$PY" sock.py "$WORK/app.sock" > sock.log 2>&1 < /dev/null &
+  SOCKPID=$!
+  for _ in $(seq 1 50); do [[ -S app.sock ]] && break; sleep 0.1; done
+  run "$MP" add --unix "$WORK/app.sock" --name sock --json --timeout 60
+  grep -q '"status": "ready"' cmd.out
+  grep -q '"target": "unix:' cmd.out
+  run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "sock.t.test:$HTTPS:127.0.0.1" "https://sock.t.test:$HTTPS/"
+  grep -q "hello over a socket" cmd.out
+  run "$MP" remove sock
+fi
 
 step "list and remove"
 run "$MP" list

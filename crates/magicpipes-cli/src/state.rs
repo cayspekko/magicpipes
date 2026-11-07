@@ -179,6 +179,9 @@ pub enum Target {
         key: Option<String>,
         max_clients: u16,
     },
+    /// A Unix socket (`--unix`). The path is absolute, with links as given: a deploy can point a
+    /// link at a new release.
+    Unix { unix: PathBuf },
 }
 
 fn pages_ran_scripts_before_site_existed() -> bool {
@@ -195,13 +198,14 @@ impl Target {
             Target::Shell { shell, writable, .. } => {
                 format!("shell:{} ({})", command_line(shell), if *writable { "read-write" } else { "read-only" })
             }
+            Target::Unix { unix } => format!("unix:{}", display_path(unix)),
         }
     }
 
     /// The URL to share: the public URL, plus the write key in the fragment for a writable shell.
     /// Like [`Target::describe`], minus local details the server operator has no need for: a
-    /// shell's arguments (which may hold secrets) and the folder's full path (which names the
-    /// local user).
+    /// shell's arguments (which may hold secrets) and the full path of a folder or socket (which can
+    /// name the local user).
     pub fn server_description(&self, kind: Kind) -> String {
         match self {
             Target::Static { serve, .. } => {
@@ -209,6 +213,9 @@ impl Target {
             }
             Target::Shell { shell, writable, .. } => {
                 format!("shell:{} ({})", program_name(shell), if *writable { "read-write" } else { "read-only" })
+            }
+            Target::Unix { unix } => {
+                format!("unix:{}", unix.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| display_path(unix)))
             }
             Target::Port { .. } => self.describe(kind),
         }
@@ -228,6 +235,7 @@ impl Target {
             (Target::Port { host: h1, port: p1 }, Target::Port { host: h2, port: p2 }) => h1 == h2 && p1 == p2,
             (Target::Static { serve: a, .. }, Target::Static { serve: b, .. }) => a == b,
             (Target::Shell { shell: a, cwd: ca, .. }, Target::Shell { shell: b, cwd: cb, .. }) => a == b && ca == cb,
+            (Target::Unix { unix: a }, Target::Unix { unix: b }) => a == b,
             _ => false,
         }
     }
@@ -324,6 +332,30 @@ mod tests {
     }
 
     /// A file from before `--site`: its tunnel goes on working the way it did. New ones say.
+    #[test]
+    fn a_socket_target_is_kept_and_described() {
+        let t = Target::Unix { unix: "/home/alice/app/run.sock".into() };
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, r#"{"unix":"/home/alice/app/run.sock"}"#);
+        assert_eq!(serde_json::from_str::<Target>(&json).unwrap(), t);
+        assert_eq!(t.describe(Kind::Http), "unix:/home/alice/app/run.sock");
+        assert_eq!(t.describe(Kind::Tcp), "unix:/home/alice/app/run.sock");
+        assert_eq!(t.server_description(Kind::Http), "unix:run.sock", "the server has no need for the path, which names the user");
+        assert_eq!(t.share_url("https://a.t.test"), "https://a.t.test");
+        assert!(t.same_destination(&Target::Unix { unix: "/home/alice/app/run.sock".into() }));
+        assert!(!t.same_destination(&Target::Unix { unix: "/home/alice/other.sock".into() }));
+        assert!(!t.same_destination(&Target::Port { host: "127.0.0.1".into(), port: 80 }));
+
+        // A whole tunnel, as tunnels.json holds it, next to ones of other kinds.
+        let text = r#"[{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","unix":"/run/a.sock","created_at":1},
+                       {"id":"tn_2","name":"b","hostname":"b.t.test","public_url":"https://b.t.test","host":"127.0.0.1","port":8080,"created_at":1}]"#;
+        let list: Vec<LocalTunnel> = serde_json::from_str(text).unwrap();
+        assert_eq!(list[0].target, Target::Unix { unix: "/run/a.sock".into() });
+        assert_eq!(list[1].target, Target::Port { host: "127.0.0.1".into(), port: 8080 });
+        let again: Vec<LocalTunnel> = serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
+        assert_eq!(again[0].target, list[0].target);
+    }
+
     #[test]
     fn older_sites_keep_their_scripts() {
         let old: Target = serde_json::from_str(r#"{"serve":"/srv/site","list":true}"#).unwrap();

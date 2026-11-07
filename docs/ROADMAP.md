@@ -35,7 +35,7 @@ What you expose, and every way people can reach it:
 | Local service | CLI | Public HTTPS hostname | Public TCP/UDP port | SSH gateway (`ssh -J`) | Browser (management UI) |
 |---|---|---|---|---|---|
 | HTTP app | `add 8080` | ✅ today | ✅ TCP (optional) | — | via its hostname |
-| HTTP over Unix socket | `add --unix /run/app.sock` | ✅ | ✅ TCP | — | via its hostname |
+| HTTP over Unix socket | `add --unix /run/app.sock` | ✅ today | ✅ today (TCP) | — | via its hostname |
 | Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
 | Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP) | — | — |
 | Any UDP service | `add 53 --udp` | — | ✅ today (UDP) | — | — |
@@ -64,7 +64,7 @@ Everything stays under `add`, following the existing convention (positional port
 magicpipes add 8080                          # http (unchanged)
 magicpipes add --serve ./dist                # static files
 magicpipes add --shell -- htop               # web terminal (read-only; --write needs the #k= link)
-magicpipes add --unix /var/run/docker.sock   # http over a unix socket
+magicpipes add --unix /run/app.sock          # http over a unix socket
 magicpipes add 5432 --tcp --allow-any        # → tcp://example.com:65307
 magicpipes add 53 --udp --allow-any --host 10.0.0.2  # → udp://example.com:65311
 magicpipes add 22 --ssh                      # → ssh -J example.com:2222 <name>
@@ -244,8 +244,8 @@ The design, with tag-based access in place of per-user grants, is in [USERS.md](
 - New protocol fields default so old agents keep working (missing `kind` = `http`).
 - A new agent registering a non-HTTP tunnel must check that the server echoed `kind` back;
   otherwise an old server would silently ignore `--tcp` and create an HTTP tunnel.
-- Unix-socket targets are Unix/macOS only (tokio has no `UnixStream` on Windows); named pipes
-  can come later.
+- Unix-socket targets are macOS and Linux only (tokio has no `UnixStream` on Windows), and an older
+  running agent reports `agent_outdated` rather than ignore `--unix`. Named pipes can come later.
 
 ## Phases
 
@@ -256,7 +256,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1 | Static files (`add --serve`) | none | done |
 | 1b | Agent web terminal (`add --shell`) | none | done |
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
-| 2 | Tunnel model refactor (`kind`) + Unix socket targets | protocol + schema | `kind` done (with phase 3); Unix sockets planned |
+| 2 | Tunnel model refactor (`kind`) + Unix socket targets | none for sockets | done |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in and email done) |
 | 5 | SSH gateway + SSH web terminal | yes | planned |

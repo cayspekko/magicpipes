@@ -30,6 +30,7 @@ use crate::state::AgentConfig;
   magicpipes login --server https://mp.example.com   Enroll this machine
   magicpipes add 8080                                Give a local port its own address
   magicpipes add 8080 --private                      Only for people who sign in and are allowed
+  magicpipes add --unix /run/app.sock                Give a local Unix socket its own address
   magicpipes add --serve ./public                    Share a folder
   magicpipes add 22 --tcp --allow-cidr 203.0.113.0/24   Open a raw TCP port to one network
   magicpipes list                                    See what's running
@@ -80,12 +81,13 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
-    /// Expose a local port, serve a directory or share a terminal; returns once the public address is verified to work.
+    /// Expose a local port or Unix socket, serve a directory or share a terminal; returns once the public address is verified to work.
     #[command(after_help = "Examples:
   magicpipes add 8080                         Anyone with the address can reach it
   magicpipes add 8080 --private               Only you, after signing in
   magicpipes add 8080 --tag team:dev          You and people with that tag
   magicpipes add 8080 --hostname shop.example.com
+  magicpipes add --unix /run/app.sock         An application on a Unix socket
   magicpipes add --serve ./public             Share a folder
   magicpipes add --shell -- htop              Let people watch a program
   magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24
@@ -94,6 +96,15 @@ Run it again with other options to change a tunnel.")]
     Add {
         /// Local port of the application (TCP; UDP with --udp).
         port: Option<u16>,
+        /// Forward to this Unix socket instead of a port (macOS and Linux). Connections reach it as
+        /// you, so its file permissions don't apply to whoever opens the tunnel.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["port", "host", "serve", "shell", "udp"])]
+        unix: Option<PathBuf>,
+        /// With --unix: publish a socket that usually hands over more than people mean to: Docker
+        /// and other container engines, the system's services, your SSH or GPG agent, a terminal
+        /// session or this agent itself.
+        #[arg(long)]
+        allow_sensitive_socket: bool,
         /// Publish a raw TCP port (tcp://host:port) instead of an HTTPS hostname: databases, SSH,
         /// game servers, anything that speaks TCP.
         #[arg(long, conflicts_with_all = ["serve", "shell", "udp"])]
@@ -254,7 +265,7 @@ fn main() -> ExitCode {
 fn check_add_args(cmd: &Command) {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
-    let Command::Add { port, tcp, udp, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
+    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
     else {
         return;
     };
@@ -264,8 +275,11 @@ fn check_add_args(cmd: &Command) {
         cli.build();
         cli.find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit()
     };
-    if port.is_none() && serve.is_none() && !shell {
-        fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --serve <DIR> or --shell");
+    if port.is_none() && unix.is_none() && serve.is_none() && !shell {
+        fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --unix <PATH>, --serve <DIR> or --shell");
+    }
+    if unix.is_none() && *allow_sensitive_socket {
+        fail(ErrorKind::ArgumentConflict, "--allow-sensitive-socket can only be used with --unix");
     }
     if !shell && (*write || max_clients.is_some() || !command.is_empty()) {
         fail(ErrorKind::ArgumentConflict, "--write, --max-clients and a `-- <PROGRAM>` can only be used with --shell");
@@ -321,6 +335,8 @@ async fn dispatch(cmd: Command) -> ExitCode {
         Command::Login { server, token, token_file, browser, ca_cert, name, out } => (out, login(server, token, token_file, browser, ca_cert, name, out).await),
         Command::Add {
             port,
+            unix,
+            allow_sensitive_socket,
             tcp,
             udp,
             remote_port,
@@ -358,6 +374,8 @@ async fn dispatch(cmd: Command) -> ExitCode {
             };
             let req = AddRequest {
                 port,
+                unix,
+                allow_sensitive_socket,
                 kind,
                 remote_port,
                 allow: allow_cidr,
@@ -615,6 +633,17 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             .map_err(|e| ErrorInfo::new(ErrorCode::InvalidDirectory, format!("cannot serve {}: {e}", dir.display())))?;
         req.serve = Some(abs);
     }
+    if let Some(path) = &req.unix {
+        if !platform::UNIX_SOCKETS {
+            return Err(ErrorInfo::new(ErrorCode::Unsupported, "--unix needs macOS or Linux: Windows has no Unix socket support here yet"));
+        }
+        // Absolute, but with its links as they are: they may point somewhere new after a deploy.
+        let abs = std::path::absolute(path).map_err(|e| ErrorInfo::new(ErrorCode::InvalidSocket, format!("cannot use {}: {e}", path.display())))?;
+        if abs.to_str().is_none() {
+            return Err(ErrorInfo::new(ErrorCode::InvalidSocket, format!("{} isn't valid UTF-8, which the agent needs its paths to be", abs.display())));
+        }
+        req.unix = Some(abs);
+    }
     if req.shell.is_some() {
         let cwd = std::env::current_dir().and_then(std::fs::canonicalize);
         req.cwd = Some(cwd.map_err(|e| ErrorInfo::new(ErrorCode::InvalidCommand, format!("cannot use the current directory: {e}")))?);
@@ -625,6 +654,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
     // Only worth a word if it's about a page people will actually open.
     let pages_without_scripts = !req.site && serving.as_ref().is_some_and(|dir| dir.join("index.html").is_file());
     let shell = req.shell.as_ref().map(|argv| (state::command_line(argv), req.writable, req.cwd.clone().unwrap_or_default()));
+    let socket = req.unix.is_some();
     let spawned = client::ensure_agent().await?;
     if !spawned {
         client::check_agent_understands(&req).await?;
@@ -633,6 +663,8 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         Some("Checking directory...")
     } else if shell.is_some() {
         Some("Checking program...")
+    } else if socket {
+        Some("Checking socket...")
     } else {
         None
     };
@@ -728,6 +760,11 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             eprintln!("The port is open to the whole internet, and nothing but your service authenticates");
             eprintln!("clients. Use --allow-cidr to limit who can connect.");
         }
+    }
+    if socket && data["visibility"] != "private" && !out.quiet {
+        eprintln!();
+        eprintln!("Connections reach this socket as you. Its file permissions don't apply to them, and they get");
+        eprintln!("anything the service behind it trusts your user for. Use --private to require signing in.");
     }
     if listing && !out.quiet {
         eprintln!();

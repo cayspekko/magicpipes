@@ -21,6 +21,7 @@ mod session;
 mod shell;
 mod tunnels;
 mod udp;
+mod unix;
 
 use std::fs::File;
 use std::sync::Arc;

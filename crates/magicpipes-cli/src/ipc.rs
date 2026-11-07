@@ -15,8 +15,8 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// the request and drops what it doesn't know). Agents report it in `status` as
 /// `agent.ipc_version`; one that doesn't is older than 2. 3: `access` became `tags`. 4:
 /// `hostname` and `no_verify`, and the step state `skipped`. 5: `keep_list`, `site`,
-/// `allow_sensitive_root` and `allow_any`.
-pub const IPC_VERSION: u32 = 5;
+/// `allow_sensitive_root` and `allow_any`. 6: `unix` and `allow_sensitive_socket`.
+pub const IPC_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -31,8 +31,14 @@ pub enum IpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddRequest {
-    /// Local port; absent when serving a directory or a shell.
+    /// Local port; absent when serving a directory or a shell, or forwarding to a Unix socket.
     pub port: Option<u16>,
+    /// A Unix socket to forward to (absolute, made so by the CLI).
+    #[serde(default)]
+    pub unix: Option<std::path::PathBuf>,
+    /// With `unix`: publish even a socket that hands over the machine or the user's keys.
+    #[serde(default)]
+    pub allow_sensitive_socket: bool,
     /// Directory for the built-in file server (absolute, resolved by the CLI).
     #[serde(default)]
     pub serve: Option<std::path::PathBuf>,
@@ -96,6 +102,7 @@ impl AddRequest {
     /// would publish a public HTTPS tunnel, or one shared with nobody, without an error.
     pub fn needs_current_agent(&self) -> bool {
         self.serve.is_some()
+            || self.unix.is_some()
             || self.shell.is_some()
             || self.kind != magicpipes_core::proto::Kind::Http
             || self.remote_port.is_some()

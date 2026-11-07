@@ -340,6 +340,49 @@ mod windows_ipc {
     pub fn cleanup_ipc() {}
 }
 
+/// Can tunnels connect to Unix sockets here? Not on Windows, where tokio has no such stream.
+pub const UNIX_SOCKETS: bool = cfg!(unix);
+
+/// A connection to a Unix socket. Never made on Windows, where this only gives the rest of the agent
+/// one type to compile against.
+#[cfg(unix)]
+pub type UnixConnection = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type UnixConnection = tokio::io::DuplexStream;
+
+/// Room for what's on its way to an application on a Unix socket. macOS starts a socket at 8 KiB, and
+/// there the sender's buffer is the one that counts (see "Unix socket targets" in ARCHITECTURE.md).
+#[cfg(unix)]
+const UNIX_SEND_BUFFER: libc::c_int = 256 * 1024;
+
+#[cfg(unix)]
+pub async fn unix_connect(path: &Path) -> io::Result<UnixConnection> {
+    use std::os::fd::AsRawFd;
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    let (wanted, size) = (UNIX_SEND_BUFFER, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    let (fd, value) = (stream.as_raw_fd(), (&raw const wanted).cast());
+    // An optimization: where it can't be set, data just moves in smaller pieces.
+    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, value, size) } != 0 {
+        tracing::debug!(error = %io::Error::last_os_error(), "could not size a Unix socket's send buffer");
+    }
+    Ok(stream)
+}
+
+#[cfg(windows)]
+pub async fn unix_connect(_path: &Path) -> io::Result<UnixConnection> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Unix sockets aren't supported on this system"))
+}
+
+#[cfg(unix)]
+pub fn is_socket(meta: &std::fs::Metadata) -> bool {
+    std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type())
+}
+
+#[cfg(windows)]
+pub fn is_socket(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 const TCP_NOTSENT_LOWAT: libc::c_int = libc::TCP_NOTSENT_LOWAT;
 // <netinet/tcp.h>; the libc crate doesn't have it for macOS.
@@ -367,6 +410,18 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_unix_socket_has_room_for_data_on_its_way() {
+        let path = std::env::temp_dir().join(format!("mp-p-{}.sock", magicpipes_core::secret::random_string(6)));
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let stream = unix_connect(&path).await.unwrap();
+        let (mut value, mut size) = (0 as libc::c_int, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        let (fd, ptr) = (stream.as_raw_fd(), (&raw mut value).cast());
+        assert_eq!(unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, ptr, &mut size) }, 0);
+        assert!(value >= UNIX_SEND_BUFFER, "{value}");
+        std::fs::remove_file(&path).ok();
+    }
 
     #[tokio::test]
     async fn a_connections_send_queue_can_be_limited() {

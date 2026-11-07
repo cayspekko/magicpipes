@@ -238,6 +238,11 @@ udp_idle_timeout_secs = 5
         cmd
     }
 
+    /// As [`Env::cli`], run from `dir`.
+    pub async fn cli_in(&self, dir: &Path, args: &[&str]) -> Output {
+        self.cli_command(args).current_dir(dir).output().await.unwrap()
+    }
+
     /// Starts the CLI with stdout and stderr piped (and no browser), for commands that wait.
     pub fn cli_spawn(&self, args: &[&str]) -> tokio::process::Child {
         self.cli_command(args)
@@ -658,6 +663,54 @@ pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
         }
     });
     App { port, task }
+}
+
+/// A Unix socket at `path`, replacing what's left of an earlier one, as applications do.
+fn bind_unix(path: &Path) -> tokio::net::UnixListener {
+    let _ = std::fs::remove_file(path);
+    tokio::net::UnixListener::bind(path).unwrap()
+}
+
+/// An HTTP application on a Unix socket: `GET /` -> `hello over <name>`, `POST /echo` streams the
+/// body back, anything else -> 404.
+pub fn unix_http_app(path: &Path, name: &'static str) -> App {
+    use http_body_util::combinators::BoxBody;
+    use hyper::service::service_fn;
+    let listener = bind_unix(path);
+    let task = tokio::spawn(async move {
+        // Stopping the app closes its connections too, as stopping a real one does.
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            connections.spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| async move {
+                    let resp: Response<BoxBody<Bytes, hyper::Error>> = match (req.method().as_str(), req.uri().path()) {
+                        ("GET", "/") => Response::new(Full::new(Bytes::from(format!("hello over {name}"))).map_err(|never| match never {}).boxed()),
+                        ("POST", "/echo") => Response::new(req.into_body().boxed()),
+                        _ => Response::builder().status(404).body(full("app 404")).unwrap(),
+                    };
+                    Ok::<_, std::convert::Infallible>(resp)
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+            });
+        }
+    });
+    App { port: 0, task }
+}
+
+/// An echo service on a Unix socket.
+pub fn unix_echo_app(path: &Path) -> App {
+    let listener = bind_unix(path);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let (mut read, mut write) = stream.into_split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    App { port: 0, task }
 }
 
 fn full(s: &'static str) -> http_body_util::combinators::BoxBody<Bytes, hyper::Error> {

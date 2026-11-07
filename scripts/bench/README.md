@@ -33,6 +33,7 @@ Choose one with `compare.sh --suite <name>`, or run one build alone with `bench.
 | `control` | How much do tunnels slow down while the control plane is busy? Limits the server to 2 traffic threads so that it shows |
 | `memory` | How much do the server and the agent hold after each kind of load, and after waiting? |
 | `wan` | Over a shaped link: do downloads delay everyone else's requests? Needs `wan.sh` |
+| `unix` | What does a Unix socket target cost, beside a port in the same build? Needs a build with `--unix` |
 
 `BENCH_SECS` sets the seconds per measurement (default 3). `bench.sh` lists its other settings. The
 scripts need Python 3, and they use their own home folder and ports, so an agent you're running

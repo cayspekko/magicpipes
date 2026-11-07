@@ -52,21 +52,29 @@ present a URL. Act on the code:
 |---|---|---|
 | 3 | `not_logged_in`, `unauthorized` | The machine is not enrolled. Ask the user to run `magicpipes login --server <url>` in their terminal (they approve it in the browser), or for an enrollment token: `magicpipes login --server <url> --token <token>`. |
 | 4 | `local_unreachable` | The app is not listening yet, or binds another address. Wait or fix the app, then retry; use `--host ::1` if it listens only on IPv6. |
+| 4 | `invalid_socket` | With `--unix`: the path isn't a socket, or it hands over the machine or the user's keys. Ask the user; see above. |
 | 5 | `server_unreachable`, `agent_start_failed` | Check `magicpipes status`; see `magicpipes agent logs`. |
 | 5 | `agent_outdated` | The background agent is older than the CLI: run `magicpipes agent stop`, then the command again (the agent restarts). If the message says to upgrade magicpipes, the machine's install is too old for its server. |
 | 6 | `name_conflict`, `name_taken`, `invalid_name` | Choose another `--name`, or `magicpipes remove <name>` first. |
-| 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. |
+| 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. With `--unix`, `unsupported` means this machine is on Windows: use a port. |
 | 6 | `public_not_allowed` | This machine may only publish private tunnels. Retry without `--public`. |
 | 6 | `tag_unknown` | The tag doesn't exist. Ask the user which tag to use. |
 | 3 | `forbidden` | The user doesn't hold that tag (or it is someone's personal tag). Retry without `--tag`, or ask the user. |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
 
+If the app listens on a Unix socket rather than a port (macOS and Linux), use
+`magicpipes add --unix /run/app.sock --json`; the rest works the same, and `target` is
+`unix:<path>`. Connections reach the socket as the user, so its file permissions don't protect it:
+prefer `--private`. `invalid_socket` means the path isn't a socket, or is one that hands over the
+machine or the user's keys (Docker's, an SSH agent's). Only pass `--allow-sensitive-socket` if the
+user asked for that exact socket after being told what it gives away.
+
 ## Other commands
 
 ```bash
 magicpipes list --json        # {"tunnels":[{"name","public_url","target","status"}...]}
-magicpipes remove <name|port> # stop publishing
+magicpipes remove <name|port|socket path> # stop publishing
 magicpipes status --json      # login/agent/connection state
 ```
 

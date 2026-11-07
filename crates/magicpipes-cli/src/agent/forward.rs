@@ -1,20 +1,24 @@
-//! Agent data path: serves server-opened streams by piping them to local targets (a TCP
-//! connection, the built-in file server or web terminal, or a UDP socket for datagram streams).
+//! Agent data path: serves server-opened streams by piping them to local targets (a TCP or Unix
+//! socket connection, the built-in file server or web terminal, or a UDP socket for datagram
+//! streams).
 
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use magicpipes_core::mux::{COPY_BUFFER, MuxStream};
 use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::serve::{self, Site};
 use super::shell::{self, Terminal};
 use super::tunnels::{Route, Tunnels};
 use super::udp;
+use crate::platform;
 use crate::state::Target;
 
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,8 +71,24 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 let _ = stream.shutdown().await;
                 return;
             };
-            let (host, port) = match target {
-                Target::Port { host, port } => (host, port),
+            match target {
+                Target::Port { host, port } => {
+                    let connecting = TcpStream::connect((host.as_str(), port));
+                    let Some(local) = connect_local(&mut stream, connecting, |e| tracing::debug!(%host, port, error = %e, "local target unreachable")).await else { return };
+                    let _ = local.set_nodelay(true);
+                    if let Some(peer) = peer {
+                        tracing::debug!(%host, port, %peer, "TCP client");
+                    }
+                    pipe(stream, local, kind, counter, ended).await;
+                }
+                Target::Unix { unix } => {
+                    let connecting = platform::unix_connect(&unix);
+                    let Some(local) = connect_local(&mut stream, connecting, |e| tracing::debug!(socket = %unix.display(), error = %e, "local target unreachable")).await else { return };
+                    if let Some(peer) = peer {
+                        tracing::debug!(socket = %unix.display(), %peer, "client");
+                    }
+                    pipe(stream, local, kind, counter, ended).await;
+                }
                 Target::Static { serve: root, list, site } => {
                     if StreamStatus::Ok.write(&mut stream).await.is_err() {
                         return;
@@ -80,7 +100,6 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                         _ = serve::serve(stream, Arc::new(Site { root, list, scripts: site })) => {}
                         _ = ended.cancelled() => {}
                     }
-                    return;
                 }
                 Target::Shell { shell: command, cwd, writable, key, max_clients } => {
                     if StreamStatus::Ok.write(&mut stream).await.is_err() {
@@ -89,46 +108,48 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                     counter.fetch_add(1, Ordering::Relaxed);
                     let key = key.filter(|_| writable);
                     shell::serve(stream, Arc::new(Terminal { command, cwd, key, max_clients, sessions, spawns, ended })).await;
-                    return;
                 }
-            };
-            let local = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await;
-            let mut local = match local {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    tracing::debug!(%host, port, error = %e, "local target unreachable");
-                    let _ = StreamStatus::LocalUnreachable.write(&mut stream).await;
-                    let _ = stream.shutdown().await;
-                    return;
-                }
-                Err(_) => {
-                    let _ = StreamStatus::LocalUnreachable.write(&mut stream).await;
-                    let _ = stream.shutdown().await;
-                    return;
-                }
-            };
-            let _ = local.set_nodelay(true);
-            if let Some(peer) = peer {
-                tracing::debug!(%host, port, %peer, "TCP client");
-            }
-            if StreamStatus::Ok.write(&mut stream).await.is_err() {
-                return;
-            }
-            counter.fetch_add(1, Ordering::Relaxed);
-            // As for static files: a pooled HTTP connection must not outlive a target change.
-            // Raw TCP connections keep going, as they always have.
-            let changed = async {
-                if kind.is_http() { ended.cancelled().await } else { std::future::pending().await }
-            };
-            tokio::select! {
-                r = tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut local, COPY_BUFFER, COPY_BUFFER) => {
-                    if let Err(e) = r {
-                        tracing::debug!(error = %e, "data stream ended");
-                    }
-                }
-                _ = changed => {}
             }
         }
+    }
+}
+
+/// Connects to a local target within the time limit. `None`: the stream has been told it couldn't.
+async fn connect_local<T>(stream: &mut MuxStream, connecting: impl Future<Output = std::io::Result<T>>, log: impl FnOnce(&std::io::Error)) -> Option<T> {
+    match tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, connecting).await {
+        Ok(Ok(local)) => Some(local),
+        failed => {
+            if let Ok(Err(e)) = &failed {
+                log(e);
+            }
+            let _ = StreamStatus::LocalUnreachable.write(stream).await;
+            let _ = stream.shutdown().await;
+            None
+        }
+    }
+}
+
+/// Carries a data stream to and from a connection to its local target.
+async fn pipe<L>(mut stream: MuxStream, mut local: L, kind: Kind, counter: Arc<AtomicU64>, ended: CancellationToken)
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+{
+    if StreamStatus::Ok.write(&mut stream).await.is_err() {
+        return;
+    }
+    counter.fetch_add(1, Ordering::Relaxed);
+    // As for static files: a pooled HTTP connection must not outlive a target change.
+    // Raw TCP connections keep going, as they always have.
+    let changed = async {
+        if kind.is_http() { ended.cancelled().await } else { std::future::pending().await }
+    };
+    tokio::select! {
+        r = tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut local, COPY_BUFFER, COPY_BUFFER) => {
+            if let Err(e) = r {
+                tracing::debug!(error = %e, "data stream ended");
+            }
+        }
+        _ = changed => {}
     }
 }
 
