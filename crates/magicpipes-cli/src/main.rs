@@ -168,7 +168,7 @@ Run it again with other options to change a tunnel.")]
         public: bool,
         /// With --private (implied): share it with people holding this tag (repeatable or
         /// comma-separated; only tags you hold).
-        #[arg(long = "tag", value_name = "TAG", value_parser = parse_tag, conflicts_with_all = ["tcp", "udp"])]
+        #[arg(long = "tag", value_name = "TAG", value_parser = parse_tag, value_delimiter = ',', conflicts_with_all = ["tcp", "udp"])]
         tags: Vec<String>,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
@@ -960,6 +960,23 @@ async fn logs(lines: usize, follow: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_can_be_repeated_or_comma_separated() {
+        let tags = |args: &[&str]| {
+            let line = ["magicpipes", "add", "8080"].iter().chain(args).copied();
+            Cli::try_parse_from(line).map(|cli| match cli.command {
+                Command::Add { tags, .. } => tags,
+                _ => panic!("not add"),
+            })
+        };
+        assert_eq!(tags(&["--tag", "team:dev,team:ops"]).unwrap(), ["team:dev", "team:ops"]);
+        assert_eq!(tags(&["--tag", "team:dev", "--tag", "Team:Ops,qa"]).unwrap(), ["team:dev", "team:ops", "qa"]);
+        assert_eq!(tags(&["--tag", "team:dev, team:ops"]).unwrap(), ["team:dev", "team:ops"], "a space after the comma, in quotes");
+        // Each one is checked, and a stray comma is a mistake rather than nothing.
+        assert!(tags(&["--tag", "team:dev,not valid"]).is_err());
+        assert!(tags(&["--tag", "team:dev,"]).is_err());
+    }
 
     #[test]
     fn failed_connections_say_what_to_try() {
