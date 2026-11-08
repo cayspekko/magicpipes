@@ -791,6 +791,27 @@ async fn concurrent_adds_start_one_agent() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// A stopping agent holds its lock for a moment after its socket has gone. A start in that moment
+/// mustn't wait for a socket nobody is going to open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_starts_once_a_stopping_one_lets_go() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    // Stands in for an agent that is still exiting: the lock is held, and there's no socket.
+    let lock = std::fs::File::options().create(true).truncate(false).write(true).open(env.home().join("agent.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let start = env.cli_spawn(&["agent", "start"]);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    drop(lock);
+    let out = start.wait_with_output().await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}\nagent log:\n{}", String::from_utf8_lossy(&out.stderr), env.agent_log());
+    assert!(stdout.starts_with("Agent started"), "{stdout}");
+    assert!(env.agent_pid().is_some());
+    assert_eq!(env.agent_log().matches("agent started").count(), 1, "{}", env.agent_log());
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn custom_hostnames() {
     let env = Env::new(Tls::DevCa).await;

@@ -16,6 +16,8 @@ use crate::platform::{self, IpcClient};
 use crate::state::{self, AgentConfig};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for another agent's socket before trying to start one again.
+const RESPAWN_AFTER: Duration = Duration::from_millis(250);
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 pub async fn connect() -> Option<IpcClient> {
@@ -40,27 +42,32 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
     }
     require_login()?;
     state::ensure_home().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
-    let mut child = spawn_detached().map_err(|e| ErrorInfo::new(ErrorCode::AgentStartFailed, format!("could not start agent: {e}")))?;
+    let spawn = || spawn_detached().map_err(|e| ErrorInfo::new(ErrorCode::AgentStartFailed, format!("could not start agent: {e}")));
     let started = Instant::now();
-    let mut exited_ok = false;
+    // The agent we started last, until it exits because another agent holds the lock.
+    let mut child = Some(spawn()?);
+    let mut spawned_at = Instant::now();
     while started.elapsed() < START_TIMEOUT {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if connect().await.is_some() {
-            return Ok(!exited_ok);
+            return Ok(child.is_some());
         }
-        if !exited_ok {
-            match child.try_wait() {
-                // Exit 0 before we could connect: another agent won the startup race. Keep
-                // waiting for its socket.
-                Ok(Some(s)) if s.success() => exited_ok = true,
-                Ok(Some(_)) => {
-                    return Err(ErrorInfo::new(
-                        ErrorCode::AgentStartFailed,
-                        format!("the agent exited during startup:\n{}", tail_log(5).join("\n")),
-                    ));
-                }
-                _ => {}
+        match child.as_mut().map(Child::try_wait) {
+            // Exit 0 before we could connect: another agent holds the lock. It may be starting,
+            // and its socket is about to appear, or still exiting after a stop, and nobody will
+            // open one; so unless the socket appears, start one again in a moment.
+            Some(Ok(Some(s))) if s.success() => child = None,
+            Some(Ok(Some(_))) => {
+                return Err(ErrorInfo::new(
+                    ErrorCode::AgentStartFailed,
+                    format!("the agent exited during startup:\n{}", tail_log(5).join("\n")),
+                ));
             }
+            _ => {}
+        }
+        if child.is_none() && spawned_at.elapsed() >= RESPAWN_AFTER {
+            child = Some(spawn()?);
+            spawned_at = Instant::now();
         }
     }
     Err(ErrorInfo::new(
