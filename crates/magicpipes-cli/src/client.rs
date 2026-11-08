@@ -16,8 +16,6 @@ use crate::platform::{self, IpcClient};
 use crate::state::{self, AgentConfig};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait for another agent's socket before trying to start one again.
-const RESPAWN_AFTER: Duration = Duration::from_millis(250);
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 pub async fn connect() -> Option<IpcClient> {
@@ -44,9 +42,8 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
     state::ensure_home().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     let spawn = || spawn_detached().map_err(|e| ErrorInfo::new(ErrorCode::AgentStartFailed, format!("could not start agent: {e}")));
     let started = Instant::now();
-    // The agent we started last, until it exits because another agent holds the lock.
+    // The agent we started, until it exits because another agent holds the lock.
     let mut child = Some(spawn()?);
-    let mut spawned_at = Instant::now();
     while started.elapsed() < START_TIMEOUT {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if connect().await.is_some() {
@@ -55,7 +52,7 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
         match child.as_mut().map(Child::try_wait) {
             // Exit 0 before we could connect: another agent holds the lock. It may be starting,
             // and its socket is about to appear, or still exiting after a stop, and nobody will
-            // open one; so unless the socket appears, start one again in a moment.
+            // open one; so once it lets go of the lock, start one again.
             Some(Ok(Some(s))) if s.success() => child = None,
             Some(Ok(Some(_))) => {
                 return Err(ErrorInfo::new(
@@ -65,15 +62,25 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
             }
             _ => {}
         }
-        if child.is_none() && spawned_at.elapsed() >= RESPAWN_AFTER {
+        // Only once it's free: one started while another agent holds it could be slow enough to
+        // reach the lock after that agent has been stopped, and run when nobody wants it.
+        if child.is_none() && lock_is_free() {
             child = Some(spawn()?);
-            spawned_at = Instant::now();
         }
     }
     Err(ErrorInfo::new(
         ErrorCode::AgentStartFailed,
         format!("the agent did not become ready within {}s; see {}", START_TIMEOUT.as_secs(), state::log_path().display()),
     ))
+}
+
+/// Whether no agent holds its lock, so that one started now would run. Taken for a moment to see.
+fn lock_is_free() -> bool {
+    match std::fs::File::options().create(true).truncate(false).write(true).open(state::lock_path()) {
+        Ok(lock) => lock.try_lock().is_ok(),
+        // Then the agent can't take it either, and says why when it's started.
+        Err(_) => true,
+    }
 }
 
 fn spawn_detached() -> std::io::Result<Child> {

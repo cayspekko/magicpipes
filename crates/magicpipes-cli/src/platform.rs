@@ -232,8 +232,14 @@ mod unix_ipc {
     pub type IpcClient = UnixStream;
     pub type IpcConn = UnixStream;
 
+    /// A connection to a local socket is made at once or not at all, but on macOS one made just
+    /// as the agent closes its socket can wait forever: connected to a peer that's gone, it never
+    /// becomes writable and never ends. `agent stop`, polling for the agent to go, was seen
+    /// waiting on one until it was killed.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
     pub async fn ipc_connect() -> Option<IpcClient> {
-        UnixStream::connect(state::socket_path()).await.ok()
+        tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(state::socket_path())).await.ok()?.ok()
     }
 
     pub struct IpcListener {

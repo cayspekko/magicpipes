@@ -23,6 +23,17 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 pub const BASE: &str = "t.test";
+/// Longest a test waits for one command, answer or response body before failing with what it
+/// waited for. Generous: it's there to name a hang, not to time anything.
+pub const STEP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A whole response body, failing the test if it doesn't end in [`STEP_TIMEOUT`].
+pub async fn body(resp: Response<Incoming>, what: &str) -> Bytes {
+    match tokio::time::timeout(STEP_TIMEOUT, resp.into_body().collect()).await {
+        Ok(b) => b.unwrap().to_bytes(),
+        Err(_) => panic!("the response to {what} didn't end within {STEP_TIMEOUT:?}"),
+    }
+}
 
 static BUILD: Once = Once::new();
 
@@ -246,7 +257,18 @@ udp_idle_timeout_secs = 5
 
     /// As [`Env::cli`], run from `dir`.
     pub async fn cli_in(&self, dir: &Path, args: &[&str]) -> Output {
-        self.cli_command(args).current_dir(dir).output().await.unwrap()
+        let mut cmd = self.cli_command(args);
+        cmd.current_dir(dir);
+        self.run(cmd, args).await
+    }
+
+    /// Runs a CLI command to its end. One that doesn't end fails the test, saying which command:
+    /// otherwise a hang says nothing until CI gives up on the whole job.
+    async fn run(&self, mut cmd: tokio::process::Command, args: &[&str]) -> Output {
+        match tokio::time::timeout(STEP_TIMEOUT, cmd.kill_on_drop(true).output()).await {
+            Ok(out) => out.expect("run magicpipes"),
+            Err(_) => panic!("magicpipes {args:?} didn't finish within {STEP_TIMEOUT:?}\nagent log:\n{}\nserver log:\n{}", self.agent_log(), self.server_log()),
+        }
     }
 
     /// Starts the CLI with stdout and stderr piped (and no browser), for commands that wait.
@@ -261,7 +283,7 @@ udp_idle_timeout_secs = 5
     }
 
     pub async fn cli(&self, args: &[&str]) -> Output {
-        self.cli_command(args).output().await.expect("run magicpipes")
+        self.run(self.cli_command(args), args).await
     }
 
     pub async fn cli_ok(&self, args: &[&str]) -> Output {
@@ -356,12 +378,19 @@ udp_idle_timeout_secs = 5
     }
 
     pub async fn send(&self, host: &str, port: u16, req: Request<Full<Bytes>>) -> Response<Incoming> {
-        let stream = self.connect(host, port).await;
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
-        tokio::spawn(async move {
-            let _ = conn.with_upgrades().await;
-        });
-        sender.send_request(req).await.unwrap()
+        let what = format!("{} {} on {host}:{port}", req.method(), req.uri());
+        let send = async {
+            let stream = self.connect(host, port).await;
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+            tokio::spawn(async move {
+                let _ = conn.with_upgrades().await;
+            });
+            sender.send_request(req).await.unwrap()
+        };
+        match tokio::time::timeout(STEP_TIMEOUT, send).await {
+            Ok(resp) => resp,
+            Err(_) => panic!("no answer to {what} within {STEP_TIMEOUT:?}\nagent log:\n{}\nserver log:\n{}", self.agent_log(), self.server_log()),
+        }
     }
 
     /// GET on a tunnel hostname with cookies, as a browser (`html`) or not.
@@ -395,7 +424,7 @@ udp_idle_timeout_secs = 5
             .filter_map(|v| v.to_str().ok()?.split(';').next().map(str::to_string))
             .collect();
         let status = resp.status();
-        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+        let body = String::from_utf8_lossy(&self::body(resp, path).await).into_owned();
         TunnelResponse { status, location, error, set_cookies, body }
     }
 
@@ -408,7 +437,7 @@ udp_idle_timeout_secs = 5
         let resp = self.send(hostname, self.https_port, req).await;
         let status = resp.status();
         let err = resp.headers().get("x-magicpipes-error").map(|v| v.to_str().unwrap().to_string());
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = body(resp, path).await;
         (status, err, String::from_utf8_lossy(&body).into_owned())
     }
 
@@ -425,7 +454,7 @@ udp_idle_timeout_secs = 5
         }
         let resp = self.send("localhost", self.mgmt_port, b.body(Full::new(Bytes::from(body.to_string()))).unwrap()).await;
         let status = resp.status();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = self::body(resp, path).await;
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
@@ -458,7 +487,7 @@ udp_idle_timeout_secs = 5
         let refresh = header(http::HeaderName::from_static("refresh"));
         let cookie = header(header::SET_COOKIE).and_then(|c| c.split(';').next().map(str::to_string)).filter(|c| !c.ends_with('='));
         let status = resp.status();
-        let html = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+        let html = String::from_utf8_lossy(&self::body(resp, path).await).into_owned();
         UiResponse { status, location, refresh, cookie, html }
     }
 
@@ -472,7 +501,7 @@ udp_idle_timeout_secs = 5
         }
         let resp = self.send("localhost", self.mgmt_port, b.body(Full::new(Bytes::new())).unwrap()).await;
         let status = resp.status();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = body(resp, path).await;
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 

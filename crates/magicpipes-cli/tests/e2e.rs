@@ -266,7 +266,7 @@ async fn ws_roundtrip(env: &Env, host: &str) {
 
 /// Entry paths of a `.tar.gz` response body, without trailing slashes.
 async fn tar_entries(resp: http::Response<hyper::body::Incoming>) -> Vec<String> {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let bytes = common::body(resp, "an archive download").await;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
     archive
         .entries()
@@ -321,7 +321,12 @@ async fn static_files() {
     assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
     let content_type = |path: &'static str| {
         let req = request("HEAD", path);
-        async { env.send(&host, env.https_port, req).await.headers()[header::CONTENT_TYPE].to_str().unwrap().to_string() }
+        let (env, host) = (&env, &host);
+        async move {
+            let resp = env.send(host, env.https_port, req).await;
+            assert_eq!(resp.status(), 200, "HEAD {path}: {:?}", resp.headers());
+            resp.headers()[header::CONTENT_TYPE].to_str().unwrap().to_string()
+        }
     };
     assert_eq!(content_type("/notes.md").await, "text/plain; charset=utf-8", "markdown opens as text");
     assert_eq!(content_type("/song.mp3").await, "audio/mpeg");
