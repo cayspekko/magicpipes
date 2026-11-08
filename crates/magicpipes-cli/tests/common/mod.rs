@@ -1293,12 +1293,14 @@ impl TunnelResponse {
 pub struct Sshd {
     pub port: u16,
     pub dir: PathBuf,
+    program: &'static str,
     child: tokio::process::Child,
 }
 
 impl Sshd {
-    /// `None` where this machine has no OpenSSH server or client to test with.
-    pub async fn start(root: &Path) -> Option<Sshd> {
+    /// `None` where this machine has no OpenSSH server or client to test with. `extra` goes at
+    /// the end of its configuration.
+    pub async fn start(root: &Path, extra: &str) -> Option<Sshd> {
         let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().find(|p| Path::new(p).exists())?;
         which("ssh")?;
         which("ssh-keygen")?;
@@ -1312,21 +1314,47 @@ impl Sshd {
             &config,
             format!(
                 "Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nAuthorizedKeysFile {authorized}\nStrictModes no\nUsePAM no\nPidFile none\n\
-                 PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nSubsystem sftp internal-sftp\nLogLevel ERROR\n",
+                 PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nSubsystem sftp internal-sftp\nLogLevel ERROR\n{extra}",
                 host = dir.join("host_key").display(),
                 authorized = dir.join("authorized_keys").display(),
             ),
         )
         .unwrap();
-        let child = tokio::process::Command::new(sshd).arg("-D").arg("-e").arg("-f").arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().ok()?;
-        let this = Sshd { port, dir, child };
+        let child = Self::spawn(sshd, &dir)?;
+        let this = Sshd { port, dir, program: sshd, child };
+        this.wait().await;
+        Some(this)
+    }
+
+    fn spawn(program: &str, dir: &Path) -> Option<tokio::process::Child> {
+        let config = dir.join("sshd_config");
+        tokio::process::Command::new(program).arg("-D").arg("-e").arg("-f").arg(config).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().ok()
+    }
+
+    async fn wait(&self) {
         for _ in 0..100 {
-            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                return Some(this);
+            if TcpStream::connect(("127.0.0.1", self.port)).await.is_ok() {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("sshd didn't start");
+    }
+
+    /// Starts it again on the same port with a new host key, as a reinstalled machine would.
+    pub async fn reinstall(&mut self) {
+        self.stop().await;
+        let _ = std::fs::remove_file(self.dir.join("host_key"));
+        let _ = std::fs::remove_file(self.dir.join("host_key.pub"));
+        Self::keygen(&self.dir.join("host_key")).await;
+        self.child = Self::spawn(self.program, &self.dir).expect("sshd starts again");
+        self.wait().await;
+    }
+
+    /// The user this sshd can log in as: whoever runs the tests.
+    pub fn login() -> String {
+        let out = std::process::Command::new("id").arg("-un").output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     async fn keygen(path: &Path) {

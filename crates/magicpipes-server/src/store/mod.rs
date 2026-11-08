@@ -331,6 +331,15 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX ssh_keys_user ON ssh_keys(user_id);
     "#,
+    // 9: the host key each SSH tunnel's sshd showed the server's browser terminal first, kept so a
+    // different one is refused.
+    r#"
+    CREATE TABLE ssh_host_keys (
+        tunnel_id   TEXT PRIMARY KEY REFERENCES tunnels(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        seen_at     INTEGER NOT NULL
+    );
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {

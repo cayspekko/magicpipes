@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use http::{HeaderValue, StatusCode, Uri, header};
 use magicpipes_core::error::ErrorCode;
-use magicpipes_core::proto::{ErrorBody, Visibility};
+use magicpipes_core::proto::{ErrorBody, Kind, Visibility};
 use magicpipes_core::theme::{GLYPH, STYLE};
 use magicpipes_core::url;
 use serde::Deserialize;
@@ -53,6 +53,7 @@ done_messages! {
     TokenDeleted "token-deleted" "API token deleted.",
     SshKeyAdded "ssh-key-added" "SSH key added.",
     SshKeyDeleted "ssh-key-deleted" "SSH key deleted.",
+    HostKeyForgotten "host-key-forgotten" "Host key forgotten. The next one the machine shows is kept.",
     PasswordChanged "password-changed" "Password changed. Other devices were signed out.",
     UserAdded "user-added" "User added. They replace that password when they first sign in.",
     UserAddedForProxy "user-added-proxy" "User added.",
@@ -232,6 +233,13 @@ fn display_url(url: &str) -> &str {
 
 /// The public address: a link for HTTP tunnels; `tcp://` and `udp://` are not browsable.
 fn public_address(t: &TunnelView, class: &str) -> String {
+    if t.kind == Kind::Ssh && class.contains("sub") {
+        return format!(
+            r#"<code class="{class}">{}</code><a class="sub" href="{}">Open terminal</a>"#,
+            esc(&t.public_url),
+            esc(&super::terminal::href(&t.name))
+        );
+    }
     if t.kind.is_http() {
         format!(
             r#"<a class="{class}" href="{url}" target="_blank" rel="noopener noreferrer">{shown} {OPENS_ELSEWHERE}</a>"#,
@@ -447,10 +455,12 @@ pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): 
     };
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people))
+    let ssh_ca = app.control.ssh_ca();
+    let viewer_email = user.user.as_ref().map(|u| u.email.as_str()).unwrap_or("you@example.com");
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email))
 }
 
-fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>) -> String {
+fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str) -> String {
     let field = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", esc(k), v);
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
@@ -462,6 +472,19 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     } else if t.kind.has_port() {
         let allow = if t.allow.is_empty() { "anyone".to_string() } else { esc(&t.allow.join(", ")) };
         dl.push_str(&field("Allowed clients", &allow));
+    } else if let (Kind::Ssh, Some(ca)) = (t.kind, ssh_ca) {
+        let open = format!(r#"<a href="{}">Open terminal</a>{}"#, esc(&super::terminal::href(&t.name)), super::terminal::setup(ca, viewer_email));
+        dl.push_str(&field("Browser terminal", &open));
+        let host_key = match &t.ssh_host_key {
+            None => r#"<span class="sub">Kept the first time a browser terminal connects.</span>"#.to_string(),
+            Some(k) => format!(
+                r#"<code>{k}</code><form method="post" action="/tunnels/{id}/host-key/forget" data-confirm="Forget {name}'s host key? The next one it shows is trusted, so only do this after reinstalling the machine.">{csrf}<button class="btn small spaced">Forget host key</button></form>"#,
+                k = esc(k),
+                id = esc(&t.id),
+                name = esc(&t.name),
+            ),
+        };
+        dl.push_str(&field("Machine's host key", &host_key));
     }
     if let Some(e) = &t.tls_error {
         dl.push_str(&field("TLS error", &esc(e)));
@@ -601,6 +624,8 @@ fn shared_section(app: &AppState, user: &UiUser) -> String {
         .map(|t| {
             let link = if t.kind.is_http() {
                 format!(r#"<a class="name" href="{0}" target="_blank" rel="noopener noreferrer">{1} {OPENS_ELSEWHERE}</a>"#, esc(&t.public_url), esc(display_url(&t.public_url)))
+            } else if t.kind == Kind::Ssh {
+                format!(r#"<code>{}</code><a class="sub" href="{}">Open terminal</a>"#, esc(&t.public_url), esc(&super::terminal::href(&t.name)))
             } else {
                 format!("<code>{}</code>", esc(&t.public_url))
             };

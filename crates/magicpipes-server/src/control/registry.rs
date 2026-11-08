@@ -161,6 +161,10 @@ impl ControlPlane {
                     format!("tunnel '{}' is a {} tunnel; remove it first to make it {}", row.name, row.kind, req.kind),
                 ));
             }
+            // Another machine (`--host`) has its own host key.
+            if row.kind == Kind::Ssh && row.target != target && st.host_keys.remove(&id).is_some() {
+                self.store.forget_ssh_host_key(&id).map_err(internal)?;
+            }
             row.target = target;
             row.allow = allow;
             if let Some(p) = req.remote_port

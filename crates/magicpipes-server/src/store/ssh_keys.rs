@@ -104,6 +104,30 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// The host key kept for each SSH tunnel, by tunnel id.
+    pub fn ssh_host_keys(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT tunnel_id, fingerprint FROM ssh_host_keys")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        })
+    }
+
+    /// Keeps a tunnel's host key unless it has one. Returns whether this one was kept.
+    pub fn keep_ssh_host_key(&self, tunnel_id: &str, fingerprint: &str) -> anyhow::Result<bool> {
+        let n = self.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO ssh_host_keys (tunnel_id, fingerprint, seen_at) SELECT id, ?2, ?3 FROM tunnels WHERE id = ?1",
+                params![tunnel_id, fingerprint, unix_now()],
+            )
+        })?;
+        Ok(n == 1)
+    }
+
+    /// Forgets a tunnel's host key, so the next one is kept. Returns whether it had one.
+    pub fn forget_ssh_host_key(&self, tunnel_id: &str) -> anyhow::Result<bool> {
+        Ok(self.with(|c| c.execute("DELETE FROM ssh_host_keys WHERE tunnel_id = ?1", [tunnel_id]))? == 1)
+    }
+
     pub fn touch_ssh_key(&self, id: &str, at: i64) -> anyhow::Result<()> {
         self.with(|c| c.execute("UPDATE ssh_keys SET last_used_at = ?2 WHERE id = ?1", params![id, at]))?;
         Ok(())

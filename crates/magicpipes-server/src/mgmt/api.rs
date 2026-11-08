@@ -302,6 +302,12 @@ pub async fn list_ssh_keys(Caller(who): Caller, State(app): State<AppState>) -> 
     Json(json!({ "ssh_keys": app.control.ssh_keys(&who) }))
 }
 
+/// The certificate authority browser terminals use, for sshd's `TrustedUserCAKeys`.
+pub async fn ssh_ca(Caller(_): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let key = app.control.ssh_ca().ok_or_else(|| api_err(ErrorCode::SshDisabled, "this server has no SSH gateway"))?;
+    Ok(Json(json!({ "public_key": key.trim() })))
+}
+
 #[derive(Deserialize)]
 pub struct NewSshKey {
     #[serde(default)]

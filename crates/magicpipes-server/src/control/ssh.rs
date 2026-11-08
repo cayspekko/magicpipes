@@ -11,10 +11,12 @@ use russh::keys::{Algorithm, HashAlg, PublicKey};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use magicpipes_core::proto::Kind;
+
 use super::users::clean_name;
 use super::{ControlPlane, OrLog, err, internal};
-use crate::authz::Principal;
-use crate::data::ssh::Connected;
+use crate::authz::{Action, Principal};
+use crate::data::ssh::Report;
 use crate::store::{AddedSshKey, NewSshKey, SshKeyRow};
 
 /// A public key is one short line; this is for a pasted something else.
@@ -51,6 +53,15 @@ impl From<SshKeyRow> for SshKeyView {
             last_used_at: k.last_used_at.map(rfc3339),
         }
     }
+}
+
+/// A browser terminal someone may open (see `data::terminal`).
+#[derive(Debug, Clone)]
+pub struct TerminalTarget {
+    pub user_id: String,
+    pub email: String,
+    pub tunnel_id: String,
+    pub name: String,
 }
 
 /// How people reach the SSH gateway, when it's on.
@@ -143,7 +154,18 @@ impl ControlPlane {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     report = reports.recv() => match report {
-                        Some(report) => me.gateway_report(report, &mut seen),
+                        Some(Report::Connected { user_id, key_id, tunnel_id, client }) => {
+                            if me.first_in_a_while(&mut seen, &key_id, &tunnel_id) {
+                                me.store.touch_ssh_key(&key_id, unix_now()).or_log();
+                                me.audit_as(&user_id, "ssh.connect", &tunnel_id, &format!("key {key_id} from {client}"));
+                            }
+                        }
+                        Some(Report::Terminal { user_id, tunnel_id, login, client }) => {
+                            if me.first_in_a_while(&mut seen, &format!("{user_id} {login}"), &tunnel_id) {
+                                me.audit_as(&user_id, "ssh.terminal", &tunnel_id, &format!("as {login} from {client}"));
+                            }
+                        }
+                        Some(Report::HostKey { tunnel_id, fingerprint }) => me.keep_host_key(&tunnel_id, &fingerprint),
                         None => return,
                     },
                 }
@@ -151,22 +173,74 @@ impl ControlPlane {
         });
     }
 
-    fn gateway_report(&self, r: Connected, seen: &mut HashMap<(String, String), Instant>) {
+    /// Whether `who` reaching `tunnel` is worth writing down: not if they did within [`REPORT_EVERY`].
+    fn first_in_a_while(&self, seen: &mut HashMap<(String, String), Instant>, who: &str, tunnel: &str) -> bool {
         if seen.len() >= MAX_REMEMBERED {
             seen.retain(|_, at| at.elapsed() < REPORT_EVERY);
             if seen.len() >= MAX_REMEMBERED {
                 seen.clear();
             }
         }
-        let pair = (r.key_id.clone(), r.tunnel_id.clone());
+        let pair = (who.to_string(), tunnel.to_string());
         if seen.get(&pair).is_some_and(|at| at.elapsed() < REPORT_EVERY) {
-            return;
+            return false;
         }
         seen.insert(pair, Instant::now());
-        self.store.touch_ssh_key(&r.key_id, unix_now()).or_log();
-        if let Err(e) = self.store.audit(&r.user_id, "ssh.connect", &r.tunnel_id, &format!("key {} from {}", r.key_id, r.client)) {
+        true
+    }
+
+    fn audit_as(&self, user_id: &str, action: &str, resource: &str, detail: &str) {
+        if let Err(e) = self.store.audit(user_id, action, resource, detail) {
             tracing::error!(error = %format!("{e:#}"), "could not write the audit log");
         }
+    }
+
+    /// Keeps the first host key a tunnel's machine showed, unless one is kept already.
+    fn keep_host_key(&self, tunnel_id: &str, fingerprint: &str) {
+        let mut st = self.state.lock().unwrap();
+        if st.host_keys.contains_key(tunnel_id) || !st.tunnels.contains_key(tunnel_id) {
+            return;
+        }
+        if self.store.keep_ssh_host_key(tunnel_id, fingerprint).or_log() == Some(true) {
+            tracing::info!(tunnel = %tunnel_id, %fingerprint, "kept the host key of an SSH tunnel's machine");
+            st.host_keys.insert(tunnel_id.to_string(), fingerprint.to_string());
+            self.publish(&st);
+        }
+    }
+
+    /// Who may open a browser terminal on the SSH tunnel `name`: a signed-in person who may reach
+    /// it, with the gateway on. `None` otherwise, whatever the reason.
+    pub fn terminal(&self, who: &Principal, name: &str) -> Option<TerminalTarget> {
+        let Principal::User { id, .. } = who else { return None };
+        self.data.ssh_ca_public()?;
+        let st = self.state.lock().unwrap();
+        let t = st.tunnels.values().find(|t| t.row.name == name && t.row.kind == Kind::Ssh)?;
+        if !st.dir.agent_active(&t.row.agent_id) || !st.may(who, Action::Connect, t) {
+            return None;
+        }
+        Some(TerminalTarget { user_id: id.clone(), email: st.dir.email(id)?.to_string(), tunnel_id: t.row.id.clone(), name: t.row.name.clone() })
+    }
+
+    /// The certificate authority's public key, as a line for sshd; `None` unless the gateway is on.
+    pub fn ssh_ca(&self) -> Option<String> {
+        self.data.ssh_ca_public()
+    }
+
+    /// Forgets the host key kept for a tunnel's machine, for its owner or an administrator.
+    /// Returns false if there's no such tunnel for them, or no key kept.
+    pub fn forget_host_key(&self, who: &Principal, id: &str) -> Result<bool, ErrorBody> {
+        let mut st = self.state.lock().unwrap();
+        if !st.tunnels.get(id).is_some_and(|t| st.may(who, Action::Manage, t)) {
+            return Ok(false);
+        }
+        if !self.store.forget_ssh_host_key(id).map_err(internal)? {
+            return Ok(false);
+        }
+        st.host_keys.remove(id);
+        self.publish(&st);
+        drop(st);
+        self.audit(who, "ssh.host_key.forget", id, "");
+        Ok(true)
     }
 }
 

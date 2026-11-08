@@ -119,7 +119,7 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/magicpipes$ext" "target/$TARGET/release/magicpipesd$ext" "dist/$name/"
           cp README.md LICENSE magicpipesd.example.toml "dist/$name/"
-          assets=crates/magicpipes-cli/src/agent/shell/assets
+          assets=crates/magicpipes-core/assets/terminal
           cp "$assets/LICENSE" "dist/$name/LICENSE-xterm.js"
           cp "$assets/LICENSE-addon-fit" "dist/$name/LICENSE-xterm-addon-fit"
           cp "$assets/LICENSE-addon-unicode11" "dist/$name/LICENSE-xterm-addon-unicode11"

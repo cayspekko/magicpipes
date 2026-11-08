@@ -137,7 +137,8 @@ Our design:
 that keys are added on the Account page or through the API, since a `magicpipes ssh-key add` would let a
 stolen agent token add keys; and the gateway itself writes the `~/.ssh/config` entries
 (`ssh -p 2222 host config`), since it knows what a person can reach and the CLI on their machine doesn't.
-Only Ed25519 and ECDSA keys so far, and the web terminal is still to come.
+Only Ed25519 and ECDSA keys so far. The SSH web terminal is done too, with option 2 below (the server
+is the certificate authority, and it is also the SSH client): see ARCHITECTURE.md, "Browser terminals".
 
 The original idea was "the key decides which machine you reach, and the server mirrors the
 client's ssh commands". That cannot be done transparently: the key only appears during user
@@ -265,7 +266,8 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | none for sockets | done |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in and email done) |
-| 5 | SSH gateway + SSH web terminal | yes | gateway done; web terminal planned |
+| 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
+| 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |

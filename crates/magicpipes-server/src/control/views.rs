@@ -37,6 +37,9 @@ pub struct TunnelView {
     /// Port tunnels: why the public port is not open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_error: Option<String>,
+    /// SSH tunnels: the host key kept for the machine, once a browser terminal has seen one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_host_key: Option<String>,
     /// `ready`, `pending` or `failed`; `none` for port tunnels.
     pub tls: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +135,7 @@ impl ControlPlane {
             access: if t.row.visibility == Visibility::Private { st.tunnel_authz(t).access } else { Vec::new() },
             status,
             port_error,
+            ssh_host_key: st.host_keys.get(&t.row.id).cloned(),
             tls: cert.as_ref().map_or("none", CertStatus::label),
             tls_error: match cert {
                 Some(CertStatus::Failed(m)) => Some(m),

@@ -986,8 +986,10 @@ useful.
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
    (method 6). *Done,* with the differences listed under those methods.
 8. **`magicpipes connect`** for private TCP and UDP tunnels.
-9. **SSH gateway and web terminals** on the same rule; then RDP/VNC, then the VPN. *The gateway is
-   done* (see "SSH gateway" in ARCHITECTURE.md), ahead of step 8; its web terminal isn't.
+9. **SSH gateway and web terminals** on the same rule; then RDP/VNC, then the VPN. *The gateway and
+   the SSH terminal in the browser are done* (see "SSH gateway" in ARCHITECTURE.md), ahead of step 8.
+   Writing into a terminal needs no extra tag: the machine's sshd decides which account each person
+   may log in as, from their email (`AuthorizedPrincipalsFile`).
 
 End-to-end tests, at minimum:
 

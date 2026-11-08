@@ -100,6 +100,8 @@ pub enum LoginError {
 pub struct UiSession {
     pub who: Principal,
     pub csrf: String,
+    /// When it was signed in.
+    pub created_at: i64,
     /// `None` for an admin-token session.
     pub user: Option<UserView>,
 }
@@ -303,13 +305,13 @@ impl ControlPlane {
     pub fn session(&self, cookie: &str) -> Option<UiSession> {
         let row = self.store.session(cookie).or_log().flatten()?;
         let Some(user_id) = row.user_id else {
-            return Some(UiSession { who: Principal::AdminToken, csrf: row.csrf, user: None });
+            return Some(UiSession { who: Principal::AdminToken, csrf: row.csrf, created_at: row.created_at, user: None });
         };
         let (who, user) = self.user_principal(&user_id)?;
         if row.created_at < user.sessions_valid_after {
             return None;
         }
-        Some(UiSession { who, csrf: row.csrf, user: Some(self.user_view(user)) })
+        Some(UiSession { who, csrf: row.csrf, created_at: row.created_at, user: Some(self.user_view(user)) })
     }
 
     pub fn logout(&self, who: &Principal, cookie: &str) {

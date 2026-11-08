@@ -3950,7 +3950,7 @@ async fn add_ssh_key(env: &Env, cookie: &str, name: &str, key: &str) -> common::
 async fn ssh_gateway() {
     let gateway = common::free_port();
     let env = Env::with_config(Tls::DevCa, &format!("[ssh]\nlisten = \"127.0.0.1:{gateway}\"\n")).await;
-    let Some(mut sshd) = common::Sshd::start(&env.root).await else {
+    let Some(mut sshd) = common::Sshd::start(&env.root, "").await else {
         // CI must really run this: a skipped test looks the same as a passing one there.
         assert!(std::env::var_os("CI").is_none(), "CI needs OpenSSH's server and client for this test");
         return eprintln!("no OpenSSH here: skipping");
@@ -4105,4 +4105,244 @@ async fn ssh_tunnels_need_a_gateway() {
     env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
     let cookie = sign_in(&env, "ann@example.com", "correct horse battery").await;
     assert!(!env.ui("/account", Some(&cookie), None).await.html.contains("SSH keys"));
+}
+
+
+/// A browser opening the terminal of the SSH tunnel `name`, signed in with `cookie`, on a page with
+/// this `origin` (`None`: the management host's). The status the server refused with, if it did.
+async fn open_terminal(env: &Env, cookie: &str, name: &str, origin: Option<&str>) -> Result<Terminal, StatusCode> {
+    let tls = env.connect("localhost", env.mgmt_port).await;
+    let mut req = format!("wss://localhost:{}/terminal/{name}/ws", env.mgmt_port).into_client_request().unwrap();
+    req.headers_mut().insert(header::COOKIE, cookie.parse().unwrap());
+    let here = format!("https://localhost:{}", env.mgmt_port);
+    req.headers_mut().insert(header::ORIGIN, origin.unwrap_or(&here).parse().unwrap());
+    match tokio_tungstenite::client_async(req, tls).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Logs in as `login`, and returns once a shell is ready, or the message saying why not.
+async fn log_in(ws: &mut Terminal, login: &str) -> Result<(), Value> {
+    ws.send(Message::text(serde_json::json!({ "type": "hello", "login": login, "cols": 100, "rows": 30 }).to_string())).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), ws.next()).await.expect("an answer").expect("open") {
+            Ok(Message::Text(t)) => {
+                let m: Value = serde_json::from_str(&t).unwrap();
+                return if m["type"] == "ready" { Ok(()) } else { Err(m) };
+            }
+            Ok(_) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// Types `line` and waits for `want` in the output. Returns the last JSON message instead if the
+/// session ends first.
+async fn type_and_see(ws: &mut Terminal, line: &str, want: &str) -> Result<(), Value> {
+    ws.send(Message::binary(format!("{line}\r").into_bytes())).await.unwrap();
+    let mut seen = String::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), ws.next()).await.unwrap_or_else(|_| panic!("never saw {want:?}: {seen}")) {
+            Some(Ok(Message::Binary(b))) => {
+                seen.push_str(&String::from_utf8_lossy(&b));
+                if seen.contains(want) {
+                    return Ok(());
+                }
+            }
+            Some(Ok(Message::Text(t))) => return Err(serde_json::from_str(&t).unwrap()),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return Err(Value::Null),
+        }
+    }
+}
+
+/// The next JSON message, skipping output: how a session ended.
+async fn ending(ws: &mut Terminal) -> Value {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), ws.next()).await.expect("it ended") {
+            Some(Ok(Message::Text(t))) => return serde_json::from_str(&t).unwrap(),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return Value::Null,
+        }
+    }
+}
+
+/// A browser terminal on a real sshd that trusts the server's certificates: each person logs in as
+/// the account that lists them, and loses the session with their access.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browser_ssh_terminal() {
+    let gateway = common::free_port();
+    let env = Env::with_config(Tls::DevCa, &format!("[ssh]\nlisten = \"127.0.0.1:{gateway}\"\n")).await;
+    let admin = env.admin_token();
+    let (_, ca) = env.api("GET", "/api/v1/ssh-ca", Some(&admin)).await;
+    let ca = ca["public_key"].as_str().expect("a CA").to_string();
+    assert!(ca.starts_with("ssh-ed25519 "), "{ca}");
+    let me = common::Sshd::login();
+    let principals = env.root.join("principals");
+    std::fs::create_dir_all(&principals).unwrap();
+    std::fs::write(env.root.join("ca.pub"), format!("{ca}\n")).unwrap();
+    std::fs::write(principals.join(&me), "ann@example.com\n").unwrap();
+    let extra = format!("TrustedUserCAKeys {}\nAuthorizedPrincipalsFile {}/%u\n", env.root.join("ca.pub").display(), principals.display());
+    let Some(mut sshd) = common::Sshd::start(&env.root, &extra).await else {
+        assert!(std::env::var_os("CI").is_none(), "CI needs OpenSSH's server for this test");
+        return eprintln!("no OpenSSH here: skipping");
+    };
+    env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:dev" })).await;
+    let mut ids = std::collections::HashMap::new();
+    for (email, tags) in [("ann@example.com", vec!["team:dev"]), ("bob@example.com", vec![]), ("cy@example.com", vec!["team:dev"])] {
+        let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
+        let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+        let id = v["user"]["id"].as_str().unwrap().to_string();
+        env.api_json("PATCH", &format!("/api/v1/users/{id}"), Some(&admin), serde_json::json!({ "tags": tags })).await;
+        ids.insert(email, id);
+    }
+    let ann = sign_in(&env, "ann@example.com", "correct horse battery").await;
+    let bob = sign_in(&env, "bob@example.com", "correct horse battery").await;
+    let cy = sign_in(&env, "cy@example.com", "correct horse battery").await;
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"] });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca_cert) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca_cert, "--name", "dev"]).await;
+    let t = add_json(&env, &[&sshd.port.to_string(), "--ssh", "--name", "dev-box", "--tag", "team:dev"]).await;
+    assert_eq!(t["status"], "ready", "{t}");
+    let id = t["id"].as_str().unwrap().to_string();
+
+    // The page, linked from the tunnel, and what the machine needs, on the tunnel's own page.
+    let page = env.ui("/terminal/dev-box", Some(&ann), None).await;
+    assert!(page.status == 200 && page.html.contains(r#"data-access="login""#) && page.html.contains("ann@example.com"), "{}", page.html);
+    assert_eq!(env.ui("/terminal/dev-box", Some(&bob), None).await.status, StatusCode::NOT_FOUND, "Bob can't reach it");
+    let script = env.ui("/assets/terminal/page.mjs", None, None).await;
+    assert!(script.status == 200 && script.html.contains(r#"from "/assets/terminal/xterm.mjs""#));
+    assert!(env.ui("/", Some(&ann), None).await.html.contains(r#"href="/terminal/dev-box""#));
+    let detail = env.ui(&format!("/tunnels/{id}"), Some(&ann), None).await;
+    assert!(detail.html.contains("TrustedUserCAKeys") && detail.html.contains(ca.split(' ').nth(1).unwrap()), "{}", detail.html);
+
+    // Only from this host's pages, and only for people who may reach the machine.
+    assert_eq!(open_terminal(&env, &ann, "dev-box", Some("https://evil.example")).await.err(), Some(StatusCode::FORBIDDEN));
+    assert_eq!(open_terminal(&env, &bob, "dev-box", None).await.err(), Some(StatusCode::NOT_FOUND));
+    assert_eq!(open_terminal(&env, &ann, "ghost", None).await.err(), Some(StatusCode::NOT_FOUND));
+
+    // Ann's own shell, on the real sshd, logged in with a certificate.
+    let mut ws = open_terminal(&env, &ann, "dev-box", None).await.unwrap();
+    log_in(&mut ws, &me).await.expect("logged in");
+    type_and_see(&mut ws, "echo hello-$((6*7)) $(whoami)", &format!("hello-42 {me}")).await.expect("a shell");
+    ws.send(Message::text(r#"{"type":"resize","cols":120,"rows":40}"#)).await.unwrap();
+    type_and_see(&mut ws, "stty size", "40 120").await.expect("resized");
+    ws.send(Message::binary(b"exit 3\r".to_vec())).await.unwrap();
+    let end = ending(&mut ws).await;
+    assert_eq!((end["type"].as_str(), end["code"].as_u64()), (Some("exit"), Some(3)), "{end}");
+
+    // The machine decides who may be which account: Cy shares the tag but isn't listed, and nobody
+    // is listed for another account.
+    let mut ws = open_terminal(&env, &cy, "dev-box", None).await.unwrap();
+    let refused = log_in(&mut ws, &me).await.unwrap_err();
+    assert!(refused["message"].as_str().unwrap().contains("authorized_principals"), "{refused}");
+    let mut ws = open_terminal(&env, &ann, "dev-box", None).await.unwrap();
+    assert!(log_in(&mut ws, "nobody-here").await.is_err());
+    let mut ws = open_terminal(&env, &ann, "dev-box", None).await.unwrap();
+    let refused = log_in(&mut ws, "-oProxyCommand=sh").await.unwrap_err();
+    assert_eq!(refused["code"], "invalid_request", "{refused}");
+
+    // Listed, Cy gets in, and is out as soon as the tag that let her reach the machine goes.
+    std::fs::write(principals.join(&me), "ann@example.com\ncy@example.com\n").unwrap();
+    let mut ws = open_terminal(&env, &cy, "dev-box", None).await.unwrap();
+    log_in(&mut ws, &me).await.expect("logged in");
+    type_and_see(&mut ws, "echo cy-$((1+1))", "cy-2").await.unwrap();
+    env.api_json("PATCH", &format!("/api/v1/users/{}", ids["cy@example.com"]), Some(&admin), serde_json::json!({ "tags": [] })).await;
+    assert_eq!(ending(&mut ws).await["type"], "ended");
+
+    // Signing out everywhere ends Ann's terminals too.
+    let mut ws = open_terminal(&env, &ann, "dev-box", None).await.unwrap();
+    log_in(&mut ws, &me).await.expect("logged in");
+    let account = env.ui("/account", Some(&ann), None).await;
+    env.ui("/account/logout-everywhere", Some(&ann), Some(&[("csrf", &account.csrf())])).await;
+    assert_eq!(ending(&mut ws).await["type"], "ended");
+    let ann = sign_in(&env, "ann@example.com", "correct horse battery again").await;
+
+    // The machine's host key was kept, and a different one is refused until its owner forgets it.
+    let detail = env.ui(&format!("/tunnels/{id}"), Some(&ann), None).await;
+    assert!(detail.html.contains("Forget host key"), "{}", detail.html);
+    sshd.reinstall().await;
+    let mut ws = open_terminal(&env, &ann, "dev-box", None).await.unwrap();
+    let refused = log_in(&mut ws, &me).await.unwrap_err();
+    assert!(refused["message"].as_str().unwrap().contains("host key"), "{refused}");
+    let forget = env.ui(&format!("/tunnels/{id}/host-key/forget"), Some(&ann), Some(&[("csrf", &detail.csrf())])).await;
+    assert_eq!(forget.status, StatusCode::SEE_OTHER);
+    let mut ws = open_terminal(&env, &ann, "dev-box", None).await.unwrap();
+    log_in(&mut ws, &me).await.expect("the new key is kept");
+
+    env.eventually("the audit log says who logged in where", Duration::from_secs(5), async || {
+        env.api("GET", "/api/v1/audit", Some(&admin)).await.1.to_string().contains("ssh.terminal")
+    })
+    .await;
+}
+
+/// A browser SSH terminal in a real browser (headless Chrome via `scripts/browser-terminal.mjs`):
+/// the page's modules, its CSP and its WebSocket, and typing with real key presses. Needs Chrome,
+/// Node 22+ and OpenSSH's server:
+///
+/// ```text
+/// cargo test -p magicpipes-cli --test e2e browser_opens_an_ssh_terminal -- --ignored
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Chrome, Node and sshd"]
+async fn browser_opens_an_ssh_terminal() {
+    let chrome = std::env::var("MAGICPIPES_CHROME").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") { "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() } else { "google-chrome".into() }
+    });
+    let gateway = common::free_port();
+    let env = Env::with_config(Tls::DevCa, &format!("[ssh]\nlisten = \"127.0.0.1:{gateway}\"\n")).await;
+    let admin = env.admin_token();
+    let ca = env.api("GET", "/api/v1/ssh-ca", Some(&admin)).await.1["public_key"].as_str().unwrap().to_string();
+    let me = common::Sshd::login();
+    std::fs::write(env.root.join("ca.pub"), format!("{ca}\n")).unwrap();
+    std::fs::write(env.root.join("principals"), "ann@example.com\n").unwrap();
+    let extra = format!("TrustedUserCAKeys {}\nAuthorizedPrincipalsFile {}\n", env.root.join("ca.pub").display(), env.root.join("principals").display());
+    let sshd = common::Sshd::start(&env.root, &extra).await.expect("OpenSSH's server");
+    let body = serde_json::json!({ "email": "ann@example.com", "password": "correct horse battery" });
+    let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    let ann = v["user"]["id"].as_str().unwrap().to_string();
+    sign_in(&env, "ann@example.com", "correct horse battery").await;
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), serde_json::json!({ "owner_user_id": ann })).await;
+    let (url, ca_cert) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca_cert, "--name", "dev"]).await;
+    add_json(&env, &[&sshd.port.to_string(), "--ssh", "--name", "dev-box"]).await;
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/browser-terminal.mjs");
+    let profile = std::env::temp_dir().join(format!("mp-chrome-terminal-{}", std::process::id()));
+    let opts = serde_json::json!({
+        "chrome": chrome,
+        "management": url,
+        "terminal": "/terminal/dev-box",
+        "email": "ann@example.com",
+        "password": "correct horse battery again",
+        "login": me,
+        "command": "echo hello-$((6*7))",
+        "want": "hello-42",
+        "profile": profile,
+        // MAGICPIPES_SCREENSHOTS=<dir>: pictures of the terminal and the pages linking to it.
+        "shots": std::env::var("MAGICPIPES_SCREENSHOTS").map(|dir| {
+            [(1180, false), (1180, true), (1024, false), (320, true), (320, false)]
+                .iter()
+                .flat_map(|&(width, dark)| {
+                    let shade = if dark { "dark" } else { "light" };
+                    [("terminal", "/terminal/dev-box"), ("tunnels", "/"), ("detail", "/tunnels/dev-box")].map(|(what, url)| {
+                        serde_json::json!({ "path": format!("{dir}/{what}-{width}-{shade}.png"), "url": url, "width": width, "dark": dark, "full": what != "terminal" })
+                    })
+                })
+                .collect::<Vec<_>>()
+        }).unwrap_or_default(),
+    });
+    let out = tokio::process::Command::new("node").arg(&script).arg(opts.to_string()).output().await.expect("run node");
+    std::fs::remove_dir_all(&profile).ok();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+    assert!(result["errors"].as_array().unwrap().is_empty(), "the browser reported errors: {result}");
+    if let Some(measured) = result["measured"].as_array() {
+        eprintln!("{}", measured.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"));
+    }
+    assert!(result["screen"].as_str().unwrap().contains("hello-42"), "{result}");
+    assert_eq!(result["status"], "Running", "{result}");
+    env.cli_ok(&["agent", "stop"]).await;
 }

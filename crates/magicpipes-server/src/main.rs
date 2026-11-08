@@ -233,7 +233,10 @@ async fn run(cfg: Config, control_rt: tokio::runtime::Handle) -> anyhow::Result<
     };
     let mgmt = bind(cfg.management.listen, "management").await?;
     let ssh = match &cfg.ssh {
-        Some(s) => Some((bind(s.listen, "SSH gateway").await?, data::ssh::load_host_key(&cfg.data_dir)?, s.clone())),
+        Some(s) => {
+            data.set_ssh_ca(data::ssh::load_key(&cfg.data_dir, "ssh-user-ca", "magicpipes user CA")?);
+            Some((bind(s.listen, "SSH gateway").await?, data::ssh::load_key(&cfg.data_dir, "ssh-host-key", "magicpipes gateway")?, s.clone()))
+        }
         None => None,
     };
 

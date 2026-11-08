@@ -18,6 +18,7 @@ mod pool;
 mod ports;
 mod proxy;
 pub mod ssh;
+pub mod terminal;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -47,6 +48,8 @@ pub struct Route {
     pub access: AccessPolicy,
     /// Changes with the tunnel's settings, which retires its pooled connections.
     pub version: u64,
+    /// SSH tunnels: the host key its sshd showed the browser terminal first, if any yet.
+    pub ssh_host_key: Option<String>,
 }
 
 /// Who may use a route: the client's network first, then [`authz::authorize`]. The one check
@@ -204,10 +207,13 @@ pub struct DataPlane {
     traffic: Option<tokio::runtime::Handle>,
     /// What the SSH gateway reports to the control plane, which is free to write it down. Traffic
     /// doesn't wait for this: when it's full, reports are dropped.
-    ssh_reports: mpsc::Sender<ssh::Connected>,
-    ssh_reports_rx: Mutex<Option<mpsc::Receiver<ssh::Connected>>>,
+    ssh_reports: mpsc::Sender<ssh::Report>,
+    ssh_reports_rx: Mutex<Option<mpsc::Receiver<ssh::Report>>>,
     /// The fingerprint of the SSH gateway's host key, once it has one.
     ssh_fingerprint: std::sync::OnceLock<String>,
+    /// The SSH certificate authority browser terminals log in with, when the gateway is on.
+    ssh_ca: std::sync::OnceLock<Arc<russh::keys::PrivateKey>>,
+    terminals: terminal::Limits,
 }
 
 impl DataPlane {
@@ -230,6 +236,8 @@ impl DataPlane {
             ssh_reports,
             ssh_reports_rx: Mutex::new(Some(ssh_reports_rx)),
             ssh_fingerprint: std::sync::OnceLock::new(),
+            ssh_ca: std::sync::OnceLock::new(),
+            terminals: terminal::Limits::default(),
         });
         // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in
         // unit tests, nothing is pooled anyway.)
@@ -252,8 +260,18 @@ impl DataPlane {
     }
 
     /// The SSH gateway's reports, for the control plane; `None` after the first call.
-    pub fn take_ssh_reports(&self) -> Option<mpsc::Receiver<ssh::Connected>> {
+    pub fn take_ssh_reports(&self) -> Option<mpsc::Receiver<ssh::Report>> {
         self.ssh_reports_rx.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Gives browser terminals their certificate authority (at startup, with the gateway).
+    pub fn set_ssh_ca(&self, ca: russh::keys::PrivateKey) {
+        let _ = self.ssh_ca.set(Arc::new(ca));
+    }
+
+    /// The certificate authority's public key, as a line for sshd (`TrustedUserCAKeys`).
+    pub fn ssh_ca_public(&self) -> Option<String> {
+        self.ssh_ca.get()?.public_key().to_openssh().ok()
     }
 
     /// The fingerprint of the SSH gateway's host key; `None` unless it's on.

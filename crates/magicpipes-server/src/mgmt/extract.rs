@@ -40,6 +40,8 @@ pub struct UiUser {
     /// What a change just did, from the address.
     pub(super) done: Option<&'static str>,
     pub(super) sign_out: SignOut,
+    /// When this browser signed in.
+    pub(super) signed_in_at: i64,
 }
 
 impl FromRequestParts<AppState> for UiUser {
@@ -68,6 +70,7 @@ impl FromRequestParts<AppState> for UiUser {
             csrf: s.csrf,
             user: s.user,
             sign_out,
+            signed_in_at: s.created_at,
             path: parts.uri.path().to_string(),
             done: Done::from_query(parts.uri.query()),
         })

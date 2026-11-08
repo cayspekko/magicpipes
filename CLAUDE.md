@@ -112,7 +112,7 @@ trusted with each other's tunnels), and, from the agent's side, the server.
   that came over a socket, a file the user didn't write, or an HTTP request.
 - **HTML**: the management UI, file listings and the web terminal page are server-rendered;
   escape every interpolated value. Keep the CSPs tight; don't add inline event handlers or
-  third-party origins. Vendored browser assets live in `agent/shell/assets/` with a README
+  third-party origins. Vendored browser assets live in `magicpipes-core/assets/terminal/` with a README
   (source, version) and their license file, which `release.yml` must copy into archives.
 - **Management UI**: state-changing requests need the session cookie *and* the CSRF token, so a
   handler takes `Posted<T>` or `AdminPosted<T>` (`mgmt/extract.rs`), never a bare `Form`. A

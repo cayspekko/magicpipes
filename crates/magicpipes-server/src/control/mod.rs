@@ -94,6 +94,8 @@ struct State {
     /// Per agent: when each of its recent tunnels needed a new certificate order.
     cert_orders: HashMap<String, Vec<Instant>>,
     dir: directory::Directory,
+    /// SSH tunnels' host keys, by tunnel id (`store::ssh_host_keys`).
+    host_keys: HashMap<String, String>,
 }
 
 const CERT_ORDER_WINDOW: Duration = Duration::from_secs(24 * 3600);
@@ -166,7 +168,7 @@ impl<T> OrLog<T> for anyhow::Result<T> {
 
 impl ControlPlane {
     pub fn new(cfg: Arc<Config>, store: Store, certs: Arc<CertManager>, data: Arc<DataPlane>) -> anyhow::Result<Arc<Self>> {
-        let mut state = State { dir: directory::Directory::load(&store)?, ..State::default() };
+        let mut state = State { dir: directory::Directory::load(&store)?, host_keys: store.ssh_host_keys()?, ..State::default() };
         for row in store.tunnels()? {
             if let Some(port) = row.public_port
                 && !cfg.port_range().is_some_and(|r| r.contains(port))
@@ -209,6 +211,11 @@ impl ControlPlane {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The data plane, which serves browser terminals once the control plane has let them in.
+    pub fn data_plane(&self) -> Arc<DataPlane> {
+        self.data.clone()
     }
 
     /// See [`DataPlane::on_traffic_threads`].
@@ -275,7 +282,8 @@ impl ControlPlane {
                 }
             };
             let access = AccessPolicy { allow, authz: st.tunnel_authz(t) };
-            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access, version: t.version });
+            let ssh_host_key = st.host_keys.get(&t.row.id).cloned();
+            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access, version: t.version, ssh_host_key });
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {
                     table.by_host.insert(t.row.hostname.clone(), route);

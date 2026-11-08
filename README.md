@@ -240,7 +240,7 @@ The defaults are the safe ones. These turn something on, or tighten it further, 
 | `add --allow-sensitive-socket` | off | Publishes a Unix socket that usually hands over the machine or your keys, such as Docker's or your SSH agent's |
 | `add --write` | off | Lets anyone with a terminal's link, and whoever controls the server, run commands as you |
 | `[public] allow_cookie_domain` | off | Lets applications set cookies for the whole base domain, which reach other tunnels and the management host |
-| `[[oidc]] trust_email` | off | Accepts addresses the provider didn't verify |
+| `[[oidc]] trust_email` | off | Accepts addresses the provider didn't verify, which also name people to machines' browser terminals |
 | `[[oidc]] allow_unverified_admin` | off | Lets those addresses reach administrators' accounts |
 | `[[oidc]] link_by_email` | off | Lets a first sign-in use an existing account with the same address |
 | `[proxy_auth] trust_email` | off | Accepts addresses nothing says were verified |
@@ -813,6 +813,43 @@ $ ssh -J mp.example.com:2222 doug@dev-box
 `--host` reaches an sshd elsewhere on the machine's network. Connections appear in the audit log as
 `ssh.connect`, once a minute per key and machine at most.
 
+#### Terminals in the browser
+
+Everyone who can reach an SSH tunnel also gets **Open terminal**, in the Tunnels list and on the
+tunnel's page: their own shell in the browser, logged in as the account they type, with no key on the
+device they're using. The server is a certificate authority. For each session it makes a key and a
+certificate that names the person by their MagicPipes email and lasts five minutes, and logs in with it
+through the same tunnel as `ssh -J`. The machine decides who may be which account, so one SSH tunnel
+can serve many accounts, each person their own.
+
+Once per machine, as root (the tunnel's page shows these lines with your server's key), then reload sshd:
+
+```console
+# echo 'ssh-ed25519 AAAA… magicpipes user CA' > /etc/ssh/magicpipes_ca.pub
+# cat >> /etc/ssh/sshd_config <<'EOF'
+TrustedUserCAKeys /etc/ssh/magicpipes_ca.pub
+AuthorizedPrincipalsFile %h/.ssh/authorized_principals
+EOF
+```
+
+Then each account lists, one per line, the MagicPipes addresses that may log in as it:
+
+```console
+$ echo 'ann@example.com' >> ~/.ssh/authorized_principals
+```
+
+* **The server can read browser sessions,** and anyone controlling it could log in to every machine
+  that trusts its key, as any account that lists someone. `ssh -J` stays end to end. The key is
+  `<data_dir>/ssh-user-ca`, kept like the server's other secrets, and `GET /api/v1/ssh-ca` gives its public half.
+* **The machine's host key is kept** the first time a browser terminal connects, and a different one is
+  refused, since that would mean something is in between. After reinstalling the machine, its owner
+  forgets the old key on the tunnel's page.
+* **Access follows your account,** as for `ssh -J`: losing the tag, being disabled or signing out
+  everywhere ends the session. Each person may have 8 open.
+* **Addresses are principals.** With `trust_email` on for a sign-in provider, someone who can choose
+  their address there can take on an address an account lists, unless an account already has it.
+* Opened terminals appear in the audit log as `ssh.terminal`.
+
 ### TCP and UDP ports
 
 For anything that is not HTTP (databases, SSH, game servers, MQTT, DNS), `--tcp` or `--udp`
@@ -1003,6 +1040,7 @@ administrators answer `403 forbidden` to members.
 | GET | `/api/v1/tokens` | Your API tokens (never their secrets) |
 | POST | `/api/v1/tokens` | 201 `{"api_token", "token"}`; body `{"name", "expires_in_days"?}`; the secret is returned once; at most 20 per user |
 | DELETE | `/api/v1/tokens/{id}` | 204 |
+| GET | `/api/v1/ssh-ca` | `{"public_key"}`: the certificate authority browser terminals log in with, for sshd's `TrustedUserCAKeys`; `ssh_disabled` (409) without a gateway |
 | GET | `/api/v1/ssh-keys` | Your public keys for the SSH gateway |
 | POST | `/api/v1/ssh-keys` | 201 `{"ssh_key"}`; body `{"public_key", "name"?}`; `invalid_ssh_key` (400), `ssh_key_taken` (409), or `limit_reached` (409) past 20 |
 | DELETE | `/api/v1/ssh-keys/{id}` | 204; connections using it end |

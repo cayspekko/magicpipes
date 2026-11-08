@@ -492,6 +492,36 @@ credential for every machine.
   aren't taken. It brings RustCrypto's Ed25519, ECDSA and AES into the server only; the agent doesn't
   link it.
 
+### Browser terminals (`data/terminal.rs`)
+
+The server is the SSH client here, and logs in with a certificate it signs itself. It opens the same
+`ServerOpen::Data` stream to the agent that `ssh -J` uses, so the agent changes nothing: it connects to
+the sshd its own user configured, and older agents, Windows agents and `--host` machines all work.
+
+* **One authority, short certificates.** `<data_dir>/ssh-user-ca` (Ed25519, made on first use, never
+  replaced on its own). For each session a new key and a certificate valid for five minutes (one more
+  before now, for a slow clock), principal the person's email, extension `permit-pty` only: no
+  forwarding, no agent, no X11. The key lives in memory for the session. The machine maps principals
+  to accounts (`AuthorizedPrincipalsFile`), so MagicPipes never knows Unix names, and a refusal comes
+  from sshd. The same authority will sign more than SSH certificates later (ROADMAP.md).
+* **Why the server, not the agent.** The agent could hold the authority, and a stolen server database
+  couldn't log in anywhere. But the server decides who is signed in either way, a server authority
+  needs nothing from the agent, and it's the start of the server being a certificate authority in general.
+* **Host keys are kept** (`ssh_host_keys`, migration 9): the first one after a successful login, through the
+  reports queue, and a different one is refused with both fingerprints. Changing the tunnel's target
+  forgets it; so does its owner, on the tunnel's page.
+* **Checks** before the WebSocket: the session cookie, `Origin` equal to the management URL (cookies go
+  with cross-site WebSockets), and `authorize(user, Connect, tunnel)`. During it, on every publish, the
+  same, and that the user hasn't signed out everywhere since this browser signed in. The user name is
+  plain characters only, as it's passed to sshd.
+* **Threads:** the handshake answers on the control threads; the session itself runs on the traffic
+  threads, like every other stream. At most 256 sessions, 8 per person; 10 s for the first message,
+  20 s to log in, and keepalives for the rest, since an idle shell is normal.
+* **The page** is the agent's web terminal page (`magicpipes_core::terminal`, assets vendored there),
+  with a form for the user name. It has its own CSP, which adds the stylesheet, font and WebSocket.
+* **Tests:** `browser_ssh_terminal` logs in to a real sshd that trusts the authority; the ignored
+  `browser_opens_an_ssh_terminal` types into it in headless Chrome.
+
 ## Wire protocol
 
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.

@@ -60,26 +60,40 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 const NO_SUCH_MACHINE: &str = "no such machine";
 const CONNECT_FAILED: u32 = 2;
 
-/// Someone reached a machine through the gateway.
+/// What the gateway and browser terminals report to the control plane, which writes it down.
 #[derive(Debug)]
-pub struct Connected {
-    pub user_id: String,
-    pub key_id: String,
-    pub tunnel_id: String,
-    pub client: std::net::IpAddr,
+pub enum Report {
+    /// Someone reached a machine through the gateway (`ssh -J`).
+    Connected { user_id: String, key_id: String, tunnel_id: String, client: std::net::IpAddr },
+    /// Someone logged in to a machine in a browser terminal.
+    Terminal { user_id: String, tunnel_id: String, login: String, client: std::net::IpAddr },
+    /// The first host key a tunnel's sshd showed a browser terminal, to be kept.
+    HostKey { tunnel_id: String, fingerprint: String },
 }
 
-/// The gateway's host key, in `<data_dir>/ssh-host-key` in OpenSSH's format, so `ssh-keygen -lf`
-/// reads it. Made on first use. Anything wrong with an existing one stops the server: a new key
-/// would have every client warn about an attack.
-pub fn load_host_key(data_dir: &Path) -> anyhow::Result<PrivateKey> {
-    let path = data_dir.join("ssh-host-key");
+/// Random bytes from the system.
+pub(super) fn random<const N: usize>() -> anyhow::Result<[u8; N]> {
+    let mut bytes = [0u8; N];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| anyhow::anyhow!("no system randomness"))?;
+    Ok(bytes)
+}
+
+/// A new Ed25519 key.
+pub(super) fn new_key(comment: &str) -> anyhow::Result<PrivateKey> {
+    Ok(PrivateKey::new(KeypairData::Ed25519(Ed25519Keypair::from_seed(&random()?)), comment)?)
+}
+
+/// A key kept in `<data_dir>/<file>` in OpenSSH's format, so `ssh-keygen -lf` reads it: the
+/// gateway's host key (`ssh-host-key`) and the certificate authority for browser terminals
+/// (`ssh-user-ca`). Made on first use. Anything wrong with an existing one stops the server: a new
+/// host key would have every client warn about an attack, and a new authority would lock everyone
+/// out of the machines that trust the old one.
+pub fn load_key(data_dir: &Path, file: &str, comment: &str) -> anyhow::Result<PrivateKey> {
+    let path = data_dir.join(file);
     match std::fs::read_to_string(&path) {
         Ok(text) => PrivateKey::from_openssh(text).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let mut seed = [0u8; 32];
-            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed).map_err(|_| anyhow::anyhow!("no system randomness"))?;
-            let key = PrivateKey::new(KeypairData::Ed25519(Ed25519Keypair::from_seed(&seed)), "magicpipes gateway")?;
+            let key = new_key(comment)?;
             crate::certs::write_private(&path, key.to_openssh(LineEnding::LF)?.as_bytes())?;
             Ok(key)
         }
@@ -372,7 +386,7 @@ impl Handler for Client {
                 return;
             };
             reply.accept().await;
-            let report = Connected { user_id: who.key.user_id.clone(), key_id: who.key.id.clone(), tunnel_id: route.tunnel_id.clone(), client: peer.ip() };
+            let report = Report::Connected { user_id: who.key.user_id.clone(), key_id: who.key.id.clone(), tunnel_id: route.tunnel_id.clone(), client: peer.ip() };
             let _ = dp.ssh_reports.try_send(report);
             let id = channel.id();
             tokio::select! {
@@ -506,8 +520,8 @@ mod tests {
     fn a_host_key_is_made_once_and_kept() {
         let dir = std::env::temp_dir().join(format!("mp-ssh-key-{}", magicpipes_core::secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
-        let first = load_host_key(&dir).unwrap();
-        let again = load_host_key(&dir).unwrap();
+        let first = load_key(&dir, "ssh-host-key", "test").unwrap();
+        let again = load_key(&dir, "ssh-host-key", "test").unwrap();
         assert_eq!(first.fingerprint(HashAlg::Sha256), again.fingerprint(HashAlg::Sha256));
         #[cfg(unix)]
         {
@@ -516,7 +530,7 @@ mod tests {
         }
         // A damaged key stops the server, rather than quietly becoming a new one.
         std::fs::write(dir.join("ssh-host-key"), "not a key").unwrap();
-        assert!(load_host_key(&dir).is_err());
+        assert!(load_key(&dir, "ssh-host-key", "test").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

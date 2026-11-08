@@ -1,8 +1,8 @@
 //! Web terminal for `magicpipes add --shell [-- program args...]`, in the spirit of ttyd.
 //!
 //! Like `--serve`, it runs inside the agent: each data stream of a shell tunnel is served by
-//! hyper, so no local port is opened. `GET /` is the terminal page (xterm.js, vendored under
-//! `assets/`), which opens a WebSocket on `/ws`. Every WebSocket session starts its own copy of
+//! hyper, so no local port is opened. `GET /` is the terminal page (xterm.js, vendored in
+//! `magicpipes-core`), which opens a WebSocket on `/ws`. Every WebSocket session starts its own copy of
 //! the command in a new pty (portable-pty; ConPTY on Windows), and the copy is killed when the
 //! session ends.
 //!
@@ -195,12 +195,12 @@ impl Asset {
     }
 }
 
-static XTERM_JS: Asset = Asset::new(include_bytes!("assets/xterm.mjs"));
-static FIT_JS: Asset = Asset::new(include_bytes!("assets/addon-fit.mjs"));
-static UNICODE11_JS: Asset = Asset::new(include_bytes!("assets/addon-unicode11.mjs"));
-static XTERM_CSS: Asset = Asset::new(include_bytes!("assets/xterm.css"));
+static XTERM_JS: Asset = Asset::new(magicpipes_core::terminal::XTERM_JS);
+static FIT_JS: Asset = Asset::new(magicpipes_core::terminal::FIT_JS);
+static UNICODE11_JS: Asset = Asset::new(magicpipes_core::terminal::UNICODE11_JS);
+static XTERM_CSS: Asset = Asset::new(magicpipes_core::terminal::XTERM_CSS);
 /// Nerd Font icons (private-use code points), a fallback after the viewer's own monospace font.
-static SYMBOLS_FONT: Asset = Asset::compressed(include_bytes!("assets/symbols-nerd-font-mono.woff2"));
+static SYMBOLS_FONT: Asset = Asset::compressed(magicpipes_core::terminal::SYMBOLS_FONT);
 
 fn asset(req: &Request<Incoming>, asset: &Asset, content_type: &'static str) -> Response<Body> {
     let gzip = asset.compress && accepts_gzip(req.headers());

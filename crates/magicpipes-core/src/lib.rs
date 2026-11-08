@@ -17,6 +17,7 @@ pub mod names;
 pub mod proto;
 pub mod secret;
 pub mod tags;
+pub mod terminal;
 pub mod theme;
 pub mod url;
 

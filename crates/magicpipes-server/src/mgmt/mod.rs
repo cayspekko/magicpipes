@@ -23,6 +23,7 @@ mod picker;
 mod proxy_auth;
 mod settings;
 mod ssh;
+mod terminal;
 mod ui;
 
 use std::collections::HashMap;
@@ -116,6 +117,10 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/machines", get(ui::machines))
         .route("/tunnels/{id}", get(ui::tunnel_detail))
         .route("/tunnels/{id}/delete", post(ui::delete_tunnel))
+        .route("/tunnels/{id}/host-key/forget", post(terminal::forget_host_key))
+        .route("/terminal/{name}", get(terminal::page))
+        .route("/terminal/{name}/ws", get(terminal::socket))
+        .route("/assets/terminal/{file}", get(terminal::asset))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
         .route("/agents/{id}/tags", get(ui::agent_tags_page).post(ui::agent_tags))
         .route("/tags", get(accounts::tags).post(accounts::create_tag))
@@ -180,6 +185,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/tokens/{id}", axum::routing::delete(api::delete_token))
         .route("/api/v1/ssh-keys", get(api::list_ssh_keys).post(api::add_ssh_key))
         .route("/api/v1/ssh-keys/{id}", axum::routing::delete(api::delete_ssh_key))
+        .route("/api/v1/ssh-ca", get(api::ssh_ca))
         .route("/api/v1/audit", get(api::audit))
         .route("/api/v1/enroll", post(api::enroll))
         .route("/api/v1/device", post(api::start_device))
@@ -233,10 +239,10 @@ async fn security_headers(mut resp: axum::response::Response) -> axum::response:
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
     h.entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'"),
-    );
+    // The terminal page sets its own, which also allows its WebSocket, fonts and stylesheet.
+    h.entry(header::CONTENT_SECURITY_POLICY).or_insert(HeaderValue::from_static(
+        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'",
+    ));
     resp
 }
 
