@@ -172,9 +172,9 @@ user, then pipe a WebSocket into a tunnel stream.
 | Feature | Browser side | Server side | Agent side |
 |---|---|---|---|
 | VNC desktop | noVNC (MPL-2.0) | plain relay | TCP to the VNC server |
-| RDP desktop | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway) | TCP to the RDP server |
+| RDP desktop | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway), which lets it read the session (below) | TCP to the RDP server |
 | Shell terminal (**done**: `add --shell`) | xterm.js (MIT), served by the agent | none: an ordinary tunnel WebSocket | pty (`portable-pty`, ConPTY on Windows) |
-| SSH terminal | xterm.js | SSH client (`russh`) through the tunnel | TCP to sshd |
+| SSH terminal (**done**) | xterm.js | SSH client (`russh`) through the tunnel | TCP to sshd |
 
 ### Web terminal: build, don't embed ttyd
 
@@ -232,6 +232,53 @@ Logging in to the SSH terminal (a browser has no SSH private key):
 | Our own RDP client | Too much protocol work. |
 
 VNC is nearly free once the relay exists.
+
+**What IronRDP's browser client is (checked 2026-11-09, from its source and docs).** The answers that
+decide the design:
+
+* **The server would read the session.** The browser client only connects through an
+  RDCleanPath proxy: the browser sends its X.224 request over a WebSocket, the proxy completes
+  TLS with the machine itself and returns the machine's certificate chain, and from then on the
+  browser sends plain RDP inside the WebSocket while the proxy re-encrypts it
+  (`crates/ironrdp-web/src/session.rs`; Devolutions Gateway's `rd_clean_path.rs`). That's on
+  purpose, to avoid TLS in TLS. So the proxy sees the screen and the keystrokes. NLA (CredSSP)
+  runs in the browser and the password reaches the machine encrypted, but the proxy sees the
+  NTLM challenge and response, which can be cracked offline when the password is weak; Kerberos
+  needs a KDC proxy as well.
+* **Nobody checks the machine's identity.** The Gateway's TLS step accepts any certificate, and
+  the browser uses the first one it's handed without checking it. Ours would keep each machine's
+  certificate the first time, as browser terminals keep SSH host keys.
+* **No end-to-end mode exists.** A fork of `ironrdp-web` could run rustls in WebAssembly over the
+  WebSocket, leaving the server a plain relay of ciphertext, at the cost of maintaining the fork,
+  TLS in TLS, slower crypto, and no TLS 1.0/1.1 servers (inferred; nothing upstream discusses it).
+* **What works in the browser:** clipboard both ways (text, HTML, images, files), keyboard as
+  scancodes with the machine's layout, Ctrl+Alt+Del and the Windows key, resizing, NLA with NTLM.
+  **What doesn't:** audio, several monitors, reconnecting, drive redirection, H.264 and the
+  graphics pipeline (EGFX). Decoding runs on the page's main thread, and an open issue has it
+  freezing under fast screen updates.
+* **Linux desktops are weak:** xrdp shows corrupted tiles in 16-bit color, and GNOME Remote
+  Desktop refuses it, since it doesn't offer EGFX (both open issues). Windows 10/11 and Server
+  2016-2025 are what Devolutions' products and Cloudflare's browser RDP (generally available since
+  2025-09) run it against.
+* **Maturity:** everything is 0.x; the npm packages had one release in the last 12 months; 72
+  open issues, among them a server-supplied desktop size allocated without a bound and quadratic
+  clipboard handling.
+* **Fit here:** the crates now need Rust 1.94 and the 2024 edition; the server needs only the
+  small `ironrdp-rdcleanpath` (0.2.2 builds on 1.90) or its one DER message written here, and the
+  browser part would be vendored, built. The TLS step is a rustls client with ring that pins a
+  self-signed certificate. Licenses are MIT or Apache-2.0, but the npm packages carry no license
+  files. The RDP package is one 6.1 MB JavaScript file with its WebAssembly (about 4.5 MB) inlined
+  as base64, plus a 129 KB Svelte web component; built here, the `.wasm` could be served on its own.
+  Its page needs `'wasm-unsafe-eval'`, inline styles, `data:` images for cursors and, for the npm
+  build, `data:` in `connect-src`: a page with its own CSP, as the terminal page has.
+* **Decided (2026-11-09): the stock client**, trusting the server as browser SSH terminals do,
+  rather than a fork that keeps the server to ciphertext. `ssh -J` and native RDP clients through
+  `magicpipes connect` stay end to end. As with terminals: the session cookie, the page's origin and
+  `authorize(user, Connect, tunnel)` before the WebSocket, and again on every publish; the server
+  does the TLS step over the agent's ordinary data stream, so the agent changes nothing; the
+  browser's RDCleanPath `destination` is ignored, since the tunnel decides where it goes; and each
+  machine's certificate is kept the first time, a different one refused, like SSH host keys.
+  Linux desktops stay second-class for now, where VNC (noVNC, MPL-2.0) may serve better.
 
 ## Prerequisite for browser access and the SSH gateway: users
 
