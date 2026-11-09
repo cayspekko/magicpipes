@@ -314,7 +314,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in, email and `magicpipes connect` for private TCP and UDP tunnels done) |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
-| 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | in progress (RDP desktops in the browser and through `magicpipes connect` done; VNC planned) |
+| 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | in progress (RDP desktops in the browser and through `magicpipes connect` done, used against Windows 11 with NLA; VNC planned) |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |

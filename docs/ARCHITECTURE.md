@@ -583,7 +583,7 @@ client and not a fork that would keep the server to ciphertext.
   page, so the management UI's CSP stays as it was.
 * **Tests:** `rdp_desktops` runs a stand-in machine (X.224 answer, then TLS) and speaks RDCleanPath as
   the client does. Nothing runs the WebAssembly client in CI; try a real Windows machine after
-  updating it.
+  updating it (first done 2026-11-09: Windows 11, NLA, through `--host` over Tailscale).
 
 ## `magicpipes connect` (`data/connect.rs`)
 
