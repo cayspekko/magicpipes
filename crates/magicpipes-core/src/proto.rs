@@ -58,7 +58,8 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   refuses them, or ignores `visibility` and opens a public port, so the agent checks this first.
 /// * 7: RDP tunnels. [`RegisterTunnel`] may carry the kind [`Kind::Rdp`], which an older server
 ///   can't read, so the agent checks this version first.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// * 8: VNC tunnels: the kind [`Kind::Vnc`], checked the same way.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -131,6 +132,9 @@ pub enum Kind {
     /// A remote desktop: a machine's RDP port, opened in the browser through the server, or with
     /// `magicpipes connect` for a native client. Protocol 7.
     Rdp,
+    /// A remote desktop over VNC: a machine's VNC port, opened in the browser (noVNC) through the
+    /// server, or with `magicpipes connect` for a native viewer. Protocol 8.
+    Vnc,
 }
 
 impl Kind {
@@ -143,6 +147,11 @@ impl Kind {
         matches!(self, Kind::Tcp | Kind::Udp)
     }
 
+    /// Is it a remote desktop, opened in the browser from the management site?
+    pub fn is_desktop(&self) -> bool {
+        matches!(self, Kind::Rdp | Kind::Vnc)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Http => "http",
@@ -150,6 +159,7 @@ impl Kind {
             Kind::Udp => "udp",
             Kind::Ssh => "ssh",
             Kind::Rdp => "rdp",
+            Kind::Vnc => "vnc",
         }
     }
 
@@ -160,6 +170,7 @@ impl Kind {
             "udp" => Some(Kind::Udp),
             "ssh" => Some(Kind::Ssh),
             "rdp" => Some(Kind::Rdp),
+            "vnc" => Some(Kind::Vnc),
             _ => None,
         }
     }
@@ -485,6 +496,10 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pc","target":"x","kind":"rdp"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Rdp, .. })));
         assert!(serde_json::to_string(&Kind::Rdp).unwrap() == r#""rdp""# && Kind::parse("rdp") == Some(Kind::Rdp) && !Kind::Rdp.has_port() && !Kind::Rdp.is_http());
+        // Protocol 8: the same for VNC.
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pi","target":"x","kind":"vnc"}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Vnc, .. })));
+        assert!(serde_json::to_string(&Kind::Vnc).unwrap() == r#""vnc""# && Kind::parse("vnc") == Some(Kind::Vnc) && !Kind::Vnc.has_port() && Kind::Vnc.is_desktop());
     }
 
     #[test]

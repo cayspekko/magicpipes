@@ -3,7 +3,7 @@
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
 # terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`) private, registers an SSH tunnel
-# and a remote desktop, reaches an application on a Unix socket (or, on Windows, is told that isn't supported), and stops the agent.
+# and remote desktops (RDP and VNC), reaches an application on a Unix socket (or, on Windows, is told that isn't supported), and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -87,7 +87,7 @@ export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP=""
+SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP="" CONNVNC=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -99,6 +99,7 @@ cleanup() {
   stop_pid "$CONNTCP"
   stop_pid "$CONNUDP"
   stop_pid "$CONNRDP"
+  stop_pid "$CONNVNC"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
@@ -370,7 +371,7 @@ grep -q '"visibility": "private"' cmd.out
 grep -q "\"public_url\": \"$MGMT_URL/desktop/smoke-pc\"" cmd.out
 cat > desktop.py <<'PYEOF'
 import http.client, re, ssl, sys, urllib.parse
-host, port, ca, email, password, name = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+host, port, ca, email, password, name, file, least = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], int(sys.argv[8])
 tls = ssl.create_default_context(cafile=ca)
 tls.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
 def get(method, path, cookie="", form=None):
@@ -387,12 +388,12 @@ def get(method, path, cookie="", form=None):
     return r.status, data, (cookies[0] if cookies else cookie)
 _, _, cookie = get("POST", "/login", form={"email": email, "password": password})
 status, page, _ = get("GET", "/desktop/" + name, cookie)
-at = re.search(rb'src="(/assets/desktop/[0-9a-f]{16})/page.mjs"', page).group(1).decode()
-status, client, _ = get("GET", at + "/iron-remote-desktop-rdp.js")
-assert status == 200 and len(client) > 1000000, (status, len(client))
-print(f"the desktop page's client: {len(client)} bytes from {at}")
+at = re.search(rb'src="(/assets/(?:desktop|vnc)/[0-9a-f]{16})/page.mjs"', page).group(1).decode()
+status, client, _ = get("GET", f"{at}/{file}")
+assert status == 200 and len(client) > least, (status, len(client))
+print(f"the desktop page's client: {len(client)} bytes of {file} from {at}")
 PYEOF
-run "$PY" desktop.py localhost "$MGMT" "$CA" smoke@example.com "another horse battery staple" smoke-pc
+run "$PY" desktop.py localhost "$MGMT" "$CA" smoke@example.com "another horse battery staple" smoke-pc iron-remote-desktop-rdp.js 1000000
 MAGICPIPES_API_TOKEN=$SMOKE_TOKEN "$MP" connect smoke-pc --local 39523 --json > connect-rdp.out 2>&1 < /dev/null &
 CONNRDP=$!
 for _ in $(seq 1 100); do grep -q '"local"' connect-rdp.out && break; sleep 0.2; done
@@ -401,6 +402,22 @@ run "$PY" ports.py tcp 39523 "smoke over a desktop"
 stop_pid "$CONNRDP"
 CONNRDP=""
 run "$MP" remove smoke-pc --json
+
+step "vnc desktop"
+# The same for VNC, which the server only relays: the echo service stands in for a VNC server.
+run "$MP" add "$ECHO_TCP" --vnc --tag smoke --name smoke-vnc --json --timeout 60
+grep -q '"kind": "vnc"' cmd.out
+grep -q '"visibility": "private"' cmd.out
+grep -q "\"public_url\": \"$MGMT_URL/desktop/smoke-vnc\"" cmd.out
+run "$PY" desktop.py localhost "$MGMT" "$CA" smoke@example.com "another horse battery staple" smoke-vnc novnc/core/rfb.js 50000
+MAGICPIPES_API_TOKEN=$SMOKE_TOKEN "$MP" connect smoke-vnc --local 39524 --json > connect-vnc.out 2>&1 < /dev/null &
+CONNVNC=$!
+for _ in $(seq 1 100); do grep -q '"local"' connect-vnc.out && break; sleep 0.2; done
+cat connect-vnc.out | tee -a transcript.log
+run "$PY" ports.py tcp 39524 "smoke over vnc"
+stop_pid "$CONNVNC"
+CONNVNC=""
+run "$MP" remove smoke-vnc --json
 
 step "unix socket"
 if [[ -n "$WINDOWS" ]]; then

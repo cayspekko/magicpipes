@@ -1,5 +1,6 @@
-//! Remote desktops on the management host: the page, IronRDP's vendored web client, and the
-//! WebSocket, which is checked here and served on the traffic threads (`data::desktop`).
+//! Remote desktops on the management host: the page, the vendored web clients (IronRDP's for
+//! RDP, noVNC for VNC), and the WebSocket, which is checked here and served on the traffic threads
+//! (`data::desktop`).
 
 use std::sync::LazyLock;
 
@@ -8,6 +9,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use http::{HeaderValue, StatusCode, header};
 use hyper_util::rt::TokioIo;
+use magicpipes_core::proto::Kind;
 use magicpipes_core::terminal;
 use magicpipes_core::theme::{GLYPH, STYLE};
 use tokio_tungstenite::WebSocketStream;
@@ -19,80 +21,112 @@ use super::html::esc;
 use super::terminal::same_origin;
 use super::ui::{not_there, server_url};
 use super::{AppState, ClientIp};
-use crate::data::desktop::run;
+use super::novnc;
+use crate::data::desktop::{relay, run};
 use crate::data::terminal::Opening;
 
-/// What names this server's version of the page's files: a digest of all three, in their path,
-/// so they can be kept for good and a new server's reach browsers at once. `page.mjs` imports the
+/// What names this server's version of a page's files: a digest of them all, in their path, so
+/// they can be kept for good and a new server's reach browsers at once. Each `page.mjs` imports the
 /// others by relative path, so they come from the same version.
-static VERSION: LazyLock<String> = LazyLock::new(|| {
-    let digest = magicpipes_core::secret::sha256_hex(&[PAGE_JS, COMPONENT_JS, RDP_JS].concat());
+fn version_of<'a>(files: impl Iterator<Item = &'a str>) -> String {
+    let digest = magicpipes_core::secret::sha256_hex(&files.collect::<String>());
     digest[..16].to_string()
-});
+}
+static RDP_VERSION: LazyLock<String> = LazyLock::new(|| version_of([PAGE_JS, COMPONENT_JS, RDP_JS].into_iter()));
+static VNC_VERSION: LazyLock<String> = LazyLock::new(|| version_of(std::iter::once(VNC_PAGE_JS).chain(novnc::FILES.iter().map(|(_, f)| *f))));
 /// Largest message accepted from the browser: input, and clipboard contents.
 const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 
-/// The client is WebAssembly (`wasm-unsafe-eval`), which the published build carries as a `data:`
-/// URL it fetches; its web component injects styles, and draws cursors from `data:` images.
-const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; \
-                   connect-src 'self' data:; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/// The RDP client is WebAssembly (`wasm-unsafe-eval`), which the published build carries as a
+/// `data:` URL it fetches; its web component injects styles, and draws cursors from `data:` images.
+const RDP_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; \
+                       connect-src 'self' data:; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/// noVNC is plain script: it draws JPEG rectangles and its cursor from `data:` images.
+const VNC_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; \
+                       connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 const PAGE_JS: &str = include_str!("assets/desktop/page.mjs");
 const COMPONENT_JS: &str = include_str!("assets/desktop/iron-remote-desktop.js");
 const RDP_JS: &str = include_str!("assets/desktop/iron-remote-desktop-rdp.js");
+const VNC_PAGE_JS: &str = include_str!("assets/vnc/page.mjs");
 
 /// What the desktop page adds to the terminal page's layout.
 const DESKTOP_STYLE: &str = r#"
 .screen.desk{padding:0;background:#000;display:flex}
 .screen.desk iron-remote-desktop{flex:1;min-width:0;min-height:0;display:block}
-.login .field{display:flex;align-items:center;gap:8px;min-width:0}
+.screen.desk .vnc{flex:1;min-width:0;min-height:0;display:flex}
+.login .field{display:flex;align-items:center;gap:8px;min-width:0}.login .field[hidden]{display:none}
 .login input.pw{font-family:inherit}
 .keys{display:flex;gap:8px;flex-wrap:wrap}.keys[hidden],.login[hidden]{display:none}
 .keys .btn{padding:6px 12px;font-size:13px}
 "#;
 
-/// The address of the remote desktop of an RDP tunnel.
+/// The address of the remote desktop of an RDP or VNC tunnel.
 pub(super) fn href(name: &str) -> String {
     format!("/desktop/{name}")
 }
 
 pub async fn page(user: UiUser, State(app): State<AppState>, Path(name): Path<String>) -> Response {
-    let Some(t) = app.control.desktop(&user.who, &name) else {
+    let Some((t, kind)) = app.control.desktop(&user.who, &name) else {
         return not_there(&user, "/", "Tunnels", "There's no remote desktop by that name that you can reach.");
     };
-    let html = format!(
+    let (html, csp) = match kind {
+        Kind::Vnc => (vnc_page(&t.name), VNC_CSP),
+        _ => (rdp_page(&t.name), RDP_CSP),
+    };
+    let mut resp = Response::new(Body::from(html));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(csp));
+    resp
+}
+
+/// The page around a desktop: its header, the toolbar (`cmd`), and the screen (`screen`).
+fn desktop_page(name: &str, badge: &str, cmd: &str, screen: &str, script: &str) -> String {
+    format!(
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>{name} · MagicPipes</title>
 <style>{STYLE}{term_style}{DESKTOP_STYLE}</style></head>
 <body data-ws="/desktop/{name}/ws" data-name="{name}">
 <header class="top"><div class="top-in"><h1 class="brand"><a href="/" aria-label="Back to your tunnels">{GLYPH}</a><span class="nm">{name}</span></h1>
-<div class="side"><span class="status" id="st" role="status">Not connected</span><span class="badge rw">RDP</span></div></div></header>
+<div class="side"><span class="status" id="st" role="status">Not connected</span><span class="badge rw">{badge}</span></div></div></header>
 <main class="tm">
-<div class="cmd"><form class="login" id="login"><span class="field"><label for="du">User</label><input id="du" type="text" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="256" required></span>
+<div class="cmd">{cmd}</div>
+<div class="screen desk" id="screen">{screen}<div class="notice" id="nt" hidden><span id="nt-text"></span></div></div>
+<noscript><p class="note">The remote desktop needs JavaScript. Without it, use <code>magicpipes connect {name}</code> with a {badge} client.</p></noscript>
+</main>
+<script type="module" src="{script}"></script>
+</body></html>"##,
+        name = esc(name),
+        term_style = terminal::style(super::terminal::ASSETS),
+    )
+}
+
+fn rdp_page(name: &str) -> String {
+    let cmd = r#"<form class="login" id="login"><span class="field"><label for="du">User</label><input id="du" type="text" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="256" required></span>
 <span class="field"><label for="dd">Domain</label><input id="dd" type="text" name="domain" autocapitalize="none" spellcheck="false" maxlength="256" placeholder="optional"></span>
 <span class="field"><label for="dp">Password</label><input id="dp" class="pw" type="password" name="password" autocomplete="current-password" maxlength="512" required></span><button class="btn primary">Connect</button></form>
 <div class="keys" id="keys" hidden><button class="btn" id="cad" type="button">Ctrl+Alt+Del</button><button class="btn" id="win" type="button">Windows key</button><button class="btn" id="bye" type="button">Disconnect</button></div>
-<span class="hint">Windows checks the password; MagicPipes doesn't keep it</span></div>
-<div class="screen desk" id="screen"><iron-remote-desktop id="rd" scale="fit" flexcenter="true"></iron-remote-desktop><div class="notice" id="nt" hidden><span id="nt-text"></span></div></div>
-<noscript><p class="note">The remote desktop needs JavaScript. Without it, use <code>magicpipes connect {name}</code> with a Remote Desktop client.</p></noscript>
-</main>
-<script type="module" src="/assets/desktop/{version}/page.mjs"></script>
-</body></html>"##,
-        name = esc(&t.name),
-        term_style = terminal::style(super::terminal::ASSETS),
-        version = *VERSION,
-    );
-    let mut resp = Response::new(Body::from(html));
-    let h = resp.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    resp
+<span class="hint">Windows checks the password; MagicPipes doesn't keep it</span>"#;
+    let screen = r#"<iron-remote-desktop id="rd" scale="fit" flexcenter="true"></iron-remote-desktop>"#;
+    desktop_page(name, "RDP", cmd, screen, &format!("/assets/desktop/{}/page.mjs", *RDP_VERSION))
 }
 
-/// The page's script and IronRDP's web client. They're public: anyone can get them from npm.
+/// The VNC server may ask for nothing, a password, or a user name and password: the form shows
+/// what it asks for, once it does.
+fn vnc_page(name: &str) -> String {
+    let cmd = r#"<form class="login" id="go"><button class="btn primary">Connect</button></form>
+<form class="login" id="login" hidden><span class="field" id="f-user" hidden><label for="vu">User</label><input id="vu" type="text" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="256"></span>
+<span class="field"><label for="vp">Password</label><input id="vp" class="pw" type="password" name="password" autocomplete="current-password" maxlength="512" required></span><button class="btn primary">Sign in</button></form>
+<div class="keys" id="keys" hidden><button class="btn" id="cad" type="button">Ctrl+Alt+Del</button><button class="btn" id="bye" type="button">Disconnect</button></div>
+<span class="hint">The VNC server checks its own password; MagicPipes doesn't keep it</span>"#;
+    desktop_page(name, "VNC", cmd, r#"<div class="vnc" id="vnc"></div>"#, &format!("/assets/vnc/{}/page.mjs", *VNC_VERSION))
+}
+
+/// The RDP page's script and IronRDP's web client. They're public: anyone can get them from npm.
 pub async fn asset(Path((version, file)): Path<(String, String)>) -> Response {
     // Another version's address would keep these files under it for good.
-    if version != *VERSION {
+    if version != *RDP_VERSION {
         return StatusCode::NOT_FOUND.into_response();
     }
     let body = match file.as_str() {
@@ -101,6 +135,25 @@ pub async fn asset(Path((version, file)): Path<(String, String)>) -> Response {
         "iron-remote-desktop-rdp.js" => RDP_JS,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    script(body)
+}
+
+/// The VNC page's script and noVNC's, under `novnc/`. Public too.
+pub async fn vnc_asset(Path((version, path)): Path<(String, String)>) -> Response {
+    if version != *VNC_VERSION {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let body = match path.as_str() {
+        "page.mjs" => VNC_PAGE_JS,
+        _ => match path.strip_prefix("novnc/").and_then(|p| novnc::FILES.iter().find(|(f, _)| *f == p)) {
+            Some((_, body)) => body,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
+    script(body)
+}
+
+fn script(body: &'static str) -> Response {
     let mut resp = Response::new(Body::from(body));
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
     resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
@@ -118,7 +171,7 @@ pub async fn socket(user: UiUser, State(app): State<AppState>, Path(name): Path<
         return (StatusCode::BAD_REQUEST, "expected a WebSocket\n").into_response();
     };
     let accept = derive_accept_key(key.as_bytes());
-    let Some(t) = app.control.desktop(&user.who, &name) else {
+    let Some((t, kind)) = app.control.desktop(&user.who, &name) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(on_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
@@ -133,7 +186,10 @@ pub async fn socket(user: UiUser, State(app): State<AppState>, Path(name): Path<
             let Ok(upgraded) = on_upgrade.await else { return };
             let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
             let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config)).await;
-            run(dp, ws, opening).await;
+            match kind {
+                Kind::Vnc => relay(dp, ws, opening).await,
+                _ => run(dp, ws, opening).await,
+            }
         })
     });
     let mut resp = Response::new(Body::empty());

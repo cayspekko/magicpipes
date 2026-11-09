@@ -234,7 +234,7 @@ fn display_url(url: &str) -> &str {
 
 /// The public address: a link for HTTP tunnels; `tcp://` and `udp://` are not browsable.
 fn public_address(t: &TunnelView, class: &str) -> String {
-    if t.kind == Kind::Rdp {
+    if t.kind.is_desktop() {
         return format!(r#"<a class="{class}" href="{}">Open desktop</a>"#, esc(&super::desktop::href(&t.name)));
     }
     if t.kind == Kind::Ssh && class.contains("sub") {
@@ -469,8 +469,8 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
     dl.push_str(&field("Machine", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
-    // SSH and RDP tunnels are always private: only their tags change.
-    let change = if matches!(t.kind, Kind::Ssh | Kind::Rdp) {
+    // SSH tunnels and desktops are always private: only their tags change.
+    let change = if t.kind == Kind::Ssh || t.kind.is_desktop() {
         r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--tag</code>.</p>"#
     } else {
         r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--private</code>, <code>--public</code> or <code>--tag</code>.</p>"#
@@ -509,6 +509,8 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
             ),
         };
         dl.push_str(&field("Machine's certificate", &kept));
+    } else if t.kind == Kind::Vnc {
+        dl.push_str(&field("VNC viewers", &format!("<code>magicpipes connect {}</code>", esc(&t.name))));
     }
     if let Some(e) = &t.tls_error {
         dl.push_str(&field("TLS error", &esc(e)));
@@ -650,7 +652,7 @@ fn shared_section(app: &AppState, user: &UiUser) -> String {
                 format!(r#"<a class="name" href="{0}" target="_blank" rel="noopener noreferrer">{1} {OPENS_ELSEWHERE}</a>"#, esc(&t.public_url), esc(display_url(&t.public_url)))
             } else if t.kind == Kind::Ssh {
                 format!(r#"<code>{}</code><a class="sub" href="{}">Open terminal</a>"#, esc(&t.public_url), esc(&super::terminal::href(&t.name)))
-            } else if t.kind == Kind::Rdp {
+            } else if t.kind.is_desktop() {
                 format!(r#"<a class="name" href="{}">Open desktop</a>"#, esc(&super::desktop::href(&t.name)))
             } else {
                 format!("<code>{}</code>", esc(&t.public_url))

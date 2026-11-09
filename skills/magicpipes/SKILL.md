@@ -82,6 +82,11 @@ to Windows with its own account. Native Remote Desktop clients reach it through
 `magicpipes connect <name>`. Windows must have Remote Desktop turned on, or the `add` fails with
 `local_unreachable`. `server_outdated` means the server doesn't know RDP tunnels yet.
 
+For a VNC server (Linux desktops, Macs with Screen Sharing on, Raspberry Pis), use
+`magicpipes add 5900 --vnc --json` the same way: always private, `public_url` is the page that
+opens it, the VNC server's own password (if any) is typed there, and viewers reach it through
+`magicpipes connect <name>`.
+
 ## Databases and other non-HTTP services
 
 `magicpipes add 5432 --tcp --json` (or `--udp`) publishes a raw port. With `--private` or `--tag`, and

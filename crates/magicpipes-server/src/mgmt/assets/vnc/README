@@ -1,0 +1,20 @@
+The VNC desktop page's client.
+
+novnc/
+    noVNC 1.7.0 (@novnc/novnc from the npm registry, integrity
+    sha512-ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA==),
+    unchanged: its core/ and vendor/pako/lib/ ES modules, with LICENSE.txt, AUTHORS,
+    docs/LICENSE.MPL-2.0, docs/LICENSE.BSD-2-Clause, docs/LICENSE.BSD-3-Clause and
+    vendor/pako/LICENSE. Source: https://github.com/novnc/noVNC.
+    noVNC's library is MPL-2.0, which applies to its files only: change them here and the changes
+    must be published under the MPL too. pako (zlib) is MIT. LICENSE.txt says which file is which.
+    ../../novnc.rs lists every script, and a test there checks the list against this folder: after
+    an update, regenerate the list.
+
+page.mjs
+    Ours: opens /desktop/{name}/ws, hands the socket to noVNC's RFB, and shows what the VNC server
+    asks for (a password, or a user name and password).
+
+The server only relays bytes for noVNC (data::desktop::relay), so nothing on the server side has to
+match its version. After updating it, run the vnc_desktops e2e test and a real VNC server through
+the page.

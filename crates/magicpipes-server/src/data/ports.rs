@@ -82,7 +82,7 @@ pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: Cancellati
             let socket = Arc::new(UdpSocket::from_std(std)?);
             tokio::spawn(serve_udp(dp, port, socket, stop));
         }
-        Kind::Http | Kind::Ssh | Kind::Rdp => return Err(io::Error::other("this kind of tunnel has no port of its own")),
+        Kind::Http | Kind::Ssh | Kind::Rdp | Kind::Vnc => return Err(io::Error::other("this kind of tunnel has no port of its own")),
     }
     Ok(())
 }

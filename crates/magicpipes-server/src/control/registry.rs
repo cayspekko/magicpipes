@@ -57,7 +57,7 @@ impl ControlPlane {
                 ));
             }
             // The gateway and remote desktops only let people in through a tag.
-            (None, None) if matches!(req.kind, Kind::Ssh | Kind::Rdp) => (Visibility::Private, Vec::new()),
+            (None, None) if req.kind == Kind::Ssh || req.kind.is_desktop() => (Visibility::Private, Vec::new()),
             // Agents from before private ports ask for an allow-list (or anyone) with every new port,
             // which they open to the public; and an allow-list is only for a public port.
             (None, None) if req.kind.has_port() && (protocol < 6 || !req.allow.is_empty()) => (Visibility::Public, Vec::new()),
@@ -80,8 +80,9 @@ impl ControlPlane {
             Visibility::Public if req.kind == Kind::Ssh => {
                 return Err(err(ErrorCode::InvalidRequest, "SSH tunnels are always private. For a port anyone can reach, use --tcp"));
             }
-            Visibility::Public if req.kind == Kind::Rdp => {
-                return Err(err(ErrorCode::InvalidRequest, "RDP tunnels are always private. For a port anyone can reach, use --tcp"));
+            Visibility::Public if req.kind.is_desktop() => {
+                let kind = req.kind.as_str().to_ascii_uppercase();
+                return Err(err(ErrorCode::InvalidRequest, format!("{kind} tunnels are always private. For a port anyone can reach, use --tcp")));
             }
             Visibility::Public if members_may_not => {
                 return Err(err(ErrorCode::PublicNotAllowed, "members' machines may only publish private tunnels on this server"));
@@ -128,7 +129,7 @@ impl ControlPlane {
             Some(h) => Some(h.trim().trim_end_matches('.').to_ascii_lowercase()),
         };
         match req.kind {
-            Kind::Http | Kind::Ssh | Kind::Rdp if req.remote_port.is_some() || !allow.is_empty() => {
+            Kind::Http | Kind::Ssh | Kind::Rdp | Kind::Vnc if req.remote_port.is_some() || !allow.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "a remote port and an allow-list apply only to TCP and UDP tunnels"));
             }
             Kind::Ssh if self.cfg.ssh.is_none() => {
@@ -340,7 +341,7 @@ impl ControlPlane {
                 None => row.name.clone(),
             },
             (Kind::Tcp | Kind::Udp, None) => format!("magicpipes connect {}", row.name),
-            (Kind::Rdp, _) => format!("{}/desktop/{}", self.cfg.management_url(), row.name),
+            (Kind::Rdp | Kind::Vnc, _) => format!("{}/desktop/{}", self.cfg.management_url(), row.name),
             (Kind::Http, _) => self.cfg.public_url(&row.hostname),
             (kind, Some(port)) => self.cfg.port_url(kind, port),
         }

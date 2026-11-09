@@ -243,7 +243,7 @@ impl Link {
             let (status, v) = https::call(&self.server, Method::GET, &path, &self.tls, Some(&pass), None).await.map_err(|e| crate::unreachable_server(&e))?;
             if status.is_success() {
                 // An RDP tunnel is TCP to a Remote Desktop client.
-                let kind = serde_json::from_value::<Kind>(v["kind"].clone()).ok().filter(|k| k.has_port() || *k == Kind::Rdp);
+                let kind = serde_json::from_value::<Kind>(v["kind"].clone()).ok().filter(|k| k.has_port() || k.is_desktop());
                 let kind = kind.ok_or_else(|| ErrorInfo::new(ErrorCode::Protocol, "unexpected answer about the tunnel"))?;
                 return Ok((kind, v["online"].as_bool().unwrap_or(true)));
             }

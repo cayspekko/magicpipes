@@ -19,6 +19,7 @@ mod email;
 mod extract;
 mod html;
 mod icons;
+mod novnc;
 mod oidc;
 mod picker;
 mod proxy_auth;
@@ -124,6 +125,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/desktop/{name}", get(desktop::page))
         .route("/desktop/{name}/ws", get(desktop::socket))
         .route("/assets/desktop/{version}/{file}", get(desktop::asset))
+        .route("/assets/vnc/{version}/{*path}", get(desktop::vnc_asset))
         .route("/assets/terminal/{file}", get(terminal::asset))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
         .route("/agents/{id}/tags", get(ui::agent_tags_page).post(ui::agent_tags))

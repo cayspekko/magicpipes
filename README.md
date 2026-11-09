@@ -895,6 +895,34 @@ have buttons of their own, since the browser keeps them.
   client to `127.0.0.1:13389` (see [Private ones](#private-ones-with-magicpipes-connect)).
 * Opened desktops appear in the audit log as `rdp.desktop`, once a minute per person and machine at most.
 
+#### VNC
+
+Linux desktops, Macs and Raspberry Pis usually offer VNC rather than RDP. `--vnc` gives them the
+same **Open desktop**, with [noVNC](https://github.com/novnc/noVNC) in the page:
+
+```console
+$ magicpipes add 5900 --vnc --name studio --tag team:dev
+...
+  Desktop: https://mp.example.com:8443/desktop/studio
+  Local:   vnc://127.0.0.1:5900
+
+Tunnel active in background. Private: only you, people with team:dev can open it, after signing in here, then to the VNC server if it asks.
+VNC viewers reach it with: magicpipes connect studio
+```
+
+* **Press Connect first.** If the VNC server asks for a password, or a user name and password, the
+  page asks for them then and passes them on. MagicPipes never keeps them.
+* **The server can read VNC sessions**, in the browser and through `magicpipes connect` alike: most
+  VNC servers don't encrypt, and the server passes their bytes on as they are. Between your browser
+  and the server, and the server and the agent, it's all inside TLS.
+* **No certificate is kept,** since VNC servers rarely have one. Classic VNC passwords are at most 8
+  characters and weak against anyone who sees the exchange; a server with its own user accounts
+  (VeNCrypt) is better.
+* **It's always private,** and access follows your account as for RDP. Desktops of both kinds count
+  toward the 8 each person may have open. Opened desktops appear in the audit log as `vnc.desktop`.
+* **With a VNC viewer** (TigerVNC, RealVNC, macOS Screen Sharing), run
+  `magicpipes connect studio --local 5901` and connect it to `127.0.0.1:5901`.
+
 ### TCP and UDP ports
 
 For anything that is not HTTP (databases, SSH, game servers, MQTT, DNS), `--tcp` or `--udp`

@@ -588,6 +588,32 @@ client and not a fork that would keep the server to ciphertext.
   the client does. Nothing runs the WebAssembly client in CI; try a real Windows machine after
   updating it (first done 2026-11-09: Windows 11, NLA, through `--host` over Tailscale).
 
+### VNC desktops (`add --vnc`, `data::desktop::relay`)
+
+noVNC 1.7.0, vendored unchanged in `mgmt/assets/vnc/novnc/` (README there), on the same
+`/desktop/{name}` page with its own script. noVNC speaks RFB itself, so the server is a plain relay,
+as websockify would be: the WebSocket's binary messages to an ordinary `ServerOpen::Data` stream and
+back. Unlike RDP there's no step the server must do, and the agent changes nothing beyond the kind
+(protocol 8, IPC 10).
+
+* **Trust:** the server passes the RFB bytes on as they are. Most VNC servers don't encrypt, so the
+  server can read VNC sessions, through `magicpipes connect` too; that's in the README. There's no
+  certificate to keep. noVNC handles the VNC server's own sign-in (VNC password, VeNCrypt, Apple's,
+  RealVNC's RA2ne) in the page.
+* **One check:** the relay reads the machine's 12-byte greeting (`RFB 003.008\n`) before passing
+  anything on, so that a port that isn't a VNC server gets its own message.
+* **Refusals** close the WebSocket with 4000 plus the HTTP status `run` would send in RDCleanPath
+  (4404, 4429, 4502, 4503). noVNC hides a close's code, so the page opens the socket itself, reads
+  the code, and hands the socket to noVNC.
+* **Checks, bounds and threads** are the RDP desktop's: the same `admitted` for the tunnel's kind,
+  the same limit of 256 desktops and 8 per person (RDP and VNC together), the same pump.
+* **The page's CSP** is the RDP one without `'wasm-unsafe-eval'` and `data:` connections; `data:`
+  images stay, for JPEG rectangles and the cursor. Its files are versioned like RDP's
+  (`/assets/vnc/<version>/`); `mgmt/novnc.rs` lists them, and a test keeps the list equal to the
+  folder.
+* **Tests:** `vnc_desktops` runs a stand-in that greets as a VNC server (or, switched, as something
+  else) and echoes.
+
 ## `magicpipes connect` (`data/connect.rs`)
 
 How a person reaches a private TCP or UDP tunnel from their own computer. The CLI listens there and,
@@ -638,9 +664,9 @@ tunnel, never an address.
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 7: 2 added the handshake and
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 8: 2 added the handshake and
   answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
-  and UDP tunnels, 7 RDP tunnels). A peer without the header is
+  and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,

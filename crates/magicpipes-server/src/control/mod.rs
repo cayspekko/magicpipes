@@ -292,8 +292,8 @@ impl ControlPlane {
                     table.by_ssh.insert(t.row.name.clone(), route);
                 }
                 // In the browser, and through `magicpipes connect` for a native client.
-                (Kind::Rdp, _) => {
-                    table.by_connect.insert(t.row.name.clone(), (Kind::Rdp, route));
+                (kind @ (Kind::Rdp | Kind::Vnc), _) => {
+                    table.by_connect.insert(t.row.name.clone(), (kind, route));
                 }
                 // The [ports] range may have been narrowed or removed since: then the port stays
                 // closed (the tunnel shows as offline) rather than reopening outside it.

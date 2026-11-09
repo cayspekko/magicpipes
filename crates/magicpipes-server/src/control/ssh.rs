@@ -171,9 +171,9 @@ impl ControlPlane {
                                 me.audit_as(&user_id, "tunnel.connect", &tunnel_id, &format!("from {client}"));
                             }
                         }
-                        Some(Report::Desktop { user_id, tunnel_id, client }) => {
+                        Some(Report::Desktop { user_id, tunnel_id, client, kind }) => {
                             if me.first_in_a_while(&mut seen, &format!("{user_id} desktop"), &tunnel_id) {
-                                me.audit_as(&user_id, "rdp.desktop", &tunnel_id, &format!("from {client}"));
+                                me.audit_as(&user_id, &format!("{kind}.desktop"), &tunnel_id, &format!("from {client}"));
                             }
                         }
                         None => return,
@@ -231,16 +231,17 @@ impl ControlPlane {
         Some(TerminalTarget { user_id: id.clone(), email: st.dir.email(id)?.to_string(), tunnel_id: t.row.id.clone(), name: t.row.name.clone() })
     }
 
-    /// Who may open a remote desktop on the RDP tunnel `name`: a signed-in person who may reach it.
-    /// `None` otherwise, whatever the reason.
-    pub fn desktop(&self, who: &Principal, name: &str) -> Option<TerminalTarget> {
+    /// Who may open the remote desktop (RDP or VNC) of the tunnel `name`: a signed-in person who
+    /// may reach it, and which kind it is. `None` otherwise, whatever the reason.
+    pub fn desktop(&self, who: &Principal, name: &str) -> Option<(TerminalTarget, Kind)> {
         let Principal::User { id, .. } = who else { return None };
         let st = self.state.lock().unwrap();
-        let t = st.tunnels.values().find(|t| t.row.name == name && t.row.kind == Kind::Rdp)?;
+        let t = st.tunnels.values().find(|t| t.row.name == name && t.row.kind.is_desktop())?;
         if !st.dir.agent_active(&t.row.agent_id) || !st.may(who, Action::Connect, t) {
             return None;
         }
-        Some(TerminalTarget { user_id: id.clone(), email: st.dir.email(id)?.to_string(), tunnel_id: t.row.id.clone(), name: t.row.name.clone() })
+        let target = TerminalTarget { user_id: id.clone(), email: st.dir.email(id)?.to_string(), tunnel_id: t.row.id.clone(), name: t.row.name.clone() };
+        Some((target, t.row.kind))
     }
 
     /// The certificate authority's public key, as a line for sshd; `None` unless the gateway is on.

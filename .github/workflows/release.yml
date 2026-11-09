@@ -128,6 +128,12 @@ jobs:
           cp crates/magicpipes-server/src/mgmt/assets/desktop/LICENSE-ironrdp-MIT "dist/$name/LICENSE-ironrdp-MIT"
           cp crates/magicpipes-server/src/mgmt/assets/desktop/LICENSE-ironrdp-APACHE "dist/$name/LICENSE-ironrdp-APACHE"
           cp crates/magicpipes-server/src/mgmt/assets/desktop/LICENSE-svelte "dist/$name/LICENSE-svelte"
+          novnc=crates/magicpipes-server/src/mgmt/assets/vnc/novnc
+          cp "$novnc/LICENSE.txt" "dist/$name/LICENSE-novnc"
+          cp "$novnc/docs/LICENSE.MPL-2.0" "dist/$name/LICENSE-novnc-MPL-2.0"
+          cp "$novnc/docs/LICENSE.BSD-2-Clause" "dist/$name/LICENSE-novnc-BSD-2-Clause"
+          cp "$novnc/docs/LICENSE.BSD-3-Clause" "dist/$name/LICENSE-novnc-BSD-3-Clause"
+          cp "$novnc/vendor/pako/LICENSE" "dist/$name/LICENSE-pako"
           cd dist
           if [[ "$TARGET" == *windows* ]]; then
             7z a -tzip -bso0 "$name.zip" "$name"

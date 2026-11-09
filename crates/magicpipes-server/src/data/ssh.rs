@@ -71,8 +71,8 @@ pub enum Report {
     HostKey { tunnel_id: String, fingerprint: String },
     /// Someone reached a private TCP or UDP tunnel with `magicpipes connect`.
     Connect { user_id: String, tunnel_id: String, client: std::net::IpAddr },
-    /// Someone opened a remote desktop in the browser.
-    Desktop { user_id: String, tunnel_id: String, client: std::net::IpAddr },
+    /// Someone opened a remote desktop in the browser: `rdp.desktop` or `vnc.desktop`.
+    Desktop { user_id: String, tunnel_id: String, client: std::net::IpAddr, kind: magicpipes_core::proto::Kind },
 }
 
 /// Random bytes from the system.

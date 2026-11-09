@@ -1,4 +1,5 @@
-//! Remote desktops in the browser: IronRDP's web client, reaching an RDP tunnel's machine.
+//! Remote desktops in the browser: IronRDP's web client, reaching an RDP tunnel's machine, and
+//! noVNC, reaching a VNC tunnel's (`relay`, at the end).
 //!
 //! The browser's WebSocket arrives here once the management side has checked the session cookie,
 //! the page's origin and that the person may reach the tunnel. The client runs in the page and
@@ -61,13 +62,13 @@ enum Refusal {
     Offline = 503,
 }
 
-/// The tunnel's route, if the person may still use it.
-fn admitted<'t>(table: &'t RouteTable, o: &Opening) -> Option<&'t Arc<Route>> {
+/// The tunnel's route, if the person may still use it as a desktop of this kind.
+fn admitted<'t>(table: &'t RouteTable, o: &Opening, kind: Kind) -> Option<&'t Arc<Route>> {
     let user = table.users.get(&o.user_id).filter(|u| u.valid_after <= o.signed_in_at)?;
     table
         .by_connect
         .get(&o.name)
-        .filter(|(kind, r)| *kind == Kind::Rdp && r.tunnel_id == o.tunnel_id && r.access.admits(&user.principal, o.client))
+        .filter(|(k, r)| *k == kind && r.tunnel_id == o.tunnel_id && r.access.admits(&user.principal, o.client))
         .map(|(_, r)| r)
 }
 
@@ -257,8 +258,8 @@ where
         return;
     }
     tracing::info!(user = %o.user_id, tunnel = %o.tunnel_id, client = %o.client, "remote desktop opened");
-    let _ = dp.ssh_reports.try_send(Report::Desktop { user_id: o.user_id.clone(), tunnel_id: o.tunnel_id.clone(), client: o.client });
-    pump(&dp, ws, tls, &o).await;
+    let _ = dp.ssh_reports.try_send(Report::Desktop { user_id: o.user_id.clone(), tunnel_id: o.tunnel_id.clone(), client: o.client, kind: Kind::Rdp });
+    pump(&dp, ws, tls, &o, Kind::Rdp).await;
 }
 
 enum Reached<T> {
@@ -268,13 +269,7 @@ enum Reached<T> {
 
 /// Reaches the machine through the agent, and as far as the end of the TLS handshake.
 async fn reach(dp: &DataPlane, o: &Opening, x224_request: &[u8]) -> Result<Reached<tokio_rustls::client::TlsStream<magicpipes_core::mux::MuxStream>>, Refusal> {
-    let route = admitted(&dp.table(), o).ok_or(Refusal::NotFound)?.clone();
-    let agent = match &route.session {
-        Some(s) if !s.is_closed() => s.clone(),
-        _ => return Err(Refusal::Offline),
-    };
-    let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(o.client.to_string()) };
-    let mut stream = ports::open(dp, &route, &agent, o.client, header).await.ok_or(Refusal::Unreachable)?;
+    let (route, mut stream) = open_stream(dp, o, Kind::Rdp).await?;
     let handshake = async {
         stream.write_all(x224_request).await.map_err(|_| Refusal::Unreachable)?;
         let x224 = read_tpkt(&mut stream).await.map_err(|_| Refusal::Unreachable)?;
@@ -317,14 +312,26 @@ async fn send_to_machine<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> std::
     w.flush().await
 }
 
-/// Carries the page's RDP to the machine and back, until either ends or the person may no
+/// A data stream to the tunnel's machine through its agent, as for any connection.
+async fn open_stream(dp: &DataPlane, o: &Opening, kind: Kind) -> Result<(Arc<Route>, magicpipes_core::mux::MuxStream), Refusal> {
+    let route = admitted(&dp.table(), o, kind).ok_or(Refusal::NotFound)?.clone();
+    let agent = match &route.session {
+        Some(s) if !s.is_closed() => s.clone(),
+        _ => return Err(Refusal::Offline),
+    };
+    let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(o.client.to_string()) };
+    let stream = ports::open(dp, &route, &agent, o.client, header).await.ok_or(Refusal::Unreachable)?;
+    Ok((route, stream))
+}
+
+/// Carries the page's messages to the machine and back, until either ends or the person may no
 /// longer reach the tunnel.
-async fn pump<S, T>(dp: &DataPlane, mut ws: WebSocketStream<S>, tls: T, o: &Opening)
+async fn pump<S, T>(dp: &DataPlane, mut ws: WebSocketStream<S>, machine: T, o: &Opening, kind: Kind)
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut from_machine, mut to_machine) = tokio::io::split(tls);
+    let (mut from_machine, mut to_machine) = tokio::io::split(machine);
     let mut changes = dp.generation.subscribe();
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
@@ -333,7 +340,7 @@ where
         tokio::select! {
             _ = dp.shutdown.cancelled() => break,
             r = changes.changed() => {
-                if r.is_err() || admitted(&dp.table(), o).is_none() {
+                if r.is_err() || admitted(&dp.table(), o, kind).is_none() {
                     tracing::debug!(user = %o.user_id, tunnel = %o.tunnel_id, "closing a remote desktop its user may no longer use");
                     break;
                 }
@@ -363,6 +370,54 @@ where
         }
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), ws.close(None)).await;
+}
+
+/// The greeting a VNC server opens with: `RFB 003.008\n`.
+const RFB_GREETING: usize = 12;
+
+/// Serves one VNC desktop until it ends. noVNC speaks RFB itself inside the WebSocket, so this
+/// side only carries bytes, as websockify would; it checks only that the machine greets as a VNC
+/// server, so that the page can say so when it doesn't. A refusal closes the WebSocket with
+/// 4000 + the HTTP status of [`Refusal`], which the page, holding the socket, can read.
+pub async fn relay<S>(dp: Arc<DataPlane>, mut ws: WebSocketStream<S>, o: Opening)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(_slot) = dp.desktops.take(&o.user_id) else {
+        tracing::debug!(user = %o.user_id, "refusing a desktop: {MAX_PER_PERSON} open, or the server is at its limit");
+        return close_with(ws, Refusal::TooMany).await;
+    };
+    let reached = async {
+        let (_, mut stream) = open_stream(&dp, &o, Kind::Vnc).await?;
+        let mut greeting = [0u8; RFB_GREETING];
+        stream.read_exact(&mut greeting).await.map_err(|_| Refusal::Unreachable)?;
+        if !greeting.starts_with(b"RFB ") {
+            tracing::debug!(tunnel = %o.tunnel_id, "the machine didn't greet as a VNC server");
+            return Err(Refusal::Unreachable);
+        }
+        Ok((stream, greeting))
+    };
+    let (stream, greeting) = match tokio::time::timeout(CONNECT_TIMEOUT, reached).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(why)) => return close_with(ws, why).await,
+        Err(_) => return close_with(ws, Refusal::Unreachable).await,
+    };
+    if ws.send(Message::Binary(greeting.to_vec().into())).await.is_err() {
+        return;
+    }
+    tracing::info!(user = %o.user_id, tunnel = %o.tunnel_id, client = %o.client, "remote desktop opened");
+    let _ = dp.ssh_reports.try_send(Report::Desktop { user_id: o.user_id.clone(), tunnel_id: o.tunnel_id.clone(), client: o.client, kind: Kind::Vnc });
+    pump(&dp, ws, stream, &o, Kind::Vnc).await;
+}
+
+/// Closes a VNC desktop's WebSocket with the reason as its code.
+async fn close_with<S>(mut ws: WebSocketStream<S>, why: Refusal)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    let frame = CloseFrame { code: CloseCode::Library(4000 + why as u16), reason: "".into() };
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.close(Some(frame))).await;
 }
 
 #[cfg(test)]

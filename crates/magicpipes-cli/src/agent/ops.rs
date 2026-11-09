@@ -157,7 +157,7 @@ impl Agent {
             // A datagram service cannot be checked end to end (it need not answer anything).
             Kind::Udp => out["verified"] = json!(false),
             Kind::Http if req.no_verify => out["verified"] = json!(false),
-            Kind::Http | Kind::Ssh | Kind::Rdp => {}
+            Kind::Http | Kind::Ssh | Kind::Rdp | Kind::Vnc => {}
         }
         Ok(out)
     }
@@ -208,6 +208,9 @@ impl Agent {
         }
         if req.kind == Kind::Rdp && self.session.server_protocol().is_some_and(|v| v < 7) {
             return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support RDP tunnels; it needs a newer magicpipesd"));
+        }
+        if req.kind == Kind::Vnc && self.session.server_protocol().is_some_and(|v| v < 8) {
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support VNC tunnels; it needs a newer magicpipesd"));
         }
         // A writable shell keeps its key across re-adds, so links already shared keep working.
         if let Target::Shell { writable: true, key, .. } = &mut target {
@@ -583,7 +586,7 @@ impl Agent {
 async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
     if let Some(path) = &req.unix {
         // A socket here is a stream: UDP has nothing to send datagrams to.
-        if matches!(req.kind, Kind::Udp | Kind::Ssh | Kind::Rdp) {
+        if matches!(req.kind, Kind::Udp | Kind::Ssh | Kind::Rdp | Kind::Vnc) {
             return Err(ErrorInfo::new(ErrorCode::InvalidRequest, format!("--{} needs a local port", req.kind)));
         }
         cidr::parse_list(&req.allow).map_err(|m| ErrorInfo::new(ErrorCode::InvalidCidr, m))?;

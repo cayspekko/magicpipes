@@ -42,7 +42,7 @@ What you expose, and every way people can reach it:
 | SSH | `add 22 --ssh` | — | ✅ TCP (`add 22 --tcp`) | ✅ today | 🖥 terminal (server-side SSH client) |
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP (`add 3389 --tcp`); native clients through `magicpipes connect` | — | 🖥 desktop (IronRDP), today |
-| VNC | `add 5900 --vnc` | — | ✅ TCP | — | 🖥 desktop (noVNC) |
+| VNC | `add 5900 --vnc` | — | ✅ TCP (`add 5900 --tcp`); native viewers through `magicpipes connect` | — | 🖥 desktop (noVNC), today |
 
 `--host somehost` (and a `host:port` positional shorthand) works on every row except static
 files and shell, so an agent can publish services elsewhere on its LAN.
@@ -171,8 +171,8 @@ user, then pipe a WebSocket into a tunnel stream.
 
 | Feature | Browser side | Server side | Agent side |
 |---|---|---|---|
-| VNC desktop | noVNC (MPL-2.0) | plain relay | TCP to the VNC server |
-| RDP desktop | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway), which lets it read the session (below) | TCP to the RDP server |
+| VNC desktop (**done**: `add --vnc`) | noVNC (MPL-2.0) | plain relay | TCP to the VNC server |
+| RDP desktop (**done**: `add --rdp`) | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway), which lets it read the session (below) | TCP to the RDP server |
 | Shell terminal (**done**: `add --shell`) | xterm.js (MIT), served by the agent | none: an ordinary tunnel WebSocket | pty (`portable-pty`, ConPTY on Windows) |
 | SSH terminal (**done**) | xterm.js | SSH client (`russh`) through the tunnel | TCP to sshd |
 
@@ -314,7 +314,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in, email and `magicpipes connect` for private TCP and UDP tunnels done) |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
-| 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | in progress (RDP desktops in the browser and through `magicpipes connect` done, used against Windows 11 with NLA; VNC planned) |
+| 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | done (RDP used against Windows 11 with NLA; VNC built, not yet tried against a real VNC server) |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |

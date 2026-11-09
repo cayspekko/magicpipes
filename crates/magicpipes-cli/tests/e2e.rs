@@ -950,6 +950,122 @@ async fn rdp_desktops() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// A stand-in VNC server on any port: it greets as VNC servers do, or, while `as_vnc` is false, as
+/// something else, then echoes. Returns its port and the task serving it.
+async fn vnc_stand_in(as_vnc: Arc<std::sync::atomic::AtomicBool>) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let greeting: &[u8] = if as_vnc.load(std::sync::atomic::Ordering::SeqCst) { b"RFB 003.008\n" } else { b"SSH-2.0-OpenSSH\r\n" };
+            tokio::spawn(async move {
+                // The agent's checks connect and close without a word.
+                if tcp.write_all(greeting).await.is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 4096];
+                while let Ok(n @ 1..) = tcp.read(&mut buf).await {
+                    if tcp.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vnc_desktops() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:dev" })).await;
+    let mut ids = std::collections::HashMap::new();
+    for (email, tags) in [("ann@example.com", vec!["team:dev"]), ("bob@example.com", vec![])] {
+        let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": email, "password": "correct horse battery" })).await;
+        let id = v["user"]["id"].as_str().unwrap().to_string();
+        env.api_json("PATCH", &format!("/api/v1/users/{id}"), Some(&admin), serde_json::json!({ "tags": tags })).await;
+        ids.insert(email, id);
+    }
+    let (ann, bob) = (sign_in(&env, "ann@example.com", "correct horse battery").await, sign_in(&env, "bob@example.com", "correct horse battery").await);
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"] });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "anns-pi"]).await;
+
+    // Always private, and its address is the desktop's page.
+    let as_vnc = Arc::new(AtomicBool::new(true));
+    let (port, _machine) = vnc_stand_in(as_vnc.clone()).await;
+    let t = add_json(&env, &[&port.to_string(), "--vnc", "--name", "pi", "--tag", "team:dev"]).await;
+    assert_eq!((t["status"].as_str(), t["kind"].as_str(), t["visibility"].as_str()), (Some("ready"), Some("vnc"), Some("private")), "{t}");
+    assert_eq!(t["public_url"], format!("{url}/desktop/pi"));
+
+    // The page, with noVNC under a version that changes with it; Bob can't reach it.
+    let page = env.ui("/desktop/pi", Some(&ann), None).await;
+    assert!(page.status == 200 && page.html.contains(r#"<div class="vnc" id="vnc">"#) && page.html.contains(">VNC</span>"), "{}", page.html);
+    assert_eq!(env.ui("/desktop/pi", Some(&bob), None).await.status, StatusCode::NOT_FOUND);
+    let at = page.html.split(r#"<script type="module" src=""#).nth(1).and_then(|s| s.split("/page.mjs").next()).unwrap().to_string();
+    assert!(at.starts_with("/assets/vnc/") && at.len() == "/assets/vnc/".len() + 16, "{at}");
+    let script = env.ui(&format!("{at}/page.mjs"), None, None).await;
+    assert!(script.status == 200 && script.html.contains(r#"from "./novnc/core/rfb.js""#));
+    for file in ["novnc/core/rfb.js", "novnc/vendor/pako/lib/zlib/inflate.js"] {
+        assert_eq!(env.ui(&format!("{at}/{file}"), None, None).await.status, 200, "{file}");
+    }
+    for missing in [format!("{at}/novnc/LICENSE.txt"), format!("{at}/rfb.js"), "/assets/vnc/0123456789abcdef/page.mjs".to_string()] {
+        assert_eq!(env.ui(&missing, None, None).await.status, StatusCode::NOT_FOUND, "{missing}");
+    }
+    assert!(env.ui("/", Some(&ann), None).await.html.contains(r#"href="/desktop/pi""#));
+
+    // Only from this host's pages, and only for people who may reach the machine.
+    assert_eq!(open_desktop(&env, &ann, "pi", Some("https://evil.example")).await.err(), Some(StatusCode::FORBIDDEN));
+    assert_eq!(open_desktop(&env, &bob, "pi", None).await.err(), Some(StatusCode::NOT_FOUND));
+
+    // The machine's greeting, then bytes both ways: noVNC speaks VNC itself.
+    let mut ws = open_desktop(&env, &ann, "pi", None).await.unwrap();
+    assert_eq!(desktop_echo(&mut ws, b"RFB 003.008\n").await.as_deref(), Some(&b"RFB 003.008\n"[..]));
+    ws.send(Message::binary(b"hello over vnc".to_vec())).await.unwrap();
+    assert_eq!(desktop_echo(&mut ws, b"hello over vnc").await.as_deref(), Some(&b"hello over vnc"[..]));
+
+    // Something that isn't a VNC server is refused with a code the page explains.
+    as_vnc.store(false, Ordering::SeqCst);
+    let mut other = open_desktop(&env, &ann, "pi", None).await.unwrap();
+    let closed = match tokio::time::timeout(Duration::from_secs(30), other.next()).await.expect("an answer") {
+        Some(Ok(Message::Close(frame))) => frame.map(|f| f.code),
+        Some(Ok(m)) => panic!("{m:?}"),
+        Some(Err(_)) | None => None,
+    };
+    assert_eq!(closed, Some(CloseCode::Library(4502)));
+    as_vnc.store(true, Ordering::SeqCst);
+
+    // A VNC viewer gets there with `magicpipes connect`.
+    let token = api_token(&env, &ann).await;
+    let mut connect = env.cli_spawn(&["connect", "pi", "--api-token", &token, "--json"]);
+    let local = connect_port(&mut connect).await;
+    {
+        use tokio::io::AsyncReadExt;
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", local)).await.unwrap();
+        let mut greeting = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(20), c.read_exact(&mut greeting)).await.unwrap().unwrap();
+        assert_eq!(&greeting, b"RFB 003.008\n");
+    }
+    drop(connect);
+
+    // Signing out everywhere ends it.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let account = env.ui("/account", Some(&ann), None).await;
+    env.ui("/account/logout-everywhere", Some(&ann), Some(&[("csrf", &account.csrf())])).await;
+    assert!(desktop_echo(&mut ws, b"anything").await.is_none(), "the desktop stayed open");
+
+    env.eventually("the audit log says who opened a desktop", Duration::from_secs(5), async || {
+        env.api("GET", "/api/v1/audit", Some(&admin)).await.1.to_string().contains("vnc.desktop")
+    })
+    .await;
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn port_tunnels() {
     let mut env = Env::new(Tls::DevCa).await;
