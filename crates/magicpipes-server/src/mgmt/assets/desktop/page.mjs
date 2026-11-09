@@ -13,6 +13,12 @@ const status = $("st");
 const screen = $("screen");
 const desktop = $("rd");
 
+/// The header's dot and word: "ok" is green, "warn" amber, "bad" red, "" grey.
+function state(kind, label) {
+  status.className = `status ${kind}`.trim();
+  status.textContent = label;
+}
+
 /// Shows `text` over the screen, or hides the notice; a problem is announced as an alert.
 function say(text, problem = false) {
   $("nt-text").textContent = text || "";
@@ -58,7 +64,7 @@ function ended(text, problem = false) {
   connected = false;
   keys.hidden = true;
   form.hidden = false;
-  status.textContent = "Not connected";
+  state(problem ? "bad" : "", "Not connected");
   say(text, problem);
 }
 
@@ -82,12 +88,12 @@ form.addEventListener("submit", async (event) => {
   form.elements.password.value = "";
   connected = true;
   form.hidden = true;
-  status.textContent = "Connecting…";
+  state("warn", "Connecting…");
   say("");
   try {
     const session = await ui.connect(config);
     ui.setVisibility(true);
-    status.textContent = "Connected";
+    state("ok", "Connected");
     keys.hidden = false;
     session.run().then(
       () => ended("The remote desktop ended."),

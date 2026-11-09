@@ -581,6 +581,9 @@ client and not a fork that would keep the server to ciphertext.
 * **The page's CSP** adds `'wasm-unsafe-eval'` (the WebAssembly is inlined) and `data:` for
   `connect-src` (the npm build fetches it from a `data:` URL) and for cursor images. It is its own
   page, so the management UI's CSP stays as it was.
+* **Its files** are served under a digest of all three (`/assets/desktop/<version>/`), cached for
+  good, as `ui.js` is; `page.mjs` imports the others by relative path, so a new server's files reach
+  browsers at once and never mix with an old version's.
 * **Tests:** `rdp_desktops` runs a stand-in machine (X.224 answer, then TLS) and speaks RDCleanPath as
   the client does. Nothing runs the WebAssembly client in CI; try a real Windows machine after
   updating it (first done 2026-11-09: Windows 11, NLA, through `--host` over Tailscale).

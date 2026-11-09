@@ -869,9 +869,13 @@ async fn rdp_desktops() {
     let page = env.ui("/desktop/pc", Some(&ann), None).await;
     assert!(page.status == 200 && page.html.contains(r#"data-ws="/desktop/pc/ws""#) && page.html.contains("<iron-remote-desktop"), "{}", page.html);
     assert_eq!(env.ui("/desktop/pc", Some(&bob), None).await.status, StatusCode::NOT_FOUND);
-    let script = env.ui("/assets/desktop/page.mjs", None, None).await;
+    // Its files are under a version, which changes with them.
+    let at = page.html.split(r#"<script type="module" src=""#).nth(1).and_then(|s| s.split("/page.mjs").next()).unwrap().to_string();
+    assert!(at.starts_with("/assets/desktop/") && at.len() == "/assets/desktop/".len() + 16, "{at}");
+    let script = env.ui(&format!("{at}/page.mjs"), None, None).await;
     assert!(script.status == 200 && script.html.contains(r#"from "./iron-remote-desktop-rdp.js""#));
-    assert_eq!(env.ui("/assets/desktop/iron-remote-desktop-rdp.js", None, None).await.status, 200);
+    assert_eq!(env.ui(&format!("{at}/iron-remote-desktop-rdp.js"), None, None).await.status, 200);
+    assert_eq!(env.ui("/assets/desktop/0123456789abcdef/page.mjs", None, None).await.status, StatusCode::NOT_FOUND);
     assert!(env.ui("/", Some(&ann), None).await.html.contains(r#"href="/desktop/pc""#));
 
     // Only from this host's pages, and only for people who may reach the machine.

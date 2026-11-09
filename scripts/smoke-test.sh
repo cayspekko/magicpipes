@@ -368,8 +368,31 @@ run "$MP" add "$ECHO_TCP" --rdp --tag smoke --name smoke-pc --json --timeout 60
 grep -q '"kind": "rdp"' cmd.out
 grep -q '"visibility": "private"' cmd.out
 grep -q "\"public_url\": \"$MGMT_URL/desktop/smoke-pc\"" cmd.out
-run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt -o desktop-rdp.js "$MGMT_URL/assets/desktop/iron-remote-desktop-rdp.js"
-[[ $(wc -c < desktop-rdp.js) -gt 1000000 ]]
+cat > desktop.py <<'PYEOF'
+import http.client, re, ssl, sys, urllib.parse
+host, port, ca, email, password, name = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+tls = ssl.create_default_context(cafile=ca)
+tls.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+def get(method, path, cookie="", form=None):
+    c = http.client.HTTPSConnection(host, port, context=tls, timeout=20)
+    headers = {"Cookie": cookie} if cookie else {}
+    body = urllib.parse.urlencode(form) if form is not None else None
+    if body is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    c.request(method, path, body, headers)
+    r = c.getresponse()
+    data = r.read()
+    cookies = [v.split(";")[0] for k, v in r.getheaders() if k.lower() == "set-cookie" and v.startswith("__Host-mp_session=")]
+    c.close()
+    return r.status, data, (cookies[0] if cookies else cookie)
+_, _, cookie = get("POST", "/login", form={"email": email, "password": password})
+status, page, _ = get("GET", "/desktop/" + name, cookie)
+at = re.search(rb'src="(/assets/desktop/[0-9a-f]{16})/page.mjs"', page).group(1).decode()
+status, client, _ = get("GET", at + "/iron-remote-desktop-rdp.js")
+assert status == 200 and len(client) > 1000000, (status, len(client))
+print(f"the desktop page's client: {len(client)} bytes from {at}")
+PYEOF
+run "$PY" desktop.py localhost "$MGMT" "$CA" smoke@example.com "another horse battery staple" smoke-pc
 MAGICPIPES_API_TOKEN=$SMOKE_TOKEN "$MP" connect smoke-pc --local 39523 --json > connect-rdp.out 2>&1 < /dev/null &
 CONNRDP=$!
 for _ in $(seq 1 100); do grep -q '"local"' connect-rdp.out && break; sleep 0.2; done

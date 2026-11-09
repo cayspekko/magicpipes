@@ -1,6 +1,8 @@
 //! Remote desktops on the management host: the page, IronRDP's vendored web client, and the
 //! WebSocket, which is checked here and served on the traffic threads (`data::desktop`).
 
+use std::sync::LazyLock;
+
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
@@ -20,8 +22,13 @@ use super::{AppState, ClientIp};
 use crate::data::desktop::run;
 use crate::data::terminal::Opening;
 
-/// Where the page's files are served.
-pub(super) const ASSETS: &str = "/assets/desktop";
+/// What names this server's version of the page's files: a digest of all three, in their path,
+/// so they can be kept for good and a new server's reach browsers at once. `page.mjs` imports the
+/// others by relative path, so they come from the same version.
+static VERSION: LazyLock<String> = LazyLock::new(|| {
+    let digest = magicpipes_core::secret::sha256_hex(&[PAGE_JS, COMPONENT_JS, RDP_JS].concat());
+    digest[..16].to_string()
+});
 /// Largest message accepted from the browser: input, and clipboard contents.
 const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 
@@ -69,10 +76,11 @@ pub async fn page(user: UiUser, State(app): State<AppState>, Path(name): Path<St
 <div class="screen desk" id="screen"><iron-remote-desktop id="rd" scale="fit" flexcenter="true"></iron-remote-desktop><div class="notice" id="nt" hidden><span id="nt-text"></span></div></div>
 <noscript><p class="note">The remote desktop needs JavaScript. Without it, use <code>magicpipes connect {name}</code> with a Remote Desktop client.</p></noscript>
 </main>
-<script type="module" src="{ASSETS}/page.mjs"></script>
+<script type="module" src="/assets/desktop/{version}/page.mjs"></script>
 </body></html>"##,
         name = esc(&t.name),
         term_style = terminal::style(super::terminal::ASSETS),
+        version = *VERSION,
     );
     let mut resp = Response::new(Body::from(html));
     let h = resp.headers_mut();
@@ -82,7 +90,11 @@ pub async fn page(user: UiUser, State(app): State<AppState>, Path(name): Path<St
 }
 
 /// The page's script and IronRDP's web client. They're public: anyone can get them from npm.
-pub async fn asset(Path(file): Path<String>) -> Response {
+pub async fn asset(Path((version, file)): Path<(String, String)>) -> Response {
+    // Another version's address would keep these files under it for good.
+    if version != *VERSION {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let body = match file.as_str() {
         "page.mjs" => PAGE_JS,
         "iron-remote-desktop.js" => COMPONENT_JS,
@@ -91,8 +103,7 @@ pub async fn asset(Path(file): Path<String>) -> Response {
     };
     let mut resp = Response::new(Body::from(body));
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
-    // They change only with the server, which an hour is short enough to follow.
-    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
     resp
 }
 

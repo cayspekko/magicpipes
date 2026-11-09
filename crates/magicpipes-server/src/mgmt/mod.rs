@@ -123,7 +123,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/terminal/{name}/ws", get(terminal::socket))
         .route("/desktop/{name}", get(desktop::page))
         .route("/desktop/{name}/ws", get(desktop::socket))
-        .route("/assets/desktop/{file}", get(desktop::asset))
+        .route("/assets/desktop/{version}/{file}", get(desktop::asset))
         .route("/assets/terminal/{file}", get(terminal::asset))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
         .route("/agents/{id}/tags", get(ui::agent_tags_page).post(ui::agent_tags))
