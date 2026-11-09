@@ -590,7 +590,8 @@ mod tests {
 
     use super::response_within;
 
-    #[tokio::test]
+    /// On tokio's paused clock: the times below are exact, however slow the machine.
+    #[tokio::test(start_paused = true)]
     async fn uploads_count_as_progress() {
         let timeout = Duration::from_millis(200);
         // The answer comes 600 ms in, after an upload that kept sending until 450 ms.

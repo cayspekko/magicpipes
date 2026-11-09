@@ -51,6 +51,11 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 tower = { version = "0.5", features = ["util"] }
 
+[dev-dependencies]
+# Tests that wait for a timeout run on tokio's paused clock (`start_paused`), so a slow runner
+# can't make them fail.
+tokio = { workspace = true, features = ["test-util"] }
+
 # musl's allocator takes a global lock. See "Threads and memory" in docs/ARCHITECTURE.md.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc.workspace = true
