@@ -11,12 +11,13 @@ use std::future::poll_fn;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
@@ -86,6 +87,20 @@ pub struct MuxHandle {
     open_tx: mpsc::Sender<OpenReply>,
     closed: CancellationToken,
     data: Arc<DataBudget>,
+    lent: Arc<Lent>,
+}
+
+/// Shared streams in use by a request, which will be idle again (or closed) once its response
+/// has been read to the end: the server's connection pool counts them here, so that a request
+/// finding the budget full can wait for one rather than be refused. Lock-free, since every
+/// pooled request passes through it; the [`Notify`] is touched only when someone waits.
+#[derive(Debug, Default)]
+struct Lent {
+    out: AtomicUsize,
+    /// How many have come back, ever.
+    back: AtomicU64,
+    waiting: AtomicUsize,
+    returned: Notify,
 }
 
 /// Open data streams in total, and uses per client (a stream of its own, or a request on a
@@ -178,6 +193,49 @@ impl MuxHandle {
     /// Whether both handles belong to the same session.
     pub fn same_session(&self, other: &MuxHandle) -> bool {
         Arc::ptr_eq(&self.data, &other.data)
+    }
+
+    /// Counts a shared stream as lent to a request, until [`MuxHandle::came_back`].
+    pub fn lend(&self) {
+        self.lent.out.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A stream [`MuxHandle::lend`] counted is idle again, or closed. Wakes the requests
+    /// waiting for one.
+    pub fn came_back(&self) {
+        let lent = &self.lent;
+        lent.out.fetch_sub(1, Ordering::SeqCst);
+        lent.back.fetch_add(1, Ordering::SeqCst);
+        if lent.waiting.load(Ordering::SeqCst) > 0 {
+            lent.returned.notify_waiters();
+        }
+    }
+
+    /// How many lent streams have come back so far, to pass to [`MuxHandle::wait_for_return`].
+    pub fn returns(&self) -> u64 {
+        self.lent.back.load(Ordering::SeqCst)
+    }
+
+    /// Waits for a lent stream to come back, as long as any are out and `deadline` hasn't
+    /// passed. `true` when one has come back since `seen` ([`MuxHandle::returns`]), so another try
+    /// may find it idle; `false` when there's nothing to wait for.
+    pub async fn wait_for_return(&self, seen: u64, deadline: tokio::time::Instant) -> bool {
+        let lent = &self.lent;
+        lent.waiting.fetch_add(1, Ordering::SeqCst);
+        let returned = lent.returned.notified();
+        tokio::pin!(returned);
+        returned.as_mut().enable();
+        // Counted as waiting before looking: one coming back after this either shows here, or
+        // sees the waiter and wakes it.
+        let woke = if self.returns() != seen {
+            true
+        } else if lent.out.load(Ordering::SeqCst) == 0 {
+            false
+        } else {
+            tokio::time::timeout_at(deadline, returned).await.is_ok()
+        };
+        lent.waiting.fetch_sub(1, Ordering::SeqCst);
+        woke
     }
 
     /// Opens a new outbound stream, failing after `timeout`.
@@ -310,7 +368,7 @@ where
     let (open_tx, mut open_rx) = mpsc::channel::<OpenReply>(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let token = CancellationToken::new();
-    let handle = MuxHandle { open_tx, closed: token.clone(), data: Arc::default() };
+    let handle = MuxHandle { open_tx, closed: token.clone(), data: Arc::default(), lent: Arc::default() };
 
     tokio::spawn(async move {
         let mut pending: Option<OpenReply> = None;
@@ -541,5 +599,30 @@ mod tests {
         assert_eq!(budget.0.lock().unwrap().0, 0);
         drop(used);
         assert!(budget.0.lock().unwrap().1.is_empty());
+    }
+    #[tokio::test]
+    async fn a_request_waits_only_for_a_stream_on_its_way_back() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let ((s1, _in1), (s2, _in2)) = (spawn(a, Mode::Server), spawn(b, Mode::Client));
+        // Never reached: each answer below comes at once, or from a stream coming back.
+        let far = tokio::time::Instant::now() + Duration::from_secs(3600);
+        assert!(!s1.wait_for_return(s1.returns(), far).await, "nothing lent");
+        s1.lend();
+        assert!(!s2.wait_for_return(s2.returns(), far).await, "only on another session");
+        // One that came back since the request last looked is worth another try at once.
+        let seen = s1.returns();
+        s1.came_back();
+        assert!(s1.wait_for_return(seen, far).await);
+        assert!(!s1.wait_for_return(s1.returns(), far).await, "counted back");
+        // And one coming back wakes a request waiting for it.
+        s1.lend();
+        let seen = s1.returns();
+        let back = async {
+            tokio::task::yield_now().await;
+            s1.came_back();
+        };
+        let (woke, ()) = tokio::join!(s1.wait_for_return(seen, far), back);
+        assert!(woke);
+        assert_eq!(s1.lent.waiting.load(Ordering::SeqCst), 0, "no waiter left behind");
     }
 }

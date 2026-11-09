@@ -28,8 +28,8 @@ use magicpipes_core::proto::{self, ERROR_HEADER, PROBE_ACK_HEADER, PROBE_HEADER,
 use magicpipes_core::theme::PALETTE;
 use tokio_util::sync::CancellationToken;
 
-use super::gate;
 use super::io::{StatusPrefixed, UpstreamStatus, bridge, find_status};
+use super::{gate, pool};
 use super::{DataPlane, Outcome, Route};
 use crate::authz::Principal;
 use crate::forwarded::{TrustedProxies, client_key};
@@ -150,11 +150,13 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     // the connection instead. The client's place is kept until then.
     let resp = match reuse {
         Some((mut sender, used, version)) => {
-            let (dp, tunnel, session) = (dp.clone(), route.tunnel_id.clone(), session.clone());
+            let (dp, tunnel, back) = (dp.clone(), route.tunnel_id.clone(), ComingBack::new(session.clone()));
             tokio::spawn(async move {
                 if sender.ready().await.is_ok() {
-                    dp.pool.put(&tunnel, session, version, sender);
+                    dp.pool.put(&tunnel, back.0.clone(), version, sender);
                 }
+                // Then wakes the requests waiting for a connection.
+                drop(back);
             });
             resp.map(|inner| Holding { inner, _used: used }.boxed())
         }
@@ -241,9 +243,27 @@ fn busy() -> Response<ProxyBody> {
     error_page(ErrorCode::AgentBusy, "This tunnel is handling too many connections. Try again shortly.")
 }
 
+/// A pooled connection whose response is under way, counted on its session as on its way back
+/// ([`MuxHandle::lend`]) until dropped, whether it went back to the pool or was closed.
+struct ComingBack(MuxHandle);
+
+impl ComingBack {
+    fn new(session: MuxHandle) -> Self {
+        session.lend();
+        Self(session)
+    }
+}
+
+impl Drop for ComingBack {
+    fn drop(&mut self) {
+        self.0.came_back();
+    }
+}
+
 /// Sends `req` over an idle pooled connection, or a new one. A pooled connection that the
 /// application closed just as it was taken refuses the request before sending any of it; the
-/// request then goes over a new connection.
+/// request then goes over a new connection. When the session's streams are all in use and none
+/// is idle, it waits for a connection on its way back to the pool, and takes that.
 async fn send_shared(
     dp: &DataPlane,
     route: &Route,
@@ -252,25 +272,34 @@ async fn send_shared(
     uploading: tokio::sync::watch::Receiver<()>,
 ) -> Result<(Response<Incoming>, SendRequest<Progress<Incoming>>), Response<ProxyBody>> {
     let timeout = dp.settings.upstream_response_timeout;
+    let deadline = tokio::time::Instant::now() + pool::RETURN_WAIT;
     let mut req = req;
-    if let Some(mut sender) = dp.pool.take(&route.tunnel_id, session, route.version) {
-        match response_within(sender.try_send_request(req), uploading.clone(), timeout).await {
-            Some(Ok(resp)) => return Ok((resp, sender)),
-            Some(Err(mut e)) => match e.take_message() {
-                Some(unsent) => req = unsent,
-                None => return Err(answer(route, Some(Err(e.into_error()))).unwrap_err()),
-            },
-            None => return Err(answer(route, None).unwrap_err()),
+    loop {
+        let seen = session.returns();
+        if let Some(mut sender) = dp.pool.take(&route.tunnel_id, session, route.version) {
+            match response_within(sender.try_send_request(req), uploading.clone(), timeout).await {
+                Some(Ok(resp)) => return Ok((resp, sender)),
+                Some(Err(mut e)) => match e.take_message() {
+                    Some(unsent) => req = unsent,
+                    None => return Err(answer(route, Some(Err(e.into_error()))).unwrap_err()),
+                },
+                None => return Err(answer(route, None).unwrap_err()),
+            }
         }
+        let Some(mut sender) = connect_shared(dp, route, session).await? else {
+            if session.data_streams_full() && session.wait_for_return(seen, deadline).await {
+                continue;
+            }
+            return Err(busy());
+        };
+        let resp = answer(route, response_within(sender.send_request(req), uploading, timeout).await)?;
+        return Ok((resp, sender));
     }
-    let mut sender = connect_shared(dp, route, session).await?;
-    let resp = answer(route, response_within(sender.send_request(req), uploading, timeout).await)?;
-    Ok((resp, sender))
 }
 
-/// A new HTTP/1.1 connection over a shared stream, for the pool. When the session's streams are
-/// used up, idle pooled ones on it are closed to make room.
-async fn connect_shared(dp: &DataPlane, route: &Route, session: &MuxHandle) -> Result<SendRequest<Progress<Incoming>>, Response<ProxyBody>> {
+/// A new HTTP/1.1 connection over a shared stream, for the pool; `None` when the session has no
+/// stream to spare. When its streams are used up, idle pooled ones on it are closed to make room.
+async fn connect_shared(dp: &DataPlane, route: &Route, session: &MuxHandle) -> Result<Option<SendRequest<Progress<Incoming>>>, Response<ProxyBody>> {
     let fail = || {
         route.stats.record(Outcome::AgentOffline);
         error_page(ErrorCode::AgentUnavailable, "Could not open a stream to the MagicPipes agent.")
@@ -278,7 +307,7 @@ async fn connect_shared(dp: &DataPlane, route: &Route, session: &MuxHandle) -> R
     let open = dp.settings.stream_open_timeout;
     let mut stream = match dp.with_room(session, || session.open_shared(open)).await {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
         Err(_) => return Err(fail()),
     };
     proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })
@@ -292,7 +321,7 @@ async fn connect_shared(dp: &DataPlane, route: &Route, session: &MuxHandle) -> R
             tracing::debug!(error = %e, "upstream connection ended");
         }
     });
-    Ok(sender)
+    Ok(Some(sender))
 }
 
 /// A response body that keeps the client's place in the agent's budget until it is done.
@@ -389,7 +418,7 @@ async fn open_upstream(
         error_page(ErrorCode::AgentUnavailable, "Could not open a stream to the MagicPipes agent.")
     };
     let timeout = dp.settings.stream_open_timeout;
-    let mut stream = match dp.with_room(session, || session.open_data(timeout, client)).await {
+    let mut stream = match dp.with_room_or_wait(session, || session.open_data(timeout, client)).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
         Err(_) => return Err(fail()),

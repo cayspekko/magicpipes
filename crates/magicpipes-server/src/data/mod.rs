@@ -331,6 +331,28 @@ impl DataPlane {
         codes.insert(nonce.to_string(), std::time::Instant::now()).is_none()
     }
 
+    /// [`DataPlane::with_room`], and when nothing is idle to close but pooled connections on the
+    /// session are on their way back, waits for one to come back ([`pool::RETURN_WAIT`] at most),
+    /// which makes room. For a stream of its own; a pooled request reuses what comes back instead.
+    async fn with_room_or_wait<F, Fut>(&self, session: &MuxHandle, open: F) -> std::io::Result<MuxStream>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = std::io::Result<MuxStream>>,
+    {
+        let deadline = tokio::time::Instant::now() + pool::RETURN_WAIT;
+        loop {
+            let seen = session.returns();
+            match self.with_room(session, &open).await {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && session.data_streams_full() => {
+                    if !session.wait_for_return(seen, deadline).await {
+                        return Err(e);
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Opens a stream with `open`. When the session's data streams are used up, idle pooled
     /// connections on it are closed to make room; a closed connection gives its stream back once
     /// its task notices, so this waits a moment between tries. A client over its own share gets
@@ -456,5 +478,45 @@ mod tests {
         assert_eq!(session.open_data(WAIT, client).await.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         assert!(dp.with_room(&session, || session.open_data(WAIT, client)).await.is_ok());
         assert!(dp.pool.len() < MAX_DATA_STREAMS);
+    }
+
+    /// Under load, finished requests' connections hold the session's streams until their tasks
+    /// put them back, and nothing is idle: a new stream waits for one, rather than being refused.
+    #[tokio::test]
+    async fn connections_on_their_way_back_make_room() {
+        let cfg: Config = toml::from_str("base_domain = \"t.test\"\n[management]\nhostname = \"m.t.test\"\n[tls]\nmode = \"dev-ca\"").unwrap();
+        let dp = DataPlane::new(ProxySettings::from_config(&cfg, Signer::for_tests()), CancellationToken::new());
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (session, _rpcs) = mux::spawn(a, Mode::Server);
+        let (_agent, mut inbound) = mux::spawn(b, Mode::Client);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(s) = inbound.recv().await {
+                held.push(s);
+            }
+        });
+        let mut lent = Vec::new();
+        for _ in 0..MAX_DATA_STREAMS {
+            let stream = session.open_shared(WAIT).await.unwrap();
+            let (sender, conn) = hyper::client::conn::http1::handshake::<_, proxy::Progress<Incoming>>(TokioIo::new(stream)).await.unwrap();
+            tokio::spawn(conn);
+            session.lend();
+            lent.push(sender);
+        }
+        assert!(session.data_streams_full() && dp.pool.len() == 0);
+
+        let client: IpAddr = "203.0.113.2".parse().unwrap();
+        let opening = tokio::spawn({
+            let (dp, session) = (dp.clone(), session.clone());
+            async move { dp.with_room_or_wait(&session, || session.open_data(WAIT, client)).await.map(drop) }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!opening.is_finished(), "refused while connections were on their way back");
+        // One comes back to the pool: it's closed to make room, and the stream opens.
+        dp.pool.put("tn_a", session.clone(), 0, lent.pop().unwrap());
+        session.came_back();
+        assert!(tokio::time::timeout(WAIT, opening).await.unwrap().unwrap().is_ok());
     }
 }

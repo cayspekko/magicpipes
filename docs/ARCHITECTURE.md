@@ -80,6 +80,20 @@ connections:
   request holds its client's place until its response body is done. When a session's streams are
   used up, idle connections on it are closed to make room, for pooled requests, WebSockets and
   port connections alike.
+* **Connections on their way back.** A connection holds its stream from its request until the
+  task that puts it back has run, a moment after the client has its response. Under load that
+  moment adds up: with 150 clients on a busy 4-core VM, refusals (`agent_busy`) were logged with all
+  224 streams in use, none idle, and 96 to 147 connections finished but not back yet, a few per
+  million requests. So each session counts them (`MuxHandle::lend`, `came_back`), and a request
+  that finds the streams used up and nothing idle waits for one to come back (1 s at most): a
+  pooled request takes it, and anything else closes it for room. More tries at closing idle ones
+  (40 instead of 3) had changed nothing, since there were none. The count is a few atomics on the
+  session, and wakes anyone only when someone is waiting on that session: a first version kept it
+  in the pool, under a lock every request took twice, and woke waiting requests whenever any
+  agent's connection came back. Measured with 150 clients, 50 runs per build on the Linux VM:
+  refusals went from 71 (in 11 runs) to none, at the same rate (131,200 against 129,600 requests a
+  second, ±3%), and the traffic suite didn't move. On macOS small requests from 16 clients were 3%
+  slower with either version, at the same server CPU per request; nothing else moved.
 
 ## Data plane vs control plane
 

@@ -11,6 +11,13 @@
 //! most [`IDLE_TIMEOUT`]. Idle connections hold a place in their session's stream budget (not a
 //! client's), and give it up when a session needs a stream ([`Pool::evict`], through
 //! `DataPlane::with_room`).
+//!
+//! A connection whose response is under way holds its stream too, and comes back once the
+//! response has been read to the end, a moment after the client has it: under load, half a
+//! session's streams can be in that state while nothing is idle. So each one is counted on its
+//! session ([`MuxHandle::lend`], [`MuxHandle::came_back`]), and a request that finds the budget
+//! full and nothing idle waits for one to come back ([`MuxHandle::wait_for_return`], at most
+//! [`RETURN_WAIT`]) rather than being refused.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -26,6 +33,10 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
 /// again for the next request, until the agent runs out of local ports.
 pub const MAX_IDLE_PER_TUNNEL: usize = MAX_DATA_STREAMS;
 pub const MAX_IDLE: usize = 4096;
+/// How long a request waits for a connection to come back when its session's streams are all in
+/// use and none is idle. One comes back within milliseconds of its response; a session full of
+/// long downloads refuses after this.
+pub const RETURN_WAIT: Duration = Duration::from_secs(1);
 
 struct Idle<B> {
     sender: SendRequest<B>,
@@ -181,4 +192,5 @@ mod tests {
         pool.sweep();
         assert_eq!(pool.len(), MAX_IDLE_PER_TUNNEL - 1);
     }
+
 }

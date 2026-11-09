@@ -128,7 +128,7 @@ pub(super) async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, cli
 pub(super) async fn opened(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Result<MuxStream, Outcome> {
     let timeout = dp.settings.stream_open_timeout;
     let key = client_key(client);
-    let mut stream = match dp.with_room(session, || session.open_data(timeout, key)).await {
+    let mut stream = match dp.with_room_or_wait(session, || session.open_data(timeout, key)).await {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
             tracing::debug!(tunnel = %route.tunnel_id, %client, "agent stream budget used up; refusing");
