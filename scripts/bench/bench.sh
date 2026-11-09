@@ -2,7 +2,7 @@
 # One run of one benchmark suite against one build, on this machine. Prints one line per
 # measurement. `compare.sh` is usually what you want; see README.md here.
 #
-# Usage: bench.sh <traffic|control|memory|wan|unix|ssh> <build dir>
+# Usage: bench.sh <traffic|control|memory|wan|unix|ssh|connect> <build dir>
 #
 # A build dir holds magicpipes and magicpipesd; `build.sh` makes them. Settings, all optional:
 #   BENCH_TOOLS            folder with mp-bench-load and mp-bench-app (default: <build dir>/../tools)
@@ -12,7 +12,7 @@
 #   BENCH_KEEP             set to keep the run's folder, with the server's log
 set -uo pipefail
 
-USAGE="usage: bench.sh <traffic|control|memory|wan|unix|ssh> <build dir>"
+USAGE="usage: bench.sh <traffic|control|memory|wan|unix|ssh|connect> <build dir>"
 SUITE=${1:?$USAGE}
 BIN=$(cd "${2:?$USAGE}" && pwd) || exit 2
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -25,8 +25,8 @@ for need in "$BIN/magicpipes" "$BIN/magicpipesd" "$LOAD" "$TOOLS/mp-bench-app"; 
 done
 
 # MGMT carries the agent's session, which is what wan.sh shapes.
-HTTPS=21443 HTTP=21080 MGMT=21844 APP=21900 IPERF=21901 IPERF_PUBLIC=21951 SSHD=21902 GATEWAY=21960
-for port in $HTTPS $HTTP $MGMT $APP $IPERF $IPERF_PUBLIC $SSHD $GATEWAY; do
+HTTPS=21443 HTTP=21080 MGMT=21844 APP=21900 IPERF=21901 IPERF_PUBLIC=21951 SSHD=21902 GATEWAY=21960 CONNECT=21961
+for port in $HTTPS $HTTP $MGMT $APP $IPERF $IPERF_PUBLIC $SSHD $GATEWAY $CONNECT; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     echo "port $port is in use; is another benchmark running?" >&2
     exit 2
@@ -42,13 +42,13 @@ CA=$RUN/server/dev-ca/ca.crt
 export MAGICPIPES_HOME=$RUN/home MAGICPIPES_PROBE_ADDR=127.0.0.1 MAGICPIPES_NO_BROWSER=1
 mkdir -p "$MAGICPIPES_HOME"
 
-SERVER="" APP_PID="" IPERF_PID="" AGENT="" SSHD_PID=""
+SERVER="" APP_PID="" IPERF_PID="" AGENT="" SSHD_PID="" CONNECT_PID=""
 cleanup() {
   trap - EXIT
   [ -f home/agent.pid ] && AGENT=$(cat home/agent.pid)
   # Only what this run started: a real agent on this machine has another home.
   # shellcheck disable=SC2086
-  kill $AGENT $SERVER $APP_PID $IPERF_PID $SSHD_PID 2>/dev/null
+  kill $AGENT $SERVER $APP_PID $IPERF_PID $SSHD_PID $CONNECT_PID 2>/dev/null
   if [ -n "$SERVER" ]; then
     grep -E "panicked| ERROR " server.log | head -5 >&2
   fi
@@ -408,6 +408,63 @@ suite_wan() {
   cat bulk.out
 }
 
+# A person with an API token (in `token.txt`, read by `connect`), and their machine enrolled, for
+# the connect suite.
+connect_person() {
+  local admin url=https://localhost:$MGMT jar=cookies.txt email=bench@example.com password=correct-horse-battery-staple csrf id token
+  local curl="curl -sS --cacert $CA"
+  admin=$(cat server/admin-token)
+  id=$($curl -H "Authorization: Bearer $admin" -H 'content-type: application/json' -d "{\"email\":\"$email\",\"password\":\"$password\"}" "$url/api/v1/users" |
+    sed -E 's/.*"id":"(us_[^"]+)".*/\1/')
+  $curl -c "$jar" -o /dev/null --data-urlencode "email=$email" --data-urlencode "password=$password" "$url/login"
+  csrf=$($curl -b "$jar" "$url/password" | sed -nE 's/.*name="csrf" value="([^"]+)".*/\1/p' | head -1)
+  $curl -b "$jar" -c "$jar" -o /dev/null --data-urlencode "csrf=$csrf" --data-urlencode "current=$password" --data-urlencode "new=$password again" --data-urlencode "repeat=$password again" "$url/password"
+  csrf=$($curl -b "$jar" "$url/account" | sed -nE 's/.*name="csrf" value="([^"]+)".*/\1/p' | head -1)
+  $curl -b "$jar" --data-urlencode "csrf=$csrf" --data-urlencode "name=bench" "$url/account/tokens" | sed -nE 's/.*<pre class="term">([^<]+)<\/pre>.*/\1/p' > token.txt
+  [ -s token.txt ] || fail "no API token"
+  token=$($curl -H "Authorization: Bearer $admin" -H 'content-type: application/json' -d "{\"owner_user_id\":\"$id\"}" "$url/api/v1/enrollments" |
+    sed -E 's/.*"enrollment_token":"([^"]+)".*/\1/')
+  "$BIN/magicpipes" login --server "$url" --token "$token" --ca-cert "$CA" --name bench > login.out 2>&1 || fail "login failed" login.out
+}
+
+# measure_tcp <name> <key> <port> <load arguments...>: plain TCP to a local port.
+measure_tcp() {
+  local name=$1 key=$2 port=$3
+  shift 3
+  printf 'test=%s key=%s ' "$name" "$key"
+  "$LOAD" --port "$port" --secs "$SECS" "$@"
+  sleep 1
+}
+
+# What `magicpipes connect` costs: the same requests through a public TCP port, and through
+# `connect` to a private TCP tunnel of the same machine, to the same application, in the same run.
+suite_connect() {
+  "$BIN/magicpipes" connect --help > /dev/null 2>&1 || fail "this build has no connect"
+  start_server
+  connect_person
+  start_app
+  add "$APP" --tcp --allow-any --name raw --remote-port 21959
+  add "$APP" --tcp --name db
+  grep -q '"visibility": "private"' add.out || fail "the tunnel isn't private" add.out
+  AGENT=$(cat home/agent.pid)
+  "$BIN/magicpipes" connect db --local "$CONNECT" --api-token-file token.txt --json > connect.out 2>&1 &
+  CONNECT_PID=$!
+  disown "$CONNECT_PID"
+  for _ in $(seq 1 100); do grep -q '"local"' connect.out && break; sleep 0.1; done
+  grep -q '"local"' connect.out || fail "connect didn't start" connect.out
+  local name port
+  for name in port connect; do
+    port=21959
+    [ "$name" = connect ] && port=$CONNECT
+    measure_tcp "${name}_small_c16" rps "$port" --conc 16
+    measure_tcp "${name}_new_connections_c16" rps "$port" --conc 16 --close
+    measure_tcp "${name}_download_1" mb_s "$port" --conc 1 --path /big/2048
+    measure_tcp "${name}_download_4" mb_s "$port" --conc 4 --path /big/2048
+    measure_tcp "${name}_upload_1gib" p50 "$port" --conc 1 --reqs 1 --post 1073741824
+  done
+  printf 'test=memory_connect key=mb mb=%s\n' "$(mb "$CONNECT_PID")"
+}
+
 case $SUITE in
   traffic) suite_traffic ;;
   control) suite_control ;;
@@ -415,5 +472,6 @@ case $SUITE in
   wan) suite_wan ;;
   unix) suite_unix ;;
   ssh) suite_ssh ;;
+  connect) suite_connect ;;
   *) echo "$USAGE" >&2; exit 2 ;;
 esac

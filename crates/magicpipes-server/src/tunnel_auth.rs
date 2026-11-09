@@ -18,6 +18,9 @@
 //! Every request then rechecks the cookie against the current users and tags, so revoking access
 //! takes effect at once. Tokens are `kind~user~host~nonce~issued~expires~hmac` with an
 //! HMAC-SHA256 over the rest, keyed by `data_dir/session-key` (0600, created on first start).
+//!
+//! `magicpipes connect` holds a third kind, a connect pass: the user, bound to the management
+//! host, which the CLI presents for each connection and the data plane checks the same way.
 
 use std::path::Path;
 
@@ -55,6 +58,7 @@ pub struct Claims {
 enum Kind {
     Code,
     Cookie,
+    Pass,
 }
 
 impl Kind {
@@ -62,6 +66,7 @@ impl Kind {
         match self {
             Kind::Code => "c",
             Kind::Cookie => "t",
+            Kind::Pass => "p",
         }
     }
 }
@@ -142,6 +147,15 @@ impl Signer {
     pub fn verify_cookie(&self, token: &str, host: &str) -> Option<Claims> {
         self.verify(Kind::Cookie, token, host)
     }
+
+    /// A connect pass for `magicpipes connect`, bound to the management host. Each is distinct.
+    pub fn pass(&self, user_id: &str, management_host: &str, ttl_secs: i64) -> String {
+        self.issue(Kind::Pass, user_id, management_host, &secret::random_string(16), ttl_secs)
+    }
+
+    pub fn verify_pass(&self, token: &str, management_host: &str) -> Option<Claims> {
+        self.verify(Kind::Pass, token, management_host)
+    }
 }
 
 /// A user id or nonce safe to put in a token.
@@ -202,6 +216,12 @@ mod tests {
         let cookie = s.cookie("us_ann", "app.t.test", 3600);
         assert_eq!(s.verify_cookie(&cookie, "app.t.test").unwrap().user_id, "us_ann");
         assert!(s.verify_cookie("garbage", "app.t.test").is_none());
+        let pass = s.pass("us_ann", "m.t.test", 3600);
+        assert_eq!(s.verify_pass(&pass, "m.t.test").unwrap().user_id, "us_ann");
+        assert_ne!(pass, s.pass("us_ann", "m.t.test", 3600), "each pass is distinct");
+        assert!(s.verify_cookie(&pass, "m.t.test").is_none(), "a pass is not a cookie");
+        assert!(s.verify_pass(&s.cookie("us_ann", "m.t.test", 3600), "m.t.test").is_none(), "a cookie is not a pass");
+        assert!(s.verify_pass(&pass, "other.t.test").is_none(), "another server");
         assert!(token_safe("us_Ab1-x") && !token_safe("a~b") && !token_safe(""));
     }
 

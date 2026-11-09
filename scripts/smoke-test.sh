@@ -2,8 +2,8 @@
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
-# terminal, echoes through TCP and UDP port tunnels, registers an SSH tunnel, reaches an application on a Unix socket (or, on
-# Windows, is told that isn't supported), and stops the agent.
+# terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`) private, registers an SSH tunnel,
+# reaches an application on a Unix socket (or, on Windows, is told that isn't supported), and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -87,7 +87,7 @@ export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID="" ECHOPID="" SOCKPID=""
+SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -96,6 +96,8 @@ cleanup() {
   stop_pid "$APPPID"
   stop_pid "$ECHOPID"
   stop_pid "$SOCKPID"
+  stop_pid "$CONNTCP"
+  stop_pid "$CONNUDP"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
@@ -281,6 +283,72 @@ run "$PY" ports.py tcp "$PTCP" "smoke over tcp"
 run "$MP" add "$ECHO_UDP" --udp --allow-any --name pudp --json --timeout 60
 PUDP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
 run "$PY" ports.py udp "$PUDP" "smoke over udp"
+
+step "private tcp and udp through magicpipes connect"
+# A person holding a tag that the machine's private tunnels carry reaches them with `magicpipes
+# connect`, here with an API token; signing in in a browser is in the end-to-end tests.
+ADMIN=$(tr -d '\r\n' < server/admin-token)
+api() { "${CURL[@]}" --cacert server/dev-ca/ca.crt -H "authorization: Bearer $ADMIN" -H "content-type: application/json" "$@"; }
+MGMT_URL="https://localhost:$MGMT"
+run api -X POST -d '{"name":"smoke"}' "$MGMT_URL/api/v1/tags"
+run api -X POST -d '{"email":"smoke@example.com","password":"correct horse battery staple"}' "$MGMT_URL/api/v1/users"
+SMOKE_USER=$(sed -n 's/.*"id":"\(us_[^"]*\)".*/\1/p' cmd.out | head -n 1)
+run api -X PATCH -d '{"tags":["smoke"]}' "$MGMT_URL/api/v1/users/$SMOKE_USER"
+run "$MP" status --json
+AGENT_ID=$(sed -n 's/.*"agent_id": *"\([^"]*\)".*/\1/p' cmd.out | head -n 1)
+run api -X PATCH -d '{"tags":["smoke"]}' "$MGMT_URL/api/v1/agents/$AGENT_ID"
+run "$MP" add "$ECHO_TCP" --tcp --tag smoke --name pdb --json --timeout 60
+grep -q '"public_url": "magicpipes connect pdb"' cmd.out
+run "$MP" add "$ECHO_UDP" --udp --tag smoke --name pdns --json --timeout 60
+grep -q '"visibility": "private"' cmd.out
+# The person's API token, from their account page, after the password change a new account asks for.
+cat > account.py <<'PYEOF'
+import http.client, re, ssl, sys, urllib.parse
+host, port, ca, email, password, new = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+tls = ssl.create_default_context(cafile=ca)
+# Python 3.13 also wants an Authority Key Identifier, which the development CA's certificates lack.
+tls.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+cookie = ""
+def request(method, path, form=None):
+    global cookie
+    c = http.client.HTTPSConnection(host, port, context=tls, timeout=20)
+    headers = {"Cookie": cookie} if cookie else {}
+    body = urllib.parse.urlencode(form) if form is not None else None
+    if body is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    c.request(method, path, body, headers)
+    r = c.getresponse()
+    for k, v in r.getheaders():
+        if k.lower() == "set-cookie" and v.startswith("__Host-mp_session="):
+            cookie = v.split(";")[0]
+    html = r.read().decode()
+    c.close()
+    return html
+csrf = lambda html: re.search(r'name="csrf" value="([^"]+)"', html).group(1)
+request("POST", "/login", {"email": email, "password": password})
+request("POST", "/password", {"csrf": csrf(request("GET", "/password")), "current": password, "new": new, "repeat": new})
+html = request("POST", "/account/tokens", {"csrf": csrf(request("GET", "/account")), "name": "smoke"})
+print(re.search(r'<pre class="term">([^<]+)</pre>', html).group(1))
+PYEOF
+MAGICPIPES_API_TOKEN=$("$PY" account.py localhost "$MGMT" "$CA" smoke@example.com "correct horse battery staple" "another horse battery staple" | tr -d '\r')
+export MAGICPIPES_API_TOKEN
+"$MP" connect pdb --local 39521 --json > connect-tcp.out 2>&1 < /dev/null &
+CONNTCP=$!
+"$MP" connect pdns --local 39522 --json > connect-udp.out 2>&1 < /dev/null &
+CONNUDP=$!
+unset MAGICPIPES_API_TOKEN
+for _ in $(seq 1 100); do
+  grep -q '"local"' connect-tcp.out && grep -q '"local"' connect-udp.out && break
+  sleep 0.2
+done
+cat connect-tcp.out connect-udp.out | tee -a transcript.log
+run "$PY" ports.py tcp 39521 "smoke over connect"
+run "$PY" ports.py udp 39522 "smoke over connect"
+stop_pid "$CONNTCP"
+stop_pid "$CONNUDP"
+CONNTCP="" CONNUDP=""
+run "$MP" remove pdb
+run "$MP" remove pdns
 
 step "ssh tunnel"
 # Registered and checked through the agent, with the echo service standing in for sshd: logging in

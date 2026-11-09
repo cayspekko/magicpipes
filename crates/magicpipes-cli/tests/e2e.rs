@@ -622,6 +622,141 @@ async fn udp_roundtrip(client: &tokio::net::UdpSocket, port: u16, msg: &[u8]) ->
     Vec::new()
 }
 
+/// Waits for `magicpipes connect --json` to say where it listens, and returns that port.
+async fn connect_port(child: &mut tokio::process::Child) -> u16 {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    let mut stdout = tokio::io::BufReader::new(child.stdout.as_mut().unwrap());
+    tokio::time::timeout(Duration::from_secs(60), stdout.read_line(&mut line)).await.expect("connect never said where it listens").unwrap();
+    let v: Value = serde_json::from_str(&line).unwrap_or_else(|_| panic!("not where it listens: {line:?}"));
+    v["local"].as_str().unwrap().parse::<std::net::SocketAddr>().unwrap().port()
+}
+
+/// What a `magicpipes` process that ended said last on stdout, as JSON.
+fn last_json(out: &std::process::Output) -> Value {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.lines().last().unwrap_or_default()).unwrap_or_else(|_| panic!("{stdout}{}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// A user's new API token, made on their account page.
+async fn api_token(env: &Env, cookie: &str) -> String {
+    let account = env.ui("/account", Some(cookie), None).await;
+    shown_secret(&env.ui("/account/tokens", Some(cookie), Some(&[("csrf", &account.csrf()), ("name", "connect")])).await.html)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_reaches_private_port_tunnels() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:dev" })).await;
+    let mut ids = std::collections::HashMap::new();
+    for (email, tags) in [("ann@example.com", vec!["team:dev"]), ("bob@example.com", vec![])] {
+        let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": email, "password": "correct horse battery" })).await;
+        let id = v["user"]["id"].as_str().unwrap().to_string();
+        env.api_json("PATCH", &format!("/api/v1/users/{id}"), Some(&admin), serde_json::json!({ "tags": tags })).await;
+        ids.insert(email, id);
+    }
+    let (ann, bob) = (sign_in(&env, "ann@example.com", "correct horse battery").await, sign_in(&env, "bob@example.com", "correct horse battery").await);
+
+    // Ann's machine, which may only publish private tunnels: a raw port is private too, and gets
+    // no public port. Asking for a public one still asks for one.
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"], "allow_public": false });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "anns-laptop"]).await;
+    let (echo, dns) = (common::tcp_echo_app().await, common::udp_echo_app().await);
+    let t = add_json(&env, &[&echo.port.to_string(), "--tcp", "--name", "db", "--tag", "team:dev"]).await;
+    assert_eq!((t["status"].as_str(), t["visibility"].as_str(), t["public_url"].as_str()), (Some("ready"), Some("private"), Some("magicpipes connect db")), "{t}");
+    assert!(t.get("public_port").is_none() && t.get("reachable").is_none(), "{t}");
+    assert_eq!(add_json(&env, &[&dns.port.to_string(), "--udp", "--name", "dns"]).await["visibility"], "private");
+    let out = env.cli(&["add", &echo.port.to_string(), "--tcp", "--name", "open", "--allow-any", "--json"]).await;
+    assert_eq!(last_json(&out)["error"]["code"], "public_not_allowed");
+
+    // With an API token, Ann reaches both from here.
+    let ann_token = api_token(&env, &ann).await;
+    let mut tcp = env.cli_spawn(&["connect", "db", "--api-token", &ann_token, "--json"]);
+    let port = connect_port(&mut tcp).await;
+    assert_eq!(tcp_roundtrip(port, b"hello over connect").await, b"hello over connect");
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(tcp_roundtrip(port, &big).await, big, "large transfers arrive intact");
+    let mut udp = env.cli_spawn(&["connect", "dns", "--api-token", &ann_token, "--json"]);
+    let uport = connect_port(&mut udp).await;
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(udp_roundtrip(&client, uport, b"ping").await, b"echo:ping");
+    assert_eq!(udp_roundtrip(&client, uport, b"again").await, b"echo:again");
+
+    // Bob holds no tag that lets him in: to him, there's no such tunnel.
+    let bob_token = api_token(&env, &bob).await;
+    let out = env.cli(&["connect", "db", "--api-token", &bob_token, "--json"]).await;
+    assert_eq!((out.status.code(), last_json(&out)["error"]["code"].as_str()), (Some(6), Some("not_found")));
+    // Given the tag, he gets in, and the tunnel is shared with him, with the way in.
+    let bob_id = ids["bob@example.com"].clone();
+    env.api_json("PATCH", &format!("/api/v1/users/{bob_id}"), Some(&admin), serde_json::json!({ "tags": ["team:dev"] })).await;
+    assert!(env.ui("/", Some(&bob), None).await.html.contains("<code>magicpipes connect db</code>"));
+    let mut bobs = env.cli_spawn(&["connect", "db", "--api-token", &bob_token, "--json"]);
+    let bport = connect_port(&mut bobs).await;
+    let mut open = tokio::net::TcpStream::connect(("127.0.0.1", bport)).await.unwrap();
+    open.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), open.read_exact(&mut got)).await.unwrap().unwrap();
+    assert_eq!(&got, b"ping");
+    // Losing it closes his open connection at once, and the next one ends `connect`, saying why.
+    env.api_json("PATCH", &format!("/api/v1/users/{bob_id}"), Some(&admin), serde_json::json!({ "tags": [] })).await;
+    let read = tokio::time::timeout(Duration::from_secs(10), open.read(&mut got)).await.expect("the connection stayed open");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    let _ = tokio::net::TcpStream::connect(("127.0.0.1", bport)).await;
+    let out = tokio::time::timeout(Duration::from_secs(30), bobs.wait_with_output()).await.unwrap().unwrap();
+    assert_eq!((out.status.code(), last_json(&out)["error"]["code"].as_str()), (Some(6), Some("not_found")));
+
+    // Without a token, `connect` asks Ann to approve it in a browser, on any device, and keeps the pass.
+    let mut child = env.cli_spawn(&["connect", "db", "--no-browser", "--json"]);
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let link = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if let Some(at) = line.find("/cli?code=") {
+                return line[at..].trim().to_string();
+            }
+        }
+        panic!("no approval link");
+    })
+    .await
+    .unwrap();
+    let approval = env.ui(&link, Some(&ann), None).await;
+    assert!(approval.html.contains("Connect from") && approval.html.contains("private TCP and UDP tunnels you can"), "{}", approval.html);
+    let code = link.split("code=").nth(1).unwrap().to_string();
+    let done = env.ui("/cli", Some(&ann), Some(&[("csrf", &approval.csrf()), ("code", &code), ("answer", "approve")])).await;
+    assert!(done.html.contains("carries on by itself"), "{}", done.html);
+    let port = connect_port(&mut child).await;
+    assert_eq!(tcp_roundtrip(port, b"signed in").await, b"signed in");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(env.home().join("connect.json")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    drop(child);
+    // The next run uses it: nothing to approve.
+    let mut again = env.cli_spawn(&["connect", "db", "--no-browser", "--json"]);
+    let port = connect_port(&mut again).await;
+    assert_eq!(tcp_roundtrip(port, b"once more").await, b"once more");
+    // Signing out everywhere ends the pass (issued before it, at second precision).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let account = env.ui("/account", Some(&ann), None).await;
+    env.ui("/account/logout-everywhere", Some(&ann), Some(&[("csrf", &account.csrf())])).await;
+    let _ = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+    let out = tokio::time::timeout(Duration::from_secs(30), again.wait_with_output()).await.unwrap().unwrap();
+    assert_eq!((out.status.code(), last_json(&out)["error"]["code"].as_str()), (Some(3), Some("unauthenticated")));
+
+    // Each way in is written down.
+    env.eventually("connections in the audit log", Duration::from_secs(10), || async {
+        let audit = env.api("GET", "/api/v1/audit", Some(&admin)).await.1.to_string();
+        audit.contains("tunnel.connect") && audit.contains("connect.approve")
+    })
+    .await;
+    drop((tcp, udp));
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn port_tunnels() {
     let mut env = Env::new(Tls::DevCa).await;

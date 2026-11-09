@@ -10,6 +10,7 @@
 //! | `agent-start.lock` | shared locks held by commands waiting for an agent to start |
 //! | `agent.pid`   | pid of the running agent                         |
 //! | `agent.log`   | background agent log                             |
+//! | `connect.json`| `magicpipes connect`'s passes, one per server (0600) |
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,39 @@ fn config_path() -> PathBuf {
 }
 pub fn tunnels_path() -> PathBuf {
     home().join("tunnels.json")
+}
+fn connect_path() -> PathBuf {
+    home().join("connect.json")
+}
+
+/// A connect pass from signing in, kept until it expires.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedPass {
+    pub pass: String,
+    pub expires_at: i64,
+    /// The extra CA the server's certificate needed, if any, so `--ca-cert` is needed once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_pem: Option<String>,
+}
+
+/// `connect.json`: passes by server URL.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ConnectPasses {
+    #[serde(default)]
+    pub passes: std::collections::BTreeMap<String, SavedPass>,
+}
+
+impl ConnectPasses {
+    /// The saved passes; none if the file is missing or can't be read, which only means signing in again.
+    pub fn load() -> Self {
+        std::fs::read_to_string(connect_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        ensure_home()?;
+        write_private(&connect_path(), serde_json::to_string_pretty(self)?.as_bytes())?;
+        Ok(())
+    }
 }
 
 /// Atomically writes a file readable only by the current user (mode 0600 on Unix).

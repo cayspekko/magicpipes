@@ -410,6 +410,15 @@ a certificate or an HTTP route.
 * **Compatibility**: an old server ignores `kind` and would create an HTTP tunnel, so the agent
   checks the kind echoed in `TunnelInfo` (absent = `http`) and fails with `server_outdated`.
   Old agents never send `kind` and keep getting HTTP tunnels.
+* **Private port tunnels** get no port: a raw port can't ask anyone to sign in. They are in the
+  table by name (`by_connect`), and people reach them with `magicpipes connect` (below). A port
+  tunnel follows the machine's default visibility like any other, except that an allow-list means a
+  public port. `--allow-any` is an empty list on the wire, the same as none, so a current agent says
+  `public` with it; the server takes a missing visibility with no list from a current agent to mean
+  "nothing was asked for", which makes the tunnel private where the machine's tunnels are, and is
+  refused where they're public. An agent before protocol 6 always sends a list (or `--allow-any`)
+  for a new port, so the server keeps making those public. Changing a tunnel to private gives its
+  port back; changing it to public takes one.
 
 Planned ingress kinds (browser desktop) are described in [ROADMAP.md](ROADMAP.md).
 
@@ -522,13 +531,59 @@ the sshd its own user configured, and older agents, Windows agents and `--host` 
 * **Tests:** `browser_ssh_terminal` logs in to a real sshd that trusts the authority; the ignored
   `browser_opens_an_ssh_terminal` types into it in headless Chrome.
 
+## `magicpipes connect` (`data/connect.rs`)
+
+How a person reaches a private TCP or UDP tunnel from their own computer. The CLI listens there and,
+for each local connection (TCP) or local client (UDP), makes an HTTPS connection to the management
+host: `GET /api/v1/connect/<name>`, upgraded to `magicpipes-connect/1`, with a connect pass as the
+bearer token. The server opens an ordinary `ServerOpen::Data` (or `Datagram`) stream to the agent and
+joins the two; for UDP the CLI writes and reads the agent's own framing (a `u16` length per datagram).
+So the agent changes nothing, older agents serve these tunnels too, and the server still names a
+tunnel, never an address.
+
+* **A connection per connection.** Each has its own TCP flow control and its own handshake, and one
+  person's bulk transfer doesn't queue behind another's. The cost is a TLS handshake for each new
+  connection; one multiplexed session per `connect` would save that but put every connection in one
+  queue, as an agent's session does.
+* **A pass, not a session.** Signed by the server (`tunnel_auth`, kind `p`, bound to the management
+  hostname), with the user and when it was issued, like a private tunnel's cookie. The handshake
+  checks it, the person and `authorize(user, Connect, tunnel)` against the published table, with no
+  database; so does every publish, for open connections. Signing out everywhere, a tag taken away, a
+  disabled user or the tunnel going ends them.
+* **Two ways to get one.** Approved in a browser, through the same device flow as `magicpipes login`
+  (`POST /api/v1/passes/device`, then the `/cli` page, which says what approving gives), lasting
+  `session_max_age_secs`; the browser can be on any device, which is how a machine without one signs
+  in. Or from an API token (`POST /api/v1/passes`), lasting 15 minutes, which the CLI renews while it
+  runs, so revoking the token takes effect within that. A new path, not a field on `/api/v1/device`:
+  an older server would ignore the field and offer to enroll a machine.
+* **Refusals are "not found"**, whether the tunnel is missing, someone else's or not shared with you.
+  An offline machine is `agent_offline`, a service its agent can't reach `local_unreachable`, both as
+  HTTP errors before the `101`, so `connect` can say which.
+* **Bounds:** 64 open connections and UDP flows per person (`connect::MAX_PER_PERSON`), and in all
+  they share `[ports] max_connections` with public ports; agent streams through `open_data` under the
+  client's and the session's budgets, like other public traffic. A UDP flow ends after
+  `udp_idle_timeout`, a TCP one after `tcp_idle_timeout` if that's set. Bad passes count against the
+  client like any bad credential. The CLI keeps the same 64.
+* **Threads:** the handshake is a management request, answered on the control threads (it reads only
+  the published table); the connection runs on the traffic threads.
+* **Audit:** approvals (`connect.approve`, `connect.deny`), and use through the gateway's report
+  queue (`tunnel.connect`, once a minute at most per person and tunnel, dropped when the queue is full).
+* **What it costs** (`scripts/bench --suite connect`: the same HTTP application through a public TCP
+  port and through `connect`, three runs). Static Linux in a VM, port against `connect`: small requests
+  16 at a time, 102,600 a second against 75,300; new connections 23,000 against 6,750, since each makes
+  its own TLS connection; one download 1,130 MB/s against 1,165, four at once 1,350 against 1,155; a
+  1 GiB upload 1,130 ms against 1,010. macOS: 52,400 and 39,600; 11,300 and 3,850; 2,170 and 1,820
+  MB/s, and 1,970 both; 445 ms and 530. `connect` itself held 5.5 MB on Linux and 9.7 MB on macOS. It
+  runs on one thread like the rest of the CLI: two or four changed nothing on macOS.
+
 ## Wire protocol
 
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 4: 2 added the handshake and
-  answers to unknown messages, 3 visibility and tags, 4 custom hostnames). A peer without the header is
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 6: 2 added the handshake and
+  answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
+  and UDP tunnels). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,

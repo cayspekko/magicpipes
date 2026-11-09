@@ -13,7 +13,7 @@ use super::html::{Actions, Text, alert, back, badge, chips, count, esc, form_ale
 use super::picker::{self, Holder, Submitted};
 use super::ui::{Done, done, done_url, failed, logged_in_to, not_there, outcome, page, server_url};
 use crate::authz::{Principal, Role};
-use crate::control::{InvitationView, MIN_PASSWORD_CHARS, TunnelSignIn, UserView};
+use crate::control::{InvitationView, MIN_PASSWORD_CHARS, Purpose, TunnelSignIn, UserView};
 use crate::tunnel_auth::safe_path;
 
 /// A page that shows a secret once, with a way back. `more`: HTML to follow it.
@@ -567,7 +567,7 @@ pub async fn auth_tunnel(user: UiUser, State(app): State<AppState>, axum::extrac
     }
 }
 
-// ---- approving `magicpipes login` -------------------------------------------------------------
+// ---- approving `magicpipes login` and `magicpipes connect` ---------------------------------------
 
 #[derive(Deserialize)]
 pub struct CodeQuery {
@@ -575,34 +575,69 @@ pub struct CodeQuery {
     code: String,
 }
 
-/// The page `magicpipes login` opens: shows the waiting request and asks to approve it.
-pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Query(q): axum::extract::Query<CodeQuery>) -> Response {
-    if user.user.is_none() {
-        let body = r#"<h1>Use your <em>account</em></h1><p class="lede">You are signed in with an admin token. Sign in with your user account to enroll your own machine, or create an enrollment token under <a href="/machines">Machines</a>.</p>"#;
-        return page("Approve a machine", Some(&user), body);
+/// "12 hours", "90 minutes".
+fn lasting(secs: u64) -> String {
+    match secs {
+        s if s >= 7200 && s % 3600 == 0 => format!("{} hours", s / 3600),
+        s => count((s / 60).max(1) as usize, "minute", "minutes"),
     }
-    let Some(req) = app.control.device_request(&q.code) else {
+}
+
+/// The page `magicpipes login` and `magicpipes connect` open: shows the waiting request and asks to
+/// approve it.
+pub async fn device(user: UiUser, State(app): State<AppState>, axum::extract::Query(q): axum::extract::Query<CodeQuery>) -> Response {
+    let req = app.control.device_request(&q.code);
+    let connect = req.as_ref().is_some_and(|r| r.purpose == Purpose::Connect);
+    let title = if connect { "Approve a sign-in" } else { "Approve a machine" };
+    if user.user.is_none() {
+        let body = if connect {
+            r#"<h1>Use your <em>account</em></h1><p class="lede">You are signed in with an admin token. Sign in with your user account to connect as yourself.</p>"#
+        } else {
+            r#"<h1>Use your <em>account</em></h1><p class="lede">You are signed in with an admin token. Sign in with your user account to enroll your own machine, or create an enrollment token under <a href="/machines">Machines</a>.</p>"#
+        };
+        return page(title, Some(&user), body);
+    }
+    let Some(req) = req else {
         let body = format!(
-            r#"<h1>Code not found</h1><p class="lede">The login code <code>{}</code> is unknown, was already used, or has expired. Run <code>magicpipes login</code> again.</p>"#,
+            r#"<h1>Code not found</h1><p class="lede">The code <code>{}</code> is unknown, was already used, or has expired. Run the <code>magicpipes</code> command again.</p>"#,
             esc(&q.code)
         );
-        return (StatusCode::NOT_FOUND, page("Approve a machine", Some(&user), &body)).into_response();
+        return (StatusCode::NOT_FOUND, page(title, Some(&user), &body)).into_response();
+    };
+    let (eyebrow, question, asked, what, warning) = if connect {
+        (
+            "magicpipes connect",
+            format!("Connect from <em>{}</em>?", esc(&req.agent_name)),
+            "<code>magicpipes connect</code> on this computer asked to sign in as you",
+            format!(
+                "It can then reach the private TCP and UDP tunnels you can, for {} or until you sign out everywhere.",
+                lasting(app.control.config().users.session_max_age_secs)
+            ),
+            "Only approve a request you just started yourself: an approved computer reaches tunnels as you.",
+        )
+    } else {
+        (
+            "magicpipes login",
+            format!("Approve <em>{}</em>?", esc(&req.agent_name)),
+            "A machine asked to sign in as you",
+            "Its private tunnels are for you alone until it shares one with a tag you hold (<code>magicpipes add --tag</code>).".to_string(),
+            "Only approve a request you just started yourself: an approved machine acts as you and can publish tunnels in your name.",
+        )
     };
     let body = format!(
-        r#"<div class="auth"><div class="eyebrow">magicpipes login</div><h1>Approve <em>{name}</em>?</h1>
-<p class="lede">A machine asked to sign in as you {ago} seconds ago, from <code>{client}</code>. Compare the code with the one in its terminal.</p>
+        r#"<div class="auth"><div class="eyebrow">{eyebrow}</div><h1>{question}</h1>
+<p class="lede">{asked} {ago} seconds ago, from <code>{client}</code>. Compare the code with the one in its terminal.</p>
 <div class="card"><div class="stat"><div class="k">Code</div><div class="v sm"><code>{code}</code></div></div>
 <form method="post" action="/cli">{csrf}<input type="hidden" name="code" value="{code}">
-<p class="note">Its private tunnels are for you alone until it shares one with a tag you hold (<code>magicpipes add --tag</code>).</p>
+<p class="note">{what}</p>
 <div class="row"><button class="btn primary" name="answer" value="approve">Approve</button><button class="btn danger" name="answer" value="deny">Deny</button></div></form></div>
-<p class="note">Only approve a request you just started yourself: an approved machine acts as you and can publish tunnels in your name.</p></div>"#,
-        name = esc(&req.agent_name),
+<p class="note">{warning}</p></div>"#,
         ago = req.age_secs,
         client = esc(&req.client.to_string()),
         code = esc(&req.user_code),
         csrf = user.csrf_field(),
     );
-    page("Approve a machine", Some(&user), &body)
+    page(title, Some(&user), &body)
 }
 
 #[derive(Deserialize)]
@@ -615,12 +650,14 @@ pub struct DeviceAnswer {
 
 pub async fn answer_device(State(app): State<AppState>, Posted(user, f): Posted<DeviceAnswer>) -> Response {
     let approved = f.answer == "approve";
+    let connect = app.control.device_request(&f.code).is_some_and(|r| r.purpose == Purpose::Connect);
     match app.control.answer_device_login(&user.who, &f.code, approved) {
         Ok(()) => {
-            let (title, lede) = if approved {
-                ("Approved", "Go back to the terminal: the machine finishes signing in by itself.")
-            } else {
-                ("Denied", "The machine was not signed in.")
+            let (title, lede) = match (approved, connect) {
+                (true, false) => ("Approved", "Go back to the terminal: the machine finishes signing in by itself."),
+                (false, false) => ("Denied", "The machine was not signed in."),
+                (true, true) => ("Approved", "Go back to the terminal: magicpipes connect carries on by itself."),
+                (false, true) => ("Denied", "magicpipes connect was not signed in."),
             };
             page(title, Some(&user), &format!(r#"<div class="auth"><h1>{title}</h1><p class="lede">{lede}</p></div>"#))
         }

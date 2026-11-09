@@ -18,6 +18,18 @@ use crate::store::TunnelRow;
 /// A tunnel's visibility and tags.
 type Access = (Visibility, Vec<String>);
 
+/// A private TCP or UDP tunnel's public port: none, so nothing that applies to one.
+fn private_port(allow: &[String], remote_port: Option<u16>) -> Result<Option<u16>, ErrorBody> {
+    if remote_port.is_some() || !allow.is_empty() {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "a private TCP or UDP tunnel has no public port, so --remote-port and --allow-cidr don't apply; people you share it with reach it with \
+             `magicpipes connect`",
+        ));
+    }
+    Ok(None)
+}
+
 impl ControlPlane {
     /// What a registration asks for, within the agent's enrollment. Without a visibility, a new
     /// tunnel gets the agent's default and an existing one keeps its settings as stored. With
@@ -46,8 +58,21 @@ impl ControlPlane {
             }
             // The gateway only lets people in through a tag.
             (None, None) if req.kind == Kind::Ssh => (Visibility::Private, Vec::new()),
-            // Raw ports can't ask anyone to sign in yet, so they stay public by default.
-            (None, None) if default_private && req.kind.is_http() => (Visibility::Private, Vec::new()),
+            // Agents from before private ports ask for an allow-list (or anyone) with every new port,
+            // which they open to the public; and an allow-list is only for a public port.
+            (None, None) if req.kind.has_port() && (protocol < 6 || !req.allow.is_empty()) => (Visibility::Public, Vec::new()),
+            (None, None) if default_private => (Visibility::Private, Vec::new()),
+            // A newer agent says `public` when it was given --allow-any, so it was given nothing.
+            (None, None) if req.kind.has_port() => {
+                return Err(err(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "this would open a {} port to the whole internet. Say who may connect with --allow-cidr <network>, or use --allow-any if anyone \
+                         should; or use --private, and people you share it with reach it with `magicpipes connect`",
+                        req.kind
+                    ),
+                ));
+            }
             (None, None) => (Visibility::Public, Vec::new()),
             (Some(v), _) => (v, tags::normalize_list(&req.tags).map_err(invalid)?),
         };
@@ -64,8 +89,9 @@ impl ControlPlane {
             Visibility::Public if !requested.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "tags apply only to private tunnels"));
             }
-            Visibility::Private if req.kind.has_port() => {
-                return Err(err(ErrorCode::Unsupported, "TCP and UDP tunnels can't be private yet: people can't sign in to a raw port"));
+            // An older agent can't use it, nor tell its user how people get in.
+            Visibility::Private if req.kind.has_port() && protocol < 6 => {
+                return Err(err(ErrorCode::AgentOutdated, "private TCP and UDP tunnels need a newer magicpipes on this machine"));
             }
             _ => {}
         }
@@ -98,19 +124,20 @@ impl ControlPlane {
             }
             Some(h) => Some(h.trim().trim_end_matches('.').to_ascii_lowercase()),
         };
-        let range = match req.kind {
+        match req.kind {
             Kind::Http | Kind::Ssh if req.remote_port.is_some() || !allow.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "a remote port and an allow-list apply only to TCP and UDP tunnels"));
             }
             Kind::Ssh if self.cfg.ssh.is_none() => {
                 return Err(err(ErrorCode::SshDisabled, "this server does not offer SSH (its configuration has no [ssh] gateway)"));
             }
-            Kind::Http | Kind::Ssh => None,
-            Kind::Tcp | Kind::Udp => Some(self.cfg.port_range().ok_or_else(|| {
-                err(ErrorCode::PortsDisabled, "this server does not offer TCP or UDP ports (its configuration has no [ports] range)")
-            })?),
+            _ => {}
+        }
+        // Only a public port tunnel takes a port from the range.
+        let range = || {
+            self.cfg.port_range().ok_or_else(|| err(ErrorCode::PortsDisabled, "this server does not offer TCP or UDP ports (its configuration has no [ports] range)"))
         };
-        if let (Some(r), Some(p)) = (range, req.remote_port)
+        if let (Some(r), Some(p)) = (self.cfg.port_range(), req.remote_port)
             && !r.contains(p)
         {
             return Err(err(ErrorCode::PortUnavailable, format!("port {p} is outside this server's port range {}-{}", r.first, r.last)));
@@ -167,10 +194,17 @@ impl ControlPlane {
             }
             row.target = target;
             row.allow = allow;
-            if let Some(p) = req.remote_port
-                && row.public_port != Some(p)
-            {
-                row.public_port = Some(self.claim_port(&st, row.kind, p)?);
+            if row.kind.has_port() {
+                row.public_port = match (row.visibility, req.remote_port, row.public_port) {
+                    (Visibility::Private, ..) => private_port(&row.allow, req.remote_port)?,
+                    (Visibility::Public, Some(p), current) if current != Some(p) => Some(self.claim_port(&st, row.kind, p)?),
+                    // It was private: it needs a port now.
+                    (Visibility::Public, None, None) => {
+                        self.room_for_a_port(&st, agent_id)?;
+                        Some(self.allocate_port(&st, row.kind, range()?)?)
+                    }
+                    (Visibility::Public, _, current) => current,
+                };
             }
             let t = st.tunnels.get_mut(&id).expect("checked above");
             let settings = |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.tags.clone());
@@ -191,11 +225,6 @@ impl ControlPlane {
         if owned >= self.cfg.agents.max_tunnels_per_agent {
             return Err(err(ErrorCode::LimitReached, format!("an agent may own at most {} tunnels", self.cfg.agents.max_tunnels_per_agent)));
         }
-        let max_ports = self.cfg.agents.max_ports_per_agent;
-        if range.is_some() && st.tunnels.values().filter(|t| t.row.agent_id == agent_id && t.row.public_port.is_some()).count() >= max_ports {
-            return Err(err(ErrorCode::LimitReached, format!("an agent may hold at most {max_ports} public ports")));
-        }
-
         let taken = |n: &str| st.tunnels.values().any(|t| t.row.name == n);
         let name = match &req.name {
             Some(n) => names::validate(n).map_err(|m| err(ErrorCode::InvalidName, m))?,
@@ -229,10 +258,16 @@ impl ControlPlane {
             }
         }
         let (visibility, tags) = self.requested_access(&st, agent_id, req, None)?;
-        let public_port = match (range, req.remote_port) {
-            (None, _) => None,
-            (Some(_), Some(p)) => Some(self.claim_port(&st, req.kind, p)?),
-            (Some(r), None) => Some(self.allocate_port(&st, req.kind, r)?),
+        let public_port = match (req.kind.has_port(), visibility, req.remote_port) {
+            (false, ..) => None,
+            (true, Visibility::Private, _) => private_port(&allow, req.remote_port)?,
+            (true, Visibility::Public, port) => {
+                self.room_for_a_port(&st, agent_id)?;
+                Some(match port {
+                    Some(p) => self.claim_port(&st, req.kind, p)?,
+                    None => self.allocate_port(&st, req.kind, range()?)?,
+                })
+            }
         };
         let row = TunnelRow {
             id: secret::new_id("tn"),
@@ -261,6 +296,15 @@ impl ControlPlane {
             self.certs.ensure(&row.hostname);
         }
         Ok(info)
+    }
+
+    /// Whether the agent may hold one more public port.
+    fn room_for_a_port(&self, st: &State, agent_id: &str) -> Result<(), ErrorBody> {
+        let max = self.cfg.agents.max_ports_per_agent;
+        if st.tunnels.values().filter(|t| t.row.agent_id == agent_id && t.row.public_port.is_some()).count() >= max {
+            return Err(err(ErrorCode::LimitReached, format!("an agent may hold at most {max} public ports")));
+        }
+        Ok(())
     }
 
     /// Takes a specific public port: free among this kind's tunnels and bindable on this host.
@@ -292,7 +336,8 @@ impl ControlPlane {
                 Some(gateway) => format!("ssh -J {gateway} {}", row.name),
                 None => row.name.clone(),
             },
-            (Kind::Http, _) | (_, None) => self.cfg.public_url(&row.hostname),
+            (Kind::Tcp | Kind::Udp, None) => format!("magicpipes connect {}", row.name),
+            (Kind::Http, _) => self.cfg.public_url(&row.hostname),
             (kind, Some(port)) => self.cfg.port_url(kind, port),
         }
     }

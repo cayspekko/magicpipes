@@ -590,6 +590,7 @@ magicpipes add 3000 --tag dev                       # you, and everyone holding 
 magicpipes add 3000 --public                        # explicit; refused unless the enrollment allows it
 magicpipes ls --all                                 # tunnels you can discover in the org
 magicpipes whoami                                   # user, org, role, tags; agent tags
+magicpipes connect db --local 5432                  # reach a private TCP or UDP tunnel, as you
 ```
 
 - **`magicpipes login` without an enrollment token** uses a device-style flow:
@@ -603,14 +604,15 @@ magicpipes whoami                                   # user, org, role, tags; age
 
 ## Later uses of the same rule
 
-- **TCP/UDP to private port tunnels.** A raw port can't carry a cookie, so a private port
+- **TCP/UDP to private port tunnels** (built). A raw port can't carry a cookie, so a private port
   tunnel isn't published on a public port. Instead, `magicpipes connect <tunnel> [--local
   5432]` runs on the user's machine:
-  - It authenticates as the user (API token from `login`) and opens a local listener.
-  - It sends each connection through an upgraded stream to the server.
-  - The server runs `authorize(user, Connect, tunnel)` and pipes the stream into the owning
-    agent's data stream, under the same budget as public traffic.
-  - Until that exists, `--private` on a port tunnel is refused with `unsupported`.
+  - It authenticates as the user with a connect pass, approved in a browser on any device as
+    `login` is, or traded for an API token, and opens a local listener.
+  - It sends each connection through an upgraded HTTPS connection to the server.
+  - The server runs `authorize(user, Connect, tunnel)` and pipes the connection into the owning
+    agent's data stream, under the same budget as public traffic. See "`magicpipes connect`" in
+    ARCHITECTURE.md.
 - **SSH gateway, SSH and agent web terminals, RDP/VNC.**
   - A session is allowed if `authorize(user, Connect, tunnel)` is.
   - The roadmap's "grants" table is no longer needed.
@@ -985,7 +987,8 @@ useful.
    teams aren't built (see method 4).
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
    (method 6). *Done,* with the differences listed under those methods.
-8. **`magicpipes connect`** for private TCP and UDP tunnels.
+8. **`magicpipes connect`** for private TCP and UDP tunnels. *Done.* It signs in with a connect pass
+   rather than a session: approved in a browser on any device, or from an API token for scripts.
 9. **SSH gateway and web terminals** on the same rule; then RDP/VNC, then the VPN. *The gateway and
    the SSH terminal in the browser are done* (see "SSH gateway" in ARCHITECTURE.md), ahead of step 8.
    Writing into a terminal needs no extra tag: the machine's sshd decides which account each person

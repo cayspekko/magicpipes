@@ -2,6 +2,7 @@
 
 mod agent;
 mod client;
+mod connect;
 mod https;
 mod ipc;
 mod platform;
@@ -33,6 +34,8 @@ use crate::state::AgentConfig;
   magicpipes add --unix /run/app.sock                Give a local Unix socket its own address
   magicpipes add --serve ./public                    Share a folder
   magicpipes add 22 --tcp --allow-cidr 203.0.113.0/24   Open a raw TCP port to one network
+  magicpipes add 5432 --tcp --tag team:dev           A private TCP tunnel, for people with that tag
+  magicpipes connect db --local 5432                 Reach a private TCP or UDP tunnel from here
   magicpipes list                                    See what's running
   magicpipes remove <name>                           Stop one"
 )]
@@ -91,6 +94,7 @@ enum Command {
   magicpipes add --serve ./public             Share a folder
   magicpipes add --shell -- htop              Let people watch a program
   magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24
+  magicpipes add 5432 --tcp --tag team:dev    No public port: they use `magicpipes connect`
   magicpipes add 22 --ssh --tag team:dev      Log in with `ssh -J`, with people sharing that tag
 
 Run it again with other options to change a tunnel.")]
@@ -120,11 +124,12 @@ Run it again with other options to change a tunnel.")]
         /// With --tcp/--udp: ask for this public port (it must be in the server's range).
         #[arg(long, value_name = "PORT")]
         remote_port: Option<u16>,
-        /// With --tcp/--udp: only let clients from this network connect (CIDR or address;
-        /// repeatable). A new port needs this or --allow-any; re-adding without either keeps the list.
+        /// With --tcp/--udp: open a public port, for clients from this network only (CIDR or
+        /// address; repeatable). A new public port needs this or --allow-any; re-adding without
+        /// either keeps the list.
         #[arg(long = "allow-cidr", value_name = "CIDR", value_parser = parse_cidr)]
         allow_cidr: Vec<String>,
-        /// With --tcp/--udp: open the port to the whole internet, with only your service's own
+        /// With --tcp/--udp: open a public port to the whole internet, with only your service's own
         /// authentication in front of it.
         #[arg(long, conflicts_with = "allow_cidr")]
         allow_any: bool,
@@ -159,16 +164,17 @@ Run it again with other options to change a tunnel.")]
         /// With --shell: the program (and its arguments) to run instead of your login shell.
         #[arg(last = true, value_name = "PROGRAM")]
         command: Vec<String>,
-        /// Only you, and people sharing a --tag with it, can open it, after signing in. Default
+        /// Only you, and people sharing a --tag with it, can open it, after signing in. A private
+        /// --tcp/--udp tunnel has no public port: people reach it with `magicpipes connect`. Default
         /// for machines enrolled once the server has user accounts.
-        #[arg(long, conflicts_with_all = ["public", "tcp", "udp"])]
+        #[arg(long, conflicts_with_all = ["public", "remote_port", "allow_cidr", "allow_any"])]
         private: bool,
         /// Anyone with the address can open it (if this machine's enrollment allows it).
         #[arg(long, conflicts_with = "tags")]
         public: bool,
         /// With --private (implied): share it with people holding this tag (repeatable or
         /// comma-separated; only tags you hold).
-        #[arg(long = "tag", value_name = "TAG", value_parser = parse_tag, value_delimiter = ',', conflicts_with_all = ["tcp", "udp"])]
+        #[arg(long = "tag", value_name = "TAG", value_parser = parse_tag, value_delimiter = ',', conflicts_with_all = ["remote_port", "allow_cidr", "allow_any"])]
         tags: Vec<String>,
         /// Tunnel name (first label of the public hostname). Random if omitted.
         #[arg(long)]
@@ -190,6 +196,40 @@ Run it again with other options to change a tunnel.")]
         /// Overall timeout in seconds, including certificate issuance.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        #[command(flatten)]
+        out: Output,
+    },
+    /// Reach a private TCP or UDP tunnel from this computer: listens here and passes each
+    /// connection through the server, as you, until stopped.
+    #[command(after_help = "Examples:
+  magicpipes connect db                    Listen on a free local port, and print it
+  magicpipes connect db --local 5432       Then: psql -h 127.0.0.1 -p 5432
+  MAGICPIPES_API_TOKEN=tok_... magicpipes connect db --local 5432   In a script
+
+The first time, it signs you in: approve it in a browser on this computer, or on any other
+device with the address and code it prints. That lasts as long as a browser session.")]
+    Connect {
+        /// The tunnel's name.
+        tunnel: String,
+        /// Where to listen: a port, or address:port (default: a free port on 127.0.0.1).
+        #[arg(long, value_name = "[ADDRESS:]PORT", value_parser = parse_local)]
+        local: Option<std::net::SocketAddr>,
+        /// The server's management URL (default: the server this machine is enrolled with).
+        #[arg(long)]
+        server: Option<String>,
+        /// Extra CA certificate (PEM) to trust, e.g. the server's development CA.
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        /// Don't open a browser to sign in; approve with the address and code shown, on any device.
+        #[arg(long)]
+        no_browser: bool,
+        /// Connect with an API token from your account page instead of signing in, for scripts.
+        /// Prefer the environment variable or --api-token-file, which other programs can't see.
+        #[arg(long, env = "MAGICPIPES_API_TOKEN", hide_env_values = true)]
+        api_token: Option<String>,
+        /// Read the API token from this file.
+        #[arg(long, value_name = "FILE", conflicts_with = "api_token")]
+        api_token_file: Option<PathBuf>,
         #[command(flatten)]
         out: Output,
     },
@@ -312,6 +352,14 @@ fn parse_cidr(s: &str) -> Result<String, String> {
     magicpipes_core::cidr::Cidr::parse(s).map(|c| c.to_string())
 }
 
+/// `5432`, `0.0.0.0:5432` or `[::1]:5432`; a bare port is on 127.0.0.1.
+fn parse_local(s: &str) -> Result<std::net::SocketAddr, String> {
+    match s.parse::<u16>() {
+        Ok(port) => Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+        Err(_) => s.parse().map_err(|_| format!("'{s}' isn't a port or address:port")),
+    }
+}
+
 fn run_agent(detached: bool) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -410,6 +458,17 @@ async fn dispatch(cmd: Command) -> ExitCode {
             };
             (out, add(req, out).await)
         }
+        Command::Connect { tunnel, local, server, ca_cert, no_browser, api_token, api_token_file, out } => {
+            let api_token = match api_token_file {
+                Some(path) => std::fs::read_to_string(&path).map(Some).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("reading {}: {e}", path.display()))),
+                None => Ok(api_token),
+            };
+            let result = match api_token {
+                Ok(api_token) => connect::run(connect::Options { tunnel, local, server, ca_cert, no_browser, api_token, json: out.json, quiet: out.quiet }).await,
+                Err(e) => Err(e),
+            };
+            (out, result)
+        }
         Command::List { out } => (out, list(out).await),
         Command::Status { out } => (out, status(out).await),
         Command::Remove { tunnel, force, out } => (out, remove(tunnel, force, out).await),
@@ -470,43 +529,16 @@ fn prompt_token() -> Result<String, ErrorInfo> {
 /// the user approves this machine there. Returns the enrollment token, or `None` if the server
 /// predates this kind of login.
 async fn browser_login(server: &str, tls: &Arc<rustls::ClientConfig>, agent_name: &str, quiet: bool) -> Result<Option<String>, ErrorInfo> {
-    let unreachable = |e: anyhow::Error| unreachable_server(&e);
-    let (status, resp) = https::post_json(server, "/api/v1/device", tls, &json!({ "agent_name": agent_name })).await.map_err(unreachable)?;
-    if matches!(status.as_u16(), 404 | 405) {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        let msg = resp["error"]["message"].as_str().unwrap_or("the server refused to start a login").to_string();
-        return Err(ErrorInfo::wire(resp["error"]["code"].as_str().unwrap_or(ErrorCode::Protocol.as_str()), msg));
-    }
-    let bad = || ErrorInfo::new(ErrorCode::Protocol, "unexpected answer to the login request");
-    let device_code = resp["device_code"].as_str().ok_or_else(bad)?.to_string();
-    // The URL is built here, from the server address the user typed; only a well-formed code
-    // from the server goes into it.
-    let user_code = resp["user_code"].as_str().filter(|c| c.len() <= 16 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')).ok_or_else(bad)?;
-    let expires = Duration::from_secs(resp["expires_in_secs"].as_u64().unwrap_or(600).min(900));
-    let interval = Duration::from_secs(resp["interval_secs"].as_u64().unwrap_or(2).clamp(1, 10));
-    let url = format!("{server}/cli?code={user_code}");
-    if !quiet {
-        eprintln!("To sign in, open this page and approve the machine:\n\n  {url}\n\nIt should show the code {user_code}. Waiting for approval...");
-    }
-    platform::open_url(&url);
-    let deadline = std::time::Instant::now() + expires;
-    let expired = || ErrorInfo::new(ErrorCode::InvalidEnrollmentToken, "the login code expired before it was approved; run magicpipes login again");
-    loop {
-        tokio::time::sleep(interval).await;
-        if std::time::Instant::now() > deadline {
-            return Err(expired());
-        }
-        // A failed poll (network hiccup) is retried until the deadline.
-        let Ok((_, resp)) = https::post_json(server, "/api/v1/device/poll", tls, &json!({ "device_code": device_code })).await else { continue };
-        match resp["status"].as_str() {
-            Some("approved") => return resp["enrollment_token"].as_str().map(|t| Some(t.to_string())).ok_or_else(bad),
-            Some("denied") => return Err(ErrorInfo::new(ErrorCode::InvalidEnrollmentToken, "the login was denied in the browser")),
-            Some("expired") => return Err(expired()),
-            _ => {}
-        }
-    }
+    let s = connect::SignIn {
+        start: "/api/v1/device",
+        body: json!({ "agent_name": agent_name }),
+        command: "login",
+        ask: "To sign in, open this page and approve the machine:",
+        refused: ErrorCode::InvalidEnrollmentToken,
+    };
+    let Some(resp) = connect::approve_in_browser(server, tls, s, true, quiet).await? else { return Ok(None) };
+    let token = resp["enrollment_token"].as_str().ok_or_else(|| ErrorInfo::new(ErrorCode::Protocol, "unexpected answer to the login request"))?;
+    Ok(Some(token.to_string()))
 }
 
 /// A failed attempt to reach the server, with what to try next.
@@ -691,13 +723,19 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         }
     };
     let open_to_anyone = data["allow"].as_array().is_some_and(|a| a.is_empty());
+    // A private TCP or UDP tunnel has no public port: its address is the command that reaches it.
+    let by_command = kind.has_port() && data.get("public_port").is_none();
     if out.json {
         print_json(&data);
     } else {
         println!();
         println!("Tunnel ready");
         println!();
-        let address = if kind == Kind::Ssh { "SSH:   " } else { "URL:   " };
+        let address = match kind {
+            Kind::Ssh => "SSH:   ",
+            _ if by_command => "Reach: ",
+            _ => "URL:   ",
+        };
         println!("  {address} {}", data["share_url"].as_str().or(data["public_url"].as_str()).unwrap_or_default());
         match (&serving, &shell) {
             (Some(dir), _) => println!("  Serving: {}", state::display_path(dir)),
@@ -731,6 +769,8 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
                 let who = if who.is_empty() { "nobody (give it a --tag)".to_string() } else { who.join(", ") };
                 if kind == Kind::Ssh {
                     println!("Tunnel active in background. Private: only {who} can reach it, using an SSH key on an account.");
+                } else if by_command {
+                    println!("Tunnel active in background. Private: only {who} can reach it, by running that command.");
                 } else {
                     println!("Tunnel active in background. Private: only {who} can open it, after signing in.");
                 }
@@ -768,7 +808,11 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         }
         if kind == Kind::Udp {
             eprintln!();
-            eprintln!("UDP cannot be verified end to end: datagrams to {url} now reach the local port.");
+            if by_command {
+                eprintln!("UDP cannot be verified end to end: datagrams sent through `{url}` now reach the local port.");
+            } else {
+                eprintln!("UDP cannot be verified end to end: datagrams to {url} now reach the local port.");
+            }
         }
         if open_to_anyone {
             eprintln!();

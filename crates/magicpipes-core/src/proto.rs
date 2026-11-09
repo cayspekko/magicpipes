@@ -33,6 +33,11 @@ use crate::error::ErrorCode;
 
 pub const UPGRADE_PROTOCOL: &str = "magicpipes-mux/1";
 pub const AGENT_CONNECT_PATH: &str = "/api/v1/agent/connect";
+/// `magicpipes connect`: `GET` this plus a tunnel's name, with a connect pass as the bearer token.
+/// Without an upgrade the answer says what the tunnel is; with [`CONNECT_PROTOCOL`] the connection
+/// becomes the tunnel's: raw bytes for TCP, [`write_datagram`] frames both ways for UDP.
+pub const CONNECT_PATH: &str = "/api/v1/connect/";
+pub const CONNECT_PROTOCOL: &str = "magicpipes-connect/1";
 
 /// Header on the agent's upgrade request and the server's `101` response: the sender's
 /// protocol version.
@@ -49,7 +54,9 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   it and serve the tunnel at `<name>.<base_domain>`.
 /// * 5: SSH tunnels. [`RegisterTunnel`] may carry the kind [`Kind::Ssh`], which an older server
 ///   can't read, so the agent checks this version first.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// * 6: private TCP and UDP tunnels, which people reach with `magicpipes connect`. An older server
+///   refuses them, or ignores `visibility` and opens a public port, so the agent checks this first.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -460,6 +467,13 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x","kind":"ssh"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Ssh, .. })));
         assert!(serde_json::to_string(&Kind::Ssh).unwrap() == r#""ssh""# && Kind::parse("ssh") == Some(Kind::Ssh) && !Kind::Ssh.has_port() && !Kind::Ssh.is_http());
+        // Protocol 6: a private port tunnel is a port kind with a visibility, and an answer
+        // without a public port. An agent before it never sends one, and keeps an allow-list.
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"db","target":"x","kind":"tcp","visibility":"private","tags":["dev"]}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Tcp, visibility: Some(Visibility::Private), remote_port: None, .. })));
+        let t: TunnelInfo =
+            serde_json::from_str(r#"{"id":"tn","name":"db","hostname":"db.t","public_url":"magicpipes connect db","created":true,"kind":"tcp","visibility":"private"}"#).unwrap();
+        assert_eq!((t.kind, t.public_port, t.visibility), (Kind::Tcp, None, Some(Visibility::Private)));
     }
 
     #[test]

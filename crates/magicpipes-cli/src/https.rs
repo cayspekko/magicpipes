@@ -85,6 +85,8 @@ pub fn host_header(host: &str, port: u16) -> String {
 /// Largest JSON answer `post_json` reads (enrollment and device-login answers are tiny).
 const MAX_JSON_RESPONSE: usize = 64 * 1024;
 
+pub const USER_AGENT: &str = concat!("magicpipes/", env!("CARGO_PKG_VERSION"));
+
 /// POSTs JSON to `<server><path>` and returns the status and parsed JSON body. The whole
 /// exchange, body included, has 30 s and reads at most 64 KiB.
 pub async fn post_json(
@@ -93,21 +95,39 @@ pub async fn post_json(
     tls: &Arc<ClientConfig>,
     body: &serde_json::Value,
 ) -> anyhow::Result<(http::StatusCode, serde_json::Value)> {
+    call(server, http::Method::POST, path, tls, None, Some(body)).await
+}
+
+/// One request to `<server><path>`, with a bearer token and a JSON body if given, as [`post_json`].
+pub async fn call(
+    server: &str,
+    method: http::Method,
+    path: &str,
+    tls: &Arc<ClientConfig>,
+    bearer: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> anyhow::Result<(http::StatusCode, serde_json::Value)> {
     let (host, port) = parse_server(server)?;
     let stream = connect(&host, port, tls, None).await?;
-    let req = Request::post(path)
-        .header(http::header::HOST, host_header(&host, port))
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::USER_AGENT, concat!("magicpipes/", env!("CARGO_PKG_VERSION")))
-        .body(Full::new(Bytes::from(serde_json::to_vec(body)?)))?;
+    let mut req = Request::builder().method(method).uri(path).header(http::header::HOST, host_header(&host, port)).header(http::header::USER_AGENT, USER_AGENT);
+    if let Some(token) = bearer {
+        req = req.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let req = match body {
+        Some(b) => req.header(http::header::CONTENT_TYPE, "application/json").body(Full::new(Bytes::from(serde_json::to_vec(b)?)))?,
+        None => req.body(Full::new(Bytes::new()))?,
+    };
     let exchange = async {
         let resp = send(stream, req).await?;
         let status = resp.status();
-        let body = http_body_util::Limited::new(resp.into_body(), MAX_JSON_RESPONSE);
-        let bytes = body.collect().await.map_err(|e| anyhow!("reading the server's answer: {e}"))?.to_bytes();
-        anyhow::Ok((status, bytes))
+        anyhow::Ok((status, read_json(resp).await?))
     };
-    let (status, bytes) = tokio::time::timeout(Duration::from_secs(30), exchange).await.map_err(|_| anyhow!("request timed out"))??;
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    Ok((status, json))
+    tokio::time::timeout(Duration::from_secs(30), exchange).await.map_err(|_| anyhow!("request timed out"))?
+}
+
+/// A response's JSON body, at most 64 KiB; `null` if it isn't JSON.
+pub async fn read_json(resp: Response<Incoming>) -> anyhow::Result<serde_json::Value> {
+    let body = http_body_util::Limited::new(resp.into_body(), MAX_JSON_RESPONSE);
+    let bytes = body.collect().await.map_err(|e| anyhow!("reading the server's answer: {e}"))?.to_bytes();
+    Ok(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
 }

@@ -470,8 +470,11 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     if t.kind.is_http() {
         dl.push_str(&field("TLS certificate", &badge(t.tls)));
     } else if t.kind.has_port() {
-        let allow = if t.allow.is_empty() { "anyone".to_string() } else { esc(&t.allow.join(", ")) };
-        dl.push_str(&field("Allowed clients", &allow));
+        // A private one has no public port, so nothing to allow anyone into.
+        if t.public_port.is_some() {
+            let allow = if t.allow.is_empty() { "anyone".to_string() } else { esc(&t.allow.join(", ")) };
+            dl.push_str(&field("Allowed clients", &allow));
+        }
     } else if let (Kind::Ssh, Some(ca)) = (t.kind, ssh_ca) {
         let open = format!(r#"<a href="{}">Open terminal</a>{}"#, esc(&super::terminal::href(&t.name)), super::terminal::setup(ca, viewer_email));
         dl.push_str(&field("Browser terminal", &open));

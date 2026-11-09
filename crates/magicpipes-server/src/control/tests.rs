@@ -372,8 +372,10 @@ async fn registration_respects_the_enrollment() {
     assert!(f.cp.register(&laptop, &with("pub", Some(Visibility::Public), &[])).unwrap_err().is(ErrorCode::PublicNotAllowed));
     assert!(f.cp.register(&laptop, &with("ops", Some(Visibility::Private), &["team:ops"])).unwrap_err().is(ErrorCode::Forbidden));
     assert!(f.cp.register(&laptop, &with("qa", Some(Visibility::Private), &["team:qa"])).unwrap_err().is(ErrorCode::TagUnknown));
-    let tcp = RegisterTunnel { kind: Kind::Tcp, ..with("db", Some(Visibility::Private), &[]) };
-    assert!(f.cp.register(&laptop, &tcp).unwrap_err().is(ErrorCode::Unsupported) || f.cp.register(&laptop, &tcp).unwrap_err().is(ErrorCode::PortsDisabled));
+    // A port tunnel follows the default too. Private, it needs no port, nor a port range: people
+    // reach it with `magicpipes connect`.
+    let t = f.cp.register(&laptop, &RegisterTunnel { kind: Kind::Tcp, ..with("db", None, &[]) }).unwrap();
+    assert_eq!((t.visibility, t.public_port, t.public_url.as_str()), (Some(Visibility::Private), None, "magicpipes connect db"));
     let public = RegisterTunnel { visibility: Some(Visibility::Public), tags: vec!["team:dev".into()], ..http("site") };
     assert!(f.cp.register(&ci, &public).unwrap_err().is(ErrorCode::InvalidRequest), "tags apply only to private tunnels");
 
@@ -475,11 +477,70 @@ async fn ports_outside_the_range_stay_closed() {
     let ports = format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\"");
     let f = fixture_in(fixture().stop(), &ports);
     let agent = f.agent("db");
-    f.cp.register(&agent, &RegisterTunnel { kind: Kind::Tcp, target: "tcp://127.0.0.1:5432".into(), ..http("db") }).unwrap();
+    f.cp.register(&agent, &public_port("db")).unwrap();
     assert!(f.data.lookup_port(Kind::Tcp, port).is_some());
     // The operator turns raw ports off and restarts: the port is not opened again.
     let f = fixture_in(f.stop(), "");
     assert!(f.data.lookup_port(Kind::Tcp, port).is_none());
+}
+
+/// A TCP tunnel open to anyone, as an agent asks for one with `--allow-any`.
+fn public_port(name: &str) -> RegisterTunnel {
+    use magicpipes_core::proto::{Kind, Visibility};
+    RegisterTunnel { kind: Kind::Tcp, target: "tcp://127.0.0.1:5432".into(), visibility: Some(Visibility::Public), ..http(name) }
+}
+
+/// Waits until a closed port listener's task has let go of its socket.
+async fn let_go(port: u16) {
+    for _ in 0..200 {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_private_port_tunnel_has_no_port() {
+    use magicpipes_core::proto::{Kind, Visibility};
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let f = fixture_in(fixture().stop(), &format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\""));
+    // Before the server has users, a machine's tunnels are public by default.
+    let agent = f.agent("svc");
+    let open = f.cp.register(&agent, &public_port("db")).unwrap();
+    assert_eq!(open.public_port, Some(port));
+    // Made private, it gives its port back, and the port closes.
+    let private = |name: &str| RegisterTunnel { visibility: Some(Visibility::Private), ..public_port(name) };
+    let closed = f.cp.register(&agent, &private("db")).unwrap();
+    assert_eq!((closed.id.as_str(), closed.public_port, closed.public_url.as_str()), (open.id.as_str(), None, "magicpipes connect db"));
+    assert!(f.data.lookup_port(Kind::Tcp, port).is_none());
+    // The range's one port is free for another tunnel; made public again, this one gets it back.
+    let_go(port).await;
+    assert_eq!(f.cp.register(&agent, &public_port("db")).unwrap().public_port, Some(port));
+    f.cp.register(&agent, &private("db")).unwrap();
+    let_go(port).await;
+
+    // Nothing that applies to a public port goes with a private one.
+    let with_port = RegisterTunnel { remote_port: Some(port), ..private("db2") };
+    assert!(f.cp.register(&agent, &with_port).unwrap_err().is(ErrorCode::InvalidRequest));
+    let with_list = RegisterTunnel { allow: vec!["10.0.0.0/8".into()], ..private("db3") };
+    assert!(f.cp.register(&agent, &with_list).unwrap_err().is(ErrorCode::InvalidRequest));
+    // A current agent without --allow-cidr, --allow-any or --private: public by default, so it's
+    // asked which. An allow-list alone means public.
+    let nothing = RegisterTunnel { visibility: None, ..public_port("db4") };
+    assert!(f.cp.register(&agent, &nothing).unwrap_err().is(ErrorCode::InvalidRequest));
+    let listed = RegisterTunnel { allow: vec!["10.0.0.0/8".into()], ..nothing.clone() };
+    assert_eq!(f.cp.register(&agent, &listed).unwrap().visibility, Some(Visibility::Public));
+
+    // An agent from before private ports: no visibility means public, as it always did, and it
+    // can't have a private one.
+    let old = f.agent("old");
+    let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
+    f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 5).unwrap();
+    f.cp.unregister(&agent, &f.cp.register(&agent, &listed).unwrap().id).unwrap();
+    let_go(port).await;
+    assert_eq!(f.cp.register(&old, &RegisterTunnel { visibility: None, ..public_port("legacy") }).unwrap().visibility, Some(Visibility::Public));
+    assert!(f.cp.register(&old, &private("legacy2")).unwrap_err().is(ErrorCode::AgentOutdated));
 }
 
 #[tokio::test]
@@ -505,8 +566,6 @@ async fn members_can_publish_applies_to_enrolled_machines() {
 
 #[tokio::test]
 async fn only_http_tunnels_ask_for_certificates() {
-    use magicpipes_core::proto::Kind;
-
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
@@ -517,7 +576,7 @@ async fn only_http_tunnels_ask_for_certificates() {
     let web = f.cp.register(&agent, &http("web")).unwrap();
     assert!(f.cp.cert_status(&agent, &web.hostname, Duration::ZERO).await.is_ok());
     // Asking about a port tunnel's hostname would order a certificate past the daily limit.
-    let db = f.cp.register(&agent, &RegisterTunnel { kind: Kind::Tcp, target: "tcp://127.0.0.1:5432".into(), ..http("db") }).unwrap();
+    let db = f.cp.register(&agent, &public_port("db")).unwrap();
     assert!(f.cp.cert_status(&agent, &db.hostname, Duration::ZERO).await.unwrap_err().is(ErrorCode::NotFound));
 }
 

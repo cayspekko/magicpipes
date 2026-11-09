@@ -37,8 +37,8 @@ What you expose, and every way people can reach it:
 | HTTP app | `add 8080` | ✅ today | ✅ TCP (optional) | — | via its hostname |
 | HTTP over Unix socket | `add --unix /run/app.sock` | ✅ today | ✅ today (TCP) | — | via its hostname |
 | Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
-| Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP) | — | — |
-| Any UDP service | `add 53 --udp` | — | ✅ today (UDP) | — | — |
+| Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP); private: `magicpipes connect` | — | — |
+| Any UDP service | `add 53 --udp` | — | ✅ today (UDP); private: `magicpipes connect` | — | — |
 | SSH | `add 22 --ssh` | — | ✅ TCP (`add 22 --tcp`) | ✅ today | 🖥 terminal (server-side SSH client) |
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP for native clients | — | 🖥 desktop (IronRDP) |
@@ -265,7 +265,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | none for sockets | done |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
-| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in and email done) |
+| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in, email and `magicpipes connect` for private TCP and UDP tunnels done) |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
 | 7 | UDP | yes | done (with phase 3) |

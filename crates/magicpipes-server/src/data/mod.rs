@@ -11,6 +11,7 @@
 //! WebSockets and port connections are long-lived, so they are checked again on every publish, and
 //! closed once the tunnel is gone or no longer admits them.
 
+pub mod connect;
 mod gate;
 pub mod ingress;
 mod io;
@@ -117,6 +118,8 @@ pub struct RouteTable {
     pub by_port: HashMap<(Kind, u16), Arc<Route>>,
     /// SSH tunnels, by name.
     pub by_ssh: HashMap<String, Arc<Route>>,
+    /// Private TCP and UDP tunnels, which `magicpipes connect` reaches, by name.
+    pub by_connect: HashMap<String, (Kind, Arc<Route>)>,
     /// Active users, by id, for private tunnels: who a tunnel cookie stands for now.
     pub users: HashMap<String, TunnelUser>,
     /// Public keys for the SSH gateway, by SHA-256 fingerprint.
@@ -152,6 +155,8 @@ pub struct ProxySettings {
     pub trusted_proxies: TrustedProxies,
     /// Where private tunnels send browsers to sign in, e.g. `https://example.com:8443`.
     pub management_url: String,
+    /// The management hostname, which connect passes are bound to.
+    pub management_host: String,
     /// How long a private tunnel's cookie lasts.
     pub tunnel_cookie_ttl_secs: i64,
     /// Hostnames an application's cookies may not reach (`public.allow_cookie_domain`): everything
@@ -170,6 +175,7 @@ impl ProxySettings {
         };
         Self {
             management_url,
+            management_host: cfg.management.hostname.clone(),
             tunnel_cookie_ttl_secs: cfg.users.session_max_age_secs as i64,
             shared_domains: if cfg.public.allow_cookie_domain { Vec::new() } else { vec![cfg.base_domain.clone(), cfg.management.hostname.clone()] },
             identity_headers: cfg.proxy_auth.as_ref().map(|p| p.identity_headers()).unwrap_or_default(),
@@ -214,6 +220,8 @@ pub struct DataPlane {
     /// The SSH certificate authority browser terminals log in with, when the gateway is on.
     ssh_ca: std::sync::OnceLock<Arc<russh::keys::PrivateKey>>,
     terminals: terminal::Limits,
+    /// `magicpipes connect` connections per person.
+    connections: connect::Limits,
 }
 
 impl DataPlane {
@@ -238,6 +246,7 @@ impl DataPlane {
             ssh_fingerprint: std::sync::OnceLock::new(),
             ssh_ca: std::sync::OnceLock::new(),
             terminals: terminal::Limits::default(),
+            connections: connect::Limits::default(),
         });
         // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in
         // unit tests, nothing is pooled anyway.)

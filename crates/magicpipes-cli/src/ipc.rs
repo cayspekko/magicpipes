@@ -15,8 +15,9 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// the request and drops what it doesn't know). Agents report it in `status` as
 /// `agent.ipc_version`; one that doesn't is older than 2. 3: `access` became `tags`. 4:
 /// `hostname` and `no_verify`, and the step state `skipped`. 5: `keep_list`, `site`,
-/// `allow_sensitive_root` and `allow_any`. 6: `unix` and `allow_sensitive_socket`.
-pub const IPC_VERSION: u32 = 7;
+/// `allow_sensitive_root` and `allow_any`. 6: `unix` and `allow_sensitive_socket`. 7: the kind
+/// `ssh`. 8: private TCP and UDP tunnels, which an older agent refuses, or opens a public port for.
+pub const IPC_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]

@@ -6,13 +6,14 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
 use magicpipes_core::error::ErrorCode;
-use magicpipes_core::proto::{EnrollRequest, ErrorBody};
+use magicpipes_core::proto::{CONNECT_PROTOCOL, EnrollRequest, ErrorBody};
 use serde::Deserialize;
 use serde_json::json;
 
 use super::{AppState, ClientIp, Rejected, bearer_token};
 use crate::authz::{Principal, Role};
-use crate::control::{DEVICE_LOGIN_TTL, DevicePoll, EnrollmentOptions};
+use crate::control::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, EnrollmentOptions, Purpose};
+use crate::data::connect::{MAX_PER_PERSON, Refused};
 
 /// An API error; its HTTP status follows from the code.
 pub struct ApiError(ErrorBody);
@@ -450,8 +451,12 @@ pub async fn start_device(
     client: Option<axum::Extension<ClientIp>>,
     Json(req): Json<DeviceStart>,
 ) -> Result<impl IntoResponse, ApiError> {
+    start_sign_in(&app, client, &req.agent_name, Purpose::Enroll)
+}
+
+fn start_sign_in(app: &AppState, client: Option<axum::Extension<ClientIp>>, machine: &str, purpose: Purpose) -> Result<impl IntoResponse + use<>, ApiError> {
     let ip = client.map(|c| c.0.0).unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
-    let (device_code, user_code) = app.control.start_device_login(&req.agent_name, ip).map_err(ApiError)?;
+    let (device_code, user_code) = app.control.start_device_login(machine, ip, purpose).map_err(ApiError)?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -469,12 +474,87 @@ pub struct DevicePollRequest {
 }
 
 /// `{"status": "pending" | "approved" | "denied" | "expired"}`; `approved` carries the
-/// `enrollment_token`, handed out once.
+/// `enrollment_token` (`login`) or the `pass` and its `expires_at` (`connect`), handed out once.
 pub async fn poll_device(State(app): State<AppState>, Json(req): Json<DevicePollRequest>) -> impl IntoResponse {
     Json(match app.control.poll_device_login(&req.device_code) {
         DevicePoll::Pending => json!({ "status": "pending" }),
-        DevicePoll::Approved(token) => json!({ "status": "approved", "enrollment_token": token }),
+        DevicePoll::Approved(g) if g.purpose == Purpose::Connect => json!({ "status": "approved", "pass": g.secret, "expires_at": g.expires_at }),
+        DevicePoll::Approved(g) => json!({ "status": "approved", "enrollment_token": g.secret }),
         DevicePoll::Denied => json!({ "status": "denied" }),
         DevicePoll::Gone => json!({ "status": "expired" }),
     })
+}
+
+// ---- `magicpipes connect` ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct PassSignIn {
+    machine: String,
+}
+
+/// Starts a sign-in for a connect pass, approved in a browser on any device, as for `login`.
+pub async fn start_pass_sign_in(
+    State(app): State<AppState>,
+    client: Option<axum::Extension<ClientIp>>,
+    Json(req): Json<PassSignIn>,
+) -> Result<impl IntoResponse, ApiError> {
+    start_sign_in(&app, client, &req.machine, Purpose::Connect)
+}
+
+/// A short connect pass for the person whose API token this is, for scripts.
+pub async fn create_pass(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let (pass, expires_at) = app.control.connect_pass(&who, API_PASS_SECS).map_err(ApiError)?;
+    Ok((StatusCode::CREATED, Json(json!({ "pass": pass, "expires_at": expires_at }))))
+}
+
+/// With a connect pass: what the tunnel is, or, with `Upgrade: magicpipes-connect/1`, a
+/// connection to it (`data::connect`). Every tunnel the person can't reach is "not found".
+pub async fn connect(State(app): State<AppState>, Path(name): Path<String>, mut req: axum::extract::Request) -> Response {
+    let client = req.extensions().get::<ClientIp>().map(|c| c.0);
+    let dp = app.control.data_plane();
+    let person = bearer_token(req.headers()).and_then(|t| dp.connect_person(t)).ok_or(());
+    let person = match app.check_credential(person, client) {
+        Ok(p) => p,
+        Err(Rejected::RateLimited) => return rate_limited().into_response(),
+        Err(Rejected::Invalid(())) => {
+            let message = "your connect pass is missing, has expired or no longer counts; run `magicpipes connect` again to sign in";
+            return api_err(ErrorCode::Unauthenticated, message).into_response();
+        }
+    };
+    let ip = client.unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+    let Some(found) = dp.connect_find(&person, &name, ip) else {
+        return ApiError(ErrorBody::new(ErrorCode::NotFound, format!("there is no tunnel named '{name}' that you can connect to"))).into_response();
+    };
+    let upgrade = req.headers().get(http::header::UPGRADE).and_then(|v| v.to_str().ok());
+    if !upgrade.is_some_and(|v| v.eq_ignore_ascii_case(CONNECT_PROTOCOL)) {
+        return Json(json!({ "name": found.name, "kind": found.kind, "online": found.online() })).into_response();
+    }
+    let Some(on_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+        return (StatusCode::BAD_REQUEST, "connection is not upgradable\n").into_response();
+    };
+    let name = found.name.clone();
+    let opened = match dp.connect_open(person, found, ip).await {
+        Ok(o) => o,
+        Err(why) => {
+            let (code, message) = match why {
+                Refused::Busy => (ErrorCode::Busy, format!("you have {MAX_PER_PERSON} connections open with magicpipes connect, or the server is at its limit")),
+                Refused::Offline => (ErrorCode::AgentOffline, format!("the machine serving {name} is offline")),
+                Refused::LocalUnreachable => (ErrorCode::LocalUnreachable, format!("the machine serving {name} couldn't reach the service behind it")),
+            };
+            return ApiError(ErrorBody::new(code, message)).into_response();
+        }
+    };
+    // A connection is traffic: it belongs on the traffic threads, with the agent's stream.
+    dp.clone().on_traffic_threads(move || {
+        tokio::spawn(async move {
+            let Ok(upgraded) = on_upgrade.await else { return };
+            dp.connect_run(hyper_util::rt::TokioIo::new(upgraded), opened).await;
+        })
+    });
+    let mut resp = Response::new(axum::body::Body::empty());
+    *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let h = resp.headers_mut();
+    h.insert(http::header::CONNECTION, http::HeaderValue::from_static("upgrade"));
+    h.insert(http::header::UPGRADE, http::HeaderValue::from_static(CONNECT_PROTOCOL));
+    resp
 }

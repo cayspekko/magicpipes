@@ -612,8 +612,8 @@ aren't supported.
   passes it on.
 * The readiness check of a private tunnel goes through the server to the local application
   (the public address would ask for a sign-in).
-* TCP and UDP tunnels can't be private yet: a raw port can't show a sign-in page. Use
-  `--allow-cidr` for them.
+* A private TCP or UDP tunnel has no public port, since a raw port can't ask anyone to sign in:
+  people reach it with `magicpipes connect` (see [TCP and UDP ports](#tcp-and-udp-ports)).
 * The UI lists tunnels shared with you under **Shared with you**; `GET /api/v1/shared` too.
 
 ```bash
@@ -624,6 +624,8 @@ magicpipes add --serve ./dist       # serve a directory with the built-in file s
 magicpipes add --shell -- htop      # a terminal in the browser (read-only unless --write)
 magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24   # a raw TCP port, for one network
 magicpipes add 53 --udp --allow-any # a UDP port, open to anyone
+magicpipes add 5432 --tcp --tag dev # a private TCP tunnel, no public port: for you and dev
+magicpipes connect db --local 5432  # on another computer: reach it at 127.0.0.1:5432
 
 magicpipes list                     # tunnels on this machine and their status
 magicpipes status                   # login, agent and connection status
@@ -877,9 +879,10 @@ psql -h example.com -p 65507 -U me mydb
   server keeps it. `--remote-port N` asks for a specific port inside the server's range.
 * **A new port says who may connect:** `--allow-cidr` (repeatable: networks or single addresses),
   or `--allow-any` for the whole internet, with only your service's own authentication in front of
-  it. With neither, `add` refuses (`invalid_request`). Other clients are disconnected at once.
-  Re-adding without either keeps the list; a new `--allow-cidr` replaces it, and `--allow-any`
-  removes it.
+  it. With neither, `add` makes the tunnel private on a machine whose tunnels are private by
+  default (see below), and refuses elsewhere (`invalid_request`). Other clients are disconnected at
+  once. Re-adding without either keeps the list; a new `--allow-cidr` replaces it, and
+  `--allow-any` removes it.
 * **UDP allow-lists aren't authentication.** A datagram's source address can be forged, so a
   forged packet can reach your service past `--allow-cidr` (the reply goes to the forged address).
 * **Readiness:** the server opens a connection to your service through the agent (so a service
@@ -895,6 +898,53 @@ psql -h example.com -p 65507 -U me mydb
 * Traffic is not decrypted: the server sees only what your protocol sends (use TLS or SSH
   inside for anything private). Each agent connection carries at most 256 TCP connections and
   UDP clients at once.
+
+#### Private ones, with `magicpipes connect`
+
+A raw port can't ask anyone to sign in, so a private TCP or UDP tunnel gets no port on the server.
+The people it's shared with run `magicpipes connect` on their own computer instead: it listens
+there, and passes each connection through the server, as them. On a machine whose tunnels are
+private by default (enrolled once the server had user accounts), that's what `add --tcp` and
+`add --udp` make; elsewhere, add `--private` or `--tag`.
+
+```console
+$ magicpipes add 5432 --tcp --name db --tag dev
+...
+  Reach:  magicpipes connect db
+  Local:  tcp://127.0.0.1:5432
+
+Tunnel active in background. Private: only you, people with dev can reach it, by running that command.
+```
+
+```console
+$ magicpipes connect db --local 5432
+Forwarding 127.0.0.1:5432 to db (TCP), as you, through https://example.com:8443.
+Press Ctrl+C to stop.
+```
+
+```bash
+psql -h 127.0.0.1 -p 5432 -U me mydb    # in another terminal
+```
+
+* **Signing in.** The first time, `connect` shows an address and a code, and opens the address in a
+  browser if it can: approve it there, or on any other device where you're signed in. That lasts as
+  long as a browser session (`session_max_age_secs`, 12 hours by default), kept in
+  `~/.magicpipes/connect.json`, and then it asks again. `--no-browser` only shows them.
+* **For scripts**, an API token from your account page signs in with no browser:
+  `MAGICPIPES_API_TOKEN`, or `--api-token-file`. Revoking the token stops it within 15 minutes.
+* **Any computer:** it needn't be enrolled. Without `magicpipes login`, name the server with
+  `--server` (and `--ca-cert` for a private CA).
+* `--local` takes a port or `address:port`; without it, a free port on 127.0.0.1 is chosen and
+  shown. With `--json`, the first line on stdout is `{"tunnel", "kind", "local", "server",
+  "online"}`, and it keeps running until stopped.
+* **Access is checked for every connection**, and open ones close when it goes: a tag taken away,
+  the user disabled, "Sign out everywhere", the tunnel removed. `connect` then exits with the
+  reason (`not_found`, `unauthenticated`). A tunnel you can't reach is `not_found`, whether or not
+  it exists.
+* Each person can have 64 connections and UDP clients open through `connect` at once. UDP clients
+  are forgotten after a minute without datagrams.
+* The audit log records approvals (`connect.approve`) and use (`tunnel.connect`, once a minute at
+  most per person and tunnel).
 
 ### `add` semantics
 
@@ -991,9 +1041,10 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
 | | |
 |---|---|
-| `MAGICPIPES_HOME` | State directory (default `~/.magicpipes`, mode 0700): `config.json`, `tunnels.json`, `agent.sock`, `agent.lock`, `agent-start.lock`, `agent.pid`, `agent.log` |
+| `MAGICPIPES_HOME` | State directory (default `~/.magicpipes`, mode 0700): `config.json`, `tunnels.json`, `connect.json`, `agent.sock`, `agent.lock`, `agent-start.lock`, `agent.pid`, `agent.log` |
 | `MAGICPIPES_SOCKET` | IPC endpoint override: Unix socket path (limited to ~104 bytes), or a named pipe name (`\\.\pipe\...`) on Windows |
 | `MAGICPIPES_TOKEN` | Enrollment token for `login` |
+| `MAGICPIPES_API_TOKEN` | API token for `connect`, instead of signing in in a browser |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |
 | `MAGICPIPES_PROBE_ADDR` | Testing: connect readiness probes to this IP instead of resolving DNS |
 
@@ -1001,9 +1052,10 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
 ## 4. Management API
 
-All endpoints except `enroll` and the agent endpoint require `Authorization: Bearer <token>`:
-an admin token, or a user's API token, which can do what its user can do. Endpoints for
-administrators answer `403 forbidden` to members.
+All endpoints except `enroll`, the CLI's sign-ins (`device`, `passes/device`) and the agent
+endpoint require `Authorization: Bearer <token>`: an admin token, or a user's API token, which can
+do what its user can do; `connect` takes a connect pass instead. Endpoints for administrators
+answer `403 forbidden` to members.
 
 | Method | Path | |
 |---|---|---|
@@ -1026,7 +1078,10 @@ administrators answer `403 forbidden` to members.
 | POST | `/api/v1/hostnames` | 201; body `{"hostname", "owner_user_id"? \| "agent_id"?}` (exactly one; administrators) |
 | DELETE | `/api/v1/hostnames/{hostname}` | 204; deletes the tunnel on it |
 | POST | `/api/v1/device` | Starts a browser-approved `magicpipes login` (used by the CLI) |
-| POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`), `denied` or `expired` |
+| POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`, or for `connect` a `pass` and `expires_at`), `denied` or `expired` |
+| POST | `/api/v1/passes` | 201 `{"pass", "expires_at"}`: a connect pass for 15 minutes, for your API token's user (used by `connect`) |
+| POST | `/api/v1/passes/device` | Starts a browser-approved sign-in for `magicpipes connect`; body `{"machine"}` |
+| GET | `/api/v1/connect/{name}` | With a connect pass: `{"name", "kind", "online"}` for a private TCP or UDP tunnel you can reach, else 404; with `Upgrade: magicpipes-connect/1`, a connection to it (used by `connect`) |
 | GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |
 | POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
 | GET | `/api/v1/users/{id}` | One user |

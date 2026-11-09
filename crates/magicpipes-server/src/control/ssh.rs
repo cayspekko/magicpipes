@@ -166,6 +166,11 @@ impl ControlPlane {
                             }
                         }
                         Some(Report::HostKey { tunnel_id, fingerprint }) => me.keep_host_key(&tunnel_id, &fingerprint),
+                        Some(Report::Connect { user_id, tunnel_id, client }) => {
+                            if me.first_in_a_while(&mut seen, &user_id, &tunnel_id) {
+                                me.audit_as(&user_id, "tunnel.connect", &tunnel_id, &format!("from {client}"));
+                            }
+                        }
                         None => return,
                     },
                 }

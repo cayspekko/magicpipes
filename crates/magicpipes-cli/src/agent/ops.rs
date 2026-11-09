@@ -151,6 +151,8 @@ impl Agent {
             out["allow"] = json!(tunnel.allow);
         }
         match tunnel.kind {
+            // A private one has no public port to reach.
+            Kind::Tcp if tunnel.public_port.is_none() => {}
             Kind::Tcp => out["reachable"] = json!(reachable),
             // A datagram service cannot be checked end to end (it need not answer anything).
             Kind::Udp => out["verified"] = json!(false),
@@ -223,9 +225,29 @@ impl Agent {
             .iter()
             .map(ToString::to_string)
             .collect();
+        let allow_list = !asked.is_empty() || req.allow_any;
+        // A newer server takes private TCP and UDP tunnels, which people reach with `magicpipes connect`.
+        let private_ports = self.session.server_protocol().is_some_and(|v| v >= 6);
+        if req.kind.has_port() && req.visibility == Some(Visibility::Private) && !private_ports {
+            return Err(ErrorInfo::new(ErrorCode::ServerOutdated, "the server does not support private TCP and UDP tunnels; it needs a newer magicpipesd"));
+        }
+        if let Some(t) = &existing
+            && allow_list
+            && req.visibility.is_none()
+            && t.visibility == Some(Visibility::Private)
+        {
+            return Err(ErrorInfo::new(
+                ErrorCode::InvalidRequest,
+                format!("tunnel '{}' is private, so it has no public port to allow anyone in; add --public to open one instead", t.name),
+            ));
+        }
         let allow = match &existing {
-            _ if !asked.is_empty() || req.allow_any || !req.kind.has_port() => asked,
+            _ if allow_list || !req.kind.has_port() => asked,
             Some(t) => t.allow.clone(),
+            // A private port has nothing to allow: people sign in instead.
+            None if req.visibility == Some(Visibility::Private) => Vec::new(),
+            // A newer server makes it private if this machine's tunnels are, and asks for this otherwise.
+            None if req.visibility.is_none() && private_ports => Vec::new(),
             // A raw port has nothing in front of it but the service itself, so this is asked for.
             None => {
                 return Err(ErrorInfo::new(
@@ -246,6 +268,9 @@ impl Agent {
         };
         let (visibility, tags) = match req.visibility {
             Some(v) => (Some(v), req.tags.clone()),
+            // An allow-list is for a public port. Saying so tells a newer server `--allow-any` (an
+            // empty list) from no list at all, which makes the tunnel private where this machine's are.
+            None if existing.is_none() && req.kind.has_port() && allow_list && private_ports => (Some(Visibility::Public), Vec::new()),
             None => (None, Vec::new()),
         };
         let expect_private = match (req.visibility, &existing) {
@@ -410,7 +435,8 @@ impl Agent {
                 return Err(err.at(Step::Check));
             }
         }
-        if t.kind != Kind::Tcp {
+        // A private one has no public port to try.
+        if t.kind != Kind::Tcp || t.public_port.is_none() {
             return Ok(None);
         }
         ev.step(Step::Probe, StepState::Running).await;

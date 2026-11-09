@@ -56,7 +56,7 @@ present a URL. Act on the code:
 | 5 | `server_unreachable`, `agent_start_failed` | Check `magicpipes status`; see `magicpipes agent logs`. |
 | 5 | `agent_outdated` | The background agent is older than the CLI: run `magicpipes agent stop`, then the command again (the agent restarts). If the message says to upgrade magicpipes, the machine's install is too old for its server. |
 | 6 | `name_conflict`, `name_taken`, `invalid_name` | Choose another `--name`, or `magicpipes remove <name>` first. |
-| 6 | `server_outdated`, `unsupported` | The server is too old for this request. Tell the user it needs a newer `magicpipesd`. With `--unix`, `unsupported` means this machine is on Windows: use a port. |
+| 6 | `server_outdated`, `unsupported` | The server is too old for this request (for a private `--tcp`/`--udp` tunnel, or `connect`). Tell the user it needs a newer `magicpipesd`. With `--unix`, `unsupported` means this machine is on Windows: use a port. |
 | 6 | `public_not_allowed` | This machine may only publish private tunnels. Retry without `--public`. |
 | 6 | `tag_unknown` | The tag doesn't exist. Ask the user which tag to use. |
 | 3 | `forbidden` | The user doesn't hold that tag (or it is someone's personal tag). Retry without `--tag`, or ask the user. |
@@ -74,6 +74,29 @@ To reach this machine's sshd through the server, use `magicpipes add 22 --ssh --
 private, and `public_url` is the `ssh -J` command to give people. They also need a public key on their
 account, and the machine's own `authorized_keys` still applies. `ssh_disabled` means the server has no
 gateway: tell the user, and don't fall back to `--tcp --allow-any` unless they ask.
+
+## Databases and other non-HTTP services
+
+`magicpipes add 5432 --tcp --json` (or `--udp`) publishes a raw port. With `--private` or `--tag`, and
+by default on a machine whose tunnels are private, it gets no public port: `public_url` is then
+`magicpipes connect <name>`, the command people run on their own computer to reach it. A public port
+needs `--allow-cidr <network>` or `--allow-any`; only use `--allow-any` if the user asked for the
+whole internet. `invalid_request` without either means this machine's default is public: ask the
+user which they want.
+
+To reach a private TCP or UDP tunnel from this computer:
+
+```bash
+magicpipes connect db --local 5432 --json &
+```
+
+It keeps running until stopped, so start it in the background. The first line on stdout is
+`{"tunnel","kind","local","server","online"}`; connect clients to `local` (here `127.0.0.1:5432`).
+The first time, it prints an approval address and code on stderr and waits up to 10 minutes: give the
+user both, and they approve it in a browser on any device. With `MAGICPIPES_API_TOKEN` set (an API
+token from the user's account page), it needs no approval. `not_found` means there's no such tunnel
+the user can reach; `unauthenticated` means the sign-in expired or was ended: run it again. Without
+`magicpipes login` on this machine, add `--server <management URL>`. Stop it when done (`kill %1`).
 
 ## Other commands
 

@@ -51,7 +51,7 @@ use crate::certs::CertManager;
 use crate::config::Config;
 use crate::data::{AccessPolicy, DataPlane, GatewayKey, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
-pub use device::{DEVICE_LOGIN_TTL, DevicePoll};
+pub use device::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, Purpose};
 pub use email::{AcceptError, INVITATION_DAYS, InvitationView, LinkError, OpenInvitation, SIGN_IN_LINK_MINUTES};
 pub use oidc::SignInError;
 pub use registry::TunnelSignIn;
@@ -297,7 +297,9 @@ impl ControlPlane {
                     table.by_port.insert((kind, port), route);
                 }
                 (_, Some(_)) => {}
-                (_, None) => {}
+                (kind, None) => {
+                    table.by_connect.insert(t.row.name.clone(), (kind, route));
+                }
             }
         }
         self.data.publish(table);

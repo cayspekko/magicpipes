@@ -120,37 +120,36 @@ async fn revoked(dp: &DataPlane, kind: Kind, port: u16, peer: IpAddr, tunnel_id:
 
 /// Opens a data stream to the agent for `client` and waits for its status byte.
 pub(super) async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
+    opened(dp, route, session, client, header).await.ok()
+}
+
+/// [`open`], saying why not: [`Outcome::None`] when the client's or the session's share of streams
+/// is used up, else what was counted.
+pub(super) async fn opened(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Result<MuxStream, Outcome> {
     let timeout = dp.settings.stream_open_timeout;
     let key = client_key(client);
     let mut stream = match dp.with_room(session, || session.open_data(timeout, key)).await {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
             tracing::debug!(tunnel = %route.tunnel_id, %client, "agent stream budget used up; refusing");
-            return None;
+            return Err(Outcome::None);
         }
         Err(_) => {
             route.stats.record(Outcome::AgentOffline);
-            return None;
+            return Err(Outcome::AgentOffline);
         }
     };
     let status = async {
         proto::write_frame(&mut stream, &header).await?;
         stream.read_u8().await
     };
-    match tokio::time::timeout(timeout, status).await.ok().and_then(Result::ok).and_then(StreamStatus::from_byte) {
-        Some(StreamStatus::Ok) => {
-            route.stats.record(Outcome::Ok);
-            Some(stream)
-        }
-        Some(StreamStatus::LocalUnreachable) => {
-            route.stats.record(Outcome::LocalUnreachable);
-            None
-        }
-        _ => {
-            route.stats.record(Outcome::AgentOffline);
-            None
-        }
-    }
+    let outcome = match tokio::time::timeout(timeout, status).await.ok().and_then(Result::ok).and_then(StreamStatus::from_byte) {
+        Some(StreamStatus::Ok) => Outcome::Ok,
+        Some(StreamStatus::LocalUnreachable) => Outcome::LocalUnreachable,
+        _ => Outcome::AgentOffline,
+    };
+    route.stats.record(outcome);
+    if outcome == Outcome::Ok { Ok(stream) } else { Err(outcome) }
 }
 
 async fn serve_tcp(dp: Arc<DataPlane>, port: u16, listener: TcpListener, stop: CancellationToken) {
