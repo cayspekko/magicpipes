@@ -321,7 +321,7 @@ fn run_agent(detached: bool) -> ExitCode {
         .with_ansi(!detached && std::io::stderr().is_terminal())
         .init();
     match agent::run(detached) {
-        Ok(agent::Start::Ran) => ExitCode::SUCCESS,
+        Ok(agent::Start::Ran | agent::Start::Unwanted) => ExitCode::SUCCESS,
         Ok(agent::Start::AlreadyRunning) if detached => ExitCode::SUCCESS,
         Ok(agent::Start::AlreadyRunning) => {
             eprintln!("Error: an agent is already running (pid {})", read_pid().unwrap_or_default());

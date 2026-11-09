@@ -817,6 +817,25 @@ async fn an_agent_starts_once_a_stopping_one_lets_go() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// When several commands start an agent at once, all but one of the agents exit because the
+/// first holds the lock. A slow one can get the lock only after that agent has been stopped, and
+/// every command has stopped waiting; it mustn't run then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_agent_nobody_waits_for_does_not_run() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    // Started the way commands start one, but with none waiting. If it runs, it never finishes.
+    let out = env.cli(&["agent", "run", "--detached"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("agent started"), "{stderr}");
+    assert_eq!(env.agent_pid(), None);
+    // A command that waits still gets one.
+    env.cli_ok(&["agent", "start"]).await;
+    assert!(env.agent_pid().is_some());
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn custom_hostnames() {
     let env = Env::new(Tls::DevCa).await;

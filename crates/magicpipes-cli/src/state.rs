@@ -7,6 +7,7 @@
 //! | `tunnels.json`| tunnels this agent serves (0600)                 |
 //! | `agent.sock`  | IPC socket on Unix (0600, peer uid checked; `MAGICPIPES_SOCKET` overrides; a named pipe on Windows) |
 //! | `agent.lock`  | exclusive lock held by the running agent         |
+//! | `agent-start.lock` | shared locks held by commands waiting for an agent to start |
 //! | `agent.pid`   | pid of the running agent                         |
 //! | `agent.log`   | background agent log                             |
 
@@ -45,6 +46,9 @@ pub fn socket_path() -> PathBuf {
 }
 pub fn lock_path() -> PathBuf {
     home().join("agent.lock")
+}
+pub fn start_lock_path() -> PathBuf {
+    home().join("agent-start.lock")
 }
 pub fn pid_path() -> PathBuf {
     home().join("agent.pid")

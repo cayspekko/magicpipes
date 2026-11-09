@@ -40,7 +40,10 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
     }
     require_login()?;
     state::ensure_home().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
-    let spawn = || spawn_detached().map_err(|e| ErrorInfo::new(ErrorCode::AgentStartFailed, format!("could not start agent: {e}")));
+    let start_failed = |e: std::io::Error| ErrorInfo::new(ErrorCode::AgentStartFailed, format!("could not start agent: {e}"));
+    // Held until we stop waiting; the agents we start run only while some command holds it.
+    let _waiting = wait_for_agent().map_err(start_failed)?;
+    let spawn = || spawn_detached().map_err(start_failed);
     let started = Instant::now();
     // The agent we started, until it exits because another agent holds the lock.
     let mut child = Some(spawn()?);
@@ -62,8 +65,7 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
             }
             _ => {}
         }
-        // Only once it's free: one started while another agent holds it could be slow enough to
-        // reach the lock after that agent has been stopped, and run when nobody wants it.
+        // Only once it's free, rather than one every 50 ms that exits at once.
         if child.is_none() && lock_is_free() {
             child = Some(spawn()?);
         }
@@ -72,6 +74,17 @@ pub async fn ensure_agent() -> Result<bool, ErrorInfo> {
         ErrorCode::AgentStartFailed,
         format!("the agent did not become ready within {}s; see {}", START_TIMEOUT.as_secs(), state::log_path().display()),
     ))
+}
+
+/// Says that a command is waiting for an agent, for as long as the file is open: a shared lock
+/// on `agent-start.lock`, which a detached agent checks once it holds the agent lock (see
+/// `agent::run`). One we started can get there late, after we connected to another agent that has
+/// since been stopped, or gave up; it then exits instead of running when nobody wants it.
+fn wait_for_agent() -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::options().create(true).truncate(false).write(true).open(state::start_lock_path())?;
+    // Blocks only while a starting agent looks, for a moment.
+    file.lock_shared()?;
+    Ok(file)
 }
 
 /// Whether no agent holds its lock, so that one started now would run. Taken for a moment to see.

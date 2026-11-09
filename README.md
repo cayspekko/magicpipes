@@ -991,7 +991,7 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
 | | |
 |---|---|
-| `MAGICPIPES_HOME` | State directory (default `~/.magicpipes`, mode 0700): `config.json`, `tunnels.json`, `agent.sock`, `agent.lock`, `agent.pid`, `agent.log` |
+| `MAGICPIPES_HOME` | State directory (default `~/.magicpipes`, mode 0700): `config.json`, `tunnels.json`, `agent.sock`, `agent.lock`, `agent-start.lock`, `agent.pid`, `agent.log` |
 | `MAGICPIPES_SOCKET` | IPC endpoint override: Unix socket path (limited to ~104 bytes), or a named pipe name (`\\.\pipe\...`) on Windows |
 | `MAGICPIPES_TOKEN` | Enrollment token for `login` |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |

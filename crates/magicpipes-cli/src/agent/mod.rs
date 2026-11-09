@@ -11,7 +11,8 @@
 //! A second agent (e.g. from two concurrent `magicpipes add` invocations) fails to take the lock
 //! and exits, and both CLIs then talk to the winner over the IPC endpoint (`agent.sock`, or a
 //! named pipe on Windows; see `platform`). Because the lock dies with the process, a stale socket
-//! file can always be removed safely by the lock holder.
+//! file can always be removed safely by the lock holder. An agent the CLI started (`--detached`)
+//! that gets the lock when no CLI is waiting for one any more exits too.
 
 mod forward;
 mod ops;
@@ -41,6 +42,8 @@ use ops::Agent;
 pub enum Start {
     Ran,
     AlreadyRunning,
+    /// Started detached, and no command is waiting for an agent any more.
+    Unwanted,
 }
 
 pub fn run(detached: bool) -> anyhow::Result<Start> {
@@ -51,6 +54,12 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
         Err(std::fs::TryLockError::WouldBlock) => return Ok(Start::AlreadyRunning),
         Err(std::fs::TryLockError::Error(e)) => return Err(e).context("locking agent.lock"),
     }
+    // A command started us and waits, but we may have got here too late: when several start an
+    // agent at once, the losers exit because the winner holds the lock, and a slow one can reach
+    // it only after the winner has been stopped and every command has stopped waiting.
+    if detached && !awaited() {
+        return Ok(Start::Unwanted);
+    }
     let Some(cfg) = AgentConfig::load()? else {
         bail!("not logged in; run `magicpipes login --server <url> --token <token>` first");
     };
@@ -60,6 +69,16 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
     let _ = std::fs::remove_file(state::pid_path());
     drop(lock);
     res.map(|_| Start::Ran)
+}
+
+/// Whether a command is waiting for an agent: each holds a shared lock on `agent-start.lock` while
+/// it does (`client::ensure_agent`). If that can't be told, start anyway.
+fn awaited() -> bool {
+    match File::options().create(true).truncate(false).write(true).open(state::start_lock_path()) {
+        // Taken only when nobody holds it, and let go at once.
+        Ok(file) => !matches!(file.try_lock(), Ok(())),
+        Err(_) => true,
+    }
 }
 
 async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {

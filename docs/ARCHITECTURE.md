@@ -577,6 +577,10 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * The agent takes an exclusive `flock` on `agent.lock`. Concurrent spawns lose the lock and
   exit 0; every CLI then connects to the single winner. Holding the lock proves any existing
   socket file is stale, so it is removed and re-bound.
+* A CLI holds a shared lock on `agent-start.lock` for as long as it waits for an agent, and a
+  `--detached` agent that gets `agent.lock` runs only if some CLI holds it. Otherwise a spawn
+  that was slow to start could get the lock after the winner had been stopped, and run with
+  nobody waiting for it. An agent run in the foreground (`agent run`) doesn't check.
 * IPC is newline-delimited JSON over a Unix socket: mode 0600, inside a 0700 directory, and the
   peer's uid is checked against the agent's. On Windows it is a named pipe named after a hash
   of `MAGICPIPES_HOME`, created as the first instance (so no other process can own the name),
