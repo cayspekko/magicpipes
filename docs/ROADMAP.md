@@ -39,7 +39,7 @@ What you expose, and every way people can reach it:
 | Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
 | Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP); private: `magicpipes connect` | — | — |
 | Any UDP service | `add 53 --udp` | — | ✅ today (UDP); private: `magicpipes connect` | — | — |
-| SSH | `add 22 --ssh` | — | ✅ TCP (`add 22 --tcp`) | ✅ today | 🖥 terminal (server-side SSH client) |
+| SSH | `add 22 --ssh` | — | ✅ TCP (`add 22 --tcp`) | ✅ today | 🖥 terminal (server-side SSH client); 📁 files over SFTP (planned) |
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP (`add 3389 --tcp`); native clients through `magicpipes connect` | — | 🖥 desktop (IronRDP), today |
 | VNC | `add 5900 --vnc` | — | ✅ TCP (`add 5900 --tcp`); native viewers through `magicpipes connect` | — | 🖥 desktop (noVNC), today |
@@ -164,7 +164,7 @@ port forwarding and agent forwarding all work, and the target's `authorized_keys
 applies; the gateway sees only ciphertext. A plain `ssh -p 2222 example.com` (no `-J`) gets a
 "your hosts are … use `ssh -J …`" message and is disconnected.
 
-## Browser access: one relay, four uses
+## Browser access: one relay, five uses
 
 Every browser feature except the SSH terminal is the same server piece: authenticate the UI
 user, then pipe a WebSocket into a tunnel stream.
@@ -175,6 +175,7 @@ user, then pipe a WebSocket into a tunnel stream.
 | RDP desktop (**done**: `add --rdp`) | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway), which lets it read the session (below) | TCP to the RDP server |
 | Shell terminal (**done**: `add --shell`) | xterm.js (MIT), served by the agent | none: an ordinary tunnel WebSocket | pty (`portable-pty`, ConPTY on Windows) |
 | SSH terminal (**done**) | xterm.js | SSH client (`russh`) through the tunnel | TCP to sshd |
+| SSH files (planned) | a file list, upload and download | SFTP client (`russh-sftp`) through the tunnel (below) | TCP to sshd |
 
 ### Web terminal: build, don't embed ttyd
 
@@ -280,6 +281,66 @@ decide the design:
   machine's certificate is kept the first time, a different one refused, like SSH host keys.
   Linux desktops stay second-class for now, where VNC (noVNC, MPL-2.0) may serve better.
 
+### Touch-friendly desktops
+
+Both desktop pages work on a phone only as far as tapping goes. What each client brings, checked
+in the vendored builds (2026-11-09):
+
+* **noVNC** handles touch in its core: tap is a click, two- and three-finger taps are the right and
+  middle buttons, long-press and drag work, two fingers scroll, pinch zooms. What our page lacks:
+  - a keyboard button that raises the phone's keyboard (a hidden input, as noVNC's own app has,
+    whose input becomes keysyms);
+  - the key bar planned for the terminal (Esc, Tab, sticky Ctrl, Alt and Super, arrows, F-keys);
+  - zoom and pan as well as fit-to-window (`clipViewport` and `dragViewport`);
+  - a layout that follows `visualViewport`, so the keyboard doesn't cover the screen;
+  - the dot cursor (`showDotCursor`) where the server hides its own, and full screen.
+* **IronRDP's component** handles no touch at all; it takes mouse and keyboard events only. So the
+  page turns touches into mouse events itself (tap, long-press for the right button, two fingers
+  for the wheel, pinch for a local zoom), or upstream gets it. Phone keyboards send text, not key
+  codes (`keyCode` 229, composition), so typed text goes as Unicode key events, which the session
+  supports; the key bar sends scancodes (Esc, Tab, Ctrl+Alt+Del, the Windows key). The session
+  starts at the phone's size and follows rotation (Display Control is on already).
+
+VNC first, as noVNC brings most of it; then RDP. The key bar and keyboard button are shared with
+the touch-friendly terminal (phase 1c), so whichever comes first builds them.
+
+### Files to and from a desktop
+
+* **RDP:** IronRDP's RDP package (0.7.0) has clipboard file transfer: `RdpFileTransferProvider`,
+  `initiateFileCopy` and the file-contents callbacks. Files copied on Windows can be pasted in the
+  page to download, and files dropped on the page pasted into Windows. Our page turns on neither
+  the clipboard (`enableClipboard`) nor a provider yet; text clipboard comes with the same switch.
+  Transfers are chunked, so the server's 4 MiB message limit holds, and the server sees the files
+  as it sees the session. Drive redirection (a folder in Explorer) isn't in the browser client.
+  Printer redirection is (`printerName`, print-job callbacks): later, a printed page could become a
+  PDF download.
+* **VNC:** noVNC has no file transfer (RFB has none as standard, and TightVNC's and UltraVNC's
+  extensions aren't in noVNC). Two ways, to choose when building:
+  - for Macs and Linux, the SSH files page below, on the same machine's sshd;
+  - a **Files** panel on the desktop page, served by the agent from a folder its user names
+    (`--files <dir>` on `add --vnc` or `--rdp`), built on `--serve`'s listing plus upload. The agent
+    only ever touches the folder its user configured, so the server still names a tunnel and never
+    a path. This works for any desktop, Windows included, and needs upload limits (per file, per
+    request, free space) and the desktop's own access check.
+
+### Files over SSH: an SFTP browser
+
+**Files** beside **Open terminal** on an SSH tunnel: a page that lists folders and downloads,
+uploads, makes folders, renames and deletes (deleting asks first). Like the browser terminal, the
+server logs in with a five-minute certificate from its own authority, naming the person by email,
+and sshd maps that to an account (`AuthorizedPrincipalsFile`); then it opens the `sftp` subsystem
+instead of a pty, with `russh-sftp` (3.0.1, Apache-2.0, a new dependency). A certificate for files
+needs no `permit-pty`, so it carries no extensions at all.
+
+* **Trust** is the browser terminal's: the server reads what passes. `scp` and `sftp` through
+  `ssh -J` stay end to end.
+* **Paths** are the person's, inside their own login, and sshd's permissions apply: the server
+  passes on what they chose and never picks a path on the machine itself.
+* **Bounds:** uploads and downloads stream (nothing whole in memory), with a size limit per upload
+  in the server's settings, transfers per person, and timeouts. Downloads are attachments with
+  `nosniff`, never rendered on the management host.
+* Files opened appear in the audit log (`ssh.files`), once a minute per person and machine at most.
+
 ## Prerequisite for browser access and the SSH gateway: users
 
 Today the management UI has a single admin token. Desktops and SSH terminals in the browser
@@ -314,7 +375,10 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in, email and `magicpipes connect` for private TCP and UDP tunnels done) |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
+| 5b | SSH files in the browser: an SFTP browser beside the terminal (`russh-sftp`) | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | done (RDP used against Windows 11 with NLA; VNC built, not yet tried against a real VNC server) |
+| 6b | Touch-friendly desktops: VNC, then RDP (keyboard button, key bar, touch for RDP, zoom and pan) | none (the pages) | planned |
+| 6c | Files to and from desktops: RDP's clipboard file copy, then VNC (a Files panel from a folder the agent's user names, or SSH files) | none for RDP; agent and server for the panel | planned |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |
