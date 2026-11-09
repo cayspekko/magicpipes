@@ -31,6 +31,8 @@ const STYLE: &str = r#"
 font-display:block;unicode-range:U+23FB-23FE,U+2B58,U+E000-F8FF,U+F0000-F1AF0}
 html,body{height:100%}body{min-height:0;overflow:hidden}.top h1{margin:0}
 .brand{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brand>a{display:inline-flex;align-items:center;justify-content:center;min-width:24px;min-height:24px;flex:none}
+.brand .nm{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .side{display:flex;align-items:center;gap:14px;flex:none}
 .badge{font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line-2);border-radius:999px;padding:4px 10px;white-space:nowrap}
 .badge.rw{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line-2))}

@@ -18,6 +18,7 @@ pub const CHECK: &str = icon!("ic", r#"<path d="M20 6 9 17l-5-5"/>"#);
 pub const DOWNLOAD: &str = icon!("ic sm", r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>"#);
 pub const FOLDER: &str = icon!("ic", r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#);
 pub const GLOBE: &str = icon!("ic", r#"<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>"#);
+pub const MONITOR: &str = icon!("ic", r#"<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>"#);
 pub const LOCK: &str = icon!("ic", r#"<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>"#);
 pub const MORE: &str = icon!("ic", r#"<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>"#);
 pub const OPENS_ELSEWHERE: &str = icon!("ic sm", r#"<path d="M7 7h10v10"/><path d="M7 17 17 7"/>"#);
@@ -43,6 +44,7 @@ pub fn tunnel_kind(kind: magicpipes_core::proto::Kind, target: &str) -> (&'stati
         Kind::Tcp => (PLUG, "TCP port"),
         Kind::Udp => (RADIO, "UDP port"),
         Kind::Ssh => (TERMINAL, "SSH"),
+        Kind::Rdp => (MONITOR, "Remote desktop"),
         Kind::Http if target.starts_with("static:") => (FOLDER, "Shared files"),
         Kind::Http if target.starts_with("shell:") => (TERMINAL, "Web terminal"),
         Kind::Http => (APP_WINDOW, "Web app"),

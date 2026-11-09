@@ -96,6 +96,7 @@ enum Command {
   magicpipes add 5432 --tcp --allow-cidr 203.0.113.0/24
   magicpipes add 5432 --tcp --tag team:dev    No public port: they use `magicpipes connect`
   magicpipes add 22 --ssh --tag team:dev      Log in with `ssh -J`, with people sharing that tag
+  magicpipes add 3389 --rdp --tag team:dev    A remote desktop in the browser, for people with that tag
 
 Run it again with other options to change a tunnel.")]
     Add {
@@ -118,6 +119,11 @@ Run it again with other options to change a tunnel.")]
         /// you, and people sharing a --tag with it, who then log in to sshd as usual.
         #[arg(long, conflicts_with_all = ["serve", "shell", "udp", "tcp", "unix", "public", "hostname", "no_verify"])]
         ssh: bool,
+        /// Open this machine's (or --host's) Remote Desktop in the browser, from the server's
+        /// management page. Always private: you, and people sharing a --tag with it, who then sign in
+        /// to Windows as usual. Remote Desktop clients reach it with `magicpipes connect`.
+        #[arg(long, conflicts_with_all = ["serve", "shell", "udp", "tcp", "ssh", "unix", "public", "hostname", "no_verify"])]
+        rdp: bool,
         /// Publish a UDP port (udp://host:port); datagrams go to the local UDP port.
         #[arg(long, conflicts_with_all = ["serve", "shell"])]
         udp: bool,
@@ -310,7 +316,7 @@ fn main() -> ExitCode {
 fn check_add_args(cmd: &Command) {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
-    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, ssh, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
+    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, ssh, rdp, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
     else {
         return;
     };
@@ -325,6 +331,9 @@ fn check_add_args(cmd: &Command) {
     }
     if *ssh && port.is_none() {
         fail(ErrorKind::MissingRequiredArgument, "--ssh needs the local port of sshd, usually: magicpipes add 22 --ssh");
+    }
+    if *rdp && port.is_none() {
+        fail(ErrorKind::MissingRequiredArgument, "--rdp needs the port of Remote Desktop, usually: magicpipes add 3389 --rdp");
     }
     if unix.is_none() && *allow_sensitive_socket {
         fail(ErrorKind::ArgumentConflict, "--allow-sensitive-socket can only be used with --unix");
@@ -396,6 +405,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
             tcp,
             udp,
             ssh,
+            rdp,
             remote_port,
             allow_cidr,
             allow_any,
@@ -424,10 +434,11 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 (_, true) => Some(Visibility::Public),
                 _ => None,
             };
-            let kind = match (tcp, udp, ssh) {
+            let kind = match (tcp, udp, ssh, rdp) {
                 (true, ..) => Kind::Tcp,
-                (_, true, _) => Kind::Udp,
-                (.., true) => Kind::Ssh,
+                (_, true, ..) => Kind::Udp,
+                (_, _, true, _) => Kind::Ssh,
+                (.., true) => Kind::Rdp,
                 _ => Kind::Http,
             };
             let req = AddRequest {
@@ -733,6 +744,7 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         println!();
         let address = match kind {
             Kind::Ssh => "SSH:   ",
+            Kind::Rdp => "Desktop:",
             _ if by_command => "Reach: ",
             _ => "URL:   ",
         };
@@ -743,6 +755,8 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
                 println!("  Shell:  {cmd} ({})", if *writable { "read-write" } else { "read-only" });
                 println!("  In:     {}", state::display_path(cwd));
             }
+            // Lined up under the longer "Desktop:".
+            _ if kind == Kind::Rdp => println!("  Local:   {}", data["target"].as_str().unwrap_or_default()),
             _ => println!("  Local:  {}", data["target"].as_str().unwrap_or_default()),
         }
         println!();
@@ -769,6 +783,9 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
                 let who = if who.is_empty() { "nobody (give it a --tag)".to_string() } else { who.join(", ") };
                 if kind == Kind::Ssh {
                     println!("Tunnel active in background. Private: only {who} can reach it, using an SSH key on an account.");
+                } else if kind == Kind::Rdp {
+                    println!("Tunnel active in background. Private: only {who} can open it, after signing in here and then to Windows.");
+                    println!("Remote Desktop clients reach it with: magicpipes connect {}", data["name"].as_str().unwrap_or_default());
                 } else if by_command {
                     println!("Tunnel active in background. Private: only {who} can reach it, by running that command.");
                 } else {

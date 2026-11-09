@@ -2,8 +2,8 @@
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
-# terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`) private, registers an SSH tunnel,
-# reaches an application on a Unix socket (or, on Windows, is told that isn't supported), and stops the agent.
+# terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`) private, registers an SSH tunnel
+# and a remote desktop, reaches an application on a Unix socket (or, on Windows, is told that isn't supported), and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -87,7 +87,7 @@ export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP=""
+SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -98,6 +98,7 @@ cleanup() {
   stop_pid "$SOCKPID"
   stop_pid "$CONNTCP"
   stop_pid "$CONNUDP"
+  stop_pid "$CONNRDP"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
@@ -330,8 +331,8 @@ request("POST", "/password", {"csrf": csrf(request("GET", "/password")), "curren
 html = request("POST", "/account/tokens", {"csrf": csrf(request("GET", "/account")), "name": "smoke"})
 print(re.search(r'<pre class="term">([^<]+)</pre>', html).group(1))
 PYEOF
-MAGICPIPES_API_TOKEN=$("$PY" account.py localhost "$MGMT" "$CA" smoke@example.com "correct horse battery staple" "another horse battery staple" | tr -d '\r')
-export MAGICPIPES_API_TOKEN
+SMOKE_TOKEN=$("$PY" account.py localhost "$MGMT" "$CA" smoke@example.com "correct horse battery staple" "another horse battery staple" | tr -d '\r')
+export MAGICPIPES_API_TOKEN=$SMOKE_TOKEN
 "$MP" connect pdb --local 39521 --json > connect-tcp.out 2>&1 < /dev/null &
 CONNTCP=$!
 "$MP" connect pdns --local 39522 --json > connect-udp.out 2>&1 < /dev/null &
@@ -358,6 +359,25 @@ grep -q '"kind": "ssh"' cmd.out
 grep -q 'ssh -J localhost:39510 smoke-box' cmd.out
 "$PY" -c "import socket; s = socket.create_connection(('127.0.0.1', 39510), 5); s.settimeout(5); assert s.recv(32).startswith(b'SSH-2.0-')"
 run "$MP" remove smoke-box --json
+
+step "remote desktop"
+# Registered and checked through the agent, with the echo service standing in for Windows, and
+# reached with `magicpipes connect` as a Remote Desktop client would. The page in a browser is in
+# the end-to-end tests; this checks the release binary carries its client.
+run "$MP" add "$ECHO_TCP" --rdp --tag smoke --name smoke-pc --json --timeout 60
+grep -q '"kind": "rdp"' cmd.out
+grep -q '"visibility": "private"' cmd.out
+grep -q "\"public_url\": \"$MGMT_URL/desktop/smoke-pc\"" cmd.out
+run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt -o desktop-rdp.js "$MGMT_URL/assets/desktop/iron-remote-desktop-rdp.js"
+[[ $(wc -c < desktop-rdp.js) -gt 1000000 ]]
+MAGICPIPES_API_TOKEN=$SMOKE_TOKEN "$MP" connect smoke-pc --local 39523 --json > connect-rdp.out 2>&1 < /dev/null &
+CONNRDP=$!
+for _ in $(seq 1 100); do grep -q '"local"' connect-rdp.out && break; sleep 0.2; done
+cat connect-rdp.out | tee -a transcript.log
+run "$PY" ports.py tcp 39523 "smoke over a desktop"
+stop_pid "$CONNRDP"
+CONNRDP=""
+run "$MP" remove smoke-pc --json
 
 step "unix socket"
 if [[ -n "$WINDOWS" ]]; then

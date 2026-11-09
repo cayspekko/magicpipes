@@ -41,7 +41,7 @@ What you expose, and every way people can reach it:
 | Any UDP service | `add 53 --udp` | — | ✅ today (UDP); private: `magicpipes connect` | — | — |
 | SSH | `add 22 --ssh` | — | ✅ TCP (`add 22 --tcp`) | ✅ today | 🖥 terminal (server-side SSH client) |
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
-| RDP | `add 3389 --rdp` | — | ✅ TCP for native clients | — | 🖥 desktop (IronRDP) |
+| RDP | `add 3389 --rdp` | — | ✅ TCP (`add 3389 --tcp`); native clients through `magicpipes connect` | — | 🖥 desktop (IronRDP), today |
 | VNC | `add 5900 --vnc` | — | ✅ TCP | — | 🖥 desktop (noVNC) |
 
 `--host somehost` (and a `host:port` positional shorthand) works on every row except static
@@ -263,9 +263,9 @@ decide the design:
 * **Maturity:** everything is 0.x; the npm packages had one release in the last 12 months; 72
   open issues, among them a server-supplied desktop size allocated without a bound and quadratic
   clipboard handling.
-* **Fit here:** the crates now need Rust 1.94 and the 2024 edition; the server needs only the
-  small `ironrdp-rdcleanpath` (0.2.2 builds on 1.90) or its one DER message written here, and the
-  browser part would be vendored, built. The TLS step is a rustls client with ring that pins a
+* **Fit here:** the crates need Rust 1.94 and the 2024 edition, which the move to 1.99 covers; the
+  server needs only the small `ironrdp-rdcleanpath`, and the browser part is the npm build,
+  vendored (`mgmt/assets/desktop/README`). The TLS step is a rustls client with ring that pins a
   self-signed certificate. Licenses are MIT or Apache-2.0, but the npm packages carry no license
   files. The RDP package is one 6.1 MB JavaScript file with its WebAssembly (about 4.5 MB) inlined
   as base64, plus a 129 KB Svelte web component; built here, the `.wasm` could be served on its own.
@@ -314,7 +314,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in, email and `magicpipes connect` for private TCP and UDP tunnels done) |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
-| 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | planned |
+| 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | in progress (RDP desktops in the browser and through `magicpipes connect` done; VNC planned) |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |

@@ -43,6 +43,7 @@ portable-pty.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+ironrdp-rdcleanpath.workspace = true
 ring.workspace = true
 rusqlite.workspace = true
 base64.workspace = true

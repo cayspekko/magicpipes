@@ -5,5 +5,5 @@ LICENSE-lucide
     The license of the line icons in ../icons.rs and the copy and check icons in ../ui.js.
     Source: lucide-static 0.460.0 (https://github.com/lucide-icons/lucide), ISC.
     Icons: app-window, arrow-left, arrow-up-right, check, copy, download, ellipsis, folder, globe,
-    lock, plug, radio, terminal, triangle-alert. Only the paths are copied: the stroke width (1.5
+    lock, monitor, plug, radio, terminal, triangle-alert. Only the paths are copied: the stroke width (1.5
     instead of 2) and everything else about how they look comes from the UI's own styles.

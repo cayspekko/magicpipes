@@ -8,6 +8,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper_util::rt::TokioIo;
+use magicpipes_core::proto::Kind;
 use magicpipes_core::terminal;
 use magicpipes_core::theme::{GLYPH, STYLE};
 use tokio_tungstenite::WebSocketStream;
@@ -50,7 +51,7 @@ pub async fn page(user: UiUser, State(app): State<AppState>, Path(name): Path<St
 <meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>{name} · MagicPipes</title>
 <link rel="stylesheet" href="{ASSETS}/xterm.css"><style>{STYLE}{term_style}</style></head>
 <body data-access="login" data-ws="/terminal/{name}/ws">
-<header class="top"><div class="top-in"><h1 class="brand"><a href="/" aria-label="Back to your tunnels">{GLYPH}</a>{name}</h1>
+<header class="top"><div class="top-in"><h1 class="brand"><a href="/" aria-label="Back to your tunnels">{GLYPH}</a><span class="nm">{name}</span></h1>
 <div class="side"><span class="status" id="st" role="status">Not connected</span><span class="badge rw" id="mode">SSH</span></div></div></header>
 <main class="tm">
 <div class="cmd"><form class="login" id="login"><label for="ln">Log in as</label><input id="ln" type="text" name="login" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32" pattern="[A-Za-z0-9._][A-Za-z0-9._\-]*" placeholder="{guess}" required><button class="btn primary" id="ln-go">Connect</button></form><span class="hint">Your own session, as {email}</span></div>
@@ -93,7 +94,7 @@ pub async fn asset(Path(file): Path<String>) -> Response {
 
 /// Whether a request came from a page on this management host: browsers send `Origin` with
 /// every WebSocket, and a page elsewhere would otherwise get the session cookie sent along.
-fn same_origin(headers: &HeaderMap, management_url: &str) -> bool {
+pub(super) fn same_origin(headers: &HeaderMap, management_url: &str) -> bool {
     headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()).is_some_and(|o| o.eq_ignore_ascii_case(management_url))
 }
 
@@ -139,7 +140,9 @@ pub async fn socket(user: UiUser, State(app): State<AppState>, Path(name): Path<
 
 pub async fn forget_host_key(State(app): State<AppState>, Path(id): Path<String>, Posted(user, _): Posted<NoFields>) -> Response {
     let back = format!("/tunnels/{id}");
-    outcome(&user, app.control.forget_host_key(&user.who, &id), &back, "Tunnel", Done::HostKeyForgotten, "No host key is kept for that tunnel.")
+    let forgot = app.control.forget_host_key(&user.who, &id);
+    let what = if matches!(forgot, Ok(Some(Kind::Rdp))) { Done::CertificateForgotten } else { Done::HostKeyForgotten };
+    outcome(&user, forgot.map(|k| k.is_some()), &back, "Tunnel", what, "No host key or certificate is kept for that tunnel.")
 }
 
 /// What a machine needs to let people in from browser terminals, for the tunnel's page.

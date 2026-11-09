@@ -545,6 +545,46 @@ the sshd its own user configured, and older agents, Windows agents and `--host` 
 * **Tests:** `browser_ssh_terminal` logs in to a real sshd that trusts the authority; the ignored
   `browser_opens_an_ssh_terminal` types into it in headless Chrome.
 
+### Remote desktops (`add --rdp`, `data/desktop.rs`)
+
+IronRDP's browser client, from npm, vendored in `mgmt/assets/desktop/` (its README has versions and
+digests), on a page of the management site, `/desktop/{name}`. The client starts with RDCleanPath, the
+protocol Devolutions Gateway speaks: its first WebSocket message carries the RDP handshake's X.224
+request. The server opens an ordinary `ServerOpen::Data` stream to the agent, passes the request on,
+reads the machine's answer, completes TLS with the machine itself (a page can't), and answers with the
+X.224 reply and the machine's certificates. From then on the page's RDP travels unencrypted inside the
+WebSocket and the server re-encrypts it. So, as with browser terminals, the server reads browser
+sessions; `magicpipes connect` with a native client stays end to end. ROADMAP.md has why the stock
+client and not a fork that would keep the server to ciphertext.
+
+* **The agent changes nothing** beyond accepting the kind (protocol 7, IPC 9): it dials the target its
+  user configured, as for a TCP tunnel. RDP tunnels are always private and have no port on the server;
+  they're in `by_connect`, so `magicpipes connect` reaches them like a private TCP tunnel.
+* **Where to go** comes from the tunnel. The client's `destination` and `proxy_auth` are ignored
+  (the session cookie is the authentication), and a preconnection blob (Hyper-V's console) is refused.
+* **The machine's certificate** is checked against the first one seen: the SHA-256 of its public key
+  (so a certificate Windows renews for the same key still counts), in `ssh_host_keys` like SSH host
+  keys, kept through the reports queue and forgotten by a target change or by the owner. The TLS
+  client accepts any certificate otherwise, since Windows makes its own, but still checks handshake
+  signatures; no SNI, and no session resumption.
+* **Only TLS is spoken.** An X.224 answer choosing standard RDP security is refused; a negotiation
+  failure (NLA required and not offered, say) goes back to the client, which explains it.
+* **Checks** are the browser terminal's: the session cookie, `Origin`, `authorize(user, Connect,
+  tunnel)` before the WebSocket, and again on every publish with the sign-out-everywhere time.
+  Refusals reach the page as RDCleanPath errors with an HTTP status it turns into a sentence.
+* **Bounds:** 256 desktops, 8 per person (separate from terminals), the first message 16 KiB within
+  10 s, the machine's answer one TPKT packet of at most 1 KiB, 20 s to reach TLS, WebSocket messages
+  of 4 MiB, pings every 30 s.
+* **Threads:** like terminals, the handshake answers on the control threads and the session runs on the
+  traffic threads. Each message from the page is flushed through TLS at once, since a TLS stream holds
+  what the agent's stream couldn't take (`what_the_page_sends_reaches_the_machine_whole`).
+* **The page's CSP** adds `'wasm-unsafe-eval'` (the WebAssembly is inlined) and `data:` for
+  `connect-src` (the npm build fetches it from a `data:` URL) and for cursor images. It is its own
+  page, so the management UI's CSP stays as it was.
+* **Tests:** `rdp_desktops` runs a stand-in machine (X.224 answer, then TLS) and speaks RDCleanPath as
+  the client does. Nothing runs the WebAssembly client in CI; try a real Windows machine after
+  updating it.
+
 ## `magicpipes connect` (`data/connect.rs`)
 
 How a person reaches a private TCP or UDP tunnel from their own computer. The CLI listens there and,
@@ -595,9 +635,9 @@ tunnel, never an address.
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 6: 2 added the handshake and
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 7: 2 added the handshake and
   answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
-  and UDP tunnels). A peer without the header is
+  and UDP tunnels, 7 RDP tunnels). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,

@@ -12,6 +12,7 @@
 //! closed once the tunnel is gone or no longer admits them.
 
 pub mod connect;
+pub mod desktop;
 mod gate;
 pub mod ingress;
 mod io;
@@ -49,8 +50,9 @@ pub struct Route {
     pub access: AccessPolicy,
     /// Changes with the tunnel's settings, which retires its pooled connections.
     pub version: u64,
-    /// SSH tunnels: the host key its sshd showed the browser terminal first, if any yet.
-    pub ssh_host_key: Option<String>,
+    /// SSH and RDP tunnels: the key the machine showed first (its sshd's host key, or its RDP
+    /// certificate's public key), kept and required since; `None` before it's been seen.
+    pub host_key: Option<String>,
 }
 
 /// Who may use a route: the client's network first, then [`authz::authorize`]. The one check
@@ -118,7 +120,8 @@ pub struct RouteTable {
     pub by_port: HashMap<(Kind, u16), Arc<Route>>,
     /// SSH tunnels, by name.
     pub by_ssh: HashMap<String, Arc<Route>>,
-    /// Private TCP and UDP tunnels, which `magicpipes connect` reaches, by name.
+    /// Private TCP and UDP tunnels, which `magicpipes connect` reaches, and RDP tunnels, which it
+    /// and browser desktops do, by name.
     pub by_connect: HashMap<String, (Kind, Arc<Route>)>,
     /// Active users, by id, for private tunnels: who a tunnel cookie stands for now.
     pub users: HashMap<String, TunnelUser>,
@@ -220,6 +223,7 @@ pub struct DataPlane {
     /// The SSH certificate authority browser terminals log in with, when the gateway is on.
     ssh_ca: std::sync::OnceLock<Arc<russh::keys::PrivateKey>>,
     terminals: terminal::Limits,
+    desktops: terminal::Limits,
     /// `magicpipes connect` connections per person.
     connections: connect::Limits,
 }
@@ -246,6 +250,7 @@ impl DataPlane {
             ssh_fingerprint: std::sync::OnceLock::new(),
             ssh_ca: std::sync::OnceLock::new(),
             terminals: terminal::Limits::default(),
+            desktops: terminal::Limits::default(),
             connections: connect::Limits::default(),
         });
         // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in

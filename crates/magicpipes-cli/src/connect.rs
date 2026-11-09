@@ -1,4 +1,4 @@
-//! `magicpipes connect`: reach a private TCP or UDP tunnel from this computer, as yourself.
+//! `magicpipes connect`: reach a private TCP or UDP tunnel, or a remote desktop, from this computer, as yourself.
 //!
 //! It listens here and, for each local connection (TCP) or local client (UDP), makes an HTTPS
 //! connection to the server's management address and upgrades it with a connect pass
@@ -242,7 +242,8 @@ impl Link {
             let path = format!("{CONNECT_PATH}{name}");
             let (status, v) = https::call(&self.server, Method::GET, &path, &self.tls, Some(&pass), None).await.map_err(|e| crate::unreachable_server(&e))?;
             if status.is_success() {
-                let kind = serde_json::from_value::<Kind>(v["kind"].clone()).ok().filter(|k| k.has_port());
+                // An RDP tunnel is TCP to a Remote Desktop client.
+                let kind = serde_json::from_value::<Kind>(v["kind"].clone()).ok().filter(|k| k.has_port() || *k == Kind::Rdp);
                 let kind = kind.ok_or_else(|| ErrorInfo::new(ErrorCode::Protocol, "unexpected answer about the tunnel"))?;
                 return Ok((kind, v["online"].as_bool().unwrap_or(true)));
             }

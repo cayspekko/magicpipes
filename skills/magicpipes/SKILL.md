@@ -75,6 +75,13 @@ private, and `public_url` is the `ssh -J` command to give people. They also need
 account, and the machine's own `authorized_keys` still applies. `ssh_disabled` means the server has no
 gateway: tell the user, and don't fall back to `--tcp --allow-any` unless they ask.
 
+To open a Windows machine's Remote Desktop in the browser, use `magicpipes add 3389 --rdp --json`
+(with `--host <address>` for another machine on this network, and `--tag` for who may open it). It
+is always private, and `public_url` is the page that opens the desktop: people sign in there, then
+to Windows with its own account. Native Remote Desktop clients reach it through
+`magicpipes connect <name>`. Windows must have Remote Desktop turned on, or the `add` fails with
+`local_unreachable`. `server_outdated` means the server doesn't know RDP tunnels yet.
+
 ## Databases and other non-HTTP services
 
 `magicpipes add 5432 --tcp --json` (or `--udp`) publishes a raw port. With `--private` or `--tag`, and

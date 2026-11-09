@@ -40,6 +40,10 @@ pub struct TunnelView {
     /// SSH tunnels: the host key kept for the machine, once a browser terminal has seen one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_host_key: Option<String>,
+    /// RDP tunnels: the SHA-256 of the machine's certificate key, kept once a browser desktop has
+    /// seen it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rdp_certificate: Option<String>,
     /// `ready`, `pending` or `failed`; `none` for port tunnels.
     pub tls: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,7 +139,8 @@ impl ControlPlane {
             access: if t.row.visibility == Visibility::Private { st.tunnel_authz(t).access } else { Vec::new() },
             status,
             port_error,
-            ssh_host_key: st.host_keys.get(&t.row.id).cloned(),
+            ssh_host_key: st.host_keys.get(&t.row.id).filter(|_| t.row.kind == Kind::Ssh).cloned(),
+            rdp_certificate: st.host_keys.get(&t.row.id).filter(|_| t.row.kind == Kind::Rdp).cloned(),
             tls: cert.as_ref().map_or("none", CertStatus::label),
             tls_error: match cert {
                 Some(CertStatus::Failed(m)) => Some(m),

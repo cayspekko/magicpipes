@@ -55,7 +55,7 @@ impl From<SshKeyRow> for SshKeyView {
     }
 }
 
-/// A browser terminal someone may open (see `data::terminal`).
+/// A browser terminal or remote desktop someone may open (see `data::terminal`, `data::desktop`).
 #[derive(Debug, Clone)]
 pub struct TerminalTarget {
     pub user_id: String,
@@ -171,6 +171,11 @@ impl ControlPlane {
                                 me.audit_as(&user_id, "tunnel.connect", &tunnel_id, &format!("from {client}"));
                             }
                         }
+                        Some(Report::Desktop { user_id, tunnel_id, client }) => {
+                            if me.first_in_a_while(&mut seen, &format!("{user_id} desktop"), &tunnel_id) {
+                                me.audit_as(&user_id, "rdp.desktop", &tunnel_id, &format!("from {client}"));
+                            }
+                        }
                         None => return,
                     },
                 }
@@ -207,7 +212,7 @@ impl ControlPlane {
             return;
         }
         if self.store.keep_ssh_host_key(tunnel_id, fingerprint).or_log() == Some(true) {
-            tracing::info!(tunnel = %tunnel_id, %fingerprint, "kept the host key of an SSH tunnel's machine");
+            tracing::info!(tunnel = %tunnel_id, %fingerprint, "kept the host key of a tunnel's machine");
             st.host_keys.insert(tunnel_id.to_string(), fingerprint.to_string());
             self.publish(&st);
         }
@@ -226,6 +231,18 @@ impl ControlPlane {
         Some(TerminalTarget { user_id: id.clone(), email: st.dir.email(id)?.to_string(), tunnel_id: t.row.id.clone(), name: t.row.name.clone() })
     }
 
+    /// Who may open a remote desktop on the RDP tunnel `name`: a signed-in person who may reach it.
+    /// `None` otherwise, whatever the reason.
+    pub fn desktop(&self, who: &Principal, name: &str) -> Option<TerminalTarget> {
+        let Principal::User { id, .. } = who else { return None };
+        let st = self.state.lock().unwrap();
+        let t = st.tunnels.values().find(|t| t.row.name == name && t.row.kind == Kind::Rdp)?;
+        if !st.dir.agent_active(&t.row.agent_id) || !st.may(who, Action::Connect, t) {
+            return None;
+        }
+        Some(TerminalTarget { user_id: id.clone(), email: st.dir.email(id)?.to_string(), tunnel_id: t.row.id.clone(), name: t.row.name.clone() })
+    }
+
     /// The certificate authority's public key, as a line for sshd; `None` unless the gateway is on.
     pub fn ssh_ca(&self) -> Option<String> {
         self.data.ssh_ca_public()
@@ -233,19 +250,20 @@ impl ControlPlane {
 
     /// Forgets the host key kept for a tunnel's machine, for its owner or an administrator.
     /// Returns false if there's no such tunnel for them, or no key kept.
-    pub fn forget_host_key(&self, who: &Principal, id: &str) -> Result<bool, ErrorBody> {
+    /// Forgets the SSH host key or RDP certificate kept for a tunnel; says which kind it was.
+    pub fn forget_host_key(&self, who: &Principal, id: &str) -> Result<Option<Kind>, ErrorBody> {
         let mut st = self.state.lock().unwrap();
-        if !st.tunnels.get(id).is_some_and(|t| st.may(who, Action::Manage, t)) {
-            return Ok(false);
-        }
+        let Some(kind) = st.tunnels.get(id).filter(|t| st.may(who, Action::Manage, t)).map(|t| t.row.kind) else {
+            return Ok(None);
+        };
         if !self.store.forget_ssh_host_key(id).map_err(internal)? {
-            return Ok(false);
+            return Ok(None);
         }
         st.host_keys.remove(id);
         self.publish(&st);
         drop(st);
-        self.audit(who, "ssh.host_key.forget", id, "");
-        Ok(true)
+        self.audit(who, if kind == Kind::Rdp { "rdp.certificate.forget" } else { "ssh.host_key.forget" }, id, "");
+        Ok(Some(kind))
     }
 }
 

@@ -852,6 +852,49 @@ $ echo 'ann@example.com' >> ~/.ssh/authorized_principals
   their address there can take on an address an account lists, unless an account already has it.
 * Opened terminals appear in the audit log as `ssh.terminal`.
 
+### Remote desktop
+
+A Windows machine's Remote Desktop opens in the browser, from the server's management site, with
+nothing opened to the internet and nothing to install where you are:
+
+```console
+$ magicpipes add 3389 --rdp --name office-pc --tag team:dev
+Checking local service...     ✓
+Connecting to server...       ✓
+Registering tunnel...         ✓
+Checking tunnel...            ✓
+
+Tunnel ready
+
+  Desktop: https://mp.example.com:8443/desktop/office-pc
+  Local:   rdp://127.0.0.1:3389
+
+Tunnel active in background. Private: only you, people with team:dev can open it, after signing in here and then to Windows.
+Remote Desktop clients reach it with: magicpipes connect office-pc
+```
+
+**Open desktop**, in the Tunnels list and on the tunnel's page, asks for the Windows account and
+password, and shows the desktop in the page, sized to the window. Ctrl+Alt+Del and the Windows key
+have buttons of their own, since the browser keeps them.
+
+* **Turn on Remote Desktop** in Windows (Settings → System → Remote Desktop; Windows Pro or
+  Enterprise). The agent can run on that machine, or on another one with `--host` naming it.
+* **There are two locks.** MagicPipes lets in the people who share a tag with the tunnel, as for any
+  private tunnel; then Windows checks its own account and password. MagicPipes never keeps the
+  password.
+* **The server can read browser sessions**, as with terminals in the browser: it does the TLS step
+  with the machine for the browser, so the session is readable on the server. A Remote Desktop
+  client (`mstsc`, Windows App) through `magicpipes connect` stays end to end.
+* **The machine's certificate is kept** the first time a desktop opens, and a different one is
+  refused, since that would mean something is in between. After reinstalling Windows or changing
+  its certificate, the tunnel's owner forgets the old one on the tunnel's page.
+* **It's always private.** `--public` is refused. For a port anyone can reach, use `--tcp`.
+* **Access follows your account:** losing the tag, being disabled or signing out everywhere closes
+  the desktop. Each person may have 8 open.
+* **With a Remote Desktop client**, run `magicpipes connect office-pc --local 13389` and connect the
+  client to `127.0.0.1:13389` (see [Private ones](#private-ones-with-magicpipes-connect)).
+* Opened desktops appear in the audit log as `rdp.desktop`, once a minute per person and machine at most.
+
 ### TCP and UDP ports
 
 For anything that is not HTTP (databases, SSH, game servers, MQTT, DNS), `--tcp` or `--udp`
@@ -1081,7 +1124,7 @@ answer `403 forbidden` to members.
 | POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`, or for `connect` a `pass` and `expires_at`), `denied` or `expired` |
 | POST | `/api/v1/passes` | 201 `{"pass", "expires_at"}`: a connect pass for 15 minutes, for your API token's user (used by `connect`) |
 | POST | `/api/v1/passes/device` | Starts a browser-approved sign-in for `magicpipes connect`; body `{"machine"}` |
-| GET | `/api/v1/connect/{name}` | With a connect pass: `{"name", "kind", "online"}` for a private TCP or UDP tunnel you can reach, else 404; with `Upgrade: magicpipes-connect/1`, a connection to it (used by `connect`) |
+| GET | `/api/v1/connect/{name}` | With a connect pass: `{"name", "kind", "online"}` for a private TCP or UDP tunnel or a remote desktop you can reach, else 404; with `Upgrade: magicpipes-connect/1`, a connection to it (used by `connect`) |
 | GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |
 | POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
 | GET | `/api/v1/users/{id}` | One user |

@@ -37,9 +37,9 @@ use tokio_tungstenite::tungstenite::Message;
 use super::ssh::{Report, new_key, random};
 use super::{DataPlane, Route, RouteTable, ports};
 
-/// Open browser terminals, in all and per person.
+/// Open browser terminals, in all and per person; the same again for remote desktops.
 const MAX_TERMINALS: usize = 256;
-const MAX_PER_PERSON: usize = 8;
+pub(super) const MAX_PER_PERSON: usize = 8;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reaching the machine and logging in.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -76,7 +76,7 @@ impl Default for Limits {
 }
 
 impl Limits {
-    fn take(&self, user_id: &str) -> Option<Slot> {
+    pub(super) fn take(&self, user_id: &str) -> Option<Slot> {
         let permit = self.all.clone().try_acquire_owned().ok()?;
         let mut people = self.per_person.lock().unwrap_or_else(|e| e.into_inner());
         let n = people.entry(user_id.to_string()).or_insert(0);
@@ -88,7 +88,7 @@ impl Limits {
     }
 }
 
-struct Slot {
+pub(super) struct Slot {
     _permit: tokio::sync::OwnedSemaphorePermit,
     people: Arc<Mutex<HashMap<String, usize>>>,
     user_id: String,
@@ -228,13 +228,13 @@ async fn log_in(dp: &DataPlane, o: &Opening, login: &str, (cols, rows): (u32, u3
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let machine = Machine { kept: route.ssh_host_key.clone(), seen: seen.clone() };
+    let machine = Machine { kept: route.host_key.clone(), seen: seen.clone() };
     let connect = tokio::time::timeout(LOGIN_TIMEOUT, client::connect_stream(config, stream, machine));
     let mut handle = match connect.await {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             let shown = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let (Some(kept), Some(shown)) = (&route.ssh_host_key, shown)
+            if let (Some(kept), Some(shown)) = (&route.host_key, shown)
                 && *kept != shown
             {
                 tracing::warn!(tunnel = %o.tunnel_id, %kept, %shown, "browser terminal refused a changed host key");
@@ -268,7 +268,7 @@ async fn log_in(dp: &DataPlane, o: &Opening, login: &str, (cols, rows): (u32, u3
             ),
         ));
     }
-    if route.ssh_host_key.is_none()
+    if route.host_key.is_none()
         && let Some(fingerprint) = seen.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     {
         let _ = dp.ssh_reports.try_send(Report::HostKey { tunnel_id: route.tunnel_id.clone(), fingerprint });

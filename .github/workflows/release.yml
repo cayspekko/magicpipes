@@ -125,6 +125,9 @@ jobs:
           cp "$assets/LICENSE-addon-unicode11" "dist/$name/LICENSE-xterm-addon-unicode11"
           cp "$assets/LICENSE-nerd-fonts" "dist/$name/LICENSE-nerd-fonts"
           cp crates/magicpipes-server/src/mgmt/assets/LICENSE-lucide "dist/$name/LICENSE-lucide"
+          cp crates/magicpipes-server/src/mgmt/assets/desktop/LICENSE-ironrdp-MIT "dist/$name/LICENSE-ironrdp-MIT"
+          cp crates/magicpipes-server/src/mgmt/assets/desktop/LICENSE-ironrdp-APACHE "dist/$name/LICENSE-ironrdp-APACHE"
+          cp crates/magicpipes-server/src/mgmt/assets/desktop/LICENSE-svelte "dist/$name/LICENSE-svelte"
           cd dist
           if [[ "$TARGET" == *windows* ]]; then
             7z a -tzip -bso0 "$name.zip" "$name"

@@ -56,7 +56,9 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   can't read, so the agent checks this version first.
 /// * 6: private TCP and UDP tunnels, which people reach with `magicpipes connect`. An older server
 ///   refuses them, or ignores `visibility` and opens a public port, so the agent checks this first.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// * 7: RDP tunnels. [`RegisterTunnel`] may carry the kind [`Kind::Rdp`], which an older server
+///   can't read, so the agent checks this version first.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -126,6 +128,9 @@ pub enum Kind {
     Udp,
     /// A name on the server's SSH gateway (`ssh -J`). Protocol 5.
     Ssh,
+    /// A remote desktop: a machine's RDP port, opened in the browser through the server, or with
+    /// `magicpipes connect` for a native client. Protocol 7.
+    Rdp,
 }
 
 impl Kind {
@@ -144,6 +149,7 @@ impl Kind {
             Kind::Tcp => "tcp",
             Kind::Udp => "udp",
             Kind::Ssh => "ssh",
+            Kind::Rdp => "rdp",
         }
     }
 
@@ -153,6 +159,7 @@ impl Kind {
             "tcp" => Some(Kind::Tcp),
             "udp" => Some(Kind::Udp),
             "ssh" => Some(Kind::Ssh),
+            "rdp" => Some(Kind::Rdp),
             _ => None,
         }
     }
@@ -474,6 +481,10 @@ mod tests {
         let t: TunnelInfo =
             serde_json::from_str(r#"{"id":"tn","name":"db","hostname":"db.t","public_url":"magicpipes connect db","created":true,"kind":"tcp","visibility":"private"}"#).unwrap();
         assert_eq!((t.kind, t.public_port, t.visibility), (Kind::Tcp, None, Some(Visibility::Private)));
+        // Protocol 7: like SSH, an older peer can't read this kind.
+        let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pc","target":"x","kind":"rdp"}"#).unwrap();
+        assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Rdp, .. })));
+        assert!(serde_json::to_string(&Kind::Rdp).unwrap() == r#""rdp""# && Kind::parse("rdp") == Some(Kind::Rdp) && !Kind::Rdp.has_port() && !Kind::Rdp.is_http());
     }
 
     #[test]

@@ -54,6 +54,7 @@ done_messages! {
     SshKeyAdded "ssh-key-added" "SSH key added.",
     SshKeyDeleted "ssh-key-deleted" "SSH key deleted.",
     HostKeyForgotten "host-key-forgotten" "Host key forgotten. The next one the machine shows is kept.",
+    CertificateForgotten "certificate-forgotten" "Certificate forgotten. The next one the machine shows is kept.",
     PasswordChanged "password-changed" "Password changed. Other devices were signed out.",
     UserAdded "user-added" "User added. They replace that password when they first sign in.",
     UserAddedForProxy "user-added-proxy" "User added.",
@@ -233,6 +234,9 @@ fn display_url(url: &str) -> &str {
 
 /// The public address: a link for HTTP tunnels; `tcp://` and `udp://` are not browsable.
 fn public_address(t: &TunnelView, class: &str) -> String {
+    if t.kind == Kind::Rdp {
+        return format!(r#"<a class="{class}" href="{}">Open desktop</a>"#, esc(&super::desktop::href(&t.name)));
+    }
     if t.kind == Kind::Ssh && class.contains("sub") {
         return format!(
             r#"<code class="{class}">{}</code><a class="sub" href="{}">Open terminal</a>"#,
@@ -465,7 +469,12 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
     dl.push_str(&field("Machine", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
-    let change = r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--private</code>, <code>--public</code> or <code>--tag</code>.</p>"#;
+    // SSH and RDP tunnels are always private: only their tags change.
+    let change = if matches!(t.kind, Kind::Ssh | Kind::Rdp) {
+        r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--tag</code>.</p>"#
+    } else {
+        r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--private</code>, <code>--public</code> or <code>--tag</code>.</p>"#
+    };
     dl.push_str(&field("Who can open it", &format!("{}{change}", access_cell(t, people, false))));
     if t.kind.is_http() {
         dl.push_str(&field("TLS certificate", &badge(t.tls)));
@@ -488,6 +497,18 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
             ),
         };
         dl.push_str(&field("Machine's host key", &host_key));
+    } else if t.kind == Kind::Rdp {
+        dl.push_str(&field("Remote Desktop clients", &format!("<code>magicpipes connect {}</code>", esc(&t.name))));
+        let kept = match &t.rdp_certificate {
+            None => r#"<span class="sub">Kept the first time a remote desktop connects.</span>"#.to_string(),
+            Some(k) => format!(
+                r#"<code>{k}</code><form method="post" action="/tunnels/{id}/host-key/forget" data-confirm="Forget {name}'s certificate? The next one it shows is trusted, so only do this after reinstalling the machine or replacing its certificate.">{csrf}<button class="btn small spaced">Forget certificate</button></form>"#,
+                k = esc(k),
+                id = esc(&t.id),
+                name = esc(&t.name),
+            ),
+        };
+        dl.push_str(&field("Machine's certificate", &kept));
     }
     if let Some(e) = &t.tls_error {
         dl.push_str(&field("TLS error", &esc(e)));
@@ -629,6 +650,8 @@ fn shared_section(app: &AppState, user: &UiUser) -> String {
                 format!(r#"<a class="name" href="{0}" target="_blank" rel="noopener noreferrer">{1} {OPENS_ELSEWHERE}</a>"#, esc(&t.public_url), esc(display_url(&t.public_url)))
             } else if t.kind == Kind::Ssh {
                 format!(r#"<code>{}</code><a class="sub" href="{}">Open terminal</a>"#, esc(&t.public_url), esc(&super::terminal::href(&t.name)))
+            } else if t.kind == Kind::Rdp {
+                format!(r#"<a class="name" href="{}">Open desktop</a>"#, esc(&super::desktop::href(&t.name)))
             } else {
                 format!("<code>{}</code>", esc(&t.public_url))
             };

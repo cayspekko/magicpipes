@@ -757,6 +757,195 @@ async fn connect_reaches_private_port_tunnels() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// The first message of an RDP client, the X.224 connection request, asking for TLS and NLA.
+const RDP_REQUEST: [u8; 19] = [3, 0, 0, 19, 14, 0xe0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 3, 0, 0, 0];
+/// What Windows answers it with: NLA chosen.
+const RDP_CONFIRM: [u8; 19] = [3, 0, 0, 19, 14, 0xd0, 0, 0, 0x12, 0x34, 0, 2, 0x1f, 8, 0, 2, 0, 0, 0];
+
+/// A stand-in Remote Desktop server on `port` (0: any): it answers the X.224 connection request
+/// as Windows does, then TLS with a self-signed certificate for `key`, then echoes what comes
+/// through that. Returns its port, its certificate, and the task serving it.
+async fn rdp_stand_in(key: &rcgen::KeyPair, port: u16) -> (u16, Vec<u8>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cert = rcgen::CertificateParams::new(vec!["pc".into()]).unwrap().self_signed(key).unwrap();
+    let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into());
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key_der)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                // The agent's checks connect and close without a word.
+                let mut request = [0u8; RDP_REQUEST.len()];
+                if tcp.read_exact(&mut request).await.is_err() || request != RDP_REQUEST || tcp.write_all(&RDP_CONFIRM).await.is_err() {
+                    return;
+                }
+                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let mut buf = [0u8; 4096];
+                while let Ok(n @ 1..) = tls.read(&mut buf).await {
+                    if tls.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, cert.der().to_vec(), task)
+}
+
+async fn open_desktop(env: &Env, cookie: &str, name: &str, origin: Option<&str>) -> Result<Terminal, StatusCode> {
+    let tls = env.connect("localhost", env.mgmt_port).await;
+    let mut req = format!("wss://localhost:{}/desktop/{name}/ws", env.mgmt_port).into_client_request().unwrap();
+    req.headers_mut().insert(header::COOKIE, cookie.parse().unwrap());
+    let here = format!("https://localhost:{}", env.mgmt_port);
+    req.headers_mut().insert(header::ORIGIN, origin.unwrap_or(&here).parse().unwrap());
+    match tokio_tungstenite::client_async(req, tls).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Opens a desktop as IronRDP's browser client does: the RDCleanPath request, then the answer.
+async fn rdcleanpath(ws: &mut Terminal) -> ironrdp_rdcleanpath::RDCleanPath {
+    let request = ironrdp_rdcleanpath::RDCleanPathPdu::new_request(RDP_REQUEST.to_vec(), "anywhere.example:3389".into(), "token".into(), None).unwrap();
+    ws.send(Message::binary(request.to_der().unwrap())).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), ws.next()).await.expect("an answer").expect("open").unwrap() {
+            Message::Binary(b) => return ironrdp_rdcleanpath::RDCleanPathPdu::from_der(&b).unwrap().into_enum().unwrap(),
+            _ => continue,
+        }
+    }
+}
+
+/// What came back through the desktop's WebSocket, until `want`, or `None` once it closes.
+async fn desktop_echo(ws: &mut Terminal, want: &[u8]) -> Option<Vec<u8>> {
+    let mut seen = Vec::new();
+    while seen.len() < want.len() {
+        match tokio::time::timeout(Duration::from_secs(20), ws.next()).await.expect("an answer") {
+            Some(Ok(Message::Binary(b))) => seen.extend_from_slice(&b),
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
+            Some(Ok(_)) => {}
+        }
+    }
+    Some(seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdp_desktops() {
+    use ironrdp_rdcleanpath::RDCleanPath;
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:dev" })).await;
+    let mut ids = std::collections::HashMap::new();
+    for (email, tags) in [("ann@example.com", vec!["team:dev"]), ("bob@example.com", vec![])] {
+        let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), serde_json::json!({ "email": email, "password": "correct horse battery" })).await;
+        let id = v["user"]["id"].as_str().unwrap().to_string();
+        env.api_json("PATCH", &format!("/api/v1/users/{id}"), Some(&admin), serde_json::json!({ "tags": tags })).await;
+        ids.insert(email, id);
+    }
+    let (ann, bob) = (sign_in(&env, "ann@example.com", "correct horse battery").await, sign_in(&env, "bob@example.com", "correct horse battery").await);
+    let body = serde_json::json!({ "owner_user_id": ids["ann@example.com"] });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "anns-pc"]).await;
+
+    // Always private, and its address is the desktop's page.
+    let key = rcgen::KeyPair::generate().unwrap();
+    let (port, cert, machine) = rdp_stand_in(&key, 0).await;
+    let t = add_json(&env, &[&port.to_string(), "--rdp", "--name", "pc", "--tag", "team:dev"]).await;
+    assert_eq!((t["status"].as_str(), t["kind"].as_str(), t["visibility"].as_str()), (Some("ready"), Some("rdp"), Some("private")), "{t}");
+    assert_eq!(t["public_url"], format!("{url}/desktop/pc"));
+    let id = t["id"].as_str().unwrap().to_string();
+
+    // The page and its files, linked from the tunnel; Bob can't reach it.
+    let page = env.ui("/desktop/pc", Some(&ann), None).await;
+    assert!(page.status == 200 && page.html.contains(r#"data-ws="/desktop/pc/ws""#) && page.html.contains("<iron-remote-desktop"), "{}", page.html);
+    assert_eq!(env.ui("/desktop/pc", Some(&bob), None).await.status, StatusCode::NOT_FOUND);
+    let script = env.ui("/assets/desktop/page.mjs", None, None).await;
+    assert!(script.status == 200 && script.html.contains(r#"from "./iron-remote-desktop-rdp.js""#));
+    assert_eq!(env.ui("/assets/desktop/iron-remote-desktop-rdp.js", None, None).await.status, 200);
+    assert!(env.ui("/", Some(&ann), None).await.html.contains(r#"href="/desktop/pc""#));
+
+    // Only from this host's pages, and only for people who may reach the machine.
+    assert_eq!(open_desktop(&env, &ann, "pc", Some("https://evil.example")).await.err(), Some(StatusCode::FORBIDDEN));
+    assert_eq!(open_desktop(&env, &bob, "pc", None).await.err(), Some(StatusCode::NOT_FOUND));
+    assert_eq!(open_desktop(&env, &ann, "ghost", None).await.err(), Some(StatusCode::NOT_FOUND));
+
+    // RDCleanPath: the machine's answer and certificate, then RDP over its TLS, both ways.
+    let mut ws = open_desktop(&env, &ann, "pc", None).await.unwrap();
+    match rdcleanpath(&mut ws).await {
+        RDCleanPath::Response { x224_connection_response, server_cert_chain, .. } => {
+            assert_eq!(x224_connection_response.as_bytes(), RDP_CONFIRM);
+            assert_eq!(server_cert_chain.first().map(|c| c.as_bytes()), Some(&cert[..]));
+        }
+        other => panic!("{other:?}"),
+    }
+    ws.send(Message::binary(b"hello over rdp".to_vec())).await.unwrap();
+    assert_eq!(desktop_echo(&mut ws, b"hello over rdp").await.as_deref(), Some(&b"hello over rdp"[..]));
+    // Something that isn't RDCleanPath is turned away.
+    let mut junk = open_desktop(&env, &ann, "pc", None).await.unwrap();
+    junk.send(Message::binary(b"GET / HTTP/1.1\r\n\r\n".to_vec())).await.unwrap();
+    assert!(desktop_echo(&mut junk, b"x").await.is_none_or(|b| ironrdp_rdcleanpath::RDCleanPathPdu::from_der(&b).is_ok()));
+
+    // A Remote Desktop client gets there with `magicpipes connect`.
+    let token = api_token(&env, &ann).await;
+    let mut connect = env.cli_spawn(&["connect", "pc", "--api-token", &token, "--json"]);
+    let local = connect_port(&mut connect).await;
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", local)).await.unwrap();
+        c.write_all(&RDP_REQUEST).await.unwrap();
+        let mut answer = [0u8; RDP_CONFIRM.len()];
+        tokio::time::timeout(Duration::from_secs(20), c.read_exact(&mut answer)).await.unwrap().unwrap();
+        assert_eq!(answer, RDP_CONFIRM);
+    }
+    drop(connect);
+
+    // The machine's certificate was kept: shown another, the desktop is refused until its owner
+    // forgets the old one.
+    env.eventually("the certificate kept", Duration::from_secs(10), async || {
+        env.ui(&format!("/tunnels/{id}"), Some(&ann), None).await.html.contains("Forget certificate")
+    })
+    .await;
+    machine.abort();
+    let _ = machine.await;
+    let (_, other, _machine) = rdp_stand_in(&rcgen::KeyPair::generate().unwrap(), port).await;
+    let mut ws = open_desktop(&env, &ann, "pc", None).await.unwrap();
+    match rdcleanpath(&mut ws).await {
+        RDCleanPath::GeneralErr(e) => assert_eq!(e.http_status_code, Some(403), "{e:?}"),
+        other => panic!("{other:?}"),
+    }
+    let detail = env.ui(&format!("/tunnels/{id}"), Some(&ann), None).await;
+    let forget = env.ui(&format!("/tunnels/{id}/host-key/forget"), Some(&ann), Some(&[("csrf", &detail.csrf())])).await;
+    assert_eq!((forget.status, forget.location.as_deref()), (StatusCode::SEE_OTHER, Some(&*format!("/tunnels/{id}?done=certificate-forgotten"))));
+    let mut ws = open_desktop(&env, &ann, "pc", None).await.unwrap();
+    match rdcleanpath(&mut ws).await {
+        RDCleanPath::Response { server_cert_chain, .. } => assert_eq!(server_cert_chain.first().map(|c| c.as_bytes()), Some(&other[..])),
+        other => panic!("{other:?}"),
+    }
+
+    // Signing out everywhere ends it.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let account = env.ui("/account", Some(&ann), None).await;
+    env.ui("/account/logout-everywhere", Some(&ann), Some(&[("csrf", &account.csrf())])).await;
+    assert!(desktop_echo(&mut ws, b"anything").await.is_none(), "the desktop stayed open");
+
+    env.eventually("the audit log says who opened a desktop", Duration::from_secs(5), async || {
+        let audit = env.api("GET", "/api/v1/audit", Some(&admin)).await.1.to_string();
+        audit.contains("rdp.desktop") && audit.contains("rdp.certificate.forget")
+    })
+    .await;
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn port_tunnels() {
     let mut env = Env::new(Tls::DevCa).await;

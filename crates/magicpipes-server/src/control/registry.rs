@@ -56,8 +56,8 @@ impl ControlPlane {
                     "this machine's tunnels are private by default, which this version of magicpipes doesn't support; upgrade magicpipes on it",
                 ));
             }
-            // The gateway only lets people in through a tag.
-            (None, None) if req.kind == Kind::Ssh => (Visibility::Private, Vec::new()),
+            // The gateway and remote desktops only let people in through a tag.
+            (None, None) if matches!(req.kind, Kind::Ssh | Kind::Rdp) => (Visibility::Private, Vec::new()),
             // Agents from before private ports ask for an allow-list (or anyone) with every new port,
             // which they open to the public; and an allow-list is only for a public port.
             (None, None) if req.kind.has_port() && (protocol < 6 || !req.allow.is_empty()) => (Visibility::Public, Vec::new()),
@@ -79,6 +79,9 @@ impl ControlPlane {
         match visibility {
             Visibility::Public if req.kind == Kind::Ssh => {
                 return Err(err(ErrorCode::InvalidRequest, "SSH tunnels are always private. For a port anyone can reach, use --tcp"));
+            }
+            Visibility::Public if req.kind == Kind::Rdp => {
+                return Err(err(ErrorCode::InvalidRequest, "RDP tunnels are always private. For a port anyone can reach, use --tcp"));
             }
             Visibility::Public if members_may_not => {
                 return Err(err(ErrorCode::PublicNotAllowed, "members' machines may only publish private tunnels on this server"));
@@ -125,7 +128,7 @@ impl ControlPlane {
             Some(h) => Some(h.trim().trim_end_matches('.').to_ascii_lowercase()),
         };
         match req.kind {
-            Kind::Http | Kind::Ssh if req.remote_port.is_some() || !allow.is_empty() => {
+            Kind::Http | Kind::Ssh | Kind::Rdp if req.remote_port.is_some() || !allow.is_empty() => {
                 return Err(err(ErrorCode::InvalidRequest, "a remote port and an allow-list apply only to TCP and UDP tunnels"));
             }
             Kind::Ssh if self.cfg.ssh.is_none() => {
@@ -188,8 +191,8 @@ impl ControlPlane {
                     format!("tunnel '{}' is a {} tunnel; remove it first to make it {}", row.name, row.kind, req.kind),
                 ));
             }
-            // Another machine (`--host`) has its own host key.
-            if row.kind == Kind::Ssh && row.target != target && st.host_keys.remove(&id).is_some() {
+            // Another machine (`--host`) has its own host key, or certificate.
+            if matches!(row.kind, Kind::Ssh | Kind::Rdp) && row.target != target && st.host_keys.remove(&id).is_some() {
                 self.store.forget_ssh_host_key(&id).map_err(internal)?;
             }
             row.target = target;
@@ -337,6 +340,7 @@ impl ControlPlane {
                 None => row.name.clone(),
             },
             (Kind::Tcp | Kind::Udp, None) => format!("magicpipes connect {}", row.name),
+            (Kind::Rdp, _) => format!("{}/desktop/{}", self.cfg.management_url(), row.name),
             (Kind::Http, _) => self.cfg.public_url(&row.hostname),
             (kind, Some(port)) => self.cfg.port_url(kind, port),
         }

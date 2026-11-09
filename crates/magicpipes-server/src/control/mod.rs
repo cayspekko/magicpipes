@@ -282,14 +282,18 @@ impl ControlPlane {
                 }
             };
             let access = AccessPolicy { allow, authz: st.tunnel_authz(t) };
-            let ssh_host_key = st.host_keys.get(&t.row.id).cloned();
-            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access, version: t.version, ssh_host_key });
+            let host_key = st.host_keys.get(&t.row.id).cloned();
+            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access, version: t.version, host_key });
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {
                     table.by_host.insert(t.row.hostname.clone(), route);
                 }
                 (Kind::Ssh, _) => {
                     table.by_ssh.insert(t.row.name.clone(), route);
+                }
+                // In the browser, and through `magicpipes connect` for a native client.
+                (Kind::Rdp, _) => {
+                    table.by_connect.insert(t.row.name.clone(), (Kind::Rdp, route));
                 }
                 // The [ports] range may have been narrowed or removed since: then the port stays
                 // closed (the tunnel shows as offline) rather than reopening outside it.

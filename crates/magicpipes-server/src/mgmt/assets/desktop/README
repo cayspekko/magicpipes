@@ -1,0 +1,20 @@
+The remote desktop page's client: IronRDP's browser client, MIT OR Apache-2.0 (LICENSE-ironrdp-MIT,
+LICENSE-ironrdp-APACHE, copied from the ironrdp-rdcleanpath crate). Source: https://github.com/Devolutions/IronRDP.
+
+iron-remote-desktop.js
+    @devolutions/iron-remote-desktop 0.11.0 from the npm registry, unchanged (sha256 22359dfb201017ebf7f25c2e496dbbfd1668bcad1a34d0dabfd05a968e1aa50f).
+    The <iron-remote-desktop> web component. It bundles the Svelte 5 runtime, MIT licensed
+    (LICENSE-svelte: LICENSE.md from the svelte 5.55.9 npm package, the last 5.x release before this
+    one was published, integrity checked against the registry).
+
+iron-remote-desktop-rdp.js
+    @devolutions/iron-remote-desktop-rdp 0.7.0 from the npm registry, unchanged (sha256 b008f0e258fd9485c6f2b07747116d4fcbbe51053ce995abd048fb2b79636332).
+    The RDP session itself: Rust compiled to WebAssembly, inlined as base64, so the page needs
+    'wasm-unsafe-eval' and connect-src data: in its CSP (../../desktop.rs).
+
+page.mjs
+    Ours: connects the component to /desktop/{name}/ws with the name and password typed into the page.
+
+The server side of the protocol the client speaks to us, RDCleanPath, is the ironrdp-rdcleanpath crate
+(0.2.2), whose version matches these packages. When updating them, update it in the same change and
+run the rdp_desktops e2e test and a real Windows machine through the page.
