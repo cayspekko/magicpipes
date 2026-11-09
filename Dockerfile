@@ -4,7 +4,7 @@
 # Run:   FROM scratch with just the binaries, a CA bundle (ACME needs to verify the CA's
 #        HTTPS endpoint) and a writable /data owned by an unprivileged user.
 
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.99
 
 FROM rust:${RUST_VERSION}-alpine AS build
 # C toolchain for ring and bundled SQLite; ca-certificates is copied into the final image.

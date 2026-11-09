@@ -167,7 +167,7 @@ async fn handle(site: &Site, req: Request<Incoming>) -> Response<Body> {
         let names = match selection(req).await {
             Ok(n) if !n.is_empty() => n,
             Ok(_) => return text(StatusCode::BAD_REQUEST, "nothing selected\n"),
-            Err(resp) => return resp,
+            Err((status, msg)) => return text(status, msg),
         };
         return archive_response(&site.root, opened.path, &folder, names);
     }
@@ -208,15 +208,15 @@ fn has_flag(query: &str, key: &str) -> bool {
     query.split('&').any(|p| p.split('=').next() == Some(key))
 }
 
-/// Reads the `f` fields of a posted selection form.
-async fn selection(req: Request<Incoming>) -> Result<Vec<String>, Response<Body>> {
+/// Reads the `f` fields of a posted selection form; the status and message for an error.
+async fn selection(req: Request<Incoming>) -> Result<Vec<String>, (StatusCode, &'static str)> {
     let body = Limited::new(req.into_body(), MAX_FORM)
         .collect()
         .await
-        .map_err(|_| text(StatusCode::PAYLOAD_TOO_LARGE, "selection too large\n"))?
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "selection too large\n"))?
         .to_bytes();
-    let body = std::str::from_utf8(&body).map_err(|_| text(StatusCode::BAD_REQUEST, "invalid form\n"))?;
-    parse_selection(body).map_err(|(status, msg)| text(status, msg))
+    let body = std::str::from_utf8(&body).map_err(|_| (StatusCode::BAD_REQUEST, "invalid form\n"))?;
+    parse_selection(body)
 }
 
 /// The distinct `f` fields of a selection form, in order.

@@ -68,7 +68,7 @@ Or build from source:
 cargo build --release
 ```
 
-This produces `target/release/magicpipesd` and `target/release/magicpipes` (Rust 1.90+, no
+This produces `target/release/magicpipesd` and `target/release/magicpipes` (Rust 1.99+, no
 system dependencies; SQLite is bundled).
 
 ### Configure and start
@@ -472,7 +472,7 @@ files, and pass it with `--config`; its providers are then locked on that server
 
 ### Docker
 
-The [`Dockerfile`](Dockerfile) builds static musl binaries in `rust:1.90-alpine` and copies
+The [`Dockerfile`](Dockerfile) builds static musl binaries in `rust:1.99-alpine` and copies
 them into a `FROM scratch` image (~30 MB). The image contains only both binaries, a CA bundle
 (ACME has to verify the CA's HTTPS endpoint) and `/data`. It runs as UID 65532.
 
@@ -1171,7 +1171,7 @@ release is published:
 
 To publish, create a GitHub release with a tag such as `v0.2.0` on a commit from `main`. The
 workflow refuses tags that aren't on `main`, and warns if the tag doesn't match the `version`
-in `Cargo.toml` (bump that first so `--version` is right). The toolchain is pinned to Rust 1.90.
+in `Cargo.toml` (bump that first so `--version` is right). The toolchain is pinned to Rust 1.99.
 To check builds without releasing, run `cargo test --workspace` and `scripts/smoke-test.sh`
 locally.
 

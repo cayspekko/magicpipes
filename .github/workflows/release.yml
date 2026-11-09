@@ -17,7 +17,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-# The toolchain is pinned (dtolnay/rust-toolchain@1.90) to the workspace rust-version and the
+# The toolchain is pinned (dtolnay/rust-toolchain@1.99) to the workspace rust-version and the
 # Dockerfile, so new compiler or clippy releases never break a release build.
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@1.99
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -75,7 +75,7 @@ jobs:
             echo "::warning::Tag ${GITHUB_REF_NAME} does not match the Cargo version ${version}; binaries report ${version}."
           fi
 
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@1.99
         with:
           targets: ${{ matrix.target }}
 

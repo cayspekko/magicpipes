@@ -253,7 +253,7 @@ struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
     fn take(count: &Arc<AtomicUsize>, max: u16) -> Option<Self> {
-        count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < usize::from(max)).then_some(n + 1)).ok()?;
+        count.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < usize::from(max)).then_some(n + 1)).ok()?;
         Some(Self(count.clone()))
     }
 }

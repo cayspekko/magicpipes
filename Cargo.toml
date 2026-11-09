@@ -5,7 +5,7 @@ members = ["crates/magicpipes-core", "crates/magicpipes-server", "crates/magicpi
 [workspace.package]
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.99"
 license = "MIT"
 # Built and released as binaries; nothing here is published to crates.io.
 publish = false

@@ -19,7 +19,7 @@ cargo test --locked --workspace
 cargo deny check
 ```
 
-- The toolchain is pinned to Rust 1.90 (workspace `rust-version`, CI, Dockerfile). Don't use
+- The toolchain is pinned to Rust 1.99 (workspace `rust-version`, CI, Dockerfile). Don't use
   newer language or library features.
 - `tests/e2e.rs` runs a real server, agent and apps on localhost and is Unix-only. New
   user-visible behavior gets an e2e test; parsing and validation get unit tests next to the code.
