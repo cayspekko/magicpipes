@@ -76,7 +76,10 @@ BENCH_WAN_MB=12 scripts/bench/compare.sh --suite wan base new
 scripts/bench/wan.sh off
 ```
 
-Take downloads that last a few seconds: `BENCH_WAN_MB` is 64 by default, for 100 Mbit/s.
+Take downloads that last a few seconds: `BENCH_WAN_MB` is 64 by default, for 100 Mbit/s. A fifth
+argument drops packets (`wan.sh on 20mbit 15ms 200 0.5%`): a lost packet stalls its connection
+until it's sent again, which is where an agent's several connections differ from one. The agent's
+connections share the shaped link and its queue, as they would a home router's.
 
 ## Measuring something new
 

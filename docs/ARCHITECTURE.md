@@ -210,7 +210,11 @@ its own (`agent/session.rs` "lanes"; `control/sessions.rs` `Link`; `data::AgentL
   small requests during downloads 3.6 ms to 0.45 ms, but small requests at 64 and 150 clients -5%
   and CPU per request +8% (server) and +12% (agent), since each connection batches only its share of
   the frames. Two connections gave about half the gains (Linux: downloads +33%, raw ports +51%,
-  small requests during downloads 0.89 ms), so the default is 4.
+  small requests during downloads 0.89 ms), so the default is 4. Over a shaped link (`wan` suite,
+  20 Mbit/s, 15 ms each way, a 200-packet queue shared by all the connections, as a home router's
+  would be): a small request during a download 339 ms to 207 ms; with 0.5% of packets lost, 358 ms
+  to 34 ms (about the bare round trip), since a lost packet stalls only its own connection, and
+  small requests from 16 clients +7%. Single downloads and requests alone were the same.
 * **Tests:** `streams_go_where_an_agents_connections_have_room` (placement, waiting across
   connections), `an_agents_connections_stay_together_up_to_a_limit` (joining, the limit,
   replacing), `several_connections_carry_more_than_one_can` (300 requests held open: 224 with one
