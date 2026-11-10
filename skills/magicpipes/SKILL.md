@@ -63,6 +63,10 @@ present a URL. Act on the code:
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
 
+`magicpipes status --json` says how many connections the agent holds to the server
+(`connections`, 4 normally). If the user's service sees `agent_busy` under heavy load, a gateway
+agent can hold up to 8 (`MAGICPIPES_CONNECTIONS=8` in its environment) if the server allows them.
+
 If the app only speaks HTTPS with its own certificate (Proxmox on 8006, a NAS, a router), add
 `--local-https`: the agent speaks TLS to it and keeps the certificate it shows (`local_certificate`
 in the result). If requests later fail with `local_unreachable` because the app got a new

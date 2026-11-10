@@ -290,7 +290,7 @@ async fn personal_tags_and_access() {
     f.cp.update_user(&admin, &ann.id, None, Some(true)).unwrap();
     assert!(f.data.lookup(&app.hostname).is_none());
     let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
-    assert!(f.cp.attach_session(&laptop, handle, "127.0.0.1:1".parse().unwrap(), 2).is_none());
+    assert_eq!(f.cp.attach_session(&laptop, handle, "127.0.0.1:1".parse().unwrap(), 2, None), super::Attached::Revoked);
 }
 
 #[tokio::test]
@@ -390,7 +390,7 @@ async fn registration_respects_the_enrollment() {
     // neither a private tunnel it would time out on nor a public one.
     let old = f.agent("old");
     let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
-    f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 2).unwrap();
+    assert!(matches!(f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 2, None), super::Attached::Yes(_)));
     assert!(f.cp.register(&old, &http("legacy")).unwrap_err().is(ErrorCode::AgentOutdated));
 }
 
@@ -536,7 +536,7 @@ async fn a_private_port_tunnel_has_no_port() {
     // can't have a private one.
     let old = f.agent("old");
     let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
-    f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 5).unwrap();
+    assert!(matches!(f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 5, None), super::Attached::Yes(_)));
     f.cp.unregister(&agent, &f.cp.register(&agent, &listed).unwrap().id).unwrap();
     let_go(port).await;
     assert_eq!(f.cp.register(&old, &RegisterTunnel { visibility: None, ..public_port("legacy") }).unwrap().visibility, Some(Visibility::Public));
@@ -722,4 +722,59 @@ async fn the_mail_servers_password_stays_in_a_private_file() {
     f.cp.save_smtp(&admin, &row, secret).unwrap();
     assert!(f.cp.delete_smtp(&admin).unwrap() && !path.exists() && !f.cp.mail_on());
     assert!(!f.cp.delete_smtp(&admin).unwrap());
+}
+
+/// An agent's connections from one run stay together, up to the limit; another run's, or an agent's
+/// from before protocol 9, replace them; and losing one leaves the agent online on the others.
+#[tokio::test]
+async fn an_agents_connections_stay_together_up_to_a_limit() {
+    use magicpipes_core::mux::{self, Mode};
+    use super::Attached;
+    let f = fixture();
+    let max = f.cp.cfg.agents.max_connections;
+    let a = f.agent("multi");
+    let t = f.cp.register(&a, &http("multi")).unwrap();
+    let mut peers = Vec::new();
+    let mut connect = |instance: Option<&str>| {
+        let (x, y) = tokio::io::duplex(1 << 16);
+        let (handle, _) = mux::spawn(x, Mode::Server);
+        peers.push(mux::spawn(y, Mode::Client));
+        let attached = f.cp.attach_session(&a, handle.clone(), "127.0.0.1:1".parse().unwrap(), 9, instance.map(str::to_string));
+        (handle, attached)
+    };
+    let connections = || f.cp.agents(&Principal::AdminToken).into_iter().find(|v| v.id == a).unwrap().connections;
+    let online = || f.data.lookup(&t.hostname).unwrap().agent.as_ref().is_some_and(|l| l.is_online());
+    const RUN: &str = "run-one-aaaaaaaaaaaa";
+
+    let mut lanes = Vec::new();
+    for _ in 0..max {
+        let (handle, attached) = connect(Some(RUN));
+        let Attached::Yes(conn_id) = attached else { panic!("{attached:?}") };
+        lanes.push((handle, conn_id));
+    }
+    assert_eq!(connections(), max);
+    assert!(!f.cp.has_room(&a, Some(RUN)), "the run is full");
+    assert!(f.cp.has_room(&a, Some("run-two-bbbbbbbbbbbb")) && f.cp.has_room(&a, None), "another run would replace it");
+    assert_eq!(connect(Some(RUN)).1, Attached::Full);
+    assert!(lanes.iter().all(|(h, _)| !h.is_closed()), "a refused connection closes none of the others");
+
+    // Losing one of them leaves the agent online on the rest.
+    let (first, conn_id) = lanes.remove(0);
+    first.close();
+    f.cp.detach_session(&a, conn_id);
+    assert_eq!(connections(), max - 1);
+    assert!(online());
+    assert!(f.cp.has_room(&a, Some(RUN)), "and its place is free again");
+
+    // A restarted agent's connection replaces the old run's.
+    let (second_run, attached) = connect(Some("run-two-bbbbbbbbbbbb"));
+    assert!(matches!(attached, Attached::Yes(_)));
+    assert!(lanes.iter().all(|(h, _)| h.is_closed()), "the old run's connections are closed");
+    assert_eq!(connections(), 1);
+    // So does a connection from an agent before protocol 9, which sends no instance.
+    let (_legacy, attached) = connect(None);
+    assert!(matches!(attached, Attached::Yes(_)));
+    assert!(second_run.is_closed());
+    assert_eq!(connections(), 1);
+    assert!(online());
 }

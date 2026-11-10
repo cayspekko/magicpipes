@@ -519,6 +519,10 @@ pub struct AgentsConfig {
     pub max_new_certificates_per_day: usize,
     /// Lifetime of enrollment tokens created by `magicpipesd enroll` / the UI.
     pub enrollment_ttl_secs: u64,
+    /// Connections one agent may hold at once (1 to 8): each carries up to 224 streams, and may
+    /// have up to 128 MiB of data on its way to the server. An agent asking for more goes on with
+    /// these.
+    pub max_connections: usize,
 }
 
 impl Default for AgentsConfig {
@@ -529,6 +533,7 @@ impl Default for AgentsConfig {
             max_ports_per_agent: 10,
             max_new_certificates_per_day: 20,
             enrollment_ttl_secs: 3600,
+            max_connections: 4,
         }
     }
 }
@@ -717,6 +722,9 @@ impl Config {
         }
         if self.management.cert_file.is_some() != self.management.key_file.is_some() {
             bail!("management.cert_file and management.key_file must be set together");
+        }
+        if !(1..=magicpipes_core::proto::MAX_CONNECTIONS).contains(&self.agents.max_connections) {
+            bail!("agents.max_connections must be between 1 and {}", magicpipes_core::proto::MAX_CONNECTIONS);
         }
         if self.tls.mode == TlsMode::Files && (self.tls.cert_file.is_none() || self.tls.key_file.is_none()) {
             bail!("tls.mode = \"files\" requires tls.cert_file and tls.key_file");

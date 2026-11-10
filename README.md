@@ -1121,7 +1121,7 @@ header, so a script can tell them from the application's own answers:
 | 502 | `agent_offline` | The machine serving the tunnel isn't connected |
 | 502 | `tunnel_inactive` | The agent no longer serves this tunnel |
 | 502 | `local_unreachable`, `upstream_error`, `bad_upstream` | The application couldn't be reached, broke off, or sent an invalid answer |
-| 503 | `agent_busy` | The tunnel is handling too many connections; try again shortly |
+| 503 | `agent_busy` | The agent's connections are all full (224 each), or this visitor has 64 open; try again shortly |
 | 504 | `upstream_timeout` | The application didn't answer in time |
 
 ### Run the agent under a service manager
@@ -1138,6 +1138,22 @@ WantedBy=default.target
 The CLI talks to whichever agent holds the lock: a supervised `agent run` and CLI-started
 agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
+### Connections to the server
+
+The agent holds 4 connections to the server, and the server spreads its tunnels' traffic across
+them. Each carries up to 224 requests or connections at once, so an agent carries up to 896; one
+visitor (an address, or a /64 for IPv6) still gets at most 64 of them. If one connection drops, the
+others go on serving while it reconnects. `magicpipes status` shows how many are open.
+
+* **More or fewer:** `MAGICPIPES_CONNECTIONS=8` in the agent's environment (for a container or a
+  service), or `"connections": 8` in `config.json`; 1 to 8. A busy gateway wants more, a laptop is
+  fine with the default.
+* **The server decides how many it keeps** (`agents.max_connections`, 4 by default, 8 at most),
+  since each may hold up to 128 MiB on its way to the server. An agent asking for more goes on with
+  what's allowed.
+* An agent opens more than one only to a server that keeps them together (`magicpipesd` with
+  protocol 9). Older servers get one, as before.
+
 ### Local files and environment
 
 | | |
@@ -1147,6 +1163,7 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 | `MAGICPIPES_TOKEN` | Enrollment token for `login` |
 | `MAGICPIPES_API_TOKEN` | API token for `connect`, instead of signing in in a browser |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |
+| `MAGICPIPES_CONNECTIONS` | Connections the agent holds to the server, 1 to 8 (default 4, or `connections` in `config.json`) |
 | `MAGICPIPES_PROBE_ADDR` | Testing: connect readiness probes to this IP instead of resolving DNS |
 
 ---
@@ -1164,7 +1181,7 @@ answer `403 forbidden` to members.
 | GET | `/api/v1/tunnels` | `{"tunnels": [...]}` |
 | GET | `/api/v1/tunnels/{id or name}` | One tunnel |
 | DELETE | `/api/v1/tunnels/{id or name}` | 204; the owning agent is notified and stops serving it; 404 if absent |
-| GET | `/api/v1/agents` | Enrolled agents and connection state |
+| GET | `/api/v1/agents` | Enrolled agents and connection state (`connections`: how many are open) |
 | DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
 | POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "allow_public"?, "default_private"?}`; `tags` only for a service agent (no owner). Members may enroll only their own machines |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |

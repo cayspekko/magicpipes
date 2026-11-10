@@ -74,3 +74,8 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # The SSH gateway (`magicpipes add 22 --ssh`, `ssh -J`). Also publish the port in docker-compose.yml.
 # [ssh]
 # listen = "0.0.0.0:2222"
+
+# Connections one agent may hold at once (1 to 8; agents ask for 4). Each carries up to 224 streams
+# and may have up to 128 MiB of data on its way here.
+# [agents]
+# max_connections = 4

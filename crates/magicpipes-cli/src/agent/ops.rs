@@ -584,6 +584,7 @@ impl Agent {
             "connected_since": connected_since,
             "reconnect_attempt": reconnect_attempt,
             "server_protocol": server_protocol,
+            "connections": self.session.connections(),
             "last_error": err,
             "tunnels": self.tunnels.len(),
         })

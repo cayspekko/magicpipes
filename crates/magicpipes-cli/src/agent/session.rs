@@ -1,7 +1,13 @@
-//! Agent control path: keeps one authenticated session to the server, reconnects with
-//! exponential backoff, restores registrations after every (re)connect and offers RPCs.
+//! Agent control path: keeps authenticated sessions to the server, reconnects with exponential
+//! backoff, restores registrations after every reconnect and offers RPCs.
+//!
+//! The agent holds several connections ("lanes", [`DEFAULT_CONNECTIONS`] unless configured), each a
+//! session of its own: the server spreads streams across them, and losing one leaves the others
+//! serving while it reconnects. They're equal: any carries RPCs, each pings and reconnects by itself.
+//! Only the first connects before the server is known to keep an agent's connections together
+//! (protocol 9); an older one would let each new connection replace the last.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -12,8 +18,8 @@ use hyper_util::rt::TokioIo;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::{self, Mode, MuxHandle, MuxStream};
 use magicpipes_core::proto::{
-    self, AGENT_CONNECT_PATH, PROTOCOL_HEADER, PROTOCOL_VERSION, RegisterTunnel, Request as Rpc, Response as RpcResponse,
-    UPGRADE_PROTOCOL, Visibility,
+    self, AGENT_CONNECT_PATH, CONNECTIONS_PROTOCOL, INSTANCE_HEADER, MAX_CONNECTIONS, PROTOCOL_HEADER, PROTOCOL_VERSION, RegisterTunnel,
+    Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL, Visibility,
 };
 use rustls::ClientConfig;
 use tokio::io::AsyncWriteExt;
@@ -31,6 +37,23 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A session that lasted this long resets the reconnect backoff; a shorter one (the server closing
 /// it at once, say, or another machine with the same credentials) keeps it growing.
 const STABLE_SESSION: Duration = Duration::from_secs(30);
+/// Connections held to a server that keeps them together, unless `MAGICPIPES_CONNECTIONS` or
+/// `connections` in config.json says otherwise.
+pub const DEFAULT_CONNECTIONS: usize = 4;
+
+/// Whether lane `lane` may connect, given the protocol of the server the latest connection reached
+/// (0 before any): the first always may; the others only to a server that keeps an agent's
+/// connections together, since an older one lets each new connection replace the last.
+fn may_connect(lane: usize, reached: u32) -> bool {
+    lane == 0 || reached >= CONNECTIONS_PROTOCOL
+}
+
+/// How many connections to hold: the environment's choice, else the configuration's, else the
+/// default; always between 1 and [`MAX_CONNECTIONS`].
+pub fn connections_wanted(configured: Option<u8>, env: Option<&str>) -> usize {
+    let asked = env.and_then(|v| v.trim().parse::<usize>().ok()).or(configured.map(usize::from)).unwrap_or(DEFAULT_CONNECTIONS);
+    asked.clamp(1, MAX_CONNECTIONS)
+}
 
 #[derive(Clone, Debug)]
 pub enum ConnState {
@@ -49,6 +72,15 @@ pub struct Session {
     /// Held while registering a tunnel (`add`, and restoring after a reconnect), so the two never
     /// interleave and an older copy of a tunnel's settings can't overwrite a newer one.
     pub register_lock: tokio::sync::Mutex<()>,
+    /// Sent on every connection, so the server keeps this run's together: random per run.
+    instance: String,
+    /// The open connection of each lane.
+    lanes: Mutex<Vec<Option<MuxHandle>>>,
+    /// The protocol of the server the latest connection reached (0 before any): lanes past the
+    /// first wait for one that keeps connections together.
+    reached: watch::Sender<u32>,
+    /// Re-registering the tunnels after the agent was offline; stopped if it goes offline again.
+    restoring: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug)]
@@ -72,7 +104,23 @@ impl Session {
     pub fn new(cfg: AgentConfig, tunnels: Arc<Tunnels>) -> anyhow::Result<Arc<Self>> {
         let tls = https::tls_config(cfg.ca_cert_pem.as_deref())?;
         let (state, _) = watch::channel(ConnState::Connecting { attempt: 0, last_error: None });
-        Ok(Arc::new(Self { cfg, tls, tunnels, state, register_lock: tokio::sync::Mutex::new(()) }))
+        let wanted = connections_wanted(cfg.connections, std::env::var("MAGICPIPES_CONNECTIONS").ok().as_deref());
+        Ok(Arc::new(Self {
+            cfg,
+            tls,
+            tunnels,
+            state,
+            register_lock: tokio::sync::Mutex::new(()),
+            instance: magicpipes_core::secret::random_string(24),
+            lanes: Mutex::new(vec![None; wanted]),
+            reached: watch::Sender::new(0),
+            restoring: Mutex::new(None),
+        }))
+    }
+
+    /// How many connections to the server are open now.
+    pub fn connections(&self) -> usize {
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().filter(|h| !h.is_closed()).count()
     }
 
     pub fn server(&self) -> &str {
@@ -91,25 +139,44 @@ impl Session {
         }
     }
 
-    /// Runs the connect/serve/reconnect loop until `shutdown`.
+    /// Runs every lane's connect/serve/reconnect loop until `shutdown`.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+        let wanted = self.lanes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let mut lanes = tokio::task::JoinSet::new();
+        for lane in 0..wanted {
+            lanes.spawn(self.clone().lane(lane, shutdown.clone()));
+        }
+        while lanes.join_next().await.is_some() {}
+    }
+
+    /// One connection, kept until `shutdown`, with its own backoff. Past the first, it connects
+    /// only to a server known to keep an agent's connections together, and gives up on one that
+    /// has no room for more.
+    async fn lane(self: Arc<Self>, lane: usize, shutdown: CancellationToken) {
         let mut attempt: u32 = 0;
         loop {
+            if lane > 0 && !self.server_keeps_connections(&shutdown).await {
+                return;
+            }
             let result = tokio::select! {
                 _ = shutdown.cancelled() => return,
                 r = self.connect() => r,
             };
             match result {
                 Ok((handle, inbound, server_protocol)) => {
+                    self.reached.send_replace(server_protocol);
+                    if !may_connect(lane, server_protocol) {
+                        // The server changed under us: an older one would drop the others for this.
+                        handle.close();
+                        continue;
+                    }
                     let started = std::time::Instant::now();
-                    self.serve(handle, inbound, server_protocol, &shutdown).await;
+                    self.serve(lane, handle, inbound, server_protocol, &shutdown).await;
                     if shutdown.is_cancelled() {
                         return;
                     }
                     attempt = if started.elapsed() >= STABLE_SESSION { 0 } else { attempt.saturating_add(1) };
-                    tracing::warn!(attempt, "disconnected from server; reconnecting");
-                    self.tunnels.mark_all_pending();
-                    self.state.send_replace(ConnState::Connecting { attempt, last_error: Some("connection lost".into()) });
+                    tracing::warn!(lane, attempt, "connection to the server lost; reconnecting");
                 }
                 Err(ConnectError::Unauthorized(msg)) => {
                     tracing::error!(error = %msg, "server rejected agent credentials; run `magicpipes login` again");
@@ -120,17 +187,70 @@ impl Session {
                     }
                     continue;
                 }
+                Err(ConnectError::Full) => {
+                    tracing::info!(lane, "the server has no room for another connection of this agent's; going on with fewer");
+                    return;
+                }
                 Err(ConnectError::Other(e)) => {
                     attempt = attempt.saturating_add(1);
                     let msg = format!("{e:#}");
-                    tracing::warn!(attempt, error = %msg, "could not connect to server");
-                    self.state.send_replace(ConnState::Connecting { attempt, last_error: Some(msg) });
+                    tracing::warn!(lane, attempt, error = %msg, "could not connect to server");
+                    if self.connections() == 0 {
+                        self.state.send_replace(ConnState::Connecting { attempt, last_error: Some(msg) });
+                    }
                 }
             }
             let backoff = backoff(attempt);
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(backoff) => {}
+            }
+        }
+    }
+
+    /// Waits until a connection has reached a server that keeps an agent's connections together;
+    /// `false` at shutdown.
+    async fn server_keeps_connections(&self, shutdown: &CancellationToken) -> bool {
+        let mut reached = self.reached.subscribe();
+        tokio::select! {
+            _ = shutdown.cancelled() => false,
+            r = reached.wait_for(|v| may_connect(1, *v)) => r.is_ok(),
+        }
+    }
+
+    /// A lane's connection is up: the agent is connected now, if it wasn't. `true` when this is
+    /// the first of its connections to be up.
+    fn up(&self, lane: usize, handle: &MuxHandle, server_protocol: u32) -> bool {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        let first = lanes.iter().flatten().all(|h| h.is_closed());
+        lanes[lane] = Some(handle.clone());
+        if first {
+            self.state.send_replace(ConnState::Connected { handle: handle.clone(), since: magicpipes_core::unix_now(), server_protocol });
+        }
+        first
+    }
+
+    /// A lane's connection is gone. While others are open, RPCs move to one of them; with none
+    /// left, the agent is offline until one comes back.
+    fn down(&self, lane: usize, handle: &MuxHandle) {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        lanes[lane] = None;
+        match lanes.iter().flatten().find(|h| !h.is_closed()).cloned() {
+            Some(open) => {
+                self.state.send_if_modified(|s| match s {
+                    ConnState::Connected { handle: h, .. } if h.same_session(handle) => {
+                        *h = open;
+                        true
+                    }
+                    _ => false,
+                });
+            }
+            None => {
+                if let Some(restoring) = self.restoring.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    restoring.abort();
+                }
+                self.tunnels.mark_all_pending();
+                self.state.send_replace(ConnState::Connecting { attempt: 0, last_error: Some("connection lost".into()) });
             }
         }
     }
@@ -144,6 +264,7 @@ impl Session {
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, UPGRADE_PROTOCOL)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .header(INSTANCE_HEADER, &self.instance)
             .header(header::USER_AGENT, concat!("magicpipes/", env!("CARGO_PKG_VERSION")))
             .body(Full::new(Bytes::new()))
             .map_err(|e| ConnectError::Other(e.into()))?;
@@ -155,6 +276,7 @@ impl Session {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 return Err(ConnectError::Unauthorized("agent credentials were rejected by the server".into()));
             }
+            StatusCode::CONFLICT => return Err(ConnectError::Full),
             s => return Err(ConnectError::Other(anyhow!("unexpected response from server: {s}"))),
         }
         let server_protocol = proto::peer_protocol(resp.headers().get(PROTOCOL_HEADER).and_then(|v| v.to_str().ok()));
@@ -165,17 +287,24 @@ impl Session {
 
     async fn serve(
         self: &Arc<Self>,
+        lane: usize,
         handle: MuxHandle,
         inbound: mpsc::Receiver<MuxStream>,
         server_protocol: u32,
         shutdown: &CancellationToken,
     ) {
-        tracing::info!(server = %self.cfg.server, server_protocol, "connected to server");
-        let since = magicpipes_core::unix_now();
-        self.state.send_replace(ConnState::Connected { handle: handle.clone(), since, server_protocol });
+        if self.up(lane, &handle, server_protocol) {
+            tracing::info!(server = %self.cfg.server, server_protocol, "connected to server");
+            // Back from offline: the server may have lost track of the tunnels meanwhile.
+            let me = self.clone();
+            let restore = tokio::spawn(async move { me.restore().await });
+            if let Some(old) = self.restoring.lock().unwrap_or_else(|e| e.into_inner()).replace(restore) {
+                old.abort();
+            }
+        } else {
+            tracing::debug!(lane, "another connection to the server");
+        }
         let fwd = tokio::spawn(forward::serve(inbound, self.tunnels.clone()));
-        let me = self.clone();
-        let restore = tokio::spawn(async move { me.restore().await });
 
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
@@ -205,8 +334,8 @@ impl Session {
             }
         }
         handle.close();
-        restore.abort();
         fwd.abort();
+        self.down(lane, &handle);
     }
 
     /// Re-registers every local tunnel on a new session (idempotent on the server). Each one is
@@ -333,6 +462,8 @@ async fn rpc_on(handle: &MuxHandle, req: &Rpc) -> anyhow::Result<RpcResponse> {
 
 enum ConnectError {
     Unauthorized(String),
+    /// The server has no room for another connection of this agent's.
+    Full,
     Other(anyhow::Error),
 }
 
@@ -351,4 +482,25 @@ fn backoff(attempt: u32) -> Duration {
     let jitter = (magicpipes_core::secret::random_u64() % 400) as i64 - 200;
     let ms = (base.as_millis() as i64 * (1000 + jitter) / 1000).max(100) as u64;
     Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_one_connection_until_the_server_keeps_them_together() {
+        assert!(may_connect(0, 0), "the first finds out what the server is");
+        assert!(!may_connect(1, 0) && !may_connect(3, CONNECTIONS_PROTOCOL - 1), "an older server would drop the others");
+        assert!(may_connect(1, CONNECTIONS_PROTOCOL) && may_connect(7, CONNECTIONS_PROTOCOL + 1));
+    }
+
+    #[test]
+    fn connections_come_from_the_environment_then_the_configuration() {
+        assert_eq!(connections_wanted(None, None), DEFAULT_CONNECTIONS);
+        assert_eq!(connections_wanted(Some(2), None), 2);
+        assert_eq!(connections_wanted(Some(2), Some("6")), 6, "the environment wins, for containers");
+        assert_eq!(connections_wanted(Some(3), Some("lots")), 3, "an unreadable value is ignored");
+        assert_eq!((connections_wanted(Some(0), None), connections_wanted(None, Some("99"))), (1, MAX_CONNECTIONS), "kept within bounds");
+    }
 }

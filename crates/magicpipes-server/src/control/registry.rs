@@ -45,7 +45,7 @@ impl ControlPlane {
         // `members_can_publish` applies to machines enrolled before it was turned off, too.
         let members_may_not = st.dir.member_owned(agent_id) && !self.cfg.users.members_can_publish;
         let invalid = |m: String| err(ErrorCode::InvalidRequest, m);
-        let protocol = st.sessions.get(agent_id).map_or(proto::PROTOCOL_VERSION, |s| s.protocol);
+        let protocol = st.sessions.get(agent_id).map_or(proto::PROTOCOL_VERSION, |l| l.first().protocol);
         let (visibility, requested) = match (req.visibility, existing) {
             (None, Some(row)) => return Ok((row.visibility, row.tags.clone())),
             // An agent from before private tunnels would wait for its readiness probe, which
@@ -375,7 +375,7 @@ impl ControlPlane {
                 Kind::Udp => ServerOpen::Datagram { tunnel_id, peer: None },
                 _ => ServerOpen::Data { tunnel_id, peer: None },
             };
-            let session = st.sessions.get(agent_id).map(|s| s.handle.clone());
+            let session = st.sessions.get(agent_id).and_then(|l| l.handle());
             (header, session.ok_or_else(|| err(ErrorCode::AgentUnavailable, "agent is not connected"))?)
         };
         let unavailable = |_| err(ErrorCode::AgentUnavailable, "could not open a stream to the agent");
@@ -419,7 +419,7 @@ impl ControlPlane {
         self.store.delete_tunnel(id).map_err(internal)?;
         st.tunnels.remove(id);
         self.publish(&st);
-        let session = st.sessions.get(&agent_id).map(|s| s.handle.clone());
+        let session = st.sessions.get(&agent_id).and_then(|l| l.handle());
         drop(st);
         tracing::info!(tunnel = %id, "tunnel deleted by administrator");
         self.audit(who, "tunnel.delete", id, "");

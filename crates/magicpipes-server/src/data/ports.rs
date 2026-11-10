@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use magicpipes_core::mux::{MuxHandle, MuxStream};
+use magicpipes_core::mux::MuxStream;
 use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::AsyncReadExt;
@@ -27,7 +27,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{DataPlane, Outcome, Route};
+use super::{AgentLink, DataPlane, Outcome, Route};
 use crate::authz::Principal;
 use crate::forwarded::client_key;
 use crate::proxy_header;
@@ -88,18 +88,18 @@ pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: Cancellati
 }
 
 /// The route for a new connection or flow, if the client may use it and the agent is online.
-fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr) -> Option<(Arc<Route>, MuxHandle)> {
+fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr) -> Option<(Arc<Route>, AgentLink)> {
     let route = dp.lookup_port(kind, port)?;
     if !route.access.admits(&Principal::Anonymous, peer.ip()) {
         tracing::debug!(%kind, port, %peer, "client not admitted by the tunnel's access policy");
         return None;
     }
-    match &route.session {
-        Some(s) if !s.is_closed() => {
-            let session = s.clone();
-            Some((route, session))
+    match route.agent.as_ref().filter(|a| a.is_online()) {
+        Some(a) => {
+            let agent = a.clone();
+            Some((route, agent))
         }
-        _ => {
+        None => {
             route.stats.record(Outcome::AgentOffline);
             None
         }
@@ -118,17 +118,18 @@ async fn revoked(dp: &DataPlane, kind: Kind, port: u16, peer: IpAddr, tunnel_id:
     }
 }
 
-/// Opens a data stream to the agent for `client` and waits for its status byte.
-pub(super) async fn open(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
-    opened(dp, route, session, client, header).await.ok()
+/// Opens a data stream to the agent for `client`, on its connection with the most room, and
+/// waits for its status byte.
+pub(super) async fn open(dp: &DataPlane, route: &Route, agent: &AgentLink, client: IpAddr, header: ServerOpen) -> Option<MuxStream> {
+    opened(dp, route, agent, client, header).await.ok()
 }
 
-/// [`open`], saying why not: [`Outcome::None`] when the client's or the session's share of streams
+/// [`open`], saying why not: [`Outcome::None`] when the client's or the agent's share of streams
 /// is used up, else what was counted.
-pub(super) async fn opened(dp: &DataPlane, route: &Route, session: &MuxHandle, client: IpAddr, header: ServerOpen) -> Result<MuxStream, Outcome> {
+pub(super) async fn opened(dp: &DataPlane, route: &Route, agent: &AgentLink, client: IpAddr, header: ServerOpen) -> Result<MuxStream, Outcome> {
     let timeout = dp.settings.stream_open_timeout;
     let key = client_key(client);
-    let mut stream = match dp.with_room_or_wait(session, || session.open_data(timeout, key)).await {
+    let mut stream = match dp.with_room_or_wait(agent, move |session| async move { session.open_data(timeout, key).await }).await {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
             tracing::debug!(tunnel = %route.tunnel_id, %client, "agent stream budget used up; refusing");
@@ -245,13 +246,13 @@ async fn udp_flow(
     dp: Arc<DataPlane>,
     port: u16,
     route: Arc<Route>,
-    session: MuxHandle,
+    agent: AgentLink,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
     mut rx: mpsc::Receiver<Bytes>,
 ) {
     let header = ServerOpen::Datagram { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
-    let Some(stream) = open(&dp, &route, &session, peer.ip(), header).await else { return };
+    let Some(stream) = open(&dp, &route, &agent, peer.ip(), header).await else { return };
     let (mut rd, mut wr) = tokio::io::split(stream);
     let idle = dp.settings.ports.udp_idle_timeout;
     let epoch = Instant::now();

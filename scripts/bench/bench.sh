@@ -297,6 +297,8 @@ suite_traffic() {
   printf 'test=cpu_agent_small_c16 key=us_per_req us_per_req=%s\n' "$(awk "BEGIN {print ($(cpu "$AGENT") - $agent_cpu) * 1000000 / $requests}")"
   measure small_c64 rps web.t.test --conc 64 --xff
   measure small_c150 rps web.t.test --conc 150 --xff
+  # Past what one agent connection carries (224 streams).
+  measure small_c400 rps web.t.test --conc 400 --xff
   measure new_connections_c16 rps web.t.test --conc 16 --close
   measure 64k_c16 mb_s web.t.test --conc 16 --path /64k
   measure download_1 mb_s web.t.test --conc 1 --path /big/2048

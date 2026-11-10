@@ -119,6 +119,10 @@ pub struct AgentConfig {
     /// Additional trusted root (PEM), e.g. a development CA. Public CAs are always trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_pem: Option<String>,
+    /// Connections to hold to the server (1 to 8; `MAGICPIPES_CONNECTIONS` overrides it). Absent:
+    /// the default, 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u8>,
 }
 
 impl AgentConfig {

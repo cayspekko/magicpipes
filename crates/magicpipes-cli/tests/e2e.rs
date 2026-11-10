@@ -4271,6 +4271,141 @@ async fn add_fails(env: &Env, args: &[&str]) -> (i32, String, String) {
     (out.status.code().unwrap_or(-1), v["error"]["code"].as_str().unwrap_or("").to_string(), v["error"]["message"].as_str().unwrap_or("").to_string())
 }
 
+/// Passes TCP connections on to a local port, and cuts them on request, as a network failure would.
+struct Relay {
+    port: u16,
+    live: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl Relay {
+    async fn start(to: u16) -> Relay {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let live: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+        let task = tokio::spawn({
+            let live = live.clone();
+            async move {
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    let pass = tokio::spawn(async move {
+                        let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", to)).await else { return };
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    });
+                    let mut live = live.lock().unwrap();
+                    live.retain(|h| !h.is_finished());
+                    live.push(pass.abort_handle());
+                }
+            }
+        });
+        Relay { port, live, _task: task }
+    }
+
+    /// Cuts the connection open longest.
+    fn cut_one(&self) {
+        let mut live = self.live.lock().unwrap();
+        live.retain(|h| !h.is_finished());
+        if !live.is_empty() {
+            live.remove(0).abort();
+        }
+    }
+
+    fn cut_all(&self) {
+        for h in self.live.lock().unwrap().drain(..) {
+            h.abort();
+        }
+    }
+}
+
+/// How many connections the agent holds, as it and the server see them.
+async fn connections(env: &Env, admin: &str) -> (u64, u64) {
+    let agent = env.cli_json(&["status", "--json"]).await["connections"].as_u64().unwrap_or(0);
+    let server = env.api("GET", "/api/v1/agents", Some(admin)).await.1["agents"][0]["connections"].as_u64().unwrap_or(0);
+    (agent, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agents_connections_carry_on_when_one_is_cut() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    // The agent reaches the server through a relay that can cut its connections.
+    let relay = Relay::start(env.mgmt_port).await;
+    let (url, ca) = (format!("https://localhost:{}", relay.port), env.ca_path.to_string_lossy().to_string());
+    env.cli_ok(&["login", "--server", &url, "--token", &env.enrollment_token(), "--ca-cert", &ca, "--name", "relayed"]).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string(), "--name", "lanes"]).await;
+    assert_eq!(t["status"], "ready", "{t}");
+    let host = format!("lanes.{BASE}");
+    env.eventually("four connections, as both ends see them", Duration::from_secs(20), async || connections(&env, &admin).await == (4, 4)).await;
+
+    // One is cut: the others go on serving while it comes back.
+    relay.cut_one();
+    env.eventually("the server to see three", Duration::from_secs(10), async || connections(&env, &admin).await.1 == 3).await;
+    for _ in 0..20 {
+        assert_eq!(env.get_public(&host, "/").await, (StatusCode::OK, None, "hello from app".to_string()));
+    }
+    env.eventually("the fourth back", Duration::from_secs(20), async || connections(&env, &admin).await == (4, 4)).await;
+
+    // All are cut: the agent is offline for a moment, then back with its tunnel.
+    relay.cut_all();
+    env.eventually("the tunnel back", Duration::from_secs(30), async || env.get_public(&host, "/").await.0 == StatusCode::OK).await;
+    env.eventually("all four back", Duration::from_secs(30), async || connections(&env, &admin).await == (4, 4)).await;
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+/// Holds `n` requests open at once from `n` clients (named by X-Forwarded-For from a trusted proxy,
+/// or all one client): what each got, the responses kept so their streams stay in use.
+async fn hold_open(env: &Env, host: &str, n: usize, one_client: bool) -> (Vec<StatusCode>, Vec<http::Response<hyper::body::Incoming>>) {
+    let requests = (0..n).map(|i| {
+        let client = if one_client { "10.9.9.9".to_string() } else { format!("10.{}.{}.1", i / 250, i % 250) };
+        let req = Request::get("/stream")
+            .header(header::HOST, format!("{host}:{}", env.https_port))
+            .header("x-forwarded-for", client)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        env.send(host, env.https_port, req)
+    });
+    let responses = futures_util::future::join_all(requests).await;
+    (responses.iter().map(|r| r.status()).collect(), responses)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_connections_carry_more_than_one_can() {
+    use magicpipes_core::mux::{MAX_DATA_STREAMS, MAX_DATA_STREAMS_PER_CLIENT};
+    let env = Env::with_settings(Tls::DevCa, "trusted_proxies = [\"127.0.0.1/32\"]", "").await;
+    env.login().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = common::http_app(release.clone()).await;
+    let host = format!("many.{BASE}");
+    let n = MAX_DATA_STREAMS + 76;
+
+    // One connection carries its 224 streams, and refuses the rest.
+    let out = env.cli_with(&[("MAGICPIPES_CONNECTIONS", "1")], &["add", &app.port.to_string(), "--name", "many", "--json"]).await;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (statuses, held) = hold_open(&env, &host, n, false).await;
+    let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    assert_eq!((ok, statuses.iter().filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE).count()), (MAX_DATA_STREAMS, n - MAX_DATA_STREAMS));
+    release.notify_waiters();
+    drop(held);
+    env.cli_ok(&["agent", "stop"]).await;
+
+    // Four carry all of them.
+    let t = add_json(&env, &[&app.port.to_string(), "--name", "many"]).await;
+    assert_eq!(t["status"], "ready", "{t}");
+    let admin = env.admin_token();
+    env.eventually("four connections", Duration::from_secs(20), async || connections(&env, &admin).await == (4, 4)).await;
+    let (statuses, held) = hold_open(&env, &host, n, false).await;
+    assert!(statuses.iter().all(|s| *s == StatusCode::OK), "{:?}", statuses.iter().filter(|s| **s != StatusCode::OK).collect::<Vec<_>>());
+    release.notify_waiters();
+    drop(held);
+
+    // And one client's share is the agent's, not each connection's.
+    let (statuses, held) = hold_open(&env, &host, MAX_DATA_STREAMS_PER_CLIENT + 6, true).await;
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::OK).count(), MAX_DATA_STREAMS_PER_CLIENT);
+    release.notify_waiters();
+    drop(held);
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 /// A web app that only speaks HTTPS, with a new self-signed certificate, on `port` (0: any). It
 /// answers every request on a connection with `body`. Returns its port, its certificate's
 /// fingerprint as browsers show it, and the task serving it.

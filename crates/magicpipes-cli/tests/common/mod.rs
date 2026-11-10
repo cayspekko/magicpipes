@@ -286,6 +286,13 @@ udp_idle_timeout_secs = 5
         self.run(self.cli_command(args), args).await
     }
 
+    /// [`Env::cli`] with more environment variables, which an agent it starts inherits.
+    pub async fn cli_with(&self, vars: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut cmd = self.cli_command(args);
+        cmd.envs(vars.iter().copied());
+        self.run(cmd, args).await
+    }
+
     pub async fn cli_ok(&self, args: &[&str]) -> Output {
         let out = self.cli(args).await;
         assert!(

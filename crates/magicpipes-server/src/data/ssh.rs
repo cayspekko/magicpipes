@@ -20,7 +20,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use magicpipes_core::mux::MuxHandle;
 use magicpipes_core::proto::ServerOpen;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
@@ -32,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use super::{DataPlane, GatewayKey, Outcome, Route, RouteTable, ports};
+use super::{AgentLink, DataPlane, GatewayKey, Outcome, Route, RouteTable, ports};
 use crate::authz::Principal;
 use crate::config::SshConfig;
 use crate::listen::PerClient;
@@ -276,15 +275,15 @@ struct Client {
 }
 
 impl Client {
-    /// The route for a channel to `asked`, and the agent's session; or what to tell the client.
-    fn route(&self, who: &SignedIn, asked: &str) -> Result<(Arc<Route>, MuxHandle), String> {
+    /// The route for a channel to `asked`, and the agent's connections; or what to tell the client.
+    fn route(&self, who: &SignedIn, asked: &str) -> Result<(Arc<Route>, AgentLink), String> {
         let table = self.dp.table();
         let name = machine_name(asked, &self.dp.settings.base_domain);
         let found = who.principal(&table).and_then(|p| table.by_ssh.get(&name).filter(|r| r.access.admits(p, self.peer.ip())));
         let Some(route) = found else { return Err(NO_SUCH_MACHINE.into()) };
-        match &route.session {
-            Some(s) if !s.is_closed() => Ok((route.clone(), s.clone())),
-            _ => {
+        match route.agent.as_ref().filter(|a| a.is_online()) {
+            Some(a) => Ok((route.clone(), a.clone())),
+            None => {
                 route.stats.record(Outcome::AgentOffline);
                 Err(format!("{name} is offline"))
             }

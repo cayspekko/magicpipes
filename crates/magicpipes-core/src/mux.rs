@@ -5,6 +5,10 @@
 //! and receive inbound streams from the returned channel. Every stream is flow-controlled by
 //! yamux (256 KiB initial window, auto-tuned), which gives per-stream backpressure. Frames
 //! reach the connection in batches ([`Batched`]).
+//!
+//! An agent may hold several sessions at once, one per connection ([`MuxHandle::join`]): each
+//! keeps its own limit of data streams, which yamux's own limit per connection requires, while
+//! clients' shares and the pool's connections on their way back count across all of them.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -62,8 +66,8 @@ pub const MAX_STREAMS: usize = 256;
 /// Streams the server may open for public traffic per session. The remainder stays free for
 /// the agent's RPCs and pings, so public clients can slow a tunnel but never cut its session.
 pub const MAX_DATA_STREAMS: usize = 224;
-/// Data streams one client may hold per session, or requests it may have in flight on shared
-/// streams, so one client cannot take all of them.
+/// Data streams one client may hold per agent (across its sessions), or requests it may have in
+/// flight on shared streams, so one client cannot take all of them.
 pub const MAX_DATA_STREAMS_PER_CLIENT: usize = 64;
 /// Inbound streams buffered before new ones are refused.
 const INBOUND_QUEUE: usize = 64;
@@ -86,8 +90,18 @@ type OpenReply = oneshot::Sender<io::Result<MuxStream>>;
 pub struct MuxHandle {
     open_tx: mpsc::Sender<OpenReply>,
     closed: CancellationToken,
-    data: Arc<DataBudget>,
-    lent: Arc<Lent>,
+    /// This session's data streams.
+    streams: Arc<AtomicUsize>,
+    /// What this session shares with the agent's others ([`MuxHandle::join`]).
+    group: Arc<Group>,
+}
+
+/// What an agent's sessions count together: each client's uses, and the pool's connections on
+/// their way back.
+#[derive(Debug, Default)]
+struct Group {
+    clients: Mutex<HashMap<IpAddr, usize>>,
+    lent: Lent,
 }
 
 /// Shared streams in use by a request, which will be idle again (or closed) once its response
@@ -103,55 +117,48 @@ struct Lent {
     returned: Notify,
 }
 
-/// Open data streams in total, and uses per client (a stream of its own, or a request on a
-/// shared stream).
-#[derive(Debug, Default)]
-struct DataBudget(Mutex<(usize, HashMap<IpAddr, usize>)>);
-
-/// A place in the budget: a stream, a client's use, or both; released on drop.
+/// A place in the budget: a stream on a session, a client's use across the agent's sessions, or
+/// both; released on drop.
 struct DataSlot {
-    budget: Arc<DataBudget>,
-    stream: bool,
-    client: Option<IpAddr>,
+    stream: Option<Arc<AtomicUsize>>,
+    client: Option<(Arc<Group>, IpAddr)>,
 }
 
 /// One client's use of a shared data stream, for as long as it is held ([`MuxHandle::client_use`]).
 pub struct ClientUse(#[allow(dead_code)] DataSlot);
 
-impl DataBudget {
-    fn acquire(self: &Arc<Self>, stream: bool, client: Option<IpAddr>) -> Option<DataSlot> {
-        let mut guard = self.0.lock().unwrap();
-        let (total, per_client) = &mut *guard;
-        if stream && *total >= MAX_DATA_STREAMS {
+/// Takes a stream on `streams` (if `stream`) and a use for `client` in `group`, or neither.
+fn acquire(streams: &Arc<AtomicUsize>, group: &Arc<Group>, stream: bool, client: Option<IpAddr>) -> Option<DataSlot> {
+    let mut slot = DataSlot { stream: None, client: None };
+    if stream {
+        streams.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_DATA_STREAMS).then_some(n + 1)).ok()?;
+        slot.stream = Some(streams.clone());
+    }
+    if let Some(c) = client {
+        let mut clients = group.clients.lock().unwrap();
+        let n = clients.entry(c).or_insert(0);
+        if *n >= MAX_DATA_STREAMS_PER_CLIENT {
+            // Dropping `slot` gives back the stream, if it took one.
             return None;
         }
-        if let Some(c) = client {
-            let n = per_client.entry(c).or_insert(0);
-            if *n >= MAX_DATA_STREAMS_PER_CLIENT {
-                return None;
-            }
-            *n += 1;
-        }
-        if stream {
-            *total += 1;
-        }
-        Some(DataSlot { budget: self.clone(), stream, client })
+        *n += 1;
+        slot.client = Some((group.clone(), c));
     }
+    Some(slot)
 }
 
 impl Drop for DataSlot {
     fn drop(&mut self) {
-        let mut guard = self.budget.0.lock().unwrap();
-        let (total, per_client) = &mut *guard;
-        if self.stream {
-            *total -= 1;
+        if let Some(streams) = &self.stream {
+            streams.fetch_sub(1, Ordering::SeqCst);
         }
-        if let Some(c) = self.client
-            && let Some(n) = per_client.get_mut(&c)
-        {
-            *n -= 1;
-            if *n == 0 {
-                per_client.remove(&c);
+        if let Some((group, c)) = &self.client {
+            let mut clients = group.clients.lock().unwrap();
+            if let Some(n) = clients.get_mut(c) {
+                *n -= 1;
+                if *n == 0 {
+                    clients.remove(c);
+                }
             }
         }
     }
@@ -162,7 +169,7 @@ impl MuxHandle {
     /// /64, before passing them), within the session's data budget. Fails at once with
     /// `WouldBlock` when the budget is used up.
     pub async fn open_data(&self, timeout: Duration, client: IpAddr) -> io::Result<MuxStream> {
-        let slot = self.data.acquire(true, Some(client)).ok_or_else(busy)?;
+        let slot = acquire(&self.streams, &self.group, true, Some(client)).ok_or_else(busy)?;
         let mut stream = self.open(timeout).await?;
         stream._slot = Some(slot);
         Ok(stream)
@@ -172,38 +179,55 @@ impl MuxHandle {
     /// connection), within the session's total data budget; each use takes a [`Self::client_use`].
     /// Fails at once with `WouldBlock` when the budget is used up.
     pub async fn open_shared(&self, timeout: Duration) -> io::Result<MuxStream> {
-        let slot = self.data.acquire(true, None).ok_or_else(busy)?;
+        let slot = acquire(&self.streams, &self.group, true, None).ok_or_else(busy)?;
         let mut stream = self.open(timeout).await?;
         stream._slot = Some(slot);
         Ok(stream)
     }
 
     /// A place for one request from `client` on a shared stream; `None` when the client already
-    /// has [`MAX_DATA_STREAMS_PER_CLIENT`] in flight on this session.
+    /// has [`MAX_DATA_STREAMS_PER_CLIENT`] in flight on the agent's sessions.
     pub fn client_use(&self, client: IpAddr) -> Option<ClientUse> {
-        self.data.acquire(false, Some(client)).map(ClientUse)
+        acquire(&self.streams, &self.group, false, Some(client)).map(ClientUse)
     }
 
     /// Whether all of the session's data streams are in use, so another client's stream has to
     /// wait for one to be given back. Idle pooled connections can give theirs back at once.
     pub fn data_streams_full(&self) -> bool {
-        self.data.0.lock().unwrap().0 >= MAX_DATA_STREAMS
+        self.data_streams() >= MAX_DATA_STREAMS
+    }
+
+    /// How many of the session's data streams are in use.
+    pub fn data_streams(&self) -> usize {
+        self.streams.load(Ordering::SeqCst)
     }
 
     /// Whether both handles belong to the same session.
     pub fn same_session(&self, other: &MuxHandle) -> bool {
-        Arc::ptr_eq(&self.data, &other.data)
+        Arc::ptr_eq(&self.streams, &other.streams)
+    }
+
+    /// Whether both handles belong to the same agent's sessions ([`MuxHandle::join`]).
+    pub fn same_group(&self, other: &MuxHandle) -> bool {
+        Arc::ptr_eq(&self.group, &other.group)
+    }
+
+    /// This session, counted with `other`'s from now on: a client's share and the connections on
+    /// their way back are the agent's, whichever of its sessions they're on. For a session that
+    /// has no data streams yet.
+    pub fn join(&self, other: &MuxHandle) -> MuxHandle {
+        MuxHandle { group: other.group.clone(), ..self.clone() }
     }
 
     /// Counts a shared stream as lent to a request, until [`MuxHandle::came_back`].
     pub fn lend(&self) {
-        self.lent.out.fetch_add(1, Ordering::SeqCst);
+        self.group.lent.out.fetch_add(1, Ordering::SeqCst);
     }
 
     /// A stream [`MuxHandle::lend`] counted is idle again, or closed. Wakes the requests
     /// waiting for one.
     pub fn came_back(&self) {
-        let lent = &self.lent;
+        let lent = &self.group.lent;
         lent.out.fetch_sub(1, Ordering::SeqCst);
         lent.back.fetch_add(1, Ordering::SeqCst);
         if lent.waiting.load(Ordering::SeqCst) > 0 {
@@ -213,14 +237,14 @@ impl MuxHandle {
 
     /// How many lent streams have come back so far, to pass to [`MuxHandle::wait_for_return`].
     pub fn returns(&self) -> u64 {
-        self.lent.back.load(Ordering::SeqCst)
+        self.group.lent.back.load(Ordering::SeqCst)
     }
 
     /// Waits for a lent stream to come back, as long as any are out and `deadline` hasn't
     /// passed. `true` when one has come back since `seen` ([`MuxHandle::returns`]), so another try
     /// may find it idle; `false` when there's nothing to wait for.
     pub async fn wait_for_return(&self, seen: u64, deadline: tokio::time::Instant) -> bool {
-        let lent = &self.lent;
+        let lent = &self.group.lent;
         lent.waiting.fetch_add(1, Ordering::SeqCst);
         let returned = lent.returned.notified();
         tokio::pin!(returned);
@@ -368,7 +392,7 @@ where
     let (open_tx, mut open_rx) = mpsc::channel::<OpenReply>(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
     let token = CancellationToken::new();
-    let handle = MuxHandle { open_tx, closed: token.clone(), data: Arc::default(), lent: Arc::default() };
+    let handle = MuxHandle { open_tx, closed: token.clone(), streams: Arc::default(), group: Arc::default() };
 
     tokio::spawn(async move {
         let mut pending: Option<OpenReply> = None;
@@ -577,29 +601,71 @@ mod tests {
         tokio::time::timeout(WAIT, server.closed()).await.unwrap();
     }
 
+    /// The budget of a session that hasn't joined another: its own streams and clients.
+    fn alone() -> (Arc<AtomicUsize>, Arc<Group>) {
+        (Arc::default(), Arc::default())
+    }
+
     #[test]
     fn data_budget_limits_clients_and_total() {
-        let budget = Arc::new(DataBudget::default());
+        let (streams, group) = alone();
         let a: IpAddr = "203.0.113.1".parse().unwrap();
-        let mut held: Vec<DataSlot> = (0..MAX_DATA_STREAMS_PER_CLIENT).map(|_| budget.acquire(true, Some(a)).unwrap()).collect();
-        assert!(budget.acquire(true, Some(a)).is_none(), "per-client limit");
-        assert!(budget.acquire(false, Some(a)).is_none(), "uses of shared streams count too");
+        let mut held: Vec<DataSlot> = (0..MAX_DATA_STREAMS_PER_CLIENT).map(|_| acquire(&streams, &group, true, Some(a)).unwrap()).collect();
+        assert!(acquire(&streams, &group, true, Some(a)).is_none(), "per-client limit");
+        assert_eq!(streams.load(Ordering::SeqCst), MAX_DATA_STREAMS_PER_CLIENT, "a refused client takes no stream");
+        assert!(acquire(&streams, &group, false, Some(a)).is_none(), "uses of shared streams count too");
         held.pop();
-        assert!(budget.acquire(true, Some(a)).is_some(), "released on drop");
+        assert!(acquire(&streams, &group, true, Some(a)).is_some(), "released on drop");
         let mut i = 0u32;
-        while let Some(slot) = budget.acquire(true, Some(IpAddr::from((i + 1).to_be_bytes()))) {
+        while let Some(slot) = acquire(&streams, &group, true, Some(IpAddr::from((i + 1).to_be_bytes()))) {
             held.push(slot);
             i += 1;
         }
-        assert_eq!(budget.0.lock().unwrap().0, MAX_DATA_STREAMS);
-        assert!(budget.acquire(true, None).is_none(), "shared streams count toward the total");
+        assert_eq!(streams.load(Ordering::SeqCst), MAX_DATA_STREAMS);
+        assert!(acquire(&streams, &group, true, None).is_none(), "shared streams count toward the total");
         let b: IpAddr = "203.0.113.2".parse().unwrap();
-        let used = budget.acquire(false, Some(b)).expect("a use takes no stream");
+        let used = acquire(&streams, &group, false, Some(b)).expect("a use takes no stream");
         drop(held);
-        assert_eq!(budget.0.lock().unwrap().0, 0);
+        assert_eq!(streams.load(Ordering::SeqCst), 0);
         drop(used);
-        assert!(budget.0.lock().unwrap().1.is_empty());
+        assert!(group.clients.lock().unwrap().is_empty());
     }
+
+    /// An agent's sessions each have their own streams, which yamux limits per connection, but a
+    /// client's share is the agent's, and a connection coming back on one wakes a request on another.
+    #[tokio::test]
+    async fn joined_sessions_share_clients_and_returns_but_not_streams() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (c, d) = tokio::io::duplex(1 << 16);
+        let ((first, _in1), (_peer1, _in2)) = (spawn(a, Mode::Server), spawn(b, Mode::Client));
+        let ((second, _in3), (_peer2, _in4)) = (spawn(c, Mode::Server), spawn(d, Mode::Client));
+        let second = second.join(&first);
+        assert!(second.same_group(&first) && !second.same_session(&first));
+
+        let client: IpAddr = "203.0.113.9".parse().unwrap();
+        let mut uses: Vec<ClientUse> = (0..MAX_DATA_STREAMS_PER_CLIENT / 2).map(|_| first.client_use(client).unwrap()).collect();
+        uses.extend((0..MAX_DATA_STREAMS_PER_CLIENT / 2).map(|_| second.client_use(client).unwrap()));
+        assert!(first.client_use(client).is_none() && second.client_use(client).is_none(), "one share across the agent's sessions");
+        drop(uses);
+
+        // Each session's streams are its own.
+        let held: Vec<DataSlot> = (0..MAX_DATA_STREAMS).map(|_| acquire(&first.streams, &first.group, true, None).unwrap()).collect();
+        assert!(first.data_streams_full() && !second.data_streams_full());
+        assert_eq!((first.data_streams(), second.data_streams()), (MAX_DATA_STREAMS, 0));
+        drop(held);
+
+        // A request waiting on one session is woken by a connection coming back on the other.
+        let far = tokio::time::Instant::now() + Duration::from_secs(3600);
+        first.lend();
+        let seen = first.returns();
+        let back = async {
+            tokio::task::yield_now().await;
+            second.came_back();
+        };
+        let (woke, ()) = tokio::join!(first.wait_for_return(seen, far), back);
+        assert!(woke);
+    }
+
     #[tokio::test]
     async fn a_request_waits_only_for_a_stream_on_its_way_back() {
         let (a, b) = tokio::io::duplex(1 << 16);
@@ -623,6 +689,6 @@ mod tests {
         };
         let (woke, ()) = tokio::join!(s1.wait_for_return(seen, far), back);
         assert!(woke);
-        assert_eq!(s1.lent.waiting.load(Ordering::SeqCst), 0, "no waiter left behind");
+        assert_eq!(s1.group.lent.waiting.load(Ordering::SeqCst), 0, "no waiter left behind");
     }
 }

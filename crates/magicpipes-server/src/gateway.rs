@@ -13,11 +13,11 @@ use hyper_util::rt::TokioIo;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::{self, Mode, MuxStream};
 use magicpipes_core::proto::{
-    self, ErrorBody, PROTOCOL_HEADER, PROTOCOL_VERSION, Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL,
+    self, ErrorBody, INSTANCE_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION, Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL,
 };
 use tokio::io::AsyncWriteExt;
 
-use crate::control::ControlPlane;
+use crate::control::{Attached, ControlPlane};
 use crate::mgmt::{AppState, PeerAddr, bearer_token};
 
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,18 +33,28 @@ pub async fn connect(State(app): State<AppState>, mut req: Request) -> Response 
     }
     let peer = req.extensions().get::<PeerAddr>().map(|p| p.0).unwrap_or_else(|| ([0, 0, 0, 0], 0).into());
     let protocol = proto::peer_protocol(req.headers().get(PROTOCOL_HEADER).and_then(|v| v.to_str().ok()));
+    // Which run of the agent this connection is from (protocol 9): it joins that run's others.
+    let instance = match req.headers().get(INSTANCE_HEADER).map(|v| v.to_str().map(str::to_string)) {
+        None => None,
+        Some(Ok(id)) if proto::valid_instance(&id) => Some(id),
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid x-magicpipes-instance").into_response(),
+    };
     let Some(agent_id) = bearer_token(req.headers()).and_then(|t| app.control.authenticate_agent(t)) else {
         tracing::warn!(%peer, "rejected agent connection: invalid credentials");
         tokio::time::sleep(Duration::from_millis(250)).await;
         return (StatusCode::UNAUTHORIZED, "invalid agent credentials").into_response();
     };
+    if !app.control.has_room(&agent_id, instance.as_deref()) {
+        tracing::debug!(agent = %agent_id, %peer, "refused a connection: the agent has as many as agents.max_connections allows");
+        return (StatusCode::CONFLICT, "this agent has as many connections as the server allows").into_response();
+    }
     let Some(on_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
         return (StatusCode::BAD_REQUEST, "connection is not upgradable").into_response();
     };
     let control = app.control.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
-            Ok(upgraded) => run_session(control, agent_id, peer, protocol, TokioIo::new(upgraded)).await,
+            Ok(upgraded) => run_session(control, agent_id, peer, protocol, instance, TokioIo::new(upgraded)).await,
             Err(e) => tracing::warn!(%peer, error = %e, "agent upgrade failed"),
         }
     });
@@ -61,14 +71,24 @@ async fn run_session(
     agent_id: String,
     peer: SocketAddr,
     protocol: u32,
+    instance: Option<String>,
     io: TokioIo<hyper::upgrade::Upgraded>,
 ) {
     // All of this agent's traffic goes through the session; only its RPCs stay on this thread.
     let (handle, mut inbound) = control.on_traffic_threads(|| mux::spawn(io, Mode::Server));
-    let Some(conn_id) = control.attach_session(&agent_id, handle.clone(), peer, protocol) else {
-        tracing::warn!(agent = %agent_id, %peer, "closing session of revoked agent");
-        handle.close();
-        return;
+    let conn_id = match control.attach_session(&agent_id, handle.clone(), peer, protocol, instance) {
+        Attached::Yes(conn_id) => conn_id,
+        Attached::Revoked => {
+            tracing::warn!(agent = %agent_id, %peer, "closing session of revoked agent");
+            handle.close();
+            return;
+        }
+        // Another connection got the last place since the check before the upgrade.
+        Attached::Full => {
+            tracing::debug!(agent = %agent_id, %peer, "closing a connection the agent has no room for");
+            handle.close();
+            return;
+        }
     };
     loop {
         tokio::select! {

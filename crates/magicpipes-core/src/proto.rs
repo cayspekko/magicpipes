@@ -59,7 +59,25 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 /// * 7: RDP tunnels. [`RegisterTunnel`] may carry the kind [`Kind::Rdp`], which an older server
 ///   can't read, so the agent checks this version first.
 /// * 8: VNC tunnels: the kind [`Kind::Vnc`], checked the same way.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// * 9: several connections per agent. Each carries [`INSTANCE_HEADER`], and the server keeps an
+///   instance's connections together (up to [`MAX_CONNECTIONS`]) instead of the newest replacing
+///   the others, as an older server does: so the agent opens more than one only once it knows.
+pub const PROTOCOL_VERSION: u32 = 9;
+
+/// The first protocol version that keeps an agent's connections together.
+pub const CONNECTIONS_PROTOCOL: u32 = 9;
+
+/// Header on each of an agent's connection requests: the same random id for every connection of
+/// one run of the agent (protocol 9). Connections with another, or none, replace them.
+pub const INSTANCE_HEADER: &str = "x-magicpipes-instance";
+
+/// Most connections one agent may hold at once.
+pub const MAX_CONNECTIONS: usize = 8;
+
+/// Whether `id` can be an [`INSTANCE_HEADER`] value: 16 to 64 letters, digits, `-` or `_`.
+pub fn valid_instance(id: &str) -> bool {
+    (16..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// The peer's version from a [`PROTOCOL_HEADER`] value; a missing or unreadable value is 1.
 pub fn peer_protocol(value: Option<&str>) -> u32 {
@@ -454,6 +472,13 @@ mod tests {
         }
         assert_eq!(got, [b"one".to_vec(), vec![], b"three".to_vec()]);
         assert!(write_datagram(&mut Vec::new(), &vec![0; MAX_DATAGRAM + 1]).await.is_err());
+    }
+
+    #[test]
+    fn instance_ids_are_plain_and_bounded() {
+        assert!(valid_instance(&"a".repeat(16)) && valid_instance("Zq-_09azAZqqqqqqqqqqqqqqqqqq"));
+        assert!(!valid_instance(&"a".repeat(15)) && !valid_instance(&"a".repeat(65)));
+        assert!(!valid_instance("aaaaaaaaaaaaaaaa\n") && !valid_instance("aaaaaaaa aaaaaaaa") && !valid_instance("aaaaaaaaaaaaaaaa;"));
     }
 
     #[test]

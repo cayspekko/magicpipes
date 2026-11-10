@@ -644,6 +644,8 @@ async fn login(
         agent_token: enrolled.agent_token,
         base_domain: enrolled.base_domain.clone(),
         ca_cert_pem: ca_pem,
+        // Logging in again keeps how many connections were asked for.
+        connections: AgentConfig::load().ok().flatten().and_then(|c| c.connections),
     };
     cfg.save().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     if out.json {
@@ -950,6 +952,8 @@ async fn status(out: Output) -> Result<(), ErrorInfo> {
         "connection": agent.as_ref().map(|a| a["connection"].clone()).unwrap_or(json!("stopped")),
         "last_error": agent.as_ref().map(|a| a["last_error"].clone()).unwrap_or(Value::Null),
         "server_protocol": agent.as_ref().map(|a| a["server_protocol"].clone()).unwrap_or(Value::Null),
+        // Open connections to the server (older agents don't say).
+        "connections": agent.as_ref().map(|a| a["connections"].clone()).unwrap_or(json!(0)),
         "tunnels": agent.as_ref().map(|a| a["tunnels"].clone()).unwrap_or(json!(state::load_tunnels().map(|t| t.len()).unwrap_or(0))),
     });
     if out.json {
@@ -963,7 +967,10 @@ async fn status(out: Output) -> Result<(), ErrorInfo> {
     match &agent {
         Some(a) => {
             println!("Agent:      running (pid {}, since {})", a["agent"]["pid"], a["agent"]["started_at"].as_str().unwrap_or(""));
-            println!("Connection: {}", a["connection"].as_str().unwrap_or(""));
+            match a["connections"].as_u64() {
+                Some(n) if n > 1 => println!("Connection: {} ({n} connections)", a["connection"].as_str().unwrap_or("")),
+                _ => println!("Connection: {}", a["connection"].as_str().unwrap_or("")),
+            }
             if let Some(e) = a["last_error"].as_str() {
                 println!("Last error: {e}");
             }

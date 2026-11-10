@@ -69,6 +69,7 @@ acme_directory = "letsencrypt"
 # max_ports_per_agent = 10             # TCP/UDP ports one agent may hold
 # max_new_certificates_per_day = 20    # ACME: new hostnames one agent may add per 24 hours
 # enrollment_ttl_secs = 3600
+# max_connections = 4                 # connections one agent may hold (1 to 8): 224 streams and up to 128 MiB in flight each
 
 [users]
 # Accounts are created by administrators in the UI (Users) or the API; see the README.

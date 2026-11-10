@@ -315,9 +315,9 @@ async fn send_to_machine<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> std::
 /// A data stream to the tunnel's machine through its agent, as for any connection.
 async fn open_stream(dp: &DataPlane, o: &Opening, kind: Kind) -> Result<(Arc<Route>, magicpipes_core::mux::MuxStream), Refusal> {
     let route = admitted(&dp.table(), o, kind).ok_or(Refusal::NotFound)?.clone();
-    let agent = match &route.session {
-        Some(s) if !s.is_closed() => s.clone(),
-        _ => return Err(Refusal::Offline),
+    let agent = match route.agent.as_ref().filter(|a| a.is_online()) {
+        Some(a) => a.clone(),
+        None => return Err(Refusal::Offline),
     };
     let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(o.client.to_string()) };
     let stream = ports::open(dp, &route, &agent, o.client, header).await.ok_or(Refusal::Unreachable)?;

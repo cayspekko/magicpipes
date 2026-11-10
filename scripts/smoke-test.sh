@@ -149,6 +149,14 @@ run "$MP" login --server "https://localhost:$MGMT" --token "$TOKEN" --ca-cert "$
 step add
 run "$MP" add "$APP" --name smoke --json --timeout 60
 grep -q '"status": "ready"' cmd.out
+# The agent holds several connections to the server, which open a moment after the first.
+for _ in $(seq 1 50); do
+  "$MP" status --json > status.out 2>&1 < /dev/null
+  grep -q '"connections": 4' status.out && break
+  sleep 0.2
+done
+cat status.out | tee -a transcript.log
+grep -q '"connections": 4' status.out
 
 step "public request"
 run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "smoke.t.test:$HTTPS:127.0.0.1" "https://smoke.t.test:$HTTPS/"

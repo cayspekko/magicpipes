@@ -40,12 +40,34 @@ use crate::forwarded::TrustedProxies;
 use crate::tunnel_auth::Signer;
 pub use ports::PortSettings;
 
+/// An agent's connections, as the data plane uses them: each new stream goes on the one with the
+/// most data streams free, and losing one leaves the others serving. Every route of the agent's
+/// shares it.
+#[derive(Debug, Clone)]
+pub struct AgentLink(Arc<[MuxHandle]>);
+
+impl AgentLink {
+    /// `lanes`: one session per connection, joined ([`MuxHandle::join`]).
+    pub fn new(lanes: Vec<MuxHandle>) -> Self {
+        Self(lanes.into())
+    }
+
+    /// The open connection with the most data streams free; `None` once all are closed.
+    pub fn pick(&self) -> Option<&MuxHandle> {
+        self.0.iter().filter(|s| !s.is_closed()).min_by_key(|s| s.data_streams())
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.0.iter().any(|s| !s.is_closed())
+    }
+}
+
 /// One routable hostname or public port.
 #[derive(Debug)]
 pub struct Route {
     pub tunnel_id: String,
     /// `None` while the owning agent is disconnected.
-    pub session: Option<MuxHandle>,
+    pub agent: Option<AgentLink>,
     pub stats: Arc<RouteStats>,
     pub access: AccessPolicy,
     /// Changes with the tunnel's settings, which retires its pooled connections.
@@ -336,18 +358,21 @@ impl DataPlane {
         codes.insert(nonce.to_string(), std::time::Instant::now()).is_none()
     }
 
-    /// [`DataPlane::with_room`], and when nothing is idle to close but pooled connections on the
-    /// session are on their way back, waits for one to come back ([`pool::RETURN_WAIT`] at most),
-    /// which makes room. For a stream of its own; a pooled request reuses what comes back instead.
-    async fn with_room_or_wait<F, Fut>(&self, session: &MuxHandle, open: F) -> std::io::Result<MuxStream>
+    /// [`DataPlane::with_room`] on the agent's connection with the most room, and when nothing is
+    /// idle to close but pooled connections are on their way back, on any of its connections, waits
+    /// for one to come back ([`pool::RETURN_WAIT`] at most), which makes room, and picks again. For
+    /// a stream of its own; a pooled request reuses what comes back instead.
+    async fn with_room_or_wait<F, Fut>(&self, agent: &AgentLink, open: F) -> std::io::Result<MuxStream>
     where
-        F: Fn() -> Fut,
+        F: Fn(MuxHandle) -> Fut,
         Fut: Future<Output = std::io::Result<MuxStream>>,
     {
         let deadline = tokio::time::Instant::now() + pool::RETURN_WAIT;
         loop {
+            let session = agent.pick().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "agent disconnected"))?;
             let seen = session.returns();
-            match self.with_room(session, &open).await {
+            match self.with_room(session, || open(session.clone())).await {
+                // The one with the most room is full: so are the others.
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && session.data_streams_full() => {
                     if !session.wait_for_return(seen, deadline).await {
                         return Err(e);
@@ -512,8 +537,8 @@ mod tests {
 
         let client: IpAddr = "203.0.113.2".parse().unwrap();
         let opening = tokio::spawn({
-            let (dp, session) = (dp.clone(), session.clone());
-            async move { dp.with_room_or_wait(&session, || session.open_data(WAIT, client)).await.map(drop) }
+            let (dp, agent) = (dp.clone(), AgentLink::new(vec![session.clone()]));
+            async move { dp.with_room_or_wait(&agent, move |s| async move { s.open_data(WAIT, client).await }).await.map(drop) }
         });
         for _ in 0..10 {
             tokio::task::yield_now().await;
@@ -523,5 +548,69 @@ mod tests {
         dp.pool.put("tn_a", session.clone(), 0, lent.pop().unwrap());
         session.came_back();
         assert!(tokio::time::timeout(WAIT, opening).await.unwrap().unwrap().is_ok());
+    }
+
+    /// A session to an agent that accepts every stream and holds it.
+    fn lane() -> MuxHandle {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (session, _rpcs) = mux::spawn(a, Mode::Server);
+        let (_agent, mut inbound) = mux::spawn(b, Mode::Client);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(s) = inbound.recv().await {
+                held.push(s);
+            }
+        });
+        session
+    }
+
+    /// An agent's streams go on whichever of its connections has the most room: a full one, or a
+    /// closed one, sends them to the others, and one coming back anywhere lets a waiting stream in.
+    #[tokio::test]
+    async fn streams_go_where_an_agents_connections_have_room() {
+        let cfg: Config = toml::from_str("base_domain = \"t.test\"\n[management]\nhostname = \"m.t.test\"\n[tls]\nmode = \"dev-ca\"").unwrap();
+        let dp = DataPlane::new(ProxySettings::from_config(&cfg, Signer::for_tests()), CancellationToken::new());
+        let first = lane();
+        let second = lane().join(&first);
+        let agent = AgentLink::new(vec![first.clone(), second.clone()]);
+        // Fill the first connection; the agent still has room on the second.
+        let mut held: Vec<MuxStream> = Vec::new();
+        for _ in 0..MAX_DATA_STREAMS {
+            held.push(first.open_shared(WAIT).await.unwrap());
+        }
+        assert!(first.data_streams_full());
+        assert!(agent.pick().unwrap().same_session(&second), "the one with room");
+        let client: IpAddr = "203.0.113.3".parse().unwrap();
+        let s = dp.with_room_or_wait(&agent, move |s| async move { s.open_data(WAIT, client).await }).await.unwrap();
+        assert_eq!(second.data_streams(), 1, "it went on the second");
+        held.push(s);
+
+        // Both full, with pooled connections on their way back: one coming back on the second wakes
+        // a stream waiting on the first, which then goes where the room is.
+        while !second.data_streams_full() {
+            held.push(second.open_shared(WAIT).await.unwrap());
+        }
+        first.lend();
+        let waiting = tokio::spawn({
+            let (dp, agent) = (dp.clone(), agent.clone());
+            async move { dp.with_room_or_wait(&agent, move |s| async move { s.open_data(WAIT, client).await }).await.map(drop) }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished(), "nothing to take yet");
+        // The second gives a stream back, as a connection does when it's closed, and says so.
+        held.pop();
+        second.came_back();
+        assert!(tokio::time::timeout(WAIT, waiting).await.unwrap().unwrap().is_ok());
+
+        // A closed connection takes no streams; the agent is online while one is open.
+        drop(held);
+        first.close();
+        tokio::time::timeout(WAIT, first.closed()).await.unwrap();
+        assert!(agent.is_online() && agent.pick().unwrap().same_session(&second));
+        second.close();
+        tokio::time::timeout(WAIT, second.closed()).await.unwrap();
+        assert!(!agent.is_online() && agent.pick().is_none());
     }
 }

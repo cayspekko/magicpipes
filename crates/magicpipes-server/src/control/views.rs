@@ -67,6 +67,8 @@ pub struct AgentView {
     /// The connected agent's protocol version (1 for agents that predate the handshake).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<u32>,
+    /// How many connections the agent holds now (0 while it's offline).
+    pub connections: usize,
     /// The user the agent belongs to; absent for a service agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_user_id: Option<String>,
@@ -114,7 +116,7 @@ pub struct PrivateReach {
 
 impl ControlPlane {
     fn view(&self, st: &State, t: &TunnelRecord) -> TunnelView {
-        let connected = st.sessions.get(&t.row.agent_id).is_some_and(|s| !s.handle.is_closed());
+        let connected = st.sessions.get(&t.row.agent_id).is_some_and(|l| !l.is_closed());
         let port_error = t.row.public_port.and_then(|p| self.data.bind_error(t.row.kind, p));
         let status = match (connected, t.stats.last_outcome()) {
             _ if port_error.is_some() => "error",
@@ -196,9 +198,11 @@ impl ControlPlane {
         rows.into_iter()
             .filter(|a| authz::authorize(who, Action::Manage, st.agent_resource(&a.id)))
             .map(|a| {
-                let s = st.sessions.get(&a.id);
+                let link = st.sessions.get(&a.id);
+                let s = link.map(|l| l.first());
                 AgentView {
                     connected: s.is_some(),
+                    connections: link.map_or(0, |l| l.lanes.len()),
                     remote_addr: s.map(|s| s.remote.to_string()),
                     connected_at: s.map(|s| rfc3339(s.connected_at)),
                     protocol: s.map(|s| s.protocol),

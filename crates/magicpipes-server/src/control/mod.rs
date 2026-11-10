@@ -26,6 +26,7 @@ mod hostnames;
 mod oidc;
 mod registry;
 mod sessions;
+pub use sessions::Attached;
 mod settings;
 mod ssh;
 mod tags;
@@ -49,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 use crate::authz::{self, Action, AgentAuthz, Principal, Resource, TunnelAuthz};
 use crate::certs::CertManager;
 use crate::config::Config;
-use crate::data::{AccessPolicy, DataPlane, GatewayKey, Route, RouteStats, RouteTable, TunnelUser};
+use crate::data::{AccessPolicy, AgentLink, DataPlane, GatewayKey, Route, RouteStats, RouteTable, TunnelUser};
 use crate::store::{Store, TunnelRow};
 pub use device::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, Purpose};
 pub use email::{AcceptError, INVITATION_DAYS, InvitationView, LinkError, OpenInvitation, SIGN_IN_LINK_MINUTES};
@@ -89,7 +90,7 @@ pub struct ControlPlane {
 #[derive(Default)]
 struct State {
     tunnels: HashMap<String, TunnelRecord>,
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<String, Link>,
     next_conn_id: u64,
     /// Per agent: when each of its recent tunnels needed a new certificate order.
     cert_orders: HashMap<String, Vec<Instant>>,
@@ -128,6 +129,7 @@ impl State {
     }
 }
 
+/// One of an agent's connections.
 struct Session {
     conn_id: u64,
     handle: MuxHandle,
@@ -136,6 +138,42 @@ struct Session {
     /// The agent's protocol version (`proto::PROTOCOL_VERSION`).
     protocol: u32,
     last_ping: Instant,
+}
+
+/// An agent's connections: those of one run of it, at most [`proto::MAX_CONNECTIONS`], in the
+/// order they came. Never empty: the last one to go takes the entry with it.
+struct Link {
+    /// What its connections sent as `x-magicpipes-instance`; `None` from an agent before protocol
+    /// 9, whose one connection the next always replaces.
+    instance: Option<String>,
+    lanes: Vec<Session>,
+}
+
+impl Link {
+    /// An open connection, for the control plane's own streams (checks, removals).
+    fn handle(&self) -> Option<MuxHandle> {
+        self.lanes.iter().find(|s| !s.handle.is_closed()).map(|s| s.handle.clone())
+    }
+
+    /// The connections the data plane opens streams on.
+    fn data(&self) -> AgentLink {
+        AgentLink::new(self.lanes.iter().map(|s| s.handle.clone()).collect())
+    }
+
+    fn close(&self) {
+        for s in &self.lanes {
+            s.handle.close();
+        }
+    }
+
+    /// The connection up longest, for what's shown about the agent.
+    fn first(&self) -> &Session {
+        &self.lanes[0]
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lanes.iter().all(|s| s.handle.is_closed())
+    }
 }
 
 fn err(code: ErrorCode, msg: impl Into<String>) -> ErrorBody {
@@ -266,12 +304,14 @@ impl ControlPlane {
         for k in st.dir.ssh_keys() {
             table.ssh_keys.insert(k.fingerprint.clone(), GatewayKey { id: k.id.clone(), user_id: k.user_id.clone() });
         }
+        // One link per agent, shared by its routes.
+        let links: HashMap<&str, AgentLink> = st.sessions.iter().map(|(agent, link)| (agent.as_str(), link.data())).collect();
         for t in st.tunnels.values() {
             // A disabled owner's agents serve nothing.
             if !st.dir.agent_active(&t.row.agent_id) {
                 continue;
             }
-            let session = st.sessions.get(&t.row.agent_id).map(|s| s.handle.clone());
+            let agent = links.get(t.row.agent_id.as_str()).cloned();
             // Stored lists were validated on registration. If one no longer parses, fail closed:
             // an empty list would mean "anyone".
             let allow = match cidr::parse_list(&t.row.allow) {
@@ -283,7 +323,7 @@ impl ControlPlane {
             };
             let access = AccessPolicy { allow, authz: st.tunnel_authz(t) };
             let host_key = st.host_keys.get(&t.row.id).cloned();
-            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), session, stats: t.stats.clone(), access, version: t.version, host_key });
+            let route = Arc::new(Route { tunnel_id: t.row.id.clone(), agent, stats: t.stats.clone(), access, version: t.version, host_key });
             match (t.row.kind, t.row.public_port) {
                 (Kind::Http, _) => {
                     table.by_host.insert(t.row.hostname.clone(), route);
@@ -356,11 +396,11 @@ impl ControlPlane {
             return Ok(false);
         }
         st.tunnels.retain(|_, t| t.row.agent_id != agent_id);
-        let session = st.sessions.remove(agent_id);
+        let link = st.sessions.remove(agent_id);
         self.publish(&st);
         drop(st);
-        if let Some(s) = session {
-            s.handle.close();
+        if let Some(link) = link {
+            link.close();
         }
         tracing::info!(agent = %agent_id, by = who.actor(), "agent revoked");
         self.audit(who, "agent.revoke", agent_id, "");

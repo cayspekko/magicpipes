@@ -2,10 +2,10 @@
 //!
 //! Without them every request opens a stream, and the agent a TCP connection to the
 //! application, which costs a round trip and, under load, the agent's local ports (each closed
-//! connection waits a minute before its port is free again). A connection is reused only on the
-//! same agent session and tunnel version ([`super::Route::version`]) it was opened on, so a changed
-//! target or a reconnected agent always gets fresh ones, while changes to other tunnels cost
-//! nothing.
+//! connection waits a minute before its port is free again). A connection is reused only by the
+//! same run of the agent (any of its connections: [`MuxHandle::same_group`]) and tunnel version
+//! ([`super::Route::version`]) it was opened on, so a changed target or a restarted agent always
+//! gets fresh ones, while changes to other tunnels cost nothing.
 //!
 //! Bounded: at most [`MAX_IDLE_PER_TUNNEL`] per tunnel and [`MAX_IDLE`] in total, each for at
 //! most [`IDLE_TIMEOUT`]. Idle connections hold a place in their session's stream budget (not a
@@ -25,13 +25,15 @@ use std::time::{Duration, Instant};
 
 use hyper::client::conn::http1::SendRequest;
 use magicpipes_core::mux::{MAX_DATA_STREAMS, MuxHandle};
+use magicpipes_core::proto::MAX_CONNECTIONS;
 
 /// How long an idle connection is kept. Shorter than most applications' own keep-alive (often
 /// 5 s or more), so an application rarely closes one just as it is reused.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
-/// As many as can be in flight. With fewer, a busy tunnel closes connections only to open them
-/// again for the next request, until the agent runs out of local ports.
-pub const MAX_IDLE_PER_TUNNEL: usize = MAX_DATA_STREAMS;
+/// As many as can be in flight, on all of an agent's connections. With fewer, a busy tunnel closes
+/// connections only to open them again for the next request, until the agent runs out of local
+/// ports.
+pub const MAX_IDLE_PER_TUNNEL: usize = MAX_DATA_STREAMS * MAX_CONNECTIONS;
 pub const MAX_IDLE: usize = 4096;
 /// How long a request waits for a connection to come back when its session's streams are all in
 /// use and none is idle. One comes back within milliseconds of its response; a session full of
@@ -46,9 +48,10 @@ struct Idle<B> {
 }
 
 impl<B> Idle<B> {
+    /// Usable by a request to the agent `session` is one of the connections of.
     fn usable(&self, session: &MuxHandle, version: u64) -> bool {
         self.version == version
-            && self.session.same_session(session)
+            && self.session.same_group(session)
             && !self.session.is_closed()
             && self.since.elapsed() < IDLE_TIMEOUT
             && self.sender.is_ready()
@@ -67,14 +70,14 @@ impl<B> Default for Pool<B> {
 }
 
 impl<B> Pool<B> {
-    /// A ready connection to `tunnel` on `session`, if one is idle. Stale ones met on the way
-    /// are dropped, which closes them.
-    pub fn take(&self, tunnel: &str, session: &MuxHandle, version: u64) -> Option<SendRequest<B>> {
+    /// A ready connection to `tunnel` on any connection of the agent `session` is one of, if one
+    /// is idle, and the session it's on. Stale ones met on the way are dropped, which closes them.
+    pub fn take(&self, tunnel: &str, session: &MuxHandle, version: u64) -> Option<(SendRequest<B>, MuxHandle)> {
         let mut idle = self.idle.lock().unwrap();
         let list = idle.get_mut(tunnel)?;
         let found = loop {
             match list.pop() {
-                Some(c) if c.usable(session, version) => break Some(c.sender),
+                Some(c) if c.usable(session, version) => break Some((c.sender, c.session)),
                 Some(_) => {}
                 None => break None,
             }
@@ -157,16 +160,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuse_stays_on_its_session_and_version() {
+    async fn reuse_stays_with_its_agent_and_version() {
         let pool = Pool::default();
-        let ((s1, _p1), (s2, _p2)) = (session(), session());
+        let ((s1, _p1), (s2, _p2), (s3, _p3)) = (session(), session(), session());
+        // Another connection of the same run of the agent's.
+        let s1b = s3.join(&s1);
         let mut peers = Vec::new();
         let mut put = |tunnel: &str, s: &MuxHandle, version: u64, c: (SendRequest<Empty<Bytes>>, DuplexStream)| {
             peers.push(c.1);
             pool.put(tunnel, s.clone(), version, c.0);
         };
         put("tn_a", &s1, 1, connection().await);
-        assert!(pool.take("tn_a", &s2, 1).is_none(), "another session (a reconnected agent)");
+        assert!(pool.take("tn_a", &s2, 1).is_none(), "another agent's, or a restarted one's");
+        put("tn_a", &s1b, 1, connection().await);
+        let (_, on) = pool.take("tn_a", &s1, 1).expect("any connection of the agent's will do");
+        assert!(on.same_session(&s1b), "and the request learns which it's on");
         put("tn_a", &s1, 1, connection().await);
         assert!(pool.take("tn_a", &s1, 2).is_none(), "another version of the tunnel (a changed target)");
         put("tn_a", &s1, 1, connection().await);
@@ -180,6 +188,7 @@ mod tests {
         }
         assert_eq!(pool.len(), MAX_IDLE_PER_TUNNEL);
         assert!(!pool.evict(&s2), "nothing idle on that session");
+        assert!(!pool.evict(&s1b), "nor on another of the agent's: room is made where it's needed");
         assert!(pool.evict(&s1));
         assert_eq!(pool.len(), MAX_IDLE_PER_TUNNEL - 1);
 

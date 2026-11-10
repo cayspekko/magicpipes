@@ -131,9 +131,9 @@ impl ControlPlane {
         // Sessions of agents whose owner was disabled end now.
         let inactive: Vec<String> = st.sessions.keys().filter(|a| !st.dir.agent_active(a)).cloned().collect();
         for a in inactive {
-            if let Some(s) = st.sessions.remove(&a) {
+            if let Some(link) = st.sessions.remove(&a) {
                 tracing::info!(agent = %a, "closing session: the agent's owner is disabled");
-                s.handle.close();
+                link.close();
             }
         }
         self.publish(&st);

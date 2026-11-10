@@ -73,20 +73,23 @@ connections:
   an upgrade keeps its stream, and the probe checks that the agent opened a stream for it.
 * Requests from different visitors take turns on a connection, as behind any reverse proxy, so
   applications must not tie authentication to the TCP connection (NTLM-style).
-* Bounds: at most 224 idle connections per tunnel (as many as can be in flight, or a busy tunnel
-  closes connections only to reopen them, until the agent runs out of local ports) and 4096 in
-  total, each idle for at most 4 s (shorter than most applications' keep-alive), swept every 2 s.
-  Idle connections count toward the session's 224 data streams but not toward any client's 64; a
-  request holds its client's place until its response body is done. When a session's streams are
-  used up, idle connections on it are closed to make room, for pooled requests, WebSockets and
-  port connections alike.
+* Bounds: at most 224 idle connections per tunnel for each of its agent's connections, 1,792 at
+  most (as many as can be in flight, or a busy tunnel closes connections only to reopen them,
+  until the agent runs out of local ports), and 4096 in total, each idle for at most 4 s (shorter
+  than most applications' keep-alive), swept every 2 s. A connection idle on any of the agent's
+  connections serves the next request (`MuxHandle::same_group`). Idle connections count toward
+  their connection's 224 data streams but not toward any client's 64; a request holds its client's
+  place until its response body is done. When the streams are used up, idle connections on the
+  connection that needs one are closed to make room, for pooled requests, WebSockets and port
+  connections alike.
 * **Connections on their way back.** A connection holds its stream from its request until the
   task that puts it back has run, a moment after the client has its response. Under load that
   moment adds up: with 150 clients on a busy 4-core VM, refusals (`agent_busy`) were logged with all
   224 streams in use, none idle, and 96 to 147 connections finished but not back yet, a few per
-  million requests. So each session counts them (`MuxHandle::lend`, `came_back`), and a request
-  that finds the streams used up and nothing idle waits for one to come back (1 s at most): a
-  pooled request takes it, and anything else closes it for room. More tries at closing idle ones
+  million requests. So each agent counts them, across its connections (`MuxHandle::lend`,
+  `came_back`), and a request that finds the streams used up and nothing idle waits for one to come
+  back on any of them (1 s at most), then picks again: a pooled request takes it, and anything
+  else closes it for room. More tries at closing idle ones
   (40 instead of 3) had changed nothing, since there were none. The count is a few atomics on the
   session, and wakes anyone only when someone is waiting on that session: a first version kept it
   in the pool, under a lock every request took twice, and woke waiting requests whenever any
@@ -160,8 +163,9 @@ this split, a stuck database stopped all tunnels (`a_stuck_database_does_not_hol
 SQLite stays at `synchronous = FULL`: losing the last commits to a power failure could bring back
 a revoked token, and with commits off the traffic threads their cost no longer reaches tunnels.
 
-An agent's session is one TCP connection shared by all its streams, and three things decide how
-well it carries them (`magicpipes-core/src/mux.rs`):
+An agent holds a few connections (protocol 9; 4 unless configured, below), each a yamux session
+shared by the streams placed on it, and three things decide how well each carries them
+(`magicpipes-core/src/mux.rs`):
 
 * **Batched writes** (`Batched`, 64 KiB per session). yamux writes a frame's header and body
   separately and flushes after each frame, which over TLS is two records and two system calls per
@@ -172,6 +176,46 @@ well it carries them (`magicpipes-core/src/mux.rs`):
 * **A limit on the kernel's send queue** (`SEND_QUEUE`, `TCP_NOTSENT_LOWAT`, 128 KiB; Linux on both
   ends, and macOS agents). Unlimited, it grows to about 4 MB, which on a slow link is seconds of a
   download that every other request on the session has to wait behind.
+
+### Several connections per agent (protocol 9)
+
+One connection was one queue for everything an agent carried, capped at 224 public streams, and its
+loss took the agent offline until it reconnected. Now an agent holds several, each a session of
+its own (`agent/session.rs` "lanes"; `control/sessions.rs` `Link`; `data::AgentLink`):
+
+* **Equal, not primary and spare.** Any connection carries RPCs; each pings, and reconnects with
+  its own backoff. The agent is online while one is, and re-registers its tunnels only when it
+  comes back from none.
+* **Kept together by instance.** Every connection carries `x-magicpipes-instance`, random per run
+  of the agent. The server keeps one instance's connections together, up to
+  `agents.max_connections` (default 4, at most 8, answered with 409 beyond, and the agent goes on
+  with fewer); a connection with another instance, or none (an agent before protocol 9), replaces
+  them, as the newest connection always did. An older server lets each new connection replace the
+  last, so an agent opens more than one only once a connection has told it the server's protocol.
+* **Placement.** A new stream goes on the open connection with the fewest data streams in use
+  (`AgentLink::pick`, an atomic read per connection). Streams stay where they're opened: a lost
+  connection ends its own streams, and the next requests go on the others.
+* **What counts per connection and what per agent.** yamux limits streams per connection, so each
+  keeps its own 224. A client's share (64) and the pool's connections on their way back count
+  across the agent's connections (`MuxHandle::join`, `same_group`), so one client can't take more
+  because there are more connections, and a connection coming back on one wakes a request waiting
+  on another, which then picks again.
+* **Cost:** each connection holds a 64 KiB write batch and TLS buffers at each end and pings every
+  15 s, and may buffer up to 128 MiB of receive window on the server (see the known costs below).
+* **Measured** (2026-11-10, traffic suite against one connection, 3 rounds). Static Linux, 4-vCPU
+  VM: 4 downloads at once +47%, 4 raw-port streams +102%, small requests during downloads 1.91 ms
+  to 0.28 ms, 400 requests in flight served in full at 117k/s where one connection turned away a
+  third (`agent_busy`); small requests at 16 to 150 clients and CPU per request within noise (-4%
+  to +4%), agent memory after load unchanged (about 10 MB). macOS: downloads +30%, raw ports +60%,
+  small requests during downloads 3.6 ms to 0.45 ms, but small requests at 64 and 150 clients -5%
+  and CPU per request +8% (server) and +12% (agent), since each connection batches only its share of
+  the frames. Two connections gave about half the gains (Linux: downloads +33%, raw ports +51%,
+  small requests during downloads 0.89 ms), so the default is 4.
+* **Tests:** `streams_go_where_an_agents_connections_have_room` (placement, waiting across
+  connections), `an_agents_connections_stay_together_up_to_a_limit` (joining, the limit,
+  replacing), `several_connections_carry_more_than_one_can` (300 requests held open: 224 with one
+  connection, all with four; one client still 64) and
+  `an_agents_connections_carry_on_when_one_is_cut` (a relay cuts one, then all).
 
 The server's static Linux builds use mimalloc rather than musl's allocator, which takes a global
 lock around every allocation. In `secure` mode (guard pages and encoded free lists, since this
@@ -685,9 +729,9 @@ tunnel, never an address.
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 8: 2 added the handshake and
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 9: 2 added the handshake and
   answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
-  and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels). A peer without the header is
+  and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels, 9 several connections per agent). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,
@@ -898,9 +942,10 @@ a connection to the public port that must arrive back at the agent (a warning, n
   agent's authenticated session gives its place back once upgraded), header read
   and TLS handshake timeouts, a 15 s deadline and 64 KiB body limit for management requests,
   64 KiB control frames and IPC lines (5 s to send one), ≤256 concurrent streams per agent
-  session of which public traffic may use 224 (64 streams or in-flight requests per client;
-  idle pooled HTTP connections count toward the 224, see "Upstream connection reuse"), so pings and RPCs always get
-  through; one 64 KiB write batch per session and 64 KiB copy buffers per direction per connection; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
+  connection of which public traffic may use 224 (64 streams or in-flight requests per client
+  across the agent's connections; idle pooled HTTP connections count toward the 224, see
+  "Upstream connection reuse"), so pings and RPCs always get through; `agents.max_connections`
+  connections per agent (4 by default, 8 at most); one 64 KiB write batch per session and 64 KiB copy buffers per direction per connection; `max_tunnels_per_agent`, `max_new_certificates_per_day` per agent, at most two
   concurrent ACME orders, per-hostname failure backoff (renewals included); for email, 4 messages
   being sent at once (8 s per step and 12 s per message), a queue of 256 requests for sign-in links
   answered one at a time, 3 links per account per 15 minutes, 10 requests per client per hour, 100
@@ -979,10 +1024,13 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * Read-only web terminals are anonymous: anyone with the link can hold one of its
   `--max-clients` sessions for as long as they keep the page open, and start up to 60 programs a
   minute.
-* Four client addresses (or /64s) can hold all of an agent's 224 data streams, which
-  `body_idle_timeout_secs` and `tcp_idle_timeout_secs` can only shorten.
-* Each agent session may buffer up to 128 MiB of yamux receive window, and UDP flow queues are
-  bounded by datagram count (64 per flow), not bytes.
+* Four client addresses (or /64s) can hold one agent connection's 224 data streams, and 14 all of
+  an agent's at 4 connections, which `body_idle_timeout_secs` and `tcp_idle_timeout_secs` can only
+  shorten.
+* Each agent connection may buffer up to 128 MiB of yamux receive window, so an agent up to
+  `agents.max_connections` times that (512 MiB at the default 4): more connections carry more
+  users, and buffer more for them. UDP flow queues are bounded by datagram count (64 per flow), not
+  bytes.
 * Windows IPC relies on `first_pipe_instance` and the default pipe ACL. Another local user who
   creates the pipe name first could receive the CLI's requests; an explicit owner-only ACL and
   a server-owner check are still to do.

@@ -220,8 +220,9 @@ what has already been tried, and the costs left in place on purpose.
   session's writes, so don't wrap a session in another buffer.
 - **Sockets are set up on purpose.** Every TCP socket gets `set_nodelay(true)`, and every connection
   that can carry a session gets `SEND_QUEUE`.
-- **A session is one queue.** All of an agent's streams share one TCP connection, so bytes queued
-  below yamux delay everyone's next request. Data waits per stream, where flow control applies.
+- **A connection is one queue.** An agent's streams share its few TCP connections (4 by default),
+  so bytes queued below yamux on one delay the next requests placed on it. Data waits per stream,
+  where flow control applies.
 - **The agent stays small.** It is a background process on someone else's machine: about 6 MB on
   Linux, and back there after load. The server may spend bounded memory for speed; the agent may
   not. Judge an allocator or a cache on memory after load and after idling, as well as on speed.

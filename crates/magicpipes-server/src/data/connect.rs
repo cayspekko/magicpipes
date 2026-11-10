@@ -48,7 +48,7 @@ pub struct Found {
 
 impl Found {
     pub fn online(&self) -> bool {
-        self.route.session.as_ref().is_some_and(|s| !s.is_closed())
+        self.route.agent.as_ref().is_some_and(|a| a.is_online())
     }
 }
 
@@ -130,16 +130,16 @@ impl DataPlane {
     /// Opens the agent's stream for one connection or UDP flow.
     pub async fn connect_open(&self, person: Person, found: Found, client: IpAddr) -> Result<Opened, Refused> {
         let slot = self.connect_slot(&person.user_id).ok_or(Refused::Busy)?;
-        let session = match &found.route.session {
-            Some(s) if !s.is_closed() => s.clone(),
-            _ => return Err(Refused::Offline),
+        let agent = match found.route.agent.as_ref().filter(|a| a.is_online()) {
+            Some(a) => a.clone(),
+            None => return Err(Refused::Offline),
         };
         let (tunnel_id, peer) = (found.route.tunnel_id.clone(), Some(client.to_string()));
         let header = match found.kind {
             Kind::Udp => ServerOpen::Datagram { tunnel_id, peer },
             _ => ServerOpen::Data { tunnel_id, peer },
         };
-        let stream = ports::opened(self, &found.route, &session, client, header).await.map_err(|outcome| match outcome {
+        let stream = ports::opened(self, &found.route, &agent, client, header).await.map_err(|outcome| match outcome {
             Outcome::LocalUnreachable => Refused::LocalUnreachable,
             Outcome::None => Refused::Busy,
             _ => Refused::Offline,

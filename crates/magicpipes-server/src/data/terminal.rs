@@ -211,9 +211,9 @@ async fn log_in(dp: &DataPlane, o: &Opening, login: &str, (cols, rows): (u32, u3
     let gone = || refusal(ErrorCode::NotFound, "You can't reach this machine, or it no longer exists.");
     let table = dp.table();
     let route = admitted(&table, o).ok_or_else(gone)?.clone();
-    let agent = match &route.session {
-        Some(s) if !s.is_closed() => s.clone(),
-        _ => return Err(refusal(ErrorCode::AgentOffline, format!("{} is offline.", o.name))),
+    let agent = match route.agent.as_ref().filter(|a| a.is_online()) {
+        Some(a) => a.clone(),
+        None => return Err(refusal(ErrorCode::AgentOffline, format!("{} is offline.", o.name))),
     };
     let ca = dp.ssh_ca.get().cloned().ok_or_else(|| refusal(ErrorCode::SshDisabled, "This server has no SSH gateway."))?;
     let did_not_answer = || refusal(ErrorCode::LocalUnreachable, format!("{} did not answer. Is its sshd running?", o.name));
