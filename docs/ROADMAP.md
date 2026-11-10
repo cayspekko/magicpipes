@@ -43,6 +43,7 @@ What you expose, and every way people can reach it:
 | Shell (no sshd) | `add --shell [-- prog]` | ✅ today (terminal page) | — | — | 🖥 via its hostname (agent-side pty) |
 | RDP | `add 3389 --rdp` | — | ✅ TCP (`add 3389 --tcp`); native clients through `magicpipes connect` | — | 🖥 desktop (IronRDP), today |
 | VNC | `add 5900 --vnc` | — | ✅ TCP (`add 5900 --tcp`); native viewers through `magicpipes connect` | — | 🖥 desktop (noVNC), today |
+| SPICE (QEMU VMs) | `add 5900 --spice` (planned) | — | ✅ TCP today (`--tcp --private`); remote-viewer through `magicpipes connect` | — | 🖥 later, maybe (spice-html5) |
 
 `--host somehost` (and a `host:port` positional shorthand) works on every row except static
 files and shell, so an agent can publish services elsewhere on its LAN.
@@ -164,7 +165,7 @@ port forwarding and agent forwarding all work, and the target's `authorized_keys
 applies; the gateway sees only ciphertext. A plain `ssh -p 2222 example.com` (no `-J`) gets a
 "your hosts are … use `ssh -J …`" message and is disconnected.
 
-## Browser access: one relay, five uses
+## Browser access: one relay, many uses
 
 Every browser feature except the SSH terminal is the same server piece: authenticate the UI
 user, then pipe a WebSocket into a tunnel stream.
@@ -172,6 +173,7 @@ user, then pipe a WebSocket into a tunnel stream.
 | Feature | Browser side | Server side | Agent side |
 |---|---|---|---|
 | VNC desktop (**done**: `add --vnc`) | noVNC (MPL-2.0) | plain relay | TCP to the VNC server |
+| SPICE desktop (later, maybe) | spice-html5 (LGPL-3.0) | a relay per channel; TLS per channel for TLS-only servers | TCP to the SPICE server |
 | RDP desktop (**done**: `add --rdp`) | IronRDP compiled to WASM | relay + the TLS step of the RDP handshake (RDCleanPath, as in Devolutions Gateway), which lets it read the session (below) | TCP to the RDP server |
 | Shell terminal (**done**: `add --shell`) | xterm.js (MIT), served by the agent | none: an ordinary tunnel WebSocket | pty (`portable-pty`, ConPTY on Windows) |
 | SSH terminal (**done**) | xterm.js | SSH client (`russh`) through the tunnel | TCP to sshd |
@@ -341,6 +343,36 @@ needs no `permit-pty`, so it carries no extensions at all.
   `nosniff`, never rendered on the management host.
 * Files opened appear in the audit log (`ssh.files`), once a minute per person and machine at most.
 
+### SPICE: QEMU, libvirt and Proxmox virtual machines
+
+SPICE is QEMU's remote display protocol. Unlike VNC, each channel (main, display, inputs, cursor,
+audio, USB) is its own TCP connection to the same port, the main channel first, and servers often
+accept only TLS. Looked into 2026-11-09, for libvirt and Proxmox.
+
+* **Native viewers work today.** `magicpipes add 5900 --tcp --private` and `magicpipes connect`
+  carry every channel, since each is just another connection, TLS included; remote-viewer then
+  opens `spice://127.0.0.1:<port>`. libvirt's automatic ports change when a VM restarts, so give
+  each VM a fixed SPICE port in its domain XML.
+* **First, `--spice` for native viewers:** a kind like `--rdp`, private by default and listed as a
+  desktop, and `magicpipes connect --open` writing a `.vv` file for the local port and starting
+  remote-viewer. Proxmox hands remote-viewer a `.vv` file that goes through its `spiceproxy` (port
+  3128) with a ticket that expires in about 30 seconds and names the node's own address; tunneled
+  as a private TCP port, `magicpipes connect <name> --vv <file>` would rewrite the file's proxy to
+  the local port and start remote-viewer at once.
+* **Later, maybe, in the browser:** spice-html5, the only maintained browser client (0.3.0 from
+  2020, with commits again in 2026; oVirt dropped it as slow). It's LGPL-3.0, a license new to this
+  project and the owner's call. The server side is a relay like VNC's, but with one WebSocket per
+  channel, the `binary` subprotocol answered, and the desktop limit counting desktops rather than
+  sockets. It speaks no TLS, so a TLS-only SPICE server would need the server to do TLS per
+  channel, as for RDP. It has the main, display, inputs, cursor, audio and port channels; no USB,
+  files or smartcards.
+* **Proxmox in the browser** goes through `--local-https` to its web UI, whose consoles are noVNC
+  and xterm.js; SPICE there would need MagicPipes to hold Proxmox API credentials for its tickets.
+  libvirt VMs can also offer VNC (`<graphics type='vnc'>`), which `--vnc` serves today.
+* **Not Rust:** `spice-client` builds to WebAssembly but is GPL-3.0, which this project can't bundle;
+  Shaken Fist's `shakenfist-spice-*` crates (Apache-2.0) are protocol and decompression pieces, months
+  from a client.
+
 ## Prerequisite for browser access and the SSH gateway: users
 
 Today the management UI has a single admin token. Desktops and SSH terminals in the browser
@@ -425,6 +457,8 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | done (RDP used against Windows 11 with NLA; VNC built, not yet tried against a real VNC server) |
 | 6b | Touch-friendly desktops: VNC, then RDP (keyboard button, key bar, touch for RDP, zoom and pan) | none (the pages) | planned |
 | 6c | Files to and from desktops: RDP's clipboard file copy, then VNC (a Files panel from a folder the agent's user names, or SSH files) | none for RDP; agent and server for the panel | planned |
+| 6d | SPICE for native viewers: `--spice`, `connect --open` and Proxmox's `.vv` files (`connect --vv`) | yes (the kind) | planned |
+| 6e | SPICE in the browser with spice-html5 (its LGPL-3.0 license needs the owner's OK) | yes | later, maybe |
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |
