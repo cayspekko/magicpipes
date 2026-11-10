@@ -121,7 +121,7 @@ impl ControlPlane {
         let status = match (connected, t.stats.last_outcome()) {
             _ if port_error.is_some() => "error",
             (false, _) => "disconnected",
-            (true, Outcome::LocalUnreachable) => "error",
+            (true, Outcome::LocalUnreachable | Outcome::TimedOut) => "error",
             (true, _) => "connected",
         };
         let cert = if t.row.kind.is_http() { Some(self.certs.status(&t.row.hostname)) } else { None };

@@ -10,7 +10,7 @@ use magicpipes_core::proto::{CONNECT_PROTOCOL, EnrollRequest, ErrorBody};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{AppState, ClientIp, Rejected, bearer_token};
+use super::{AppState, ClientIp, Rejected, SESSION_COOKIE, bearer_token};
 use crate::authz::{Principal, Role};
 use crate::control::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, EnrollmentOptions, Purpose};
 use crate::data::connect::{MAX_PER_PERSON, Refused};
@@ -60,6 +60,31 @@ impl FromRequestParts<AppState> for Caller {
             Err(Rejected::Invalid(())) => Err(unauthorized()),
         }
     }
+}
+
+/// Extractor for `/metrics`: a bearer token as for the API, or else a signed-in browser, so an
+/// administrator can look at what Prometheus is given.
+pub struct Reader(Principal);
+
+impl FromRequestParts<AppState> for Reader {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Self::Rejection> {
+        if bearer_token(&parts.headers).is_none()
+            && let Some(s) = crate::tunnel_auth::cookie(&parts.headers, SESSION_COOKIE).and_then(|c| app.control.session(c))
+            && !s.user.as_ref().is_some_and(|u| u.must_change_password)
+        {
+            return Ok(Reader(s.who));
+        }
+        Caller::from_request_parts(parts, app).await.map(|Caller(who)| Reader(who))
+    }
+}
+
+/// Metrics in Prometheus' text format, for administrators.
+pub async fn metrics(Reader(who): Reader, State(app): State<AppState>) -> Result<Response, ApiError> {
+    let text = app.control.metrics(&who).ok_or_else(forbidden)?;
+    let headers = [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (http::header::CACHE_CONTROL, "no-store")];
+    Ok((headers, text).into_response())
 }
 
 pub async fn status(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {

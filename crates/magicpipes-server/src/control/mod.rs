@@ -23,6 +23,7 @@ mod device;
 mod directory;
 mod email;
 mod hostnames;
+mod metrics;
 mod oidc;
 mod registry;
 mod sessions;
@@ -35,6 +36,7 @@ mod views;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -138,6 +140,9 @@ struct Session {
     /// The agent's protocol version (`proto::PROTOCOL_VERSION`).
     protocol: u32,
     last_ping: Instant,
+    /// The last round trip the server timed on it, in microseconds; 0 until one has been, or after
+    /// one failed. See [`ControlPlane::ping_agents`].
+    round_trip: Arc<AtomicU64>,
 }
 
 /// An agent's connections: those of one run of it, at most [`proto::MAX_CONNECTIONS`], in the
@@ -282,11 +287,13 @@ impl ControlPlane {
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
+            let mut pings = tokio::time::interval(sessions::PING_EVERY);
             let mut hourly = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = tick.tick() => me.reap_sessions(),
+                    _ = pings.tick() => me.ping_agents(),
                     _ = hourly.tick() => me.prune(),
                 }
             }

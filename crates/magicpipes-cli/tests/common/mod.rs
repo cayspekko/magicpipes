@@ -512,6 +512,22 @@ udp_idle_timeout_secs = 5
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
+    /// A GET on the management host with a bearer token or a cookie: the status, the content type
+    /// and the body as text.
+    pub async fn mgmt_text(&self, path: &str, token: Option<&str>, cookie: Option<&str>) -> (StatusCode, String, String) {
+        let mut b = Request::get(path).header(header::HOST, format!("localhost:{}", self.mgmt_port));
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        let resp = self.send("localhost", self.mgmt_port, b.body(Full::new(Bytes::new())).unwrap()).await;
+        let status = resp.status();
+        let kind = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        (status, kind, String::from_utf8_lossy(&body(resp, path).await).into_owned())
+    }
+
     /// Polls `f` until it returns true or `timeout` passes.
     pub async fn eventually<F, Fut>(&self, what: &str, timeout: Duration, mut f: F)
     where

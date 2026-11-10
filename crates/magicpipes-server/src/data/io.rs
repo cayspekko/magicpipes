@@ -2,6 +2,8 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -10,6 +12,8 @@ use magicpipes_core::proto::StreamStatus;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::listen::Activity;
+
+use super::RouteStats;
 
 /// Error surfaced when the agent reports that it could not serve a data stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,12 +107,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatusPrefixed<S> {
 /// Copies bytes in both directions until either side closes, no byte moves for `idle` (if set), or
 /// `stop` is cancelled (access was revoked). Backpressure is inherent: each direction only reads
 /// when the previous write completed.
-pub async fn bridge<A, B>(a: A, b: B, idle: Option<Duration>, stop: tokio_util::sync::CancellationToken)
+pub async fn bridge<A, B>(a: A, b: B, idle: Option<Duration>, stop: tokio_util::sync::CancellationToken, stats: Arc<RouteStats>)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let activity = Activity::new();
+    // `a` is the visitor's side, `b` the agent's: what's read from each goes the other way.
+    let (a, b) = (Counted { inner: a, stats: stats.clone(), toward_app: true }, Counted { inner: b, stats, toward_app: false });
     let (mut a, mut b) = (activity.track(a), activity.track(b));
     let stalled = async {
         match idle {
@@ -127,3 +133,42 @@ where
     }
 }
 
+/// Counts the bytes read from a connection on its tunnel, as they're read: toward the app from the
+/// visitor's side, back from the agent's. A chunk is up to [`COPY_BUFFER`], so it's one atomic add
+/// per system call, and a long connection shows its traffic while it lasts.
+struct Counted<T> {
+    inner: T,
+    stats: Arc<RouteStats>,
+    toward_app: bool,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &polled {
+            let n = buf.filled().len().saturating_sub(before) as u64;
+            let total = if self.toward_app { &self.stats.bytes_in } else { &self.stats.bytes_out };
+            total.fetch_add(n, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}

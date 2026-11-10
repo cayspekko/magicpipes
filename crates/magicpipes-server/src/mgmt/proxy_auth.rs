@@ -41,7 +41,9 @@ pub async fn identify(State(app): State<AppState>, mut req: Request, next: Next)
     let Some(proxy) = app.control.proxy_auth() else { return next.run(req).await };
     // The sign-in form takes an admin token, whoever the proxy says this is.
     let signing_in = req.method() == Method::POST && req.uri().path() == "/login";
-    if !is_a_page(req.uri().path()) || signing_in {
+    // `/metrics` is a page to a browser, and not to a scraper, which brings its own token.
+    let scraping = req.uri().path() == "/metrics" && super::bearer_token(req.headers()).is_some();
+    if !is_a_page(req.uri().path()) || signing_in || scraping {
         return next.run(req).await;
     }
     let held = cookie(req.headers(), SESSION_COOKIE).map(str::to_string);

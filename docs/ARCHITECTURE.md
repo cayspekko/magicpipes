@@ -269,6 +269,29 @@ Known costs, left as they are for now:
 * No HTTP/2 toward browsers, so they open several connections.
 * A 64 KiB yamux frame size gave about 18% more on a Mac, and hasn't been measured on Linux.
 
+## Metrics (`/metrics`, `control/metrics.rs`)
+
+What tunnels carry is counted where it happens, on the traffic threads, in each tunnel's
+`RouteStats`: atomics shared with the control plane, so counting takes no lock and touches no
+database. Per request or connection that's its outcome (failures by cause: `agent_offline`,
+`local_unreachable`, `upstream_timeout`; refusals for want of streams counted apart, as they never
+reach the agent), the time to the app's answer in 15 fixed buckets (one add each for the bucket and
+the sum), and bytes: one add per body frame over HTTP, per read on a joined connection
+(`io::bridge`) and per UDP datagram, so a long connection shows its traffic while it lasts. The counters live as long as
+the tunnel's record, which outlasts route publishes, and start at zero when the server starts.
+
+Every 15 seconds, and when a connection attaches, the control plane times a round trip on each of
+an agent's connections: a control stream (`MuxHandle::open`, outside the data budget) carrying
+`ServerOpen::Ping`, which the agent answers with a status byte at once. An agent from before that
+answers it as unsupported (protocol 2 and later), which times it as well, so no protocol bump. The
+ping waits behind the connection's traffic, so a slow or full link shows, not just a far one.
+
+`/metrics` is on the management host only, for administrators (`authorize`'s `Discover` on the
+organization), with a bearer token or a signed-in browser. Rendering copies what it needs under the
+registry lock (strings and `Arc`s) and writes the text after letting go; certificate state comes
+from the certificate manager's own locks. Series are labeled by tunnel name and agent id, which are
+unique, so a scrape never has two series with the same labels.
+
 ## Management UI
 
 Server-rendered pages (`mgmt/`) with one small script, which only enhances them. The aims are that

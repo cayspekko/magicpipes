@@ -81,6 +81,10 @@ impl Directory {
         self.agents.get(agent_id)
     }
 
+    pub(super) fn agents(&self) -> impl Iterator<Item = &AgentRow> {
+        self.agents.values()
+    }
+
     pub(super) fn owner(&self, agent_id: &str) -> Option<&str> {
         self.agents.get(agent_id)?.owner_user_id.as_deref()
     }

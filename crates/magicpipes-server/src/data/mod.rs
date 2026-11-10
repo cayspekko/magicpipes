@@ -98,13 +98,30 @@ impl AccessPolicy {
     }
 }
 
-/// Counters written by the data plane and read by the control plane for status display.
+/// Counters written by the data plane and read by the control plane: for the tunnel's status, and
+/// for `/metrics`. Atomics only, and few per request.
 #[derive(Debug, Default)]
 pub struct RouteStats {
+    /// Requests and connections that reached the agent, or tried to: everything but refusals.
     pub requests: AtomicU64,
+    /// Of those, the ones that got no answer from the app ("couldn't reach app"): the sum of
+    /// `offline`, `unreachable` and `timed_out`.
     pub upstream_errors: AtomicU64,
     last_outcome: AtomicU8,
     pub last_request_at: AtomicI64,
+    /// The agent wasn't connected, or no longer served the tunnel.
+    pub offline: AtomicU64,
+    /// The app refused the connection, or closed it without an answer.
+    pub unreachable: AtomicU64,
+    /// The app didn't start answering in time (`upstream_response_timeout_secs`).
+    pub timed_out: AtomicU64,
+    /// Turned away before reaching the agent: its streams, or the client's share, were used up.
+    pub refused: AtomicU64,
+    /// Time to the answer: an HTTP response's first byte, or a connection to the app opening.
+    pub latency: Latency,
+    /// Bytes from visitors toward the app, and back: HTTP bodies, and port tunnels' connections.
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,16 +130,29 @@ pub enum Outcome {
     Ok,
     LocalUnreachable,
     AgentOffline,
+    /// The app didn't start answering in time.
+    TimedOut,
 }
 
 impl RouteStats {
     fn record(&self, outcome: Outcome) {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        if outcome != Outcome::Ok {
+        let cause = match outcome {
+            Outcome::Ok | Outcome::None => None,
+            Outcome::AgentOffline => Some(&self.offline),
+            Outcome::LocalUnreachable => Some(&self.unreachable),
+            Outcome::TimedOut => Some(&self.timed_out),
+        };
+        if let Some(cause) = cause {
+            cause.fetch_add(1, Ordering::Relaxed);
             self.upstream_errors.fetch_add(1, Ordering::Relaxed);
         }
         self.last_outcome.store(outcome as u8, Ordering::Relaxed);
         self.last_request_at.store(magicpipes_core::unix_now(), Ordering::Relaxed);
+    }
+
+    fn refuse(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn last_outcome(&self) -> Outcome {
@@ -130,8 +160,31 @@ impl RouteStats {
             1 => Outcome::Ok,
             2 => Outcome::LocalUnreachable,
             3 => Outcome::AgentOffline,
+            4 => Outcome::TimedOut,
             _ => Outcome::None,
         }
+    }
+}
+
+/// Upper bounds of [`Latency`]'s buckets, in milliseconds; one more bucket holds the rest.
+pub const LATENCY_BUCKETS_MS: [u64; 14] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000];
+
+/// How long answers took, counted in fixed buckets: one atomic increment per answer, and what
+/// Prometheus calls a histogram.
+#[derive(Debug, Default)]
+pub struct Latency {
+    /// Answers per bucket of [`LATENCY_BUCKETS_MS`] (not cumulative), the last for longer ones.
+    pub buckets: [AtomicU64; LATENCY_BUCKETS_MS.len() + 1],
+    /// All of them added up, in microseconds.
+    pub sum_micros: AtomicU64,
+}
+
+impl Latency {
+    pub fn record(&self, took: Duration) {
+        let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        let i = LATENCY_BUCKETS_MS.iter().position(|ms| micros <= ms * 1000).unwrap_or(LATENCY_BUCKETS_MS.len());
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
     }
 }
 
@@ -470,6 +523,27 @@ mod tests {
     use super::*;
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn answers_fall_in_their_buckets_and_failures_count_by_cause() {
+        let stats = RouteStats::default();
+        for ms in [0, 1, 3, 30_000, 31_000] {
+            stats.latency.record(Duration::from_millis(ms));
+        }
+        let counts: Vec<u64> = stats.latency.buckets.iter().map(|b| b.load(Ordering::Relaxed)).collect();
+        // Up to 1 ms: two (bounds are inclusive), up to 5 ms: one, up to 30 s: one, longer: one.
+        assert_eq!(counts, [2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(stats.latency.sum_micros.load(Ordering::Relaxed), 61_004_000);
+
+        for o in [Outcome::Ok, Outcome::AgentOffline, Outcome::LocalUnreachable, Outcome::LocalUnreachable, Outcome::TimedOut] {
+            stats.record(o);
+        }
+        stats.refuse();
+        let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let counted = (n(&stats.requests), n(&stats.upstream_errors), n(&stats.offline), n(&stats.unreachable), n(&stats.timed_out), n(&stats.refused));
+        assert_eq!(counted, (5, 4, 1, 2, 1, 1), "a refusal isn't a request");
+        assert_eq!(stats.last_outcome(), Outcome::TimedOut);
+    }
 
     #[tokio::test]
     async fn idle_connections_make_room_for_new_streams() {

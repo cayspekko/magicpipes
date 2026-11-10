@@ -2,12 +2,22 @@
 //! connections at once (protocol 9), each a session of its own, which together are its [`Link`].
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 use magicpipes_core::mux::MuxHandle;
+use magicpipes_core::proto::{self, ServerOpen};
 use magicpipes_core::unix_now;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{ControlPlane, Link, OrLog, Session};
+
+/// How often the server times a round trip on each agent connection, and how long it waits.
+pub(super) const PING_EVERY: Duration = Duration::from_secs(15);
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+/// The protocol from which an agent answers a stream it doesn't know, rather than dropping it.
+const ANSWERS_UNKNOWN_STREAMS: u32 = 2;
 
 /// What became of a new connection.
 #[derive(Debug, PartialEq, Eq)]
@@ -35,6 +45,16 @@ impl ControlPlane {
         // Detach happens in the gateway when the session task observes the close.
     }
 
+    /// Times a round trip on each agent connection. See [`ping`].
+    pub(super) fn ping_agents(&self) {
+        let st = self.state.lock().unwrap();
+        for s in st.sessions.values().flat_map(|l| &l.lanes) {
+            if s.protocol >= ANSWERS_UNKNOWN_STREAMS && !s.handle.is_closed() {
+                tokio::spawn(ping(s.handle.clone(), s.round_trip.clone()));
+            }
+        }
+    }
+
     /// Whether another connection from the agent's run `instance` would fit: checked before the
     /// upgrade, so the agent gets an answer it can act on instead of a connection that closes.
     pub fn has_room(&self, agent_id: &str, instance: Option<&str>) -> bool {
@@ -56,7 +76,8 @@ impl ControlPlane {
         }
         st.next_conn_id += 1;
         let conn_id = st.next_conn_id;
-        let session = |handle| Session { conn_id, handle, connected_at: unix_now(), remote, protocol, last_ping: Instant::now() };
+        let round_trip = Arc::new(AtomicU64::new(0));
+        let session = |handle| Session { conn_id, handle, connected_at: unix_now(), remote, protocol, last_ping: Instant::now(), round_trip: round_trip.clone() };
         let connections = match st.sessions.get_mut(agent_id) {
             Some(link) if instance.is_some() && link.instance == instance => {
                 if link.lanes.len() >= self.cfg.agents.max_connections {
@@ -76,7 +97,12 @@ impl ControlPlane {
             }
         };
         self.publish(&st);
+        let handle = st.sessions.get(agent_id).and_then(|l| l.lanes.last()).map(|s| s.handle.clone());
         drop(st);
+        // Its first round trip, so it's known before the next round of pings.
+        if let Some(handle) = handle.filter(|_| protocol >= ANSWERS_UNKNOWN_STREAMS) {
+            tokio::spawn(ping(handle, round_trip));
+        }
         self.store.touch_agent(agent_id).or_log();
         tracing::info!(agent = %agent_id, %remote, conn_id, protocol, connections, "agent connected");
         Attached::Yes(conn_id)
@@ -110,4 +136,24 @@ impl ControlPlane {
             link.close();
         }
     }
+}
+
+/// Times a round trip on an agent connection, and keeps it in `round_trip`: a stream the agent
+/// answers at once ([`ServerOpen::Ping`]; one from before that answers it as unsupported, which
+/// times it as well). It waits behind the connection's other traffic, so it shows a link that's
+/// slow or full, not just far. A control stream ([`MuxHandle::open`]): the agent's data budget
+/// doesn't hold it up.
+async fn ping(handle: MuxHandle, round_trip: Arc<AtomicU64>) {
+    let started = Instant::now();
+    let answered = async {
+        let mut s = handle.open(PING_TIMEOUT).await.ok()?;
+        proto::write_frame(&mut s, &ServerOpen::Ping).await.ok()?;
+        s.read_u8().await.ok()?;
+        let took = started.elapsed();
+        let _ = s.shutdown().await;
+        Some(took)
+    };
+    let took = tokio::time::timeout(PING_TIMEOUT, answered).await.ok().flatten();
+    let micros = took.map_or(0, |t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX).max(1));
+    round_trip.store(micros, Relaxed);
 }

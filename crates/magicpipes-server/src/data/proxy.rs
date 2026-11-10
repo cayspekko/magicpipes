@@ -124,8 +124,9 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
     // An upgraded connection outlives this HTTP connection; it keeps the listener's limits.
     let limits = conn.limits.clone();
     let (progress, uploading) = tokio::sync::watch::channel(());
-    let req = req.map(|inner| Progress { inner, progress });
+    let req = req.map(|inner| Progress { inner, progress, stats: route.stats.clone() });
     let timeout = dp.settings.upstream_response_timeout;
+    let started = std::time::Instant::now();
     // A probe checks that the agent opened a stream for it, and an upgrade keeps its stream:
     // both get a connection of their own. Everything else shares pooled ones.
     let (resp, reuse) = if upgrade || probe.is_some() {
@@ -141,12 +142,13 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         (answer(&route, response_within(sender.send_request(req), uploading, timeout).await)?, None)
     } else {
         // A client's share is the agent's, whichever of its connections is used.
-        let used = agent.pick().and_then(|s| s.client_use(client)).ok_or_else(busy)?;
+        let used = agent.pick().and_then(|s| s.client_use(client)).ok_or_else(|| refused(&route))?;
         let version = route.version;
         let (resp, sender, session) = send_shared(dp, &route, &agent, req, uploading).await?;
         (resp, Some((sender, used, version, session)))
     };
     route.stats.record(Outcome::Ok);
+    route.stats.latency.record(started.elapsed());
     // Back to the pool once the response has been read to the end; a response cut short closes
     // the connection instead. The client's place is kept until then.
     let resp = match reuse {
@@ -159,9 +161,9 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
                 // Then wakes the requests waiting for a connection.
                 drop(back);
             });
-            resp.map(|inner| Holding { inner, _used: used }.boxed())
+            resp.map(|inner| Sending { inner: Holding { inner, _used: used }, stats: route.stats.clone() }.boxed())
         }
-        None => resp.map(|b| b.boxed()),
+        None => resp.map(|inner| Sending { inner, stats: route.stats.clone() }.boxed()),
     };
     let mut resp = resp;
 
@@ -183,9 +185,10 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
                 }
             });
         }
+        let stats = route.stats.clone();
         tokio::spawn(async move {
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                Ok((client, upstream)) => bridge(TokioIo::new(client), TokioIo::new(upstream), Some(idle), stop.clone()).await,
+                Ok((client, upstream)) => bridge(TokioIo::new(client), TokioIo::new(upstream), Some(idle), stop.clone(), stats).await,
                 Err(e) => tracing::debug!(error = %e, "upgrade failed"),
             }
             // Ends the watcher, if any.
@@ -234,10 +237,16 @@ fn answer(route: &Route, sent: Sent) -> Result<Response<Incoming>, Response<Prox
             Err(upstream_error(route, status))
         }
         None => {
-            route.stats.record(Outcome::LocalUnreachable);
+            route.stats.record(Outcome::TimedOut);
             Err(error_page(ErrorCode::UpstreamTimeout, "The local application did not respond in time."))
         }
     }
+}
+
+/// Turned away for want of room: counted on the tunnel, not as a request.
+fn refused(route: &Route) -> Response<ProxyBody> {
+    route.stats.refuse();
+    busy()
 }
 
 fn busy() -> Response<ProxyBody> {
@@ -297,7 +306,7 @@ async fn send_shared(
             if session.data_streams_full() && session.wait_for_return(seen, deadline).await {
                 continue;
             }
-            return Err(busy());
+            return Err(refused(route));
         };
         let resp = answer(route, response_within(sender.send_request(req), uploading, timeout).await)?;
         return Ok((resp, sender, session.clone()));
@@ -357,10 +366,44 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for Holding<B> {
     }
 }
 
-/// A request body that reports each chunk it passes on, so a long upload counts as progress.
+/// A response body that counts the bytes it passes on to the visitor.
+struct Sending<B> {
+    inner: B,
+    stats: Arc<super::RouteStats>,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for Sending<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled
+            && let Some(data) = frame.data_ref()
+        {
+            self.stats.bytes_out.fetch_add(bytes::Buf::remaining(data) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// A request body that reports each chunk it passes on, so a long upload counts as progress, and
+/// counts its bytes.
 pub(super) struct Progress<B> {
     inner: B,
     progress: tokio::sync::watch::Sender<()>,
+    stats: Arc<super::RouteStats>,
 }
 
 impl<B: hyper::body::Body + Unpin> hyper::body::Body for Progress<B> {
@@ -372,8 +415,11 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for Progress<B> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        if let std::task::Poll::Ready(Some(Ok(_))) = &polled {
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
             self.progress.send_replace(());
+            if let Some(data) = frame.data_ref() {
+                self.stats.bytes_in.fetch_add(bytes::Buf::remaining(data) as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         polled
     }
@@ -422,7 +468,7 @@ async fn open_upstream(dp: &DataPlane, route: &Route, agent: &AgentLink, client:
     let timeout = dp.settings.stream_open_timeout;
     let mut stream = match dp.with_room_or_wait(agent, move |session| async move { session.open_data(timeout, client).await }).await {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(refused(route)),
         Err(_) => return Err(fail()),
     };
     proto::write_frame(&mut stream, &ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: None })

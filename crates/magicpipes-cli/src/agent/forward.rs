@@ -50,6 +50,10 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
         }
     };
     match open {
+        ServerOpen::Ping => {
+            let _ = StreamStatus::Ok.write(&mut stream).await;
+            let _ = stream.shutdown().await;
+        }
         ServerOpen::TunnelRemoved { tunnel_id } => {
             if let Some(t) = tunnels.remove(&tunnel_id) {
                 tracing::warn!(tunnel = %t.name, "tunnel was deleted on the server; no longer serving it");
@@ -193,5 +197,6 @@ mod tests {
         // A newer server's stream type gets an answer instead of a timeout.
         assert_eq!(status_for(json!({ "kind": "from_the_future" })).await, StreamStatus::Unsupported.byte());
         assert_eq!(status_for(json!({ "kind": "data", "tunnel_id": "tn_unknown" })).await, StreamStatus::UnknownTunnel.byte());
+        assert_eq!(status_for(json!({ "kind": "ping" })).await, StreamStatus::Ok.byte(), "the server times the round trip");
     }
 }

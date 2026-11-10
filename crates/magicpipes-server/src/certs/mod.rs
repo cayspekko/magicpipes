@@ -336,6 +336,18 @@ impl CertManager {
         self.hosts.lock().unwrap().get(host).map(|h| h.status.borrow().clone()).unwrap_or(CertStatus::Pending)
     }
 
+    /// Until when the certificate `host` gets is valid (Unix time), if it has one: the one
+    /// [`status`](Self::status) judges. `None` for `tls.mode = "files"`, which another tool renews.
+    pub fn not_after(&self, host: &str) -> Option<i64> {
+        if let Some(t) = self.provided_not_after(host) {
+            return Some(t);
+        }
+        if self.cfg.mode == TlsMode::Files {
+            return None;
+        }
+        self.hosts.lock().unwrap().get(host).map(|h| h.not_after).filter(|t| *t > 0)
+    }
+
     fn files_status(&self, host: &str) -> CertStatus {
         if covers(&self.static_names, host) {
             CertStatus::Ready

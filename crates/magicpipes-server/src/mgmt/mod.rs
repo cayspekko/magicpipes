@@ -3,6 +3,7 @@
 //! Authentication boundaries:
 //! * `/api/v1/*` (except enroll/agent connect): `Authorization: Bearer <admin token or a user's
 //!   API token>`.
+//! * `/metrics`: the same bearer token, or a UI session; administrators only.
 //! * UI pages: session cookie created by logging in with an email and password, an emailed link, an
 //!   OpenID Connect provider, an authenticating proxy or an admin token; state-changing forms carry
 //!   a per-session CSRF token.
@@ -168,6 +169,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/ui.js", get(ui::script))
 
         .route("/healthz", get(|| async { "ok" }))
+        .route("/metrics", get(api::metrics))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/tunnels", get(api::list_tunnels))
         .route("/api/v1/shared", get(api::shared_tunnels))

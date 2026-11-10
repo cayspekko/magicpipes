@@ -393,7 +393,7 @@ impl Handler for Client {
             let _ = dp.ssh_reports.try_send(report);
             let id = channel.id();
             tokio::select! {
-                _ = super::io::bridge(channel.into_stream(), stream, None, stop.child_token()) => {}
+                _ = super::io::bridge(channel.into_stream(), stream, None, stop.child_token(), route.stats.clone()) => {}
                 _ = revoked(&dp, &who, &name, &route.tunnel_id, peer.ip()) => {
                     tracing::debug!(%peer, %name, "SSH gateway: closing a channel its user may no longer use");
                 }

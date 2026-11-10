@@ -184,7 +184,7 @@ impl DataPlane {
             }
         };
         tokio::select! {
-            _ = super::io::bridge(io, stream, idle, CancellationToken::new()) => {}
+            _ = super::io::bridge(io, stream, idle, CancellationToken::new(), found.route.stats.clone()) => {}
             _ = revoked => tracing::debug!(user = %person.user_id, tunnel = %tunnel_id, "connect: closing, no longer admitted"),
         }
     }

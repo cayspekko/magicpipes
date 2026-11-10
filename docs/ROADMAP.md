@@ -386,6 +386,44 @@ secret link until then):
 
 The design, with tag-based access in place of per-user grants, is in [USERS.md](USERS.md).
 
+## Monitoring: health, history, alerts and synthetic checks
+
+Before this, the server counted requests and "couldn't reach app" per tunnel since it started, and
+knew whether each machine was connected and each certificate fine: no history, latency, error by
+cause, alert, or way for a monitoring system to read any of it. Decided 2026-11-10.
+
+* **Counting stays on the data plane** as atomics (no lock, no database on the request path):
+  errors by cause (agent offline, couldn't reach app, app too slow, agent busy), time to first byte
+  in fixed buckets, bytes each way, ping round trips.
+* **A sampler on the control threads** reads them every 10 s into a bounded history in memory
+  (the last 15 minutes by 10 s, the last day by 5 minutes), and keeps 5-minute rollups in SQLite
+  for 7 days by default, up to 30 (`[monitoring] history_days`).
+* **`/metrics`** in Prometheus's text format, for Grafana and the like, read with an
+  administrator's API token or the admin token (`Authorization: Bearer`), or by a signed-in
+  administrator, on the management host only. Done in phase 11.
+* **Health and alerts in the app:** rules give each machine, tunnel and certificate a state (ok,
+  warn, bad) with hysteresis (2 bad samples open an alert, 3 good ones close it); open alerts show
+  on a Health page, as a count in the header and on the pages they concern. People see alerts for
+  their own machines and tunnels, administrators all (`authorize`). Rules to start with: a machine
+  offline over 2 minutes or short of connections over 5; pings slow (95th percentile over 500 ms)
+  or reconnects over 5 an hour; a tunnel's errors over 5% of at least 20 requests in 5 minutes; a
+  synthetic check failing twice; a certificate expiring within 14 days (warn) or 3 (bad), or a
+  renewal failing; ACME orders over 80% of the day's limit; the port range over 90% used; an
+  outdated agent; a machine's key refused for changing.
+* **Synthetic checks, on by default** (`[monitoring] synthetics`, and off per tunnel): once a
+  minute the server sends the readiness probe `add` uses through each HTTP tunnel, the path a
+  visitor's request takes, and for other kinds opens a stream and reads what the machine says
+  first (SSH's banner, RDP's answer, VNC's greeting). Marked `x-magicpipes-probe`, to
+  `--probe-path`. Later the agent checks its own targets and reports (a protocol bump), and an
+  outside probe sees what the server can't: its own DNS, firewall and proxy.
+* **Certificate changes** come from comparing each hostname's fingerprint and expiry between
+  samples: renewed, replaced, expiring, renewal failed.
+* **The dashboard says what's wrong first:** one sentence of overall health, open alerts, then
+  machines (connections, round trip, reconnects, uptime), tunnels (requests per minute, errors by
+  cause, latency, last check) and only the certificates in trouble or expiring within 30 days, each
+  number with its period.
+* **Later:** email digests and webhooks for alerts.
+
 ## Kubernetes: MagicPipes as a cluster's ingress
 
 Pods that need a web presence, published through MagicPipes the way an Ingress publishes them.
@@ -466,3 +504,8 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 10b | Several connections per agent (past one connection and 224 streams) | yes | done (4 by default, `agents.max_connections` on the server) |
 | 10c | Several agents per tunnel (replicas, rolling updates, a highly available gateway) | yes | planned |
 | 10d | An Ingress / Gateway API controller (`ingressClassName: magicpipes`) | none (a separate binary) | planned |
+| 11 | Monitoring, measure: counters for errors by cause, latency and bytes, ping round trips, `/metrics` ([plan](#monitoring-health-history-alerts-and-synthetic-checks)) | yes | done |
+| 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | planned |
+| 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | planned |
+| 11d | Monitoring, probe: synthetic checks from the server, on by default; then the agent's own (protocol bump) | yes; agent for its own | planned |
+| 11e | Monitoring, tell: email and webhooks; an outside probe | yes | planned |

@@ -361,6 +361,9 @@ pub enum ServerOpen {
     },
     /// The tunnel was deleted on the server (e.g. by an administrator).
     TunnelRemoved { tunnel_id: String },
+    /// Answered with a status byte at once, so the server can time a round trip on this
+    /// connection. An agent before this answers [`StreamStatus::Unsupported`], which times it too.
+    Ping,
 }
 
 /// Body of `POST /api/v1/enroll`.
@@ -521,6 +524,9 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pc","target":"x","kind":"rdp"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Rdp, .. })));
         assert!(serde_json::to_string(&Kind::Rdp).unwrap() == r#""rdp""# && Kind::parse("rdp") == Some(Kind::Rdp) && !Kind::Rdp.has_port() && !Kind::Rdp.is_http());
+        // A ping the server times: plain, so that an agent which doesn't know it answers at once.
+        assert_eq!(serde_json::to_string(&ServerOpen::Ping).unwrap(), r#"{"kind":"ping"}"#);
+        assert_eq!(serde_json::from_str::<ServerOpen>(r#"{"kind":"ping"}"#).unwrap(), ServerOpen::Ping);
         // Protocol 8: the same for VNC.
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pi","target":"x","kind":"vnc"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Vnc, .. })));

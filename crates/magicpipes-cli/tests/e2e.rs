@@ -598,6 +598,122 @@ async fn web_terminal() {
 }
 
 /// Sends `msg` through a TCP port and returns what came back (empty if the server closed it).
+/// The value of one series in `/metrics`, such as `magicpipes_tunnel_requests_total{tunnel="web"}`.
+fn metric(text: &str, series: &str) -> f64 {
+    text.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("{series} missing from:\n{text}"))
+}
+
+/// The values of a metric's series whose labels include `with`.
+fn metrics_with(text: &str, name: &str, with: &str) -> Vec<f64> {
+    let prefix = format!("{name}{{");
+    text.lines().filter(|l| l.starts_with(&prefix) && l.contains(with)).filter_map(|l| l.rsplit(' ').next()?.parse().ok()).collect()
+}
+
+/// `/metrics` is for administrators, and counts what tunnels carry: requests and why they failed,
+/// how long the app took, bytes each way, and the machine's connections and round trips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_count_what_tunnels_carry() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let echo = common::tcp_echo_app().await;
+    let web = add_json(&env, &[&app.port.to_string(), "--name", "web"]).await;
+    let host = hostname(web["public_url"].as_str().unwrap());
+    let tcp = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any", "--name", "echo"]).await;
+    let port = tcp["public_port"].as_u64().unwrap() as u16;
+    let dns = common::udp_echo_app().await;
+    let udp = add_json(&env, &[&dns.port.to_string(), "--udp", "--allow-any", "--name", "dns"]).await;
+    let udp_port = udp["public_port"].as_u64().unwrap() as u16;
+
+    // Administrators only, with a bearer token or signed in.
+    let admin = env.admin_token();
+    assert_eq!(env.mgmt_text("/metrics", None, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(env.mgmt_text("/metrics", Some("mpadm_wrong"), None).await.0, StatusCode::UNAUTHORIZED);
+    let (status, kind, _) = env.mgmt_text("/metrics", Some(&admin), None).await;
+    assert_eq!((status, kind.as_str()), (StatusCode::OK, "text/plain; version=0.0.4; charset=utf-8"));
+    let signed_in = env.ui("/login", None, Some(&[("token", &admin)])).await.cookie.expect("signed in");
+    assert_eq!(env.mgmt_text("/metrics", None, Some(&signed_in)).await.0, StatusCode::OK);
+    let read = || async { env.mgmt_text("/metrics", Some(&admin), None).await.2 };
+
+    // HTTP: requests, their times and bytes each way.
+    let before = read().await;
+    for _ in 0..3 {
+        assert_eq!(env.get_public(&host, "/").await.2, "hello from app");
+    }
+    let req = Request::post("/echo").header(header::HOST, &host).body(Full::new(Bytes::from(vec![7u8; 1000]))).unwrap();
+    let resp = env.send(&host, env.https_port, req).await;
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes().len(), 1000);
+    let after = read().await;
+    let grew = |series: &str| metric(&after, series) - metric(&before, series);
+    assert_eq!(grew(r#"magicpipes_tunnel_requests_total{tunnel="web"}"#), 4.0, "{after}");
+    assert_eq!(grew(r#"magicpipes_tunnel_response_seconds_count{tunnel="web"}"#), 4.0);
+    assert_eq!(grew(r#"magicpipes_tunnel_response_seconds_bucket{tunnel="web",le="+Inf"}"#), 4.0);
+    assert!(grew(r#"magicpipes_tunnel_response_seconds_sum{tunnel="web"}"#) > 0.0);
+    assert_eq!(grew(r#"magicpipes_tunnel_bytes_total{tunnel="web",direction="to_app"}"#), 1000.0);
+    assert_eq!(grew(r#"magicpipes_tunnel_bytes_total{tunnel="web",direction="from_app"}"#), 3.0 * 14.0 + 1000.0);
+    assert_eq!(metric(&after, r#"magicpipes_tunnel_up{tunnel="web"}"#), 1.0);
+    assert_eq!(metric(&after, &format!("magicpipes_certificate_ready{{hostname=\"{host}\"}}")), 1.0);
+    let expires = metric(&after, &format!("magicpipes_certificate_expiry_time_seconds{{hostname=\"{host}\"}}"));
+    assert!(expires > magicpipes_core::unix_now() as f64, "{expires}");
+
+    // A TCP port: the connection, and every byte joined through.
+    let before = read().await;
+    let msg: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(tcp_roundtrip(port, &msg).await, msg);
+    let after = read().await;
+    let grew = |series: &str| metric(&after, series) - metric(&before, series);
+    assert_eq!(grew(r#"magicpipes_tunnel_requests_total{tunnel="echo"}"#), 1.0);
+    assert_eq!(grew(r#"magicpipes_tunnel_response_seconds_count{tunnel="echo"}"#), 1.0);
+    assert_eq!(grew(r#"magicpipes_tunnel_bytes_total{tunnel="echo",direction="to_app"}"#), 50_000.0);
+    assert_eq!(grew(r#"magicpipes_tunnel_bytes_total{tunnel="echo",direction="from_app"}"#), 50_000.0);
+
+    // UDP: each datagram's payload, each way (a datagram that got no answer is sent again).
+    let before = read().await;
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let reply = udp_roundtrip(&client, udp_port, &[9u8; 300]).await;
+    assert!(reply.starts_with(b"echo:") && reply.len() == 305, "{reply:?}");
+    let after = read().await;
+    for (direction, size) in [("to_app", 300.0), ("from_app", 305.0)] {
+        let series = format!("magicpipes_tunnel_bytes_total{{tunnel=\"dns\",direction=\"{direction}\"}}");
+        let grew = metric(&after, &series) - metric(&before, &series);
+        assert!(grew >= size && grew % size == 0.0, "{direction}: {grew}");
+    }
+
+    // The machine: connected, its connections, and a round trip timed on each.
+    env.eventually("a round trip timed on the agent's connection", Duration::from_secs(10), || async {
+        metrics_with(&read().await, "magicpipes_agent_ping_seconds", r#"connection="1""#).iter().any(|s| *s > 0.0 && *s < 5.0)
+    })
+    .await;
+    let text = read().await;
+    assert_eq!(metrics_with(&text, "magicpipes_agent_up", "agent_id="), [1.0], "{text}");
+    assert!(metrics_with(&text, "magicpipes_agent_connections", "agent_id=").iter().all(|n| *n >= 1.0), "{text}");
+
+    // Failures, by cause: the app gone, then the machine.
+    app.stop();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = read().await;
+    assert_eq!(env.get_public(&host, "/").await.1.as_deref(), Some("local_unreachable"));
+    let after = read().await;
+    let grew = |series: &str| metric(&after, series) - metric(&before, series);
+    assert!(grew(r#"magicpipes_tunnel_failures_total{tunnel="web",cause="local_unreachable"}"#) >= 1.0, "{after}");
+    assert_eq!(grew(r#"magicpipes_tunnel_failures_total{tunnel="web",cause="agent_offline"}"#), 0.0);
+
+    env.cli_ok(&["agent", "stop"]).await;
+    env.eventually("the tunnel shown down", Duration::from_secs(10), || async {
+        metric(&read().await, r#"magicpipes_tunnel_up{tunnel="web"}"#) == 0.0
+    })
+    .await;
+    let before = read().await;
+    assert_eq!(env.get_public(&host, "/").await.1.as_deref(), Some("agent_offline"));
+    let after = read().await;
+    assert_eq!(metric(&after, r#"magicpipes_tunnel_failures_total{tunnel="web",cause="agent_offline"}"#)
+        - metric(&before, r#"magicpipes_tunnel_failures_total{tunnel="web",cause="agent_offline"}"#), 1.0);
+    assert_eq!(metrics_with(&after, "magicpipes_agent_up", "agent_id="), [0.0]);
+    assert!(metrics_with(&after, "magicpipes_agent_ping_seconds", "agent_id=").is_empty(), "{after}");
+}
+
 async fn tcp_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return Vec::new() };
@@ -3061,6 +3177,11 @@ async fn a_proxys_signed_tokens_sign_people_in() {
     let refused = down.ui_with("/", None, None, &[("x-proxy-token", &idp.sign(&claims("sub-1", "ann@example.com", true)))]).await;
     assert!(refused.status == StatusCode::BAD_GATEWAY && refused.html.contains("can&#39;t be fetched"), "{}", refused.html);
     assert_eq!(down.ui("/", None, None).await.location.as_deref(), Some("/login"), "no token, no keys needed");
+    // A scraper brings its own token, whatever the proxy adds.
+    let bearer = format!("Bearer {}", down.admin_token());
+    let proxied = idp.sign(&claims("sub-1", "ann@example.com", true));
+    let scraped = down.ui_with("/metrics", None, None, &[("x-proxy-token", &proxied), ("authorization", &bearer)]).await;
+    assert!(scraped.status == StatusCode::OK && scraped.html.contains("magicpipes_build_info"), "{}", scraped.html);
     let admin = admin_session(&down).await;
     assert_eq!(down.ui("/users", Some(&admin), None).await.status, StatusCode::OK);
 }

@@ -129,10 +129,12 @@ pub(super) async fn open(dp: &DataPlane, route: &Route, agent: &AgentLink, clien
 pub(super) async fn opened(dp: &DataPlane, route: &Route, agent: &AgentLink, client: IpAddr, header: ServerOpen) -> Result<MuxStream, Outcome> {
     let timeout = dp.settings.stream_open_timeout;
     let key = client_key(client);
+    let started = std::time::Instant::now();
     let mut stream = match dp.with_room_or_wait(agent, move |session| async move { session.open_data(timeout, key).await }).await {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
             tracing::debug!(tunnel = %route.tunnel_id, %client, "agent stream budget used up; refusing");
+            route.stats.refuse();
             return Err(Outcome::None);
         }
         Err(_) => {
@@ -150,7 +152,11 @@ pub(super) async fn opened(dp: &DataPlane, route: &Route, agent: &AgentLink, cli
         _ => Outcome::AgentOffline,
     };
     route.stats.record(outcome);
-    if outcome == Outcome::Ok { Ok(stream) } else { Err(outcome) }
+    if outcome != Outcome::Ok {
+        return Err(outcome);
+    }
+    route.stats.latency.record(started.elapsed());
+    Ok(stream)
 }
 
 async fn serve_tcp(dp: Arc<DataPlane>, port: u16, listener: TcpListener, stop: CancellationToken) {
@@ -192,7 +198,7 @@ async fn tcp_connection(dp: &DataPlane, port: u16, mut tcp: TcpStream, mut peer:
     let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
     let Some(stream) = open(dp, &route, &session, peer.ip(), header).await else { return };
     tokio::select! {
-        _ = super::io::bridge(tcp, stream, dp.settings.ports.tcp_idle_timeout, CancellationToken::new()) => {}
+        _ = super::io::bridge(tcp, stream, dp.settings.ports.tcp_idle_timeout, CancellationToken::new(), route.stats.clone()) => {}
         _ = revoked(dp, Kind::Tcp, port, peer.ip(), &route.tunnel_id) => {
             tracing::debug!(port, %peer, "closing a port connection the tunnel no longer admits");
         }
@@ -263,6 +269,7 @@ async fn udp_flow(
         let mut buf = Vec::new();
         while let Ok(true) = proto::read_datagram(&mut rd, &mut buf).await {
             touch();
+            route.stats.bytes_out.fetch_add(buf.len() as u64, Ordering::Relaxed);
             if socket.send_to(&buf, peer).await.is_err() {
                 break;
             }
@@ -275,6 +282,7 @@ async fn udp_flow(
                 d = rx.recv() => match d {
                     Some(d) => {
                         touch();
+                        route.stats.bytes_in.fetch_add(d.len() as u64, Ordering::Relaxed);
                         if proto::write_datagram(&mut wr, &d).await.is_err() {
                             break;
                         }

@@ -403,7 +403,8 @@ first sign-in comes through plain headers.
 connect to MagicPipes over HTTPS, keeping the `Host` header. A proxy that passes TLS through by SNI,
 such as HAProxy in TCP mode, can't do this. For plain headers, `management.proxy_protocol` must be
 off, so that the connection's address is the proxy's. Let these paths past the proxy's sign-in,
-because agents and scripts have their own credentials: everything under `/api/`, plus `/healthz`.
+because agents and scripts have their own credentials: everything under `/api/`, plus `/healthz`
+and `/metrics`.
 
 Tunnels aren't covered: this signs people in to the management host, and private tunnels then work
 as usual.
@@ -1233,12 +1234,50 @@ agent's protocol version), `owner_user_id`, `owner_email`, `tags` (what it publi
 
 Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `visibility`,
 `tags` (the owner's personal tag included), `access` (private: the tags that let people in), `status`
-(`connected` / `disconnected` / `error` = local app unreachable on the last request), `tls`
+(`connected` / `disconnected` / `error` = local app unreachable or too slow on the last request), `tls`
 (`ready` / `pending` / `failed`), `tls_error`, `created_at`, `requests`, `upstream_errors`,
 `last_request_at`. Errors: `{"error": {"code", "message"}}`.
 
 Tunnels are created by agents, not through the API: the target is a port on the agent's
 machine, and only the agent may decide what it connects to.
+
+### Metrics for Prometheus
+
+`GET /metrics` on the management host answers administrators, with a bearer token (the admin token
+or an administrator's API token) or signed in, in Prometheus' text format. Counters start at zero
+when the server starts.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: magicpipes
+    scheme: https
+    authorization:
+      credentials_file: /etc/prometheus/magicpipes-token   # an administrator's API token
+    static_configs:
+      - targets: ["mp.example.com:8443"]
+```
+
+| Metric | |
+|---|---|
+| `magicpipes_agent_up{agent_id, agent}` | 1 while the machine's agent is connected, for every enrolled machine |
+| `magicpipes_agent_connections`, `magicpipes_agent_data_streams` | Its connections to the server, and the streams open on them (idle pooled ones included) |
+| `magicpipes_agent_ping_seconds{connection}` | Round trip on each connection, timed every 15 seconds behind its traffic; missing after a ping went unanswered |
+| `magicpipes_tunnel_info{tunnel, kind, hostname, agent_id}` | One per tunnel; the others carry just `tunnel` |
+| `magicpipes_tunnel_up` | 1 while its machine's agent is connected |
+| `magicpipes_tunnel_requests_total` | HTTP requests and port connections passed to the agent, failed ones included |
+| `magicpipes_tunnel_failures_total{cause}` | Those that failed before the app answered: `agent_offline`, `local_unreachable`, `upstream_timeout`. An app's own errors, such as a 500, aren't counted |
+| `magicpipes_tunnel_refused_total` | Turned away with `agent_busy`: the machine or the client had no streams left |
+| `magicpipes_tunnel_response_seconds` | Histogram of the time to the response's headers, or for a port connection to the machine's go-ahead |
+| `magicpipes_tunnel_bytes_total{direction}` | `to_app` and `from_app`: HTTP bodies, and everything through a port, WebSocket, the SSH gateway or `connect`. Browser terminals and desktops aren't counted yet |
+| `magicpipes_tunnel_last_request_time_seconds` | Its last request or connection, in Unix time |
+| `magicpipes_certificate_ready{hostname}`, `magicpipes_certificate_expiry_time_seconds` | Each HTTP tunnel's certificate, and the management host's |
+| `magicpipes_ports{state}` | `total` in the `[ports]` range, and `used` |
+| `magicpipes_build_info{version}`, `magicpipes_start_time_seconds` | |
+
+Alerts to start from: `magicpipes_agent_up == 0` for 5 minutes,
+`increase(magicpipes_tunnel_failures_total[5m]) > 0`, and
+`magicpipes_certificate_expiry_time_seconds - time() < 14 * 86400`.
 
 ---
 

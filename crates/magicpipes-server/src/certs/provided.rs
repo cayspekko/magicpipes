@@ -238,6 +238,14 @@ impl CertManager {
         })
     }
 
+    /// Until when the certificate `host` gets is valid, if it's one people brought.
+    pub(super) fn provided_not_after(&self, host: &str) -> Option<i64> {
+        if self.own_names.iter().any(|n| n == host) {
+            return None;
+        }
+        serving(&self.provided.lock().unwrap(), host).map(|e| e.view.not_after)
+    }
+
     pub fn provided_covers(&self, host: &str) -> bool {
         self.provided_status(host).is_some()
     }

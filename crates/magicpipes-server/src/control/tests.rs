@@ -89,6 +89,31 @@ fn http(name: &str) -> RegisterTunnel {
     }
 }
 
+/// Administrators read the metrics, nobody else; the hard parts of a line are escaped.
+#[tokio::test]
+async fn only_administrators_read_the_metrics() {
+    let f = fixture();
+    let a = f.agent("a \"quoted\" machine");
+    let t = f.cp.register(&a, &http("app")).unwrap();
+    let member = Principal::User { id: "us_x".into(), role: crate::authz::Role::Member, tags: vec![] };
+    assert!(f.cp.metrics(&member).is_none() && f.cp.metrics(&Principal::Anonymous).is_none());
+    let text = f.cp.metrics(&Principal::AdminToken).unwrap();
+    for want in [
+        format!("magicpipes_build_info{{version=\"{}\"}} 1", magicpipes_core::VERSION),
+        format!("magicpipes_agent_up{{agent_id=\"{a}\",agent=\"a \\\"quoted\\\" machine\"}} 0"),
+        "magicpipes_tunnel_up{tunnel=\"app\"} 0".to_string(),
+        "magicpipes_tunnel_failures_total{tunnel=\"app\",cause=\"local_unreachable\"} 0".to_string(),
+        "magicpipes_tunnel_response_seconds_bucket{tunnel=\"app\",le=\"0.001\"} 0".to_string(),
+        "magicpipes_tunnel_response_seconds_bucket{tunnel=\"app\",le=\"+Inf\"} 0".to_string(),
+        format!("magicpipes_certificate_ready{{hostname=\"{}\"}}", t.hostname),
+        "# TYPE magicpipes_tunnel_response_seconds histogram".to_string(),
+    ] {
+        assert!(text.contains(&want), "{want} missing from:\n{text}");
+    }
+    // Nothing connected: no connection counts and no round trips.
+    assert!(!text.contains("magicpipes_agent_ping_seconds{") && !text.contains("magicpipes_agent_connections{"), "{text}");
+}
+
 /// A changed target retires the tunnel's pooled connections; nothing else does.
 #[tokio::test]
 async fn a_tunnels_version_follows_its_own_settings() {
