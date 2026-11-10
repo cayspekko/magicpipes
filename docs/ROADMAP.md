@@ -354,6 +354,52 @@ secret link until then):
 
 The design, with tag-based access in place of per-user grants, is in [USERS.md](USERS.md).
 
+## Kubernetes: MagicPipes as a cluster's ingress
+
+Pods that need a web presence, published through MagicPipes the way an Ingress publishes them.
+Discussed 2026-11-09.
+
+**Decided: no plain transport on the pod network, and no server that dials pods.**
+
+* **Plain agent-to-server traffic** would put the agent's token and every user's traffic on the pod
+  network in the clear, which most clusters don't encrypt, for a small gain. Writes are already
+  batched, so TLS works on 64 KiB chunks at several GB/s per core; one session carried about
+  1.7 GB/s of downloads and 130k small requests a second on a 4-vCPU VM (2026-11-09). How much of
+  that is TLS hasn't been measured, and nothing changes without that measurement. The one place
+  plain is safe is inside one pod, over loopback or a Unix socket (last step below).
+* **A forwarder inside the server** that reaches pods directly would break the two rules the
+  security model rests on: the agent always dials out, and the server names a tunnel, never an
+  address. A compromised or buggy server could reach every Service in the cluster, and what's
+  published would move from what the cluster chose to what the server's settings say. A gateway
+  agent in the cluster takes the same path, one pod-network hop longer.
+
+**What works today, and where it stops.** A gateway (one agent Deployment, `magicpipes add 80 --host
+web.default.svc.cluster.local`, a Service balancing replicas) and a sidecar (`agent run` in the
+foreground, `login` with `MAGICPIPES_TOKEN` or a token file) both work. The limits:
+
+* An agent is one TCP connection, capped at 224 concurrent public streams, and all its TLS runs
+  through that one connection. Fine for an app, a ceiling for a gateway carrying a cluster.
+* A hostname is owned by one agent, so replicas with sidecars fight over it, and a rolling update
+  can't hand it over.
+* A sidecar costs an agent (about 10 MB), a connection and an enrollment per pod.
+
+**Plan, in order.** For most clusters the gateway with a controller; sidecars where an app needs its
+own identity, or to be reached pod by pod.
+
+1. **Container packaging:** a scratch image of the static agent; tunnels declared in a file or in
+   environment variables instead of `add` commands; a readiness endpoint. For sidecars and
+   gateways alike.
+2. **Several connections per agent:** a session over a few TCP connections lifts the 224-stream and
+   one-connection ceiling and spreads TLS across cores. A data-path change: benchmarked, and the
+   mux's one-queue design (`SEND_QUEUE`, batching) revisited per connection.
+3. **Several agents per tunnel:** replicas, rolling updates and a highly available gateway; the
+   server picks among the live sessions serving a tunnel. `authorize` decides which agents may join
+   one (a service agent, or agents sharing a tag), and hostnames stop belonging to a single agent.
+4. **An Ingress / Gateway API controller** (`ingressClassName: magicpipes`), a separate binary that
+   configures the gateway from cluster objects, as cloudflared and ngrok's operator do.
+5. **Plain transport over loopback only,** for an agent in the server's own pod, and only if a
+   profile shows TLS matters.
+
 ## Compatibility
 
 - New protocol fields default so old agents keep working (missing `kind` = `http`).
@@ -382,3 +428,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |
+| 10 | Kubernetes: container image, tunnels declared in a file or environment, a readiness endpoint ([plan](#kubernetes-magicpipes-as-a-clusters-ingress)) | none | planned |
+| 10b | Several connections per agent (past one connection and 224 streams) | yes | planned |
+| 10c | Several agents per tunnel (replicas, rolling updates, a highly available gateway) | yes | planned |
+| 10d | An Ingress / Gateway API controller (`ingressClassName: magicpipes`) | none (a separate binary) | planned |
