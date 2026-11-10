@@ -770,6 +770,36 @@ UDP needs a port, and Windows isn't supported yet: `--unix` fails there with `un
 
 Socket paths are limited to about 100 bytes by the operating system.
 
+### Apps that only speak HTTPS
+
+Some apps answer only HTTPS, with a certificate they made themselves: Proxmox's web UI on 8006, a
+NAS, a router's admin page. `--local-https` has the agent speak TLS to the app:
+
+```console
+$ magicpipes add 8006 --local-https --private --name pve
+...
+  URL:    https://pve.mp.example.com
+  Local:  https://127.0.0.1:8006
+
+Tunnel active in background. Private: only you can open it, after signing in.
+The app's certificate is kept, and only an app showing it is reached (SHA-256 3A:5F:…).
+After the app gets a new certificate, run this command again.
+```
+
+People see your server's certificate, as for any tunnel; the app's own stays between the agent and
+the app. WebSockets pass through as on any HTTP tunnel, so an app's consoles keep working.
+
+* **The certificate is kept when you add it.** There's nothing to check a self-made certificate
+  against, so the agent remembers the one the app shows (the SHA-256 browsers show too), and from
+  then on reaches only an app showing that one. Someone in between, on the network with `--host`,
+  would have to show another.
+* **After the app gets a new certificate,** requests fail with `local_unreachable` and the agent's
+  log says why. Run the same `add` again: it keeps the new one, and `--json` says which it replaced
+  (`replaced_certificate`).
+* **HTTP/1.1 and TLS 1.2 or later.** Very old admin pages that only offer TLS 1.0 can't be reached.
+* `--host` reaches an HTTPS app elsewhere on the machine's network, and sends that name to the app
+  (SNI); an address sends none.
+
 ### SSH
 
 With `[ssh]` in the server's configuration, a machine's sshd can be reached through the server, from

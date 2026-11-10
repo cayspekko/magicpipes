@@ -63,6 +63,12 @@ present a URL. Act on the code:
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
 
+If the app only speaks HTTPS with its own certificate (Proxmox on 8006, a NAS, a router), add
+`--local-https`: the agent speaks TLS to it and keeps the certificate it shows (`local_certificate`
+in the result). If requests later fail with `local_unreachable` because the app got a new
+certificate, run the same `add` again; `replaced_certificate` says which one it replaced. Tell the
+user when that happens.
+
 If the app listens on a Unix socket rather than a port (macOS and Linux), use
 `magicpipes add --unix /run/app.sock --json`; the rest works the same, and `target` is
 `unix:<path>`. Connections reach the socket as the user, so its file permissions don't protect it:

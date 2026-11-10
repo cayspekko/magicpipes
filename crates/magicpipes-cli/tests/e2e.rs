@@ -4271,6 +4271,103 @@ async fn add_fails(env: &Env, args: &[&str]) -> (i32, String, String) {
     (out.status.code().unwrap_or(-1), v["error"]["code"].as_str().unwrap_or("").to_string(), v["error"]["message"].as_str().unwrap_or("").to_string())
 }
 
+/// A web app that only speaks HTTPS, with a new self-signed certificate, on `port` (0: any). It
+/// answers every request on a connection with `body`. Returns its port, its certificate's
+/// fingerprint as browsers show it, and the task serving it.
+async fn https_app(port: u16, body: &'static str) -> (u16, String, tokio::task::JoinHandle<()>) {
+    use sha2::Digest;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["app.local".into()]).unwrap().self_signed(&key).unwrap();
+    let fingerprint = sha2::Sha256::digest(cert.der()).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Its connections end with it, as when a real app restarts.
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            connections.spawn(async move {
+                // The agent's checks connect and close without a word.
+                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let mut tls = BufReader::new(tls);
+                loop {
+                    let mut line = String::new();
+                    // A request's head, to its empty line; GETs only, so no body follows.
+                    loop {
+                        line.clear();
+                        match tls.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) if line == "\r\n" => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    let answer = format!("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                    if tls.get_mut().write_all(answer.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, fingerprint, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn https_apps() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let host = format!("pve.{BASE}");
+
+    // The agent speaks TLS to the app and keeps the certificate it shows.
+    let (port, pin, app) = https_app(0, "hello over https").await;
+    let t = add_json(&env, &[&port.to_string(), "--local-https", "--name", "pve"]).await;
+    assert_eq!((t["status"].as_str(), t["target"].as_str()), (Some("ready"), Some(format!("https://127.0.0.1:{port}").as_str())), "{t}");
+    assert_eq!(t["local_certificate"].as_str(), Some(pin.as_str()));
+    assert!(t.get("replaced_certificate").is_none(), "{t}");
+    for _ in 0..3 {
+        assert_eq!(env.get_public(&host, "/").await, (StatusCode::OK, None, "hello over https".to_string()));
+    }
+    let human = env.cli_ok(&["add", &port.to_string(), "--local-https", "--name", "pve"]).await;
+    assert!(String::from_utf8_lossy(&human.stdout).contains(&format!("(SHA-256 {pin})")));
+
+    // Another app on that port, with another certificate: refused until it's added again.
+    app.abort();
+    let _ = app.await;
+    let (_, other, _app) = https_app(port, "the new one").await;
+    env.eventually("the old pooled connections to go", Duration::from_secs(10), async || {
+        env.get_public(&host, "/").await.0 == StatusCode::BAD_GATEWAY
+    })
+    .await;
+    let t = add_json(&env, &[&port.to_string(), "--local-https", "--name", "pve"]).await;
+    assert_eq!((t["local_certificate"].as_str(), t["replaced_certificate"].as_str()), (Some(other.as_str()), Some(pin.as_str())), "{t}");
+    env.eventually("the new certificate to be accepted", Duration::from_secs(10), async || {
+        env.get_public(&host, "/").await == (StatusCode::OK, None, "the new one".to_string())
+    })
+    .await;
+
+    // Something that doesn't speak TLS isn't taken for an HTTPS app.
+    let plain = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plain_port = plain.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Ok((mut tcp, _)) = plain.accept().await {
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n").await;
+        }
+    });
+    let (code, error, message) = add_fails(&env, &[&plain_port.to_string(), "--local-https"]).await;
+    assert_eq!((code, error.as_str()), (4, "local_unreachable"), "{message}");
+    assert!(message.contains("didn't answer with TLS"), "{message}");
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unix_socket_tunnels() {
     let env = Env::new(Tls::DevCa).await;

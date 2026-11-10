@@ -34,7 +34,7 @@ What you expose, and every way people can reach it:
 
 | Local service | CLI | Public HTTPS hostname | Public TCP/UDP port | SSH gateway (`ssh -J`) | Browser (management UI) |
 |---|---|---|---|---|---|
-| HTTP app | `add 8080` | ✅ today | ✅ TCP (optional) | — | via its hostname |
+| HTTP app | `add 8080` (`--local-https` for one that only speaks HTTPS) | ✅ today | ✅ TCP (optional) | — | via its hostname |
 | HTTP over Unix socket | `add --unix /run/app.sock` | ✅ today | ✅ today (TCP) | — | via its hostname |
 | Static files | `add --serve ./dist` | ✅ today | — | — | via its hostname (listing) |
 | Any TCP service | `add 5432 --tcp` | later (TLS SNI routing on 443) | ✅ today (TCP); private: `magicpipes connect` | — | — |

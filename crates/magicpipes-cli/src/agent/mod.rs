@@ -15,6 +15,7 @@
 //! that gets the lock when no CLI is waiting for one any more exits too.
 
 mod forward;
+mod local_tls;
 mod ops;
 mod probe;
 mod serve;

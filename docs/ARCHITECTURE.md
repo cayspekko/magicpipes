@@ -468,6 +468,27 @@ full path can name the local user.
   application is the sender: a 256 KiB send buffer in the test application alone took them to 1,200 to
   1,900. An application can set that itself; the agent can't do it for one.
 
+## HTTPS apps (`add --local-https`, `agent/local_tls.rs`)
+
+For apps that only speak HTTPS (Proxmox on 8006, a NAS). The server still speaks HTTP/1.1 inside the
+tunnel; the agent wraps its connection to the app in TLS. Like a socket, it's a local target and not
+a kind: the server sees only `https://host:port` as the description, and any server works.
+
+* **Trust on first use, at `add`.** A self-made certificate can't be checked against anything, so
+  `add` keeps the SHA-256 of the one the app shows (`Target::Port::https` in `tunnels.json`, the
+  fingerprint browsers show), and the agent's verifier accepts only that certificate from then on,
+  while still checking handshake signatures. Running `add` again keeps whatever the app shows then;
+  the person running it is at the machine, which is the consent the first time needed. The result
+  says which certificate it replaced.
+* **A different certificate** makes the stream `LocalUnreachable`, so the public side gets the
+  usual 502, and the agent logs a warning that says to run `add` again. No new status byte, so no
+  protocol change.
+* **Cost:** one rustls config per kept certificate (at most 64), so connections to the same app
+  resume TLS sessions; the handshake falls inside `LOCAL_CONNECT_TIMEOUT`. ALPN offers only
+  `http/1.1`; SNI is the `--host` name, none for an address. Plain ports take the path they always
+  did.
+* **IPC 11** carries `local_https`; an older agent would ignore it and send plain HTTP to the app.
+
 ## SSH gateway (`add --ssh`, `data/ssh.rs`)
 
 A jump host, written with `russh`. `ssh -J` authenticates to it, then asks for a `direct-tcpip` channel

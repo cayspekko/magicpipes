@@ -17,8 +17,9 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// `hostname` and `no_verify`, and the step state `skipped`. 5: `keep_list`, `site`,
 /// `allow_sensitive_root` and `allow_any`. 6: `unix` and `allow_sensitive_socket`. 7: the kind
 /// `ssh`. 8: private TCP and UDP tunnels, which an older agent refuses, or opens a public port for.
-/// 9: the kind `rdp`. 10: the kind `vnc`.
-pub const IPC_VERSION: u32 = 10;
+/// 9: the kind `rdp`. 10: the kind `vnc`. 11: `local_https`, which an older agent would ignore and
+/// send plain HTTP to an app that only speaks HTTPS.
+pub const IPC_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -83,6 +84,9 @@ pub struct AddRequest {
     #[serde(default)]
     pub allow_any: bool,
     pub host: Option<String>,
+    /// The app at `port` speaks HTTPS: the agent connects with TLS and keeps its certificate.
+    #[serde(default)]
+    pub local_https: bool,
     pub name: Option<String>,
     pub probe_path: String,
     pub timeout_secs: u64,
@@ -113,6 +117,7 @@ impl AddRequest {
             || !self.tags.is_empty()
             || self.hostname.is_some()
             || self.no_verify
+            || self.local_https
     }
 }
 
@@ -245,6 +250,7 @@ mod tests {
             serde_json::json!({ "kind": "ssh" }),
             serde_json::json!({ "kind": "rdp" }),
             serde_json::json!({ "kind": "vnc" }),
+            serde_json::json!({ "local_https": true }),
             serde_json::json!({ "allow": ["10.0.0.0/8"] }),
         ] {
             assert!(req(extra.clone()).needs_current_agent(), "{extra}");

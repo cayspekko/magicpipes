@@ -196,8 +196,15 @@ impl LocalTunnel {
 #[serde(untagged)]
 pub enum Target {
     /// A local port; `host` is `127.0.0.1`, `::1` or the `--host` given. TCP, except for a UDP
-    /// tunnel, whose datagrams go to this UDP port.
-    Port { host: String, port: u16 },
+    /// tunnel, whose datagrams go to this UDP port. `https`: the app speaks HTTPS
+    /// (`--local-https`), and this is the fingerprint of the certificate it showed when added,
+    /// which it must go on showing (`agent::local_tls`). Absent in files from before.
+    Port {
+        host: String,
+        port: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        https: Option<String>,
+    },
     /// A directory served by the agent's built-in file server (`--serve`); `serve` is canonical.
     /// `site`: its pages may run scripts. A file from before `--site` existed keeps working the
     /// way it did, so an upgrade doesn't break a site that's being served.
@@ -230,8 +237,9 @@ impl Target {
     /// Shown to the local user; `kind` picks the scheme of a port.
     pub fn describe(&self, kind: Kind) -> String {
         match self {
-            Target::Port { host, port } if kind.is_http() => target_url(host, *port),
-            Target::Port { host, port } => address(kind.as_str(), host, *port),
+            Target::Port { host, port, https: Some(_) } if kind.is_http() => address("https", host, *port),
+            Target::Port { host, port, .. } if kind.is_http() => target_url(host, *port),
+            Target::Port { host, port, .. } => address(kind.as_str(), host, *port),
             Target::Static { serve, .. } => format!("static:{}", display_path(serve)),
             Target::Shell { shell, writable, .. } => {
                 format!("shell:{} ({})", command_line(shell), if *writable { "read-write" } else { "read-only" })
@@ -270,7 +278,7 @@ impl Target {
     /// settings, may differ).
     pub fn same_destination(&self, other: &Target) -> bool {
         match (self, other) {
-            (Target::Port { host: h1, port: p1 }, Target::Port { host: h2, port: p2 }) => h1 == h2 && p1 == p2,
+            (Target::Port { host: h1, port: p1, .. }, Target::Port { host: h2, port: p2, .. }) => h1 == h2 && p1 == p2,
             (Target::Static { serve: a, .. }, Target::Static { serve: b, .. }) => a == b,
             (Target::Shell { shell: a, cwd: ca, .. }, Target::Shell { shell: b, cwd: cb, .. }) => a == b && ca == cb,
             (Target::Unix { unix: a }, Target::Unix { unix: b }) => a == b,
@@ -330,7 +338,7 @@ mod tests {
     fn tunnels_json_round_trips_and_reads_older_files() {
         let old = r#"[{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","host":"127.0.0.1","port":8080,"created_at":1}]"#;
         let list: Vec<LocalTunnel> = serde_json::from_str(old).unwrap();
-        assert_eq!(list[0].target, Target::Port { host: "127.0.0.1".into(), port: 8080 });
+        assert_eq!(list[0].target, Target::Port { host: "127.0.0.1".into(), port: 8080, https: None });
         assert_eq!((list[0].kind, list[0].describe()), (Kind::Http, "http://127.0.0.1:8080".to_string()));
         // Files from the builds that had labels still load.
         let labelled = r#"[{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","host":"127.0.0.1","port":8080,"created_at":1,"visibility":"private","labels":["env:dev"]}]"#;
@@ -356,7 +364,7 @@ mod tests {
         assert_eq!(t.target.share_url("https://a.t.test"), "https://a.t.test/#k=k1");
 
         let udp = LocalTunnel {
-            target: Target::Port { host: "::1".into(), port: 53 },
+            target: Target::Port { host: "::1".into(), port: 53, https: None },
             kind: Kind::Udp,
             public_port: Some(65501),
             allow: vec!["10.0.0.0/8".into()],
@@ -367,6 +375,15 @@ mod tests {
         assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), udp);
         assert_eq!(udp.describe(), "udp://[::1]:53");
         assert!(serde_json::to_value(&list[0]).unwrap().get("kind").is_none(), "HTTP tunnels keep the old file format");
+        assert!(serde_json::to_value(&list[0]).unwrap().get("https").is_none(), "and plain ones say nothing of HTTPS");
+
+        // An app that speaks HTTPS, with the certificate it showed.
+        let https = LocalTunnel { target: Target::Port { host: "127.0.0.1".into(), port: 8006, https: Some("AB:CD".into()) }, ..list[0].clone() };
+        let json = serde_json::to_value(&https).unwrap();
+        assert_eq!((json["port"].as_u64(), json["https"].as_str()), (Some(8006), Some("AB:CD")));
+        assert_eq!(serde_json::from_value::<LocalTunnel>(json).unwrap(), https);
+        assert_eq!((https.describe(), https.server_description()), ("https://127.0.0.1:8006".to_string(), "https://127.0.0.1:8006".to_string()));
+        assert!(https.target.same_destination(&Target::Port { host: "127.0.0.1".into(), port: 8006, https: None }), "adding it again changes how, not where");
     }
 
     /// A file from before `--site`: its tunnel goes on working the way it did. New ones say.
@@ -382,14 +399,14 @@ mod tests {
         assert_eq!(t.share_url("https://a.t.test"), "https://a.t.test");
         assert!(t.same_destination(&Target::Unix { unix: "/home/alice/app/run.sock".into() }));
         assert!(!t.same_destination(&Target::Unix { unix: "/home/alice/other.sock".into() }));
-        assert!(!t.same_destination(&Target::Port { host: "127.0.0.1".into(), port: 80 }));
+        assert!(!t.same_destination(&Target::Port { host: "127.0.0.1".into(), port: 80, https: None }));
 
         // A whole tunnel, as tunnels.json holds it, next to ones of other kinds.
         let text = r#"[{"id":"tn_1","name":"a","hostname":"a.t.test","public_url":"https://a.t.test","unix":"/run/a.sock","created_at":1},
                        {"id":"tn_2","name":"b","hostname":"b.t.test","public_url":"https://b.t.test","host":"127.0.0.1","port":8080,"created_at":1}]"#;
         let list: Vec<LocalTunnel> = serde_json::from_str(text).unwrap();
         assert_eq!(list[0].target, Target::Unix { unix: "/run/a.sock".into() });
-        assert_eq!(list[1].target, Target::Port { host: "127.0.0.1".into(), port: 8080 });
+        assert_eq!(list[1].target, Target::Port { host: "127.0.0.1".into(), port: 8080, https: None });
         let again: Vec<LocalTunnel> = serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
         assert_eq!(again[0].target, list[0].target);
     }

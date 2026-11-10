@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::local_tls;
 use super::probe;
 use super::serve;
 use super::session::{ConnState, RpcError, Session};
@@ -87,6 +88,17 @@ impl Agent {
             }
         };
         ev.step(Step::Local, StepState::Done).await;
+        // The certificate kept for this app before, to say so when another replaces it.
+        let kept = match &target {
+            Target::Port { https: Some(_), .. } => self
+                .tunnels
+                .find(|t| t.kind.is_http() && t.target.same_destination(&target))
+                .and_then(|t| match t.target {
+                    Target::Port { https, .. } => https,
+                    _ => None,
+                }),
+            _ => None,
+        };
 
         // 2. Server session.
         ev.step(Step::Connect, StepState::Running).await;
@@ -141,6 +153,12 @@ impl Agent {
             // Absent when the server predates private tunnels (then it is public).
             "visibility": tunnel.visibility,
         });
+        if let Target::Port { https: Some(pin), .. } = &tunnel.target {
+            out["local_certificate"] = json!(pin);
+            if let Some(old) = kept.filter(|old| old != pin) {
+                out["replaced_certificate"] = json!(old);
+            }
+        }
         if tunnel.visibility == Some(Visibility::Private) {
             out["tags"] = json!(tunnel.tags);
             out["access"] = json!(tunnel.access);
@@ -584,6 +602,9 @@ impl Agent {
 /// Checks the local side of an `add`: a listening port or Unix socket, a directory to serve, or a
 /// program to run in a web terminal.
 async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
+    if req.local_https && (!req.kind.is_http() || req.port.is_none() || req.serve.is_some() || req.shell.is_some() || req.unix.is_some()) {
+        return Err(ErrorInfo::new(ErrorCode::InvalidRequest, "--local-https is for a web app on a local port"));
+    }
     if let Some(path) = &req.unix {
         // A socket here is a stream: UDP has nothing to send datagrams to.
         if matches!(req.kind, Kind::Udp | Kind::Ssh | Kind::Rdp | Kind::Vnc) {
@@ -615,12 +636,29 @@ async fn local_target(req: &AddRequest) -> Result<Target, ErrorInfo> {
             if port == 0 {
                 return Err(ErrorInfo::new(ErrorCode::InvalidPort, "port must be between 1 and 65535"));
             }
-            Ok(Target::Port { host, port })
+            Ok(Target::Port { host, port, https: None })
         }
-        (None, Some(port)) => Ok(Target::Port { host: resolve_local(req.host.as_deref(), port, req.kind).await?, port }),
+        (None, Some(port)) => {
+            let host = resolve_local(req.host.as_deref(), port, req.kind).await?;
+            let https = if req.local_https { Some(https_certificate(&host, port).await?) } else { None };
+            Ok(Target::Port { host, port, https })
+        }
         (None, None) => Err(ErrorInfo::new(ErrorCode::InvalidRequest, "give a local port, --unix <socket>, --serve <dir> or --shell")),
     }
 }
+
+/// The certificate an app that speaks HTTPS shows now, to keep (`--local-https`).
+async fn https_certificate(host: &str, port: u16) -> Result<String, ErrorInfo> {
+    let app = address("https", host, port);
+    match tokio::time::timeout(HTTPS_HANDSHAKE, local_tls::fetch(host, port)).await {
+        Ok(Ok(pin)) => Ok(pin),
+        Ok(Err(e)) => Err(ErrorInfo::new(ErrorCode::LocalUnreachable, format!("{app} didn't answer with TLS ({e}); without --local-https it's reached over plain HTTP"))),
+        Err(_) => Err(ErrorInfo::new(ErrorCode::LocalUnreachable, format!("{app} didn't finish a TLS handshake within {} seconds", HTTPS_HANDSHAKE.as_secs()))),
+    }
+}
+
+/// How long `add` waits for an HTTPS app's handshake.
+const HTTPS_HANDSHAKE: Duration = Duration::from_secs(10);
 
 fn check_host(h: &str) -> Result<(), ErrorInfo> {
     if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b)) {

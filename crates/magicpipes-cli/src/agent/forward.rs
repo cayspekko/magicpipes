@@ -1,6 +1,6 @@
 //! Agent data path: serves server-opened streams by piping them to local targets (a TCP or Unix
-//! socket connection, the built-in file server or web terminal, or a UDP socket for datagram
-//! streams).
+//! socket connection, TLS to an app that only speaks HTTPS, the built-in file server or web
+//! terminal, or a UDP socket for datagram streams).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::local_tls;
 use super::serve::{self, Site};
 use super::shell::{self, Terminal};
 use super::tunnels::{Route, Tunnels};
@@ -55,7 +56,7 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
             }
         }
         ServerOpen::Datagram { tunnel_id, peer } => match tunnels.route(&tunnel_id) {
-            Some(Route { kind: Kind::Udp, target: Target::Port { host, port }, streams_ok, .. }) => {
+            Some(Route { kind: Kind::Udp, target: Target::Port { host, port, .. }, streams_ok, .. }) => {
                 tracing::debug!(%host, port, peer = peer.as_deref().unwrap_or("-"), "UDP client");
                 udp::relay(stream, &host, port, &streams_ok).await;
             }
@@ -72,7 +73,22 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>) {
                 return;
             };
             match target {
-                Target::Port { host, port } => {
+                Target::Port { host, port, https: Some(pin) } => {
+                    let connecting = local_tls::connect(&host, port, &pin);
+                    let log = |e: &std::io::Error| {
+                        if local_tls::is_other_certificate(e) {
+                            tracing::warn!(%host, port, "the app showed a certificate other than the one kept; if it has a new one, run the same magicpipes add again");
+                        } else {
+                            tracing::debug!(%host, port, error = %e, "local HTTPS app unreachable");
+                        }
+                    };
+                    let Some(local) = connect_local(&mut stream, connecting, log).await else { return };
+                    if let Some(peer) = peer {
+                        tracing::debug!(%host, port, %peer, "HTTPS client");
+                    }
+                    pipe(stream, local, kind, counter, ended).await;
+                }
+                Target::Port { host, port, https: None } => {
                     let connecting = TcpStream::connect((host.as_str(), port));
                     let Some(local) = connect_local(&mut stream, connecting, |e| tracing::debug!(%host, port, error = %e, "local target unreachable")).await else { return };
                     let _ = local.set_nodelay(true);

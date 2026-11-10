@@ -98,6 +98,7 @@ enum Command {
   magicpipes add 22 --ssh --tag team:dev      Log in with `ssh -J`, with people sharing that tag
   magicpipes add 3389 --rdp --tag team:dev    A remote desktop in the browser, for people with that tag
   magicpipes add 5900 --vnc --tag team:dev    The same for a VNC server: Linux, a Mac, a Raspberry Pi
+  magicpipes add 8006 --local-https --private An app that only speaks HTTPS, such as Proxmox's web UI
 
 Run it again with other options to change a tunnel.")]
     Add {
@@ -202,6 +203,11 @@ Run it again with other options to change a tunnel.")]
         /// Local host to connect to (default: 127.0.0.1, falling back to ::1).
         #[arg(long)]
         host: Option<String>,
+        /// The app at <PORT> only speaks HTTPS (Proxmox, a NAS or a router's admin page): the agent
+        /// connects with TLS, keeps the certificate the app shows now, and from then on reaches
+        /// only an app showing that one. After it gets a new certificate, run the same command again.
+        #[arg(long, conflicts_with_all = ["serve", "shell", "udp", "tcp", "ssh", "rdp", "vnc", "unix"])]
+        local_https: bool,
         /// Path requested by the readiness probe.
         #[arg(long, default_value = "/")]
         probe_path: String,
@@ -435,6 +441,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
             hostname,
             no_verify,
             host,
+            local_https,
             probe_path,
             timeout,
             out,
@@ -470,6 +477,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 writable: write,
                 max_clients,
                 host,
+                local_https,
                 name,
                 probe_path,
                 timeout_secs: timeout,
@@ -811,6 +819,14 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
             None if kind.is_http() => println!("Tunnel active in background. Anyone with the URL can reach it."),
             None if open_to_anyone => println!("Tunnel active in background. Anyone who finds the port can connect."),
             None => println!("Tunnel active in background. Only the allowed networks can connect."),
+        }
+        if let Some(pin) = data["local_certificate"].as_str() {
+            if data["replaced_certificate"].is_string() {
+                println!("The app showed a new certificate, which is kept now instead of the old one (SHA-256 {pin}).");
+            } else {
+                println!("The app's certificate is kept, and only an app showing it is reached (SHA-256 {pin}).");
+                println!("After the app gets a new certificate, run this command again.");
+            }
         }
         if kind.is_http() && data["verified"] == false {
             println!("Not verified (--no-verify). Once its DNS points at the server, run the same command without --no-verify to check it.");

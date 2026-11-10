@@ -2,8 +2,10 @@
 # End-to-end smoke test of built release binaries on the current OS (macOS, Linux, or Windows
 # via Git Bash): starts magicpipesd with a development CA, enrolls, creates a tunnel to a local
 # HTTP server, fetches it through the public HTTPS listener, serves a directory, types into a web
-# terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`) private, registers an SSH tunnel
-# and remote desktops (RDP and VNC), reaches an application on a Unix socket (or, on Windows, is told that isn't supported), and stops the agent.
+# terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`)
+# private, registers an SSH tunnel and remote desktops (RDP and VNC), reaches an app that only
+# speaks HTTPS and an application on a Unix socket (or, on Windows, is told that isn't
+# supported), and stops the agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -87,7 +89,7 @@ export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP="" CONNVNC=""
+SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP="" CONNVNC="" HTTPSAPP=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -100,6 +102,7 @@ cleanup() {
   stop_pid "$CONNUDP"
   stop_pid "$CONNRDP"
   stop_pid "$CONNVNC"
+  stop_pid "$HTTPSAPP"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
@@ -418,6 +421,38 @@ run "$PY" ports.py tcp 39524 "smoke over vnc"
 stop_pid "$CONNVNC"
 CONNVNC=""
 run "$MP" remove smoke-vnc --json
+
+step "an app that only speaks HTTPS"
+# The dev CA's own certificate and key stand in for an app's self-signed ones: the agent speaks
+# TLS to it and keeps the certificate it shows.
+cat > httpsapp.py <<'PYEOF'
+import http.server, ssl, sys
+class Hello(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = b"hello over https\n"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args): pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Hello)
+tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls.load_cert_chain(sys.argv[2], sys.argv[3])
+srv.socket = tls.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PYEOF
+"$PY" httpsapp.py 39093 "$CA" "$(native "$WORK/server/dev-ca/ca.key")" > httpsapp.log 2>&1 < /dev/null &
+HTTPSAPP=$!
+for _ in $(seq 1 50); do "$PY" -c "import socket; socket.create_connection(('127.0.0.1', 39093), 1)" 2>/dev/null && break; sleep 0.1; done
+run "$MP" add 39093 --local-https --name smoke-https --json --timeout 60
+grep -q '"target": "https://127.0.0.1:39093"' cmd.out
+grep -q '"local_certificate"' cmd.out
+run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "smoke-https.t.test:$HTTPS:127.0.0.1" "https://smoke-https.t.test:$HTTPS/"
+grep -q "hello over https" cmd.out
+run "$MP" remove smoke-https
+stop_pid "$HTTPSAPP"
+HTTPSAPP=""
 
 step "unix socket"
 if [[ -n "$WINDOWS" ]]; then
