@@ -547,11 +547,16 @@ pub struct MonitoringConfig {
     /// Days of 5-minute history kept in the database, 1 to 30. The last 24 hours are also in
     /// memory.
     pub history_days: u32,
+    /// The server checks each tunnel's app on its own, through its machine, unless the agent
+    /// turned it off for that tunnel (`add --no-check`).
+    pub synthetics: bool,
+    /// Seconds between two checks of a tunnel, 10 to 3600.
+    pub check_interval_secs: u64,
 }
 
 impl Default for MonitoringConfig {
     fn default() -> Self {
-        Self { history_days: 7 }
+        Self { history_days: 7, synthetics: true, check_interval_secs: 60 }
     }
 }
 
@@ -742,6 +747,9 @@ impl Config {
         }
         if !(1..=30).contains(&self.monitoring.history_days) {
             bail!("monitoring.history_days must be between 1 and 30");
+        }
+        if !(10..=3600).contains(&self.monitoring.check_interval_secs) {
+            bail!("monitoring.check_interval_secs must be between 10 and 3600");
         }
         if !(1..=magicpipes_core::proto::MAX_CONNECTIONS).contains(&self.agents.max_connections) {
             bail!("agents.max_connections must be between 1 and {}", magicpipes_core::proto::MAX_CONNECTIONS);

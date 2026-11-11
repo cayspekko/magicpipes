@@ -208,9 +208,13 @@ Run it again with other options to change a tunnel.")]
         /// only an app showing that one. After it gets a new certificate, run the same command again.
         #[arg(long, conflicts_with_all = ["serve", "shell", "udp", "tcp", "ssh", "rdp", "vnc", "unix"])]
         local_https: bool,
-        /// Path requested by the readiness probe.
+        /// Path requested by the readiness probe, and by the server's checks once a minute.
         #[arg(long, default_value = "/")]
         probe_path: String,
+        /// The server doesn't check this tunnel's app on its own once a minute (on by default; the
+        /// same command without it turns them back on).
+        #[arg(long)]
+        no_check: bool,
         /// Overall timeout in seconds, including certificate issuance.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -443,6 +447,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
             host,
             local_https,
             probe_path,
+            no_check,
             timeout,
             out,
         } => {
@@ -485,6 +490,7 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 tags,
                 hostname,
                 no_verify,
+                no_check,
             };
             (out, add(req, out).await)
         }

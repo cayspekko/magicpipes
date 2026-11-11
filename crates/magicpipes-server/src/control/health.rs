@@ -25,6 +25,8 @@ pub struct TunnelHealth {
     pub tunnel: TunnelView,
     pub machine: String,
     pub recent: Series<Traffic>,
+    /// Its last check, if it has had one.
+    pub check: Option<super::checks::CheckResult>,
 }
 
 /// A certificate in trouble, or expiring within [`EXPIRING_WITHIN_SECS`].
@@ -127,7 +129,7 @@ impl ControlPlane {
                 } else {
                     history.tunnel(&t.id, period, now)
                 };
-                TunnelHealth { machine: machine_name(&t.agent_id), recent, tunnel: t }
+                TunnelHealth { machine: machine_name(&t.agent_id), recent, check: None, tunnel: t }
             })
             .collect();
         let machines = agents
@@ -143,6 +145,13 @@ impl ControlPlane {
             })
             .collect();
         drop(history);
+        let mut tunnels = tunnels;
+        {
+            let checks = self.checks.lock().unwrap();
+            for t in &mut tunnels {
+                t.check = checks.get(&t.tunnel.id).cloned();
+            }
+        }
         let alerts = self.alerts(who);
         let closed = self.closed_alerts(who, now - 86_400);
         HealthView { alerts, closed, machines, tunnels, certificates, period, history_days: self.cfg.monitoring.history_days, since, now }

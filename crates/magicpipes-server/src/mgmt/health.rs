@@ -10,6 +10,7 @@ use super::html::{Number, Text, badge, count, esc, table, when};
 use super::ui::page;
 use super::AppState;
 use crate::control::alerts::{AlertView, Severity};
+use crate::control::checks::{CheckResult, Outcome};
 use crate::control::health::{CertificateHealth, HealthView, MachineHealth, TunnelHealth};
 use crate::control::history::{Period, Presence, Series, Traffic};
 
@@ -38,12 +39,13 @@ fn body(h: &HealthView) -> String {
     let mut tunnels: Vec<&TunnelHealth> = h.tunnels.iter().collect();
     tunnels.sort_by_cached_key(|t| {
         let total = t.recent.total();
-        (std::cmp::Reverse((total.failed(), total.refused, total.requests)), t.tunnel.name.clone())
+        let checks_failing = t.check.as_ref().map_or(0, |c| c.failures);
+        (std::cmp::Reverse((checks_failing, total.failed(), total.refused, total.requests)), t.tunnel.name.clone())
     });
     let mut machines: Vec<&MachineHealth> = h.machines.iter().collect();
     machines.sort_by_cached_key(|m| (m.agent.connected || m.agent.tunnels == 0, std::cmp::Reverse(m.recent.total().reconnects), m.agent.name.clone()));
 
-    let tunnel_rows: String = tunnels.iter().take(ROWS).map(|t| tunnel_row(t)).collect();
+    let tunnel_rows: String = tunnels.iter().take(ROWS).map(|t| tunnel_row(t, h.now)).collect();
     let machine_rows: String = machines.iter().take(ROWS).map(|m| machine_row(m, h.now)).collect();
     let more = |shown: usize, all: usize, what: &str, list: &str| {
         if all > shown {
@@ -233,13 +235,13 @@ fn health_line(h: &HealthView) -> String {
     format!(r#"<p class="health"><span class="status {tone}"><span>{text}</span></span></p>"#)
 }
 
-fn tunnel_row(t: &TunnelHealth) -> String {
+fn tunnel_row(t: &TunnelHealth, now: i64) -> String {
     let total = t.recent.total();
     let requests: Vec<f64> = t.recent.points.iter().map(|p| p.requests as f64).collect();
     let max = nice_max(requests.iter().cloned().fold(0.0, f64::max));
     let causes = causes(&total);
     format!(
-        r#"<tr><td><a class="name" href="/tunnels/{id}">{name}</a><span class="sub">{machine}</span></td><td class="num">{requests}{spark}</td><td class="num">{failed}{causes}</td><td class="num">{time}</td><td>{status}</td></tr>"#,
+        r#"<tr><td><a class="name" href="/tunnels/{id}">{name}</a><span class="sub">{machine}</span></td><td class="num">{requests}{spark}</td><td class="num">{failed}{causes}</td><td class="num">{time}</td><td>{status}{check}</td></tr>"#,
         id = esc(&t.tunnel.id),
         name = esc(&t.tunnel.name),
         machine = esc(&t.machine),
@@ -249,7 +251,42 @@ fn tunnel_row(t: &TunnelHealth) -> String {
         causes = if causes.is_empty() { String::new() } else { format!(r#"<span class="sub">{}</span>"#, esc(&causes)) },
         time = response_time(&total),
         status = badge(t.tunnel.status),
+        // A check that passed gets no word; one that failed, or none at all, does.
+        check = match (&t.check, t.tunnel.checks) {
+            (_, false) => r#"<span class="sub">not checked</span>"#.to_string(),
+            (Some(c), _) if c.outcome == Outcome::Failed => format!(r#"<span class="sub">check failed {} ago</span>"#, ago(now - c.at)),
+            _ => String::new(),
+        },
     )
+}
+
+/// What a tunnel's page says about the server's checks of it.
+pub(super) fn check_field(t: &crate::control::TunnelView, check: Option<&CheckResult>, server_checks: bool, now: i64) -> String {
+    let path = t.check_path.as_deref().map(|p| format!(" for <code>{}</code>", esc(p))).unwrap_or_default();
+    if !server_checks {
+        return "This server doesn't check tunnels.".to_string();
+    }
+    if !t.checks {
+        return r#"Off.<p class="note">To turn checks on, run the same <code>magicpipes add</code> on that machine without <code>--no-check</code>.</p>"#.to_string();
+    }
+    match check {
+        None => format!("Not checked yet{path}; the first check comes shortly."),
+        Some(c) => match c.outcome {
+            Outcome::Passed => format!(
+                r#"<span class="status ok">passed</span> {} ago, in {} ms<span class="sub wrap">{}</span>"#,
+                ago(now - c.at),
+                c.took_ms,
+                esc(&c.said)
+            ),
+            Outcome::Failed => format!(
+                r#"<span class="status bad">failed</span> {} ago{}<span class="sub wrap">{}</span>"#,
+                ago(now - c.at),
+                if c.failures > 1 { format!(", {} times in a row", c.failures) } else { String::new() },
+                esc(&c.said)
+            ),
+            Outcome::Skipped => "Not checked: its machine is offline.".to_string(),
+        },
+    }
 }
 
 /// Why requests failed, and those turned away: `app down 3 · too slow 1 · busy 2`.

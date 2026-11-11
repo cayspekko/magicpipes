@@ -317,6 +317,9 @@ impl Agent {
             visibility,
             tags,
             hostname: hostname.clone(),
+            // `add` says it all again: checks on unless `--no-check`, at `--probe-path`.
+            checks: Some(!req.no_check),
+            check_path: req.kind.is_http().then(|| if req.probe_path.starts_with('/') { req.probe_path.clone() } else { format!("/{}", req.probe_path) }),
         };
         let info: TunnelInfo = loop {
             match self.session.rpc(&Rpc::Register(rpc_req.clone()), Duration::from_secs(15)).await {

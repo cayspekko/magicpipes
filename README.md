@@ -1068,6 +1068,12 @@ psql -h 127.0.0.1 -p 5432 -U me mydb    # in another terminal
   and an agent started by this command exits if it has nothing else to do.
 * A slow certificate (`tls_timeout`) does not stop the server: it keeps trying in the
   background, so rerunning `add` later usually succeeds at once.
+* **Checks:** after that, the server checks the tunnel's app on its own once a minute, through
+  this machine: `GET <--probe-path>` on an HTTP tunnel (any answer counts), the banner of an SSH
+  server, the greeting of a VNC server, the answer of an RDP one, and for other ports that the
+  machine reached the app. Two failures in a row open a "Check failing" alert. `--no-check` turns
+  them off for the tunnel; running the same `add` without it turns them back on. The tunnel's
+  page shows the last check.
 
 ### JSON output and exit codes
 
@@ -1234,9 +1240,10 @@ agent's protocol version), `owner_user_id`, `owner_email`, `tags` (what it publi
 
 Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `visibility`,
 `tags` (the owner's personal tag included), `access` (private: the tags that let people in), `status`
-(`connected` / `disconnected` / `error` = local app unreachable or too slow on the last request), `tls`
+(`connected` / `disconnected` / `error` = local app unreachable or too slow on the last request, or failing its last check), `tls`
 (`ready` / `pending` / `failed`), `tls_error`, `created_at`, `requests`, `upstream_errors`,
-`last_request_at`. Errors: `{"error": {"code", "message"}}`.
+`last_request_at`, `checks` (does the server check it), `check_path` (HTTP: what a check requests).
+Errors: `{"error": {"code", "message"}}`.
 
 Tunnels are created by agents, not through the API: the target is a port on the agent's
 machine, and only the agent may decide what it connects to.
@@ -1253,6 +1260,13 @@ own machines and tunnels; administrators see everything.
 The server samples every 10 seconds. The last day is in memory, and 5-minute slots are kept in the
 database for `[monitoring] history_days` (7 by default, up to 30), which adds "Last 7 days" (and,
 at 30, "Last 30 days") to the charts and brings the last day back after a restart.
+
+**Checks.** Once a minute (`[monitoring] check_interval_secs`) the server checks each tunnel's
+app through its machine, as a visitor's request reaches it, unless the tunnel was added with
+`--no-check` or `[monitoring] synthetics = false`. The check is marked `User-Agent:
+MagicPipes-Check` and `X-Magicpipes-Probe: check`, so an app can leave it out of its logs. A
+tunnel whose machine is offline isn't checked: that has its own alert. These checks start where
+the server is, so they can't see a problem in DNS or a firewall in front of it.
 
 **Alerts.** Rules judge every sample, and an alert opens once a problem shows on two samples in a
 row and closes after three fine ones. Open alerts lead the Health page, show as a count beside
@@ -1272,6 +1286,7 @@ about their own machines and tunnels; administrators see all of them.
 | New certificates nearly used up | A machine used over 80% of `max_new_certificates_per_day` |
 | Ports nearly used up | Over 90% of the `[ports]` range is in use |
 | Key changed | A browser terminal or desktop refused a machine's changed key, in the last day (serious) |
+| Check failing | The server's last two checks of a tunnel's app failed (serious) |
 
 For alerts outside the app, scrape `/metrics`.
 

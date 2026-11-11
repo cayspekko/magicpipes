@@ -838,6 +838,53 @@ async fn an_alert_opens_shows_everywhere_and_closes() {
     assert!(!week.contains("Last 30 days"), "only what's kept is offered");
 }
 
+/// The server checks each tunnel's app through its machine, says how it went on the tunnel's
+/// page, and opens an alert once two checks in a row fail. `add --no-check` turns it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_checks_tunnels_and_says_when_one_fails() {
+    let env = Env::with_config(Tls::DevCa, "[monitoring]\ncheck_interval_secs = 10\n").await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let echo = common::tcp_echo_app().await;
+    let web = add_json(&env, &[&app.port.to_string(), "--name", "web", "--probe-path", "/health"]).await;
+    let port = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any", "--name", "echo"]).await;
+    let quiet = add_json(&env, &[&app.port.to_string(), "--name", "quiet", "--no-check"]).await;
+    let id = |t: &Value| t["id"].as_str().unwrap().to_string();
+    let admin = env.admin_token();
+    let (_, v) = env.api("GET", &format!("/api/v1/tunnels/{}", id(&web)), Some(&admin)).await;
+    assert_eq!((v["checks"].as_bool(), v["check_path"].as_str()), (Some(true), Some("/health")), "{v}");
+    let (_, v) = env.api("GET", &format!("/api/v1/tunnels/{}", id(&quiet)), Some(&admin)).await;
+    assert_eq!(v["checks"].as_bool(), Some(false), "{v}");
+    let cookie = admin_session(&env).await;
+
+    // Any answer counts: the test app has no /health, and says 404.
+    env.eventually("both checked", Duration::from_secs(30), || async {
+        let web = env.ui(&format!("/tunnels/{}", id(&web)), Some(&cookie), None).await.html;
+        let echo = env.ui(&format!("/tunnels/{}", id(&port)), Some(&cookie), None).await.html;
+        web.contains(r#"<span class="status ok">passed</span>"#) && web.contains("HTTP 404 for /health") && echo.contains("Its machine reached the app")
+    })
+    .await;
+    let page = env.ui(&format!("/tunnels/{}", id(&quiet)), Some(&cookie), None).await.html;
+    assert!(page.contains("<dt>Check</dt><dd>Off.") && page.contains("without <code>--no-check</code>"), "{page}");
+
+    // The app goes: two failed checks in a row open an alert.
+    app.stop();
+    env.eventually("the check alert", Duration::from_secs(60), || async {
+        // However many it has been by the time it opens.
+        env.ui("/health", Some(&cookie), None).await.html.contains(" checks failed: The app isn&#39;t accepting connections.")
+    })
+    .await;
+    let page = env.ui(&format!("/tunnels/{}", id(&web)), Some(&cookie), None).await.html;
+    assert!(page.contains(r#"<div class="notice bad"><span class="status bad">Check failing</span>"#) && page.contains("times in a row"), "{page}");
+    // Its status says so, with no visitor needed to find out.
+    let (_, v) = env.api("GET", &format!("/api/v1/tunnels/{}", id(&web)), Some(&admin)).await;
+    assert_eq!(v["status"], "error", "{v}");
+    // Only the tunnel that's checked: `quiet` reaches the same app, without checks.
+    let health = env.ui("/health", Some(&cookie), None).await.html;
+    assert_eq!(health.matches(r#"<span class="status bad">Check failing</span>"#).count(), 1, "{health}");
+    assert!(health.contains("check failed") && health.contains("not checked"), "{health}");
+}
+
 async fn tcp_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return Vec::new() };

@@ -86,6 +86,8 @@ fn http(name: &str) -> RegisterTunnel {
         visibility: None,
         tags: vec![],
         hostname: None,
+        checks: None,
+        check_path: None,
     }
 }
 
@@ -133,6 +135,27 @@ async fn history_is_for_those_who_manage_it() {
     assert!(f.cp.tunnel_history(&admin, &t.id, Period::Hours24).is_some() && f.cp.tunnel_history(&member, &t.id, Period::Minutes15).is_none());
     assert!(f.cp.agent_history(&admin, &a, Period::Minutes15).is_some() && f.cp.agent_history(&member, &a, Period::Minutes15).is_none());
     assert!(f.cp.agent_history(&admin, "ag_nobody", Period::Minutes15).is_none(), "an unknown machine is not found");
+}
+
+/// The server checks a tunnel unless its agent said not to; a reconnect, which says nothing,
+/// changes nothing; and the path a check requests can't smuggle anything into the request.
+#[tokio::test]
+async fn checks_are_on_unless_turned_off_and_their_path_is_plain() {
+    let f = fixture();
+    let a = f.agent("a");
+    let t = f.cp.register(&a, &http("app")).unwrap();
+    let seen = |f: &Fixture| f.cp.tunnel(&Principal::AdminToken, &t.id).map(|v| (v.checks, v.check_path));
+    assert_eq!(seen(&f), Some((true, Some("/".into()))));
+    f.cp.register(&a, &RegisterTunnel { checks: Some(false), check_path: Some("/health".into()), ..http("app") }).unwrap();
+    f.cp.register(&a, &RegisterTunnel { id: Some(t.id.clone()), ..http("app") }).unwrap();
+    assert_eq!(seen(&f), Some((false, Some("/health".into()))), "a reconnect keeps them");
+    for bad in ["health".to_string(), "/a b".into(), "/a\r\nX-Evil: 1".into(), format!("/{}", "a".repeat(200))] {
+        let e = f.cp.register(&a, &RegisterTunnel { check_path: Some(bad.clone()), ..http("app") }).unwrap_err();
+        assert!(e.is(ErrorCode::InvalidRequest), "{bad:?}");
+    }
+    let dir = f.stop();
+    let again = fixture_in(dir, "");
+    assert_eq!(seen(&again), Some((false, Some("/health".into()))), "kept in the database");
 }
 
 /// A changed target retires the tunnel's pooled connections; nothing else does.

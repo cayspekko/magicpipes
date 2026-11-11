@@ -73,6 +73,8 @@ acme_directory = "letsencrypt"
 
 [monitoring]
 # history_days = 7                     # days of 5-minute history for the Health page and charts (1 to 30)
+# synthetics = true                    # check each tunnel's app through its machine (`add --no-check` skips one)
+# check_interval_secs = 60             # how often (10 to 3600)
 
 [users]
 # Accounts are created by administrators in the UI (Users) or the API; see the README.

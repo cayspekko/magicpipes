@@ -101,6 +101,9 @@ pub struct AddRequest {
     /// Register without waiting for the certificate or checking the public address.
     #[serde(default)]
     pub no_verify: bool,
+    /// The server doesn't check the tunnel on its own.
+    #[serde(default)]
+    pub no_check: bool,
 }
 
 impl AddRequest {
@@ -118,6 +121,7 @@ impl AddRequest {
             || self.hostname.is_some()
             || self.no_verify
             || self.local_https
+            || self.no_check
     }
 }
 
@@ -252,6 +256,7 @@ mod tests {
             serde_json::json!({ "kind": "vnc" }),
             serde_json::json!({ "local_https": true }),
             serde_json::json!({ "allow": ["10.0.0.0/8"] }),
+            serde_json::json!({ "no_check": true }),
         ] {
             assert!(req(extra.clone()).needs_current_agent(), "{extra}");
         }

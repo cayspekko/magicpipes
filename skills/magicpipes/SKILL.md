@@ -43,6 +43,10 @@ wait and public check (the JSON then has `"verified": false`); use it only when 
 DNS doesn't point at the server yet. Running
 the same `add` again is safe: it returns the existing tunnel (`"created": false`).
 
+The server then checks the app once a minute through this machine (`GET` on `--probe-path` for
+HTTP, any answer counting). If the app shouldn't get those requests, add `--no-check`; running the
+same `add` without it turns checks back on.
+
 ## On failure
 
 The exit code is nonzero and stdout holds `{"error":{"code","message","step"}}`. Don't

@@ -476,15 +476,16 @@ pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): 
     let history_days = app.control.config().monitoring.history_days;
     let traffic = super::health::traffic_section(&format!("/tunnels/{}", t.id), &series, t.kind.is_http(), history_days);
     let notices = super::health::notices(&app.control.alerts_about(&user.who, "tunnel", &t.id));
+    let check = super::health::check_field(&t, app.control.check_result(&t.id).as_ref(), app.control.checks_on(), magicpipes_core::unix_now());
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
     let ssh_ca = app.control.ssh_ca();
     let viewer_email = user.user.as_ref().map(|u| u.email.as_str()).unwrap_or("you@example.com");
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &notices, &traffic))
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &notices, &traffic, &check))
 }
 
 #[allow(clippy::too_many_arguments)] // one page's parts
-fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, notices: &str, traffic: &str) -> String {
+fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, notices: &str, traffic: &str, check: &str) -> String {
     let field = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", esc(k), v);
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
@@ -535,6 +536,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     if let Some(e) = &t.tls_error {
         dl.push_str(&field("TLS error", &esc(e)));
     }
+    dl.push_str(&field("Check", check));
     if let Some(e) = &t.port_error {
         dl.push_str(&field("Port error", &esc(e)));
     }

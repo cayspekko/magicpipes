@@ -277,6 +277,15 @@ pub struct RegisterTunnel {
     /// of `<name>.<base_domain>`. Fixed when the tunnel is created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Whether the server checks the tunnel's app on its own, once a minute (`add --no-check`
+    /// turns it off). `None`: no change, and on for a new tunnel. A server that doesn't know it
+    /// ignores it, and checks nothing anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<bool>,
+    /// HTTP tunnels: the path those checks request (`add --probe-path`). `None`: no change, and
+    /// `/` for a new tunnel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -506,9 +515,16 @@ mod tests {
             visibility: Some(Visibility::Private),
             tags: vec!["dev".into()],
             hostname: None,
+            checks: None,
+            check_path: None,
         });
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""visibility":"private""#) && json.contains(r#""tags":["dev"]"#), "{json}");
+        assert!(!json.contains("check"), "an older server is sent nothing it doesn't know: {json}");
+        // Checks: an older agent never sends these, which changes nothing; an older server ignores them.
+        assert!(matches!(r_register(r#"{"op":"register","id":null,"name":"a","target":"x"}"#), RegisterTunnel { checks: None, check_path: None, .. }));
+        let r = r_register(r#"{"op":"register","id":null,"name":"a","target":"x","checks":false,"check_path":"/health"}"#);
+        assert_eq!((r.checks, r.check_path.as_deref()), (Some(false), Some("/health")));
         // Protocol 5: an older peer can't read this kind, so the agent checks the version first.
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x","kind":"ssh"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Ssh, .. })));
@@ -531,6 +547,13 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pi","target":"x","kind":"vnc"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Vnc, .. })));
         assert!(serde_json::to_string(&Kind::Vnc).unwrap() == r#""vnc""# && Kind::parse("vnc") == Some(Kind::Vnc) && !Kind::Vnc.has_port() && Kind::Vnc.is_desktop());
+    }
+
+    fn r_register(json: &str) -> RegisterTunnel {
+        match serde_json::from_str::<Request>(json).unwrap() {
+            Request::Register(r) => r,
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

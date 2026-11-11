@@ -35,10 +35,11 @@ pub enum Rule {
     CertificateOrders,
     PortsUsedUp,
     KeyRefused,
+    CheckFailing,
 }
 
 impl Rule {
-    const ALL: [Rule; 11] = [
+    const ALL: [Rule; 12] = [
         Rule::MachineOffline,
         Rule::FewerConnections,
         Rule::SlowRoundTrips,
@@ -50,6 +51,7 @@ impl Rule {
         Rule::CertificateOrders,
         Rule::PortsUsedUp,
         Rule::KeyRefused,
+        Rule::CheckFailing,
     ];
 
     /// Its name in the database.
@@ -66,6 +68,7 @@ impl Rule {
             Rule::CertificateOrders => "certificate_orders",
             Rule::PortsUsedUp => "ports_used_up",
             Rule::KeyRefused => "key_refused",
+            Rule::CheckFailing => "check_failing",
         }
     }
 
@@ -87,6 +90,7 @@ impl Rule {
             Rule::CertificateOrders => "New certificates nearly used up",
             Rule::PortsUsedUp => "Ports nearly used up",
             Rule::KeyRefused => "Key changed",
+            Rule::CheckFailing => "Check failing",
         }
     }
 }
@@ -308,6 +312,8 @@ pub struct TunnelFacts {
     /// HTTP tunnels: its certificate's state and expiry.
     pub certificate: Option<(CertStatus, Option<i64>)>,
     pub key_refused: bool,
+    /// Its last check's failures in a row, and why it failed.
+    pub check: Option<(u32, String)>,
 }
 
 /// What the rules see on a sample.
@@ -377,6 +383,10 @@ pub fn judge(f: &Facts) -> Vec<Finding> {
             let detail = format!("{failed} of {} requests in the last 5 minutes ({}%).", t.recent.requests, failed * 100 / t.recent.requests);
             find(Rule::AppErrors, format!("tunnel:{}", t.id), &t.name, Severity::Bad, detail);
         }
+        if let Some((failures, why)) = t.check.as_ref().filter(|(n, _)| *n >= 2) {
+            let detail = format!("The last {failures} checks failed: {why}");
+            find(Rule::CheckFailing, format!("tunnel:{}", t.id), &t.name, Severity::Bad, detail);
+        }
         if t.key_refused {
             let detail = "Its machine showed a different key from the one kept, and the browser was refused. If the machine was reinstalled, forget the old key on this page.";
             find(Rule::KeyRefused, format!("tunnel:{}", t.id), &t.name, Severity::Bad, detail.to_string());
@@ -445,6 +455,7 @@ impl ControlPlane {
                     recent: Traffic::default(),
                     certificate: t.row.kind.is_http().then_some((CertStatus::Pending, None)),
                     key_refused: false,
+                    check: None,
                 })
                 .collect();
             let used = st.tunnels.values().filter(|t| t.row.public_port.is_some()).count();
@@ -460,6 +471,12 @@ impl ControlPlane {
             }
             history.started()
         };
+        {
+            let checks = self.checks.lock().unwrap();
+            for t in &mut tunnels {
+                t.check = checks.get(&t.id).map(|c| (c.failures, c.said.clone()));
+            }
+        }
         for t in tunnels.iter_mut().filter(|t| t.certificate.is_some()) {
             t.certificate = Some((self.certs.status(&t.hostname), self.certs.not_after(&t.hostname)));
         }
@@ -638,6 +655,7 @@ mod tests {
             recent: Traffic { requests, unreachable, ..Default::default() },
             certificate: None,
             key_refused: false,
+            check: None,
         }
     }
 
@@ -715,7 +733,11 @@ mod tests {
         failed.certificate = Some((CertStatus::Failed("no DNS".into()), None));
         let mut changed = tunnel("changed", 0, 0);
         changed.key_refused = true;
-        f.tunnels = vec![tunnel("down", 20, 2), tunnel("quiet", 19, 19), tunnel("edge", 20, 1), expiring, soon, later, failed, changed];
+        let mut checked = tunnel("checked", 0, 0);
+        checked.check = Some((2, "The app isn't accepting connections.".into()));
+        let mut once = tunnel("once", 0, 0);
+        once.check = Some((1, "No answer within 10 seconds.".into()));
+        f.tunnels = vec![tunnel("down", 20, 2), tunnel("quiet", 19, 19), tunnel("edge", 20, 1), expiring, soon, later, failed, changed, checked, once];
         f.ports = Some((46, 50));
         assert_eq!(rules(&f), vec![
             (Rule::AppErrors, "tunnel:down".into(), Severity::Bad),
@@ -723,8 +745,10 @@ mod tests {
             (Rule::CertificateExpiring, "certificate:soon".into(), Severity::Bad),
             (Rule::CertificateFailed, "certificate:failed".into(), Severity::Bad),
             (Rule::KeyRefused, "tunnel:changed".into(), Severity::Bad),
+            (Rule::CheckFailing, "tunnel:checked".into(), Severity::Bad),
             (Rule::PortsUsedUp, "server".into(), Severity::Warn),
         ]);
+        assert_eq!(judge(&f)[5].detail, "The last 2 checks failed: The app isn't accepting connections.");
         assert_eq!(judge(&f)[0].detail, "2 of 20 requests in the last 5 minutes (10%).");
         f.tunnels.clear();
         f.ports = Some((45, 50));

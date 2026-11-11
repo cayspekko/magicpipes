@@ -325,6 +325,22 @@ Visibility follows `authorize`: an alert about a machine or tunnel is seen by wh
 one about the server, or something gone, only by administrators. Trackers are bounded by rules
 times subjects, and closed alerts in the database by `history_days` and `MAX_CLOSED_ALERTS`.
 
+### Checks (`control/checks.rs`)
+
+Every `check_interval_secs` the control plane checks each tunnel that has them on (a column on
+`tunnels`, set by `add` and left alone by a reconnect, which sends neither field): it opens a
+control stream (`MuxHandle::open`, outside the data budget) to the tunnel's machine with the
+tunnel's `ServerOpen::Data` header, as a visitor's request would, waits for the machine's status
+byte, and then has a short exchange by kind: an HTTP `GET` of the tunnel's check path, read up to
+the status line (any status counts); SSH's banner; VNC's `RFB` greeting; an RDP connection request
+and its TPKT answer; nothing more for TCP and UDP. At most 16 run at once, each within 10 seconds,
+and an app's answer is read to at most 1 KiB. This reaches private tunnels too, which a request to
+the public address can't without signing in, but not the server's own listener: certificates
+have their rules, and DNS and firewalls need a probe from outside. A tunnel whose machine is
+offline is skipped. The last result per tunnel stays in memory; two failures in a row open an
+alert. The check path goes into a request line as it is, so registration accepts only an
+absolute path of printable characters without spaces, at most 200.
+
 The pages draw history as SVG on the server, one series per chart (the accent and the "bad" color
 are too close to share one), with the marks stretched to the card (`preserveAspectRatio="none"`,
 strokes that don't scale) and all text in HTML around them. Hovering a slot shows its values

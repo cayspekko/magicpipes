@@ -358,6 +358,9 @@ impl Session {
                 tags: Vec::new(),
                 // If the server lost the tunnel, it comes back at the same custom hostname.
                 hostname: t.custom_hostname.then(|| t.hostname.clone()),
+                // The server keeps whether it checks the tunnel, and how.
+                checks: None,
+                check_path: None,
             };
             match self.rpc(&Rpc::Register(req), Duration::from_secs(15)).await {
                 // Never let a private tunnel come back public (e.g. after a server downgrade).

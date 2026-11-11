@@ -410,12 +410,13 @@ cause, alert, or way for a monitoring system to read any of it. Decided 2026-11-
   synthetic check failing twice; a certificate expiring within 14 days (warn) or 3 (bad), or a
   renewal failing; ACME orders over 80% of the day's limit; the port range over 90% used; an
   outdated agent; a machine's key refused for changing.
-* **Synthetic checks, on by default** (`[monitoring] synthetics`, and off per tunnel): once a
-  minute the server sends the readiness probe `add` uses through each HTTP tunnel, the path a
-  visitor's request takes, and for other kinds opens a stream and reads what the machine says
-  first (SSH's banner, RDP's answer, VNC's greeting). Marked `x-magicpipes-probe`, to
-  `--probe-path`. Later the agent checks its own targets and reports (a protocol bump), and an
-  outside probe sees what the server can't: its own DNS, firewall and proxy.
+* **Synthetic checks, on by default** (`[monitoring] synthetics`, and off per tunnel with
+  `add --no-check`): once a minute the server opens a stream through each tunnel's machine to its
+  app, as a visitor's request does, and has a short exchange: `GET <--probe-path>` on HTTP (any
+  answer counts), SSH's banner, VNC's greeting, RDP's answer. Marked `x-magicpipes-probe`. Done in
+  11d; going through the machine reaches private tunnels too. Still to do: the agent checks its
+  own targets and reports (a protocol bump), and an outside probe sees what the server can't: its
+  own DNS, firewall and proxy.
 * **Certificate changes** come from comparing each hostname's fingerprint and expiry between
   samples: renewed, replaced, expiring, renewal failed. (Expiring and failing are alerts since
   11c; renewed and replaced are still to do.)
@@ -508,5 +509,5 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 11 | Monitoring, measure: counters for errors by cause, latency and bytes, ping round trips, `/metrics` ([plan](#monitoring-health-history-alerts-and-synthetic-checks)) | yes | done |
 | 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | done |
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
-| 11d | Monitoring, probe: synthetic checks from the server, on by default; then the agent's own (protocol bump) | yes; agent for its own | planned |
+| 11d | Monitoring, probe: synthetic checks from the server, on by default (done); then the agent's own (protocol bump) | yes; agent for its own | server's done |
 | 11e | Monitoring, tell: email and webhooks; an outside probe | yes | planned |

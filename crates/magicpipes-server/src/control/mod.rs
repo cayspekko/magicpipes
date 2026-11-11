@@ -23,6 +23,7 @@ mod device;
 mod directory;
 mod email;
 pub mod alerts;
+pub mod checks;
 pub mod health;
 pub mod history;
 mod hostnames;
@@ -95,6 +96,8 @@ pub struct ControlPlane {
     /// Open alerts, and what the rules need between samples ([`alerts`]). Never locked while
     /// taking `state` or `history`.
     alerts: Mutex<alerts::Alerts>,
+    /// Each tunnel's last check ([`checks`]).
+    checks: Mutex<checks::Checks>,
 }
 
 #[derive(Default)]
@@ -257,6 +260,7 @@ impl ControlPlane {
             mail: email::MailState::default(),
             history: Mutex::new(history::History::new(unix_now())),
             alerts: Mutex::new(alerts::Alerts::default()),
+            checks: Mutex::new(checks::Checks::default()),
         });
         cp.publish(&cp.state.lock().unwrap());
         cp.load_history();
@@ -295,6 +299,7 @@ impl ControlPlane {
             self.certs.ensure(&h);
         }
         self.start_mail_queue(shutdown.clone());
+        self.start_checks(shutdown.clone());
         self.start_gateway_reports(shutdown.clone());
         let me = self.clone();
         tokio::spawn(async move {

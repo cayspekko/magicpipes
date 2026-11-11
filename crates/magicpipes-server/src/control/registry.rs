@@ -115,6 +115,7 @@ impl ControlPlane {
 
     pub fn register(&self, agent_id: &str, req: &RegisterTunnel) -> Result<TunnelInfo, ErrorBody> {
         let who = Principal::Agent(agent_id.to_string());
+        let check_path = req.check_path.as_deref().map(check_path).transpose()?;
         let target: String = req.target.chars().filter(|c| !c.is_control()).take(200).collect();
         let allow: Vec<String> = cidr::parse_list(&req.allow)
             .map_err(|m| err(ErrorCode::InvalidCidr, m))?
@@ -198,6 +199,8 @@ impl ControlPlane {
             }
             row.target = target;
             row.allow = allow;
+            row.checks = req.checks.unwrap_or(row.checks);
+            row.check_path = check_path.unwrap_or(row.check_path);
             if row.kind.has_port() {
                 row.public_port = match (row.visibility, req.remote_port, row.public_port) {
                     (Visibility::Private, ..) => private_port(&row.allow, req.remote_port)?,
@@ -211,7 +214,7 @@ impl ControlPlane {
                 };
             }
             let t = st.tunnels.get_mut(&id).expect("checked above");
-            let settings = |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.tags.clone());
+            let settings = |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.tags.clone(), r.checks, r.check_path.clone());
             if settings(&t.row) != settings(&row) {
                 self.store.update_tunnel(&row).map_err(internal)?;
                 t.row = row.clone();
@@ -285,6 +288,8 @@ impl ControlPlane {
             allow,
             visibility,
             tags,
+            checks: req.checks.unwrap_or(true),
+            check_path: check_path.unwrap_or_else(|| "/".into()),
         };
         self.store.insert_tunnel(&row).map_err(internal)?;
         if new_cert {
@@ -447,6 +452,13 @@ impl ControlPlane {
             CertStatus::Failed(message) => CertState::Failed { message },
         })
     }
+}
+
+/// The path a check requests: it goes into a request line as it is, so an absolute path of
+/// printable characters without spaces, and not too long.
+fn check_path(p: &str) -> Result<String, ErrorBody> {
+    let ok = p.starts_with('/') && p.len() <= 200 && p.bytes().all(|b| b.is_ascii_graphic());
+    if ok { Ok(p.to_string()) } else { Err(err(ErrorCode::InvalidRequest, "the probe path must start with / and have no spaces, at most 200 characters")) }
 }
 
 /// Tells a connected agent that an administrator removed one of its tunnels.

@@ -32,7 +32,7 @@ pub struct TunnelView {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<String>,
     /// `connected`, `disconnected` (agent offline) or `error` (local application unreachable,
-    /// or the tunnel's port could not be opened).
+    /// too slow or failing its check, or the tunnel's port could not be opened).
     pub status: &'static str,
     /// Port tunnels: why the public port is not open.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,6 +53,11 @@ pub struct TunnelView {
     pub upstream_errors: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_request_at: Option<String>,
+    /// Does the server check its app on its own? Off with `add --no-check`.
+    pub checks: bool,
+    /// HTTP tunnels: the path those checks request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,10 +128,13 @@ impl ControlPlane {
     fn view(&self, st: &State, t: &TunnelRecord) -> TunnelView {
         let connected = st.sessions.get(&t.row.agent_id).is_some_and(|l| !l.is_closed());
         let port_error = t.row.public_port.and_then(|p| self.data.bind_error(t.row.kind, p));
+        // Taken while holding `state`; nothing takes `checks` and then `state`.
+        let check_failed = self.checks.lock().unwrap().get(&t.row.id).is_some_and(|c| c.outcome == super::checks::Outcome::Failed);
         let status = match (connected, t.stats.last_outcome()) {
             _ if port_error.is_some() => "error",
             (false, _) => "disconnected",
             (true, Outcome::LocalUnreachable | Outcome::TimedOut) => "error",
+            _ if check_failed => "error",
             (true, _) => "connected",
         };
         let cert = if t.row.kind.is_http() { Some(self.certs.status(&t.row.hostname)) } else { None };
@@ -157,6 +165,8 @@ impl ControlPlane {
             requests: t.stats.requests.load(std::sync::atomic::Ordering::Relaxed),
             upstream_errors: t.stats.upstream_errors.load(std::sync::atomic::Ordering::Relaxed),
             last_request_at: (last > 0).then(|| rfc3339(last)),
+            checks: t.row.checks,
+            check_path: t.row.kind.is_http().then(|| t.row.check_path.clone()),
         }
     }
 

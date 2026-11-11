@@ -49,6 +49,10 @@ pub struct TunnelRow {
     pub visibility: Visibility,
     /// Its tags (sorted), including its owner's personal tag.
     pub tags: Vec<String>,
+    /// Does the server check its app on its own (`add --no-check` turns it off)?
+    pub checks: bool,
+    /// HTTP tunnels: the path a check requests.
+    pub check_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +392,12 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX alerts_closed ON alerts(closed_at);
     "#,
+    // 11: the server's own checks of each tunnel, on unless an agent turned them off, and the
+    // path they request on an HTTP tunnel.
+    r#"
+    ALTER TABLE tunnels ADD COLUMN checks INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE tunnels ADD COLUMN check_path TEXT NOT NULL DEFAULT '/';
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -413,7 +423,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
 }
 
 const TUNNEL_COLUMNS: &str =
-    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility";
+    "id, name, hostname, agent_id, target, created_at, kind, public_port, allow, visibility, checks, check_path";
 
 fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
     let kind: String = r.get(6)?;
@@ -432,6 +442,8 @@ fn tunnel_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
         // A visibility that can't be read keeps the tunnel private.
         visibility: Visibility::parse(&visibility).unwrap_or(Visibility::Private),
         tags: Vec::new(),
+        checks: r.get(10)?,
+        check_path: r.get(11)?,
     })
 }
 
@@ -645,7 +657,7 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            &format!("INSERT INTO tunnels ({TUNNEL_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
             params![
                 t.id,
                 t.name,
@@ -656,7 +668,9 @@ impl Store {
                 t.kind.as_str(),
                 t.public_port,
                 t.allow.join(" "),
-                t.visibility.as_str()
+                t.visibility.as_str(),
+                t.checks,
+                t.check_path
             ],
         )?;
         Self::write_tags(&tx, t)?;
@@ -669,8 +683,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4 WHERE id = ?5",
-            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.id],
+            "UPDATE tunnels SET target = ?1, public_port = ?2, allow = ?3, visibility = ?4, checks = ?5, check_path = ?6 WHERE id = ?7",
+            params![t.target, t.public_port, t.allow.join(" "), t.visibility.as_str(), t.checks, t.check_path, t.id],
         )?;
         Self::write_tags(&tx, t)?;
         tx.commit()?;
@@ -730,6 +744,8 @@ mod tests {
                     allow: vec![],
                     visibility: Visibility::Public,
                     tags: vec![],
+                    checks: true,
+                    check_path: "/".into(),
                 })
                 .unwrap();
         }
@@ -761,6 +777,8 @@ mod tests {
             allow: vec!["10.0.0.0/8".into(), "192.0.2.1/32".into()],
             visibility: Visibility::Public,
             tags: vec![],
+            checks: false,
+            check_path: "/".into(),
         };
         store.insert_tunnel(&row("tn_tcp", Kind::Tcp, 65500)).unwrap();
         store.insert_tunnel(&row("tn_udp", Kind::Udp, 65500)).unwrap();
@@ -834,6 +852,27 @@ mod tests {
     }
 
     #[test]
+    fn tunnels_from_before_checks_are_checked_at_their_root() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(10) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        c.execute("INSERT INTO agents (id, name, token_hash, created_at) VALUES ('ag_a', 'old', 'x', 0)", []).unwrap();
+        c.execute("INSERT INTO tunnels (id, name, hostname, agent_id, target, created_at) VALUES ('tn_a', 'a', 'a.t.test', 'ag_a', 'x', 0)", []).unwrap();
+        drop(c);
+        let t = Store::open(&path).unwrap().tunnels().unwrap().remove(0);
+        assert_eq!((t.id.as_str(), t.checks, t.check_path.as_str()), ("tn_a", true, "/"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn ssh_keys_stand_for_one_person_and_are_limited() {
         let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
         std::fs::create_dir_all(&dir).unwrap();
@@ -887,6 +926,8 @@ mod tests {
                 allow: vec![],
                 visibility: Visibility::Private,
                 tags: vec!["dev".into(), "secret".into()],
+                checks: true,
+                check_path: "/".into(),
             })
             .unwrap();
         assert!(store.delete_tag("secret").unwrap());
