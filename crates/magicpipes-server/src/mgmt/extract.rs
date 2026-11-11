@@ -42,6 +42,8 @@ pub struct UiUser {
     pub(super) sign_out: SignOut,
     /// When this browser signed in.
     pub(super) signed_in_at: i64,
+    /// Open alerts they may see, and whether one is serious: a count beside Health.
+    pub(super) alerts: (usize, bool),
 }
 
 impl FromRequestParts<AppState> for UiUser {
@@ -64,6 +66,7 @@ impl FromRequestParts<AppState> for UiUser {
             None => SignOut::Here,
             Some(proxy) => proxy.sign_out_url.clone().map_or(SignOut::AtProxyElsewhere, SignOut::AtProxy),
         };
+        let alerts = app.control.alert_count(&s.who);
         Ok(UiUser {
             cookie: cookie.to_string(),
             who: s.who,
@@ -71,6 +74,7 @@ impl FromRequestParts<AppState> for UiUser {
             user: s.user,
             sign_out,
             signed_in_at: s.created_at,
+            alerts,
             path: parts.uri.path().to_string(),
             done: Done::from_query(parts.uri.query()),
         })

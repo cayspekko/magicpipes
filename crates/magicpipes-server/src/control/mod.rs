@@ -22,6 +22,7 @@
 mod device;
 mod directory;
 mod email;
+pub mod alerts;
 pub mod health;
 pub mod history;
 mod hostnames;
@@ -91,6 +92,9 @@ pub struct ControlPlane {
     mail: email::MailState,
     /// What tunnels and machines did lately ([`history`]). Never locked while taking `state`.
     history: Mutex<history::History>,
+    /// Open alerts, and what the rules need between samples ([`alerts`]). Never locked while
+    /// taking `state` or `history`.
+    alerts: Mutex<alerts::Alerts>,
 }
 
 #[derive(Default)]
@@ -252,8 +256,11 @@ impl ControlPlane {
             proxy_auth,
             mail: email::MailState::default(),
             history: Mutex::new(history::History::new(unix_now())),
+            alerts: Mutex::new(alerts::Alerts::default()),
         });
         cp.publish(&cp.state.lock().unwrap());
+        cp.load_history();
+        cp.load_alerts();
         Ok(cp)
     }
 
@@ -302,7 +309,10 @@ impl ControlPlane {
                     _ = tick.tick() => me.reap_sessions(),
                     _ = pings.tick() => me.ping_agents(),
                     _ = samples.tick() => me.sample(),
-                    _ = hourly.tick() => me.prune(),
+                    _ = hourly.tick() => {
+                        me.prune();
+                        me.prune_history();
+                    }
                 }
             }
         });

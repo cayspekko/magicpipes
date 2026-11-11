@@ -5,6 +5,7 @@
 //! statement or transaction. Users, sessions, API tokens and the audit log are in [`users`].
 
 mod email;
+mod history;
 mod hostnames;
 mod settings;
 mod ssh_keys;
@@ -12,6 +13,7 @@ mod tags;
 mod users;
 
 pub use email::{AcceptWith, Accepted, InvitationRow, Invited, LinkPurpose, NewInvitation, SmtpRow};
+pub use history::AlertRow;
 pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
 pub use ssh_keys::{AddedSshKey, NewSshKey, SshKeyRow};
 pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
@@ -339,6 +341,52 @@ const MIGRATIONS: &[&str] = &[
         fingerprint TEXT NOT NULL,
         seen_at     INTEGER NOT NULL
     );
+    "#,
+    // 10: history in 5-minute slots (`slot`: when one started, in Unix time), kept for
+    // `monitoring.history_days`; and alerts, open and closed. `l0`-`l14` count answers by how
+    // long they took (`LATENCY_BUCKETS_MS`, the last for longer ones). An alert's subject is
+    // `tunnel:<id>`, `machine:<id>`, `certificate:<tunnel id>` or `server`, with its name when the
+    // alert opened, for after it's gone.
+    r#"
+    CREATE TABLE tunnel_history (
+        tunnel_id   TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
+        slot        INTEGER NOT NULL,
+        requests    INTEGER NOT NULL,
+        offline     INTEGER NOT NULL,
+        unreachable INTEGER NOT NULL,
+        timed_out   INTEGER NOT NULL,
+        refused     INTEGER NOT NULL,
+        bytes_in    INTEGER NOT NULL,
+        bytes_out   INTEGER NOT NULL,
+        l0 INTEGER NOT NULL, l1 INTEGER NOT NULL, l2 INTEGER NOT NULL, l3 INTEGER NOT NULL, l4 INTEGER NOT NULL,
+        l5 INTEGER NOT NULL, l6 INTEGER NOT NULL, l7 INTEGER NOT NULL, l8 INTEGER NOT NULL, l9 INTEGER NOT NULL,
+        l10 INTEGER NOT NULL, l11 INTEGER NOT NULL, l12 INTEGER NOT NULL, l13 INTEGER NOT NULL, l14 INTEGER NOT NULL,
+        PRIMARY KEY (tunnel_id, slot)
+    ) WITHOUT ROWID;
+    CREATE INDEX tunnel_history_slot ON tunnel_history(slot);
+    CREATE TABLE agent_history (
+        agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        slot        INTEGER NOT NULL,
+        online      INTEGER NOT NULL,
+        samples     INTEGER NOT NULL,
+        connections INTEGER NOT NULL,
+        round_trip  INTEGER NOT NULL,
+        round_trips INTEGER NOT NULL,
+        reconnects  INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, slot)
+    ) WITHOUT ROWID;
+    CREATE INDEX agent_history_slot ON agent_history(slot);
+    CREATE TABLE alerts (
+        id           TEXT PRIMARY KEY,
+        rule         TEXT NOT NULL,
+        subject      TEXT NOT NULL,
+        subject_name TEXT NOT NULL,
+        severity     TEXT NOT NULL,
+        detail       TEXT NOT NULL,
+        opened_at    INTEGER NOT NULL,
+        closed_at    INTEGER
+    );
+    CREATE INDEX alerts_closed ON alerts(closed_at);
     "#,
 ];
 
@@ -757,6 +805,31 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.agents().unwrap().iter().any(|a| a.id == "ag_a"), "kept");
         assert!(store.ssh_keys().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_database_from_before_history_gets_it_and_keeps_its_rows() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(9) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        c.execute("INSERT INTO agents (id, name, token_hash, created_at) VALUES ('ag_a', 'old', 'x', 0)", []).unwrap();
+        drop(c);
+
+        let store = Store::open(&path).unwrap();
+        assert!(store.agents().unwrap().iter().any(|a| a.id == "ag_a"), "kept");
+        assert!(store.open_alerts().unwrap().is_empty() && store.agent_history_since(0).unwrap().is_empty());
+        let p = crate::control::history::Presence { online: 1, samples: 1, ..Default::default() };
+        store.save_history(&[], &[("ag_a".into(), 300, p)]).unwrap();
+        assert_eq!(store.agent_history_since(0).unwrap(), vec![("ag_a".to_string(), 300, p)]);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -71,6 +71,9 @@ acme_directory = "letsencrypt"
 # enrollment_ttl_secs = 3600
 # max_connections = 4                 # connections one agent may hold (1 to 8): 224 streams and up to 128 MiB in flight each
 
+[monitoring]
+# history_days = 7                     # days of 5-minute history for the Health page and charts (1 to 30)
+
 [users]
 # Accounts are created by administrators in the UI (Users) or the API; see the README.
 # session_max_age_secs = 43200         # how long a sign-in lasts

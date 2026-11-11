@@ -28,23 +28,35 @@ pub(super) const STYLE: &str = r#".periods{display:flex;flex-wrap:wrap;gap:4px;m
 .chart details.more th,.chart details.more td{padding:6px 10px 6px 0;font-size:12.5px}
 .spark{display:block;width:100px;height:22px;margin-top:6px;overflow:visible}td.num .spark{margin-left:auto}
 .quiet{margin:22px 0 4px;color:var(--muted);font-size:13.5px}
+.pill{display:inline-block;min-width:20px;margin-left:6px;padding:1px 6px;border:1px solid var(--warn);border-radius:999px;font:500 11.5px/1.4 var(--sans);text-align:center;color:var(--ink);font-variant-numeric:tabular-nums}
+.pill.bad{background:var(--bad);border-color:var(--bad);color:var(--bg)}
+.notice{margin:0 0 12px;padding:12px 16px;border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:10px;background:var(--surface);font-size:13.5px;overflow-wrap:anywhere}
+.notice.bad{border-left-color:var(--bad)}.why{display:block;margin-top:4px;font-size:13.5px;color:var(--muted)}details.more.wide>div{max-width:none}.notice .status{font-weight:500;color:var(--ink);margin-right:6px}.notices{margin:24px 0 0}
 @media (max-width:480px){.axis .mid{display:none}}"#;
 
 /// Units across the drawing: each slot is 10 wide, and values go up to 100.
 const SLOT: usize = 10;
 const HIGH: f64 = 100.0;
 
-/// The switch between periods, above what it scopes. `href`: the page's address.
-pub(super) fn periods(href: &str, period: Period) -> String {
-    let link = |p: Period, query: &str, label: &str| {
-        let current = if p == period { r#" aria-current="page""# } else { "" };
-        format!(r#"<a class="btn small ghost" href="{}{query}"{current}>{label}</a>"#, esc(href))
-    };
-    format!(
-        r#"<nav class="periods" aria-label="Period">{}{}</nav>"#,
-        link(Period::Minutes15, "", "Last 15 minutes"),
-        link(Period::Hours24, "?period=24h", "Last 24 hours")
-    )
+/// The switch between periods, above what it scopes: those the database keeps enough days for
+/// (`history_days`). `href`: the page's address.
+pub(super) fn periods(href: &str, period: Period, history_days: u32) -> String {
+    let links: String = Period::ALL
+        .into_iter()
+        .filter(|p| p.days() <= history_days)
+        .map(|p| {
+            let current = if p == period { r#" aria-current="page""# } else { "" };
+            let query = if p == Period::default() { String::new() } else { format!("?period={}", p.key()) };
+            let label = match p {
+                Period::Minutes15 => "Last 15 minutes",
+                Period::Hours24 => "Last 24 hours",
+                Period::Days7 => "Last 7 days",
+                Period::Days30 => "Last 30 days",
+            };
+            format!(r#"<a class="btn small ghost" href="{}{query}"{current}>{label}</a>"#, esc(href))
+        })
+        .collect();
+    format!(r#"<nav class="periods" aria-label="Period">{links}</nav>"#)
 }
 
 /// What the period is called in a sentence.
@@ -52,6 +64,8 @@ pub(super) fn period_words(period: Period) -> &'static str {
     match period {
         Period::Minutes15 => "the last 15 minutes",
         Period::Hours24 => "the last 24 hours",
+        Period::Days7 => "the last 7 days",
+        Period::Days30 => "the last 30 days",
     }
 }
 
@@ -60,6 +74,8 @@ pub(super) fn slot_words(period: Period) -> &'static str {
     match period {
         Period::Minutes15 => "10 seconds",
         Period::Hours24 => "5 minutes",
+        Period::Days7 => "an hour",
+        Period::Days30 => "6 hours",
     }
 }
 
@@ -186,6 +202,8 @@ fn axis(period: Period) -> String {
     let labels: &[&str] = match period {
         Period::Minutes15 => &["15 min ago", "10 min ago", "5 min ago", "now"],
         Period::Hours24 => &["24 h ago", "18 h ago", "12 h ago", "6 h ago", "now"],
+        Period::Days7 => &["7 days ago", "3½ days ago", "now"],
+        Period::Days30 => &["30 days ago", "15 days ago", "now"],
     };
     let last = labels.len() - 1;
     let spans: String = labels

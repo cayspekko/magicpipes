@@ -166,6 +166,7 @@ impl ControlPlane {
                             }
                         }
                         Some(Report::HostKey { tunnel_id, fingerprint }) => me.keep_host_key(&tunnel_id, &fingerprint),
+                        Some(Report::KeyRefused { tunnel_id }) => me.alerts.lock().unwrap().key_refused(&tunnel_id, unix_now()),
                         Some(Report::Connect { user_id, tunnel_id, client }) => {
                             if me.first_in_a_while(&mut seen, &user_id, &tunnel_id) {
                                 me.audit_as(&user_id, "tunnel.connect", &tunnel_id, &format!("from {client}"));
@@ -263,6 +264,7 @@ impl ControlPlane {
         st.host_keys.remove(id);
         self.publish(&st);
         drop(st);
+        self.alerts.lock().unwrap().key_forgotten(id);
         self.audit(who, if kind == Kind::Rdp { "rdp.certificate.forget" } else { "ssh.host_key.forget" }, id, "");
         Ok(Some(kind))
     }

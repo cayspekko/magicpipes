@@ -1250,8 +1250,30 @@ charts its requests, failures and response times, and a machine's page its round
 connections, over the last 15 minutes (by 10 seconds) or 24 hours (by 5 minutes). People see their
 own machines and tunnels; administrators see everything.
 
-The server samples every 10 seconds and keeps history in memory, so it starts again when the
-server does. For longer, or for alerts outside the app, scrape `/metrics`.
+The server samples every 10 seconds. The last day is in memory, and 5-minute slots are kept in the
+database for `[monitoring] history_days` (7 by default, up to 30), which adds "Last 7 days" (and,
+at 30, "Last 30 days") to the charts and brings the last day back after a restart.
+
+**Alerts.** Rules judge every sample, and an alert opens once a problem shows on two samples in a
+row and closes after three fine ones. Open alerts lead the Health page, show as a count beside
+Health in the navigation, and sit at the top of the tunnel's or machine's page. People see those
+about their own machines and tunnels; administrators see all of them.
+
+| Alert | When |
+|---|---|
+| Offline | A machine with tunnels has been offline over 2 minutes |
+| Fewer connections | A machine has held fewer connections than it had for 5 minutes |
+| Slow round trips | 95% of a machine's round trips in 5 minutes took over 500 ms |
+| Reconnecting often | More than 5 reconnects in an hour |
+| Agent out of date | The machine's agent speaks an older protocol than the server |
+| Couldn't reach app | Over 5% of at least 20 requests in 5 minutes (serious) |
+| Certificate failed | Ordering or renewing a tunnel's certificate failed (serious) |
+| Certificate expiring | Within 14 days; serious within 3 |
+| New certificates nearly used up | A machine used over 80% of `max_new_certificates_per_day` |
+| Ports nearly used up | Over 90% of the `[ports]` range is in use |
+| Key changed | A browser terminal or desktop refused a machine's changed key, in the last day (serious) |
+
+For alerts outside the app, scrape `/metrics`.
 
 ### Metrics for Prometheus
 
@@ -1285,6 +1307,7 @@ scrape_configs:
 | `magicpipes_tunnel_last_request_time_seconds` | Its last request or connection, in Unix time |
 | `magicpipes_certificate_ready{hostname}`, `magicpipes_certificate_expiry_time_seconds` | Each HTTP tunnel's certificate, and the management host's |
 | `magicpipes_ports{state}` | `total` in the `[ports]` range, and `used` |
+| `magicpipes_alerts_open{severity}` | Alerts open on the Health page: `warn` and `bad` |
 | `magicpipes_build_info{version}`, `magicpipes_start_time_seconds` | |
 
 Alerts to start from: `magicpipes_agent_up == 0` for 5 minutes,

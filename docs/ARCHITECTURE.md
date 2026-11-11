@@ -298,15 +298,32 @@ Every 10 seconds the control loop reads each tunnel's counters and each agent's 
 average round trip) under the registry lock, lets go, and records the differences in `History`,
 which has its own lock and is never held while taking the registry's. It keeps two views: 90 slots
 of 10 seconds and 288 of 5 minutes, the second filled from the first. Only a slot with something in
-it is stored, so an idle tunnel costs a few counters and a busy one at most 378 samples (about 38 KB
+it is stored, so an idle tunnel costs a few counters and a busy one at most 378 samples (about 70 KB
 with their latency buckets). Tunnels and agents that are gone are dropped at the next sample.
-History lives in memory and starts with the server; rollups in SQLite are phase 11c.
+When a 5-minute slot closes it's written to SQLite (`tunnel_history`, `agent_history`, one row per
+tunnel or agent with something in it), and pruned hourly to `monitoring.history_days`. At startup
+the last day is read back into memory; longer views add the database's slots up in SQL and add the
+slot still filling from memory. A tunnel's or agent's rows go with it (`ON DELETE CASCADE`).
 
 A tunnel's counters start at zero with its record, so its first sample counts everything since.
 Percentiles come from the latency buckets, interpolated within one; anything in the first bucket is
 shown as "under 1 ms" rather than an invented figure. A reconnect is an agent connection attached
 after one of the same run was lost, or from a new run (a restart, a network change) once the agent
 had connected since the server started; a run's first connections aren't.
+
+### Alerts (`control/alerts.rs`)
+
+After each sample the control plane gathers what the rules need (machines' connections and
+protocols, the history's last 5 minutes and hour, certificates, ports, certificate orders, refused
+keys), taking each lock in turn and never two at once, and `judge` returns what's wrong: a rule, a
+subject (`machine:<id>`, `tunnel:<id>`, `certificate:<tunnel id>`, `server`), a severity and a
+sentence. `Alerts::apply` keeps a tracker per rule and subject: two findings in a row open an alert,
+three samples without one close it, and a subject that's gone closes at once. Only opening, a
+change of severity and closing are written to the database, so the sentence shown while one is open
+is the latest in memory. Open alerts are read back at startup and close normally once fine.
+Visibility follows `authorize`: an alert about a machine or tunnel is seen by whoever manages it;
+one about the server, or something gone, only by administrators. Trackers are bounded by rules
+times subjects, and closed alerts in the database by `history_days` and `MAX_CLOSED_ALERTS`.
 
 The pages draw history as SVG on the server, one series per chart (the accent and the "bad" color
 are too close to share one), with the marks stretched to the card (`preserveAspectRatio="none"`,

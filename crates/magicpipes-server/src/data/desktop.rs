@@ -294,6 +294,7 @@ async fn reach(dp: &DataPlane, o: &Opening, x224_request: &[u8]) -> Result<Reach
     match &route.host_key {
         Some(kept) if *kept != shown => {
             tracing::warn!(tunnel = %o.tunnel_id, %kept, %shown, "remote desktop refused a changed certificate");
+            let _ = dp.ssh_reports.try_send(Report::KeyRefused { tunnel_id: o.tunnel_id.clone() });
             Err(Refusal::CertificateChanged)
         }
         Some(_) => Ok(Reached::Tls(tls, x224)),

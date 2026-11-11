@@ -780,6 +780,64 @@ async fn health_and_history_show_what_tunnels_carried() {
     assert_eq!(env.ui("/health", None, None).await.location.as_deref(), Some("/login?next=%2Fhealth"));
 }
 
+/// A tunnel whose app is down gets an alert once it has lasted two samples: on the Health page, as
+/// a count in the navigation, on the tunnel's page and in `/metrics`. Open alerts outlast a
+/// restart, and close after three fine samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alert_opens_shows_everywhere_and_closes() {
+    let mut env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let web = add_json(&env, &[&app.port.to_string(), "--name", "web"]).await;
+    let host = hostname(web["public_url"].as_str().unwrap());
+    let id = web["id"].as_str().unwrap().to_string();
+    let cookie = admin_session(&env).await;
+    assert!(!env.ui("/health", Some(&cookie), None).await.html.contains(r#"class="pill"#), "no alerts yet");
+
+    // Over 5% of at least 20 requests in 5 minutes couldn't reach the app.
+    app.stop();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A pooled connection may not have seen the app go yet: count the answers that say so.
+    let mut unreachable = 0;
+    for _ in 0..40 {
+        if env.get_public(&host, "/").await.1.as_deref() == Some("local_unreachable") {
+            unreachable += 1;
+        }
+        if unreachable == 20 {
+            break;
+        }
+    }
+    assert_eq!(unreachable, 20);
+    env.eventually("the alert to open", Duration::from_secs(40), || async {
+        env.ui("/health", Some(&cookie), None).await.html.contains(r#"<h2>Alerts<span class="count">1</span></h2>"#)
+    })
+    .await;
+    let health = env.ui("/health", Some(&cookie), None).await.html;
+    assert!(health.contains(r#"Health<span class="pill bad">1<span class="sr"> open alert</span></span></a>"#), "in the navigation: {health}");
+    assert!(health.contains("1 open alert</a>: web: couldn&#39;t reach app"), "{health}");
+    assert!(health.contains("20 of ") && health.contains(" requests in the last 5 minutes (") && health.contains(&format!(r#"href="/tunnels/{id}">web</a>"#)), "{health}");
+    let page = env.ui(&format!("/tunnels/{id}"), Some(&cookie), None).await.html;
+    assert!(page.contains(r#"<div class="notice bad"><span class="status bad">Couldn&#39;t reach app</span>20 of "#), "{page}");
+    let (_, _, metrics) = env.mgmt_text("/metrics", Some(&env.admin_token()), None).await;
+    assert!(metrics.contains(r#"magicpipes_alerts_open{severity="bad"} 1"#), "{metrics}");
+
+    // It was kept: after a restart it's still open, until three fine samples close it.
+    env.stop_server().await;
+    env.start_server().await;
+    let cookie = admin_session(&env).await;
+    let health = env.ui("/health", Some(&cookie), None).await.html;
+    assert!(health.contains(r#"<h2>Alerts<span class="count">1</span></h2>"#), "kept over a restart: {health}");
+    env.eventually("the alert to close", Duration::from_secs(60), || async {
+        let html = env.ui("/health", Some(&cookie), None).await.html;
+        !html.contains("<h2>Alerts") && html.contains("1 alert closed in the last 24 hours")
+    })
+    .await;
+    // Longer periods come from the database, with the minutes not yet in it.
+    let week = env.ui(&format!("/tunnels/{id}?period=7d"), Some(&cookie), None).await.html;
+    assert!(week.contains(r#"aria-current="page">Last 7 days</a>"#) && week.contains(r#"<svg viewBox="0 0 1680 100""#), "{week}");
+    assert!(!week.contains("Last 30 days"), "only what's kept is offered");
+}
+
 async fn tcp_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return Vec::new() };

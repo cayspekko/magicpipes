@@ -29,6 +29,8 @@ pub struct Config {
     pub ports: PortsConfig,
     #[serde(default)]
     pub users: UsersConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
     /// Addresses (CIDR) of reverse proxies or load balancers in front of magicpipesd, such as
     /// HAProxy. Only these may name the client: X-Forwarded-For on the HTTPS listeners (used for
     /// login rate limits and passed on to tunnels) and PROXY headers on port tunnels.
@@ -538,6 +540,21 @@ impl Default for AgentsConfig {
     }
 }
 
+/// History and alerts (the Health page).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MonitoringConfig {
+    /// Days of 5-minute history kept in the database, 1 to 30. The last 24 hours are also in
+    /// memory.
+    pub history_days: u32,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self { history_days: 7 }
+    }
+}
+
 /// User accounts (docs/USERS.md). Administrators create them in the UI or API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -722,6 +739,9 @@ impl Config {
         }
         if self.management.cert_file.is_some() != self.management.key_file.is_some() {
             bail!("management.cert_file and management.key_file must be set together");
+        }
+        if !(1..=30).contains(&self.monitoring.history_days) {
+            bail!("monitoring.history_days must be between 1 and 30");
         }
         if !(1..=magicpipes_core::proto::MAX_CONNECTIONS).contains(&self.agents.max_connections) {
             bail!("agents.max_connections must be between 1 and {}", magicpipes_core::proto::MAX_CONNECTIONS);

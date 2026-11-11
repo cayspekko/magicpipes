@@ -9,6 +9,7 @@ use super::extract::UiUser;
 use super::html::{Number, Text, badge, count, esc, table, when};
 use super::ui::page;
 use super::AppState;
+use crate::control::alerts::{AlertView, Severity};
 use crate::control::health::{CertificateHealth, HealthView, MachineHealth, TunnelHealth};
 use crate::control::history::{Period, Presence, Series, Traffic};
 
@@ -21,13 +22,13 @@ pub struct PeriodQuery {
 }
 
 impl PeriodQuery {
-    pub fn period(&self) -> Period {
-        Period::parse(self.period.as_deref())
+    pub fn period(&self, app: &AppState) -> Period {
+        Period::parse(self.period.as_deref(), app.control.config().monitoring.history_days)
     }
 }
 
 pub async fn health(user: UiUser, State(app): State<AppState>, Query(q): Query<PeriodQuery>) -> Response {
-    let period = q.period();
+    let period = q.period(&app);
     let h = app.control.health(&user.who, period);
     page("Health", Some(&user), &body(&h))
 }
@@ -70,6 +71,7 @@ fn body(h: &HealthView) -> String {
     let note = |text: String| if nothing { String::new() } else { format!(r#"<p class="note below-section">{text}</p>"#) };
     format!(
         r#"<h1>Health</h1>{line}
+{alerts}
 {periods}{since}
 <div class="section" id="tunnels"><h2>Tunnels<span class="count">{n_tunnels}</span></h2></div>
 {tunnels_note}
@@ -79,7 +81,8 @@ fn body(h: &HealthView) -> String {
 {machine_table}{more_machines}
 {certificates}"#,
         line = health_line(h),
-        periods = if nothing { String::new() } else { format!(r#"<div class="spaced">{}</div>"#, periods("/health", h.period)) },
+        alerts = alerts_section(h),
+        periods = if nothing { String::new() } else { format!(r#"<div class="spaced">{}</div>"#, periods("/health", h.period, h.history_days)) },
         since = if nothing { String::new() } else { since },
         tunnels_note = note(format!("What the server saw in {words}.")),
         machines_note = note("Round trips are timed every 15 seconds behind each connection's traffic, and a reconnect is a connection made again after one was lost or the agent restarted.".into()),
@@ -100,8 +103,93 @@ fn body(h: &HealthView) -> String {
     )
 }
 
+/// Open alerts, then those closed in the last 24 hours, folded away.
+fn alerts_section(h: &HealthView) -> String {
+    let open = if h.alerts.is_empty() {
+        String::new()
+    } else {
+        let rows: String = h.alerts.iter().map(|a| alert_row(a, h.now)).collect();
+        format!(
+            r#"<div class="section" id="alerts"><h2>Alerts<span class="count">{}</span></h2></div><p class="note below-section">An alert opens once a problem shows on two samples in a row, 10 seconds apart, and closes after three fine ones.</p>{}"#,
+            h.alerts.len(),
+            table(&[Text("Alert"), Text("About"), Text("Severity"), Text("Open for")], &rows, "")
+        )
+    };
+    let closed = if h.closed.is_empty() {
+        String::new()
+    } else {
+        let rows: String = h.closed.iter().map(|a| alert_row(a, h.now)).collect();
+        format!(
+            r#"<details class="more wide"><summary>{} in the last 24 hours</summary><div>{}</div></details>"#,
+            count(h.closed.len(), "alert closed", "alerts closed"),
+            table(&[Text("Alert"), Text("About"), Text("Severity"), Text("Was open")], &rows, "")
+        )
+    };
+    format!("{open}{closed}")
+}
+
+pub(super) fn severity_tone(s: Severity) -> &'static str {
+    match s {
+        Severity::Bad => "bad",
+        Severity::Warn => "warn",
+    }
+}
+
+fn alert_row(a: &AlertView, now: i64) -> String {
+    let about = match &a.href {
+        Some(href) => format!(r#"<a class="name" href="{}">{}</a>"#, esc(href), esc(&a.name)),
+        None => format!(r#"<span class="name">{}</span>"#, esc(&a.name)),
+    };
+    let kind = match a.subject.split(':').next() {
+        Some("machine") => "machine",
+        Some("tunnel") => "tunnel",
+        Some("certificate") => "certificate",
+        _ => "this server",
+    };
+    let lasted = match a.closed_at {
+        Some(at) => format!(r#"{}<span class="sub">closed {} ago</span>"#, ago(at - a.opened_at), ago(now - at)),
+        None => format!(r#"{}<span class="sub">since {}</span>"#, ago(now - a.opened_at), when(&magicpipes_core::rfc3339(a.opened_at))),
+    };
+    format!(
+        r#"<tr><td class="wrap"><span class="status {tone}">{title}</span><span class="why">{detail}</span></td><td>{about}<span class="sub">{kind}</span></td><td>{severity}</td><td>{lasted}</td></tr>"#,
+        // A closed alert's dot is quiet: it's history, not a problem now.
+        tone = if a.closed_at.is_some() { "" } else { severity_tone(a.severity) },
+        title = esc(a.rule.title()),
+        detail = esc(&a.detail),
+        severity = if a.severity == Severity::Bad { "serious" } else { "warning" },
+    )
+}
+
+/// What a tunnel's or machine's page says first: its open alerts.
+pub(super) fn notices(alerts: &[AlertView]) -> String {
+    if alerts.is_empty() {
+        return String::new();
+    }
+    let items: String = alerts
+        .iter()
+        .map(|a| {
+            format!(
+                r#"<div class="notice {tone}"><span class="status {tone}">{title}</span>{detail}</div>"#,
+                tone = severity_tone(a.severity),
+                title = esc(a.rule.title()),
+                detail = esc(&a.detail),
+            )
+        })
+        .collect();
+    format!(r#"<div class="notices">{items}</div>"#)
+}
+
 /// The page's first line: what's wrong, or that nothing is.
 fn health_line(h: &HealthView) -> String {
+    if !h.alerts.is_empty() {
+        let tone = if h.alerts.iter().any(|a| a.severity == Severity::Bad) { "bad" } else { "warn" };
+        let mut items: Vec<String> = h.alerts.iter().take(3).map(|a| format!("{}: {}", esc(&a.name), esc(&a.rule.title().to_lowercase()))).collect();
+        if h.alerts.len() > 3 {
+            items.push(format!("{} more", h.alerts.len() - 3));
+        }
+        let what = if h.alerts.len() == 1 { "open alert" } else { "open alerts" };
+        return format!(r##"<p class="health"><span class="status {tone}"><span><a href="#alerts">{} {what}</a>: {}</span></span></p>"##, h.alerts.len(), items.join(" · "));
+    }
     if h.tunnels.is_empty() && h.machines.is_empty() {
         return String::new();
     }
@@ -226,7 +314,7 @@ fn certificate_row(c: &CertificateHealth, now: i64) -> String {
 }
 
 /// A tunnel's history on its page: what it carried, what failed and how fast the app answered.
-pub(super) fn traffic_section(href: &str, series: &Series<Traffic>, http: bool) -> String {
+pub(super) fn traffic_section(href: &str, series: &Series<Traffic>, http: bool, history_days: u32) -> String {
     let p = series.period;
     let total = series.total();
     let noun = if http { "request" } else { "connection" };
@@ -294,14 +382,14 @@ pub(super) fn traffic_section(href: &str, series: &Series<Traffic>, http: bool) 
     };
     format!(
         r#"<div class="section"><h2>Traffic</h2></div>{periods}{since}<div class="charts">{carried}{failed}{timing}</div>"#,
-        periods = periods(href, p),
+        periods = periods(href, p, history_days),
         since = since_note(series),
         carried = carried.render(),
     )
 }
 
 /// A machine's history on its page: its round trips and connections.
-pub(super) fn presence_section(href: &str, series: &Series<Presence>) -> String {
+pub(super) fn presence_section(href: &str, series: &Series<Presence>, history_days: u32) -> String {
     let p = series.period;
     let total = series.total();
     let trips = round_trips(series);
@@ -328,12 +416,15 @@ pub(super) fn presence_section(href: &str, series: &Series<Presence>) -> String 
     let presence = match (total.samples, offline_secs) {
         (0, _) => "Nothing known yet.".to_string(),
         (_, 0) => "Connected the whole time".to_string(),
-        (_, s) if total.online == 0 => format!("Offline the whole time, {}", ago(s)),
+        _ if total.online == 0 => match series.since {
+            Some(_) => "Not connected since history starts".to_string(),
+            None => format!("Not connected in {}", period_words(p)),
+        },
         (_, s) => format!("Offline for about {}", ago(s)),
     };
     let reconnects = match total.reconnects {
         0 => ".".to_string(),
-        n => format!(", reconnected {}.", count(usize::from(n), "time", "times")),
+        n => format!(", reconnected {}.", count(usize::try_from(n).unwrap_or(usize::MAX), "time", "times")),
     };
     let connections = Chart {
         title: "Connections",
@@ -351,7 +442,7 @@ pub(super) fn presence_section(href: &str, series: &Series<Presence>) -> String 
     };
     format!(
         r#"<div class="section"><h2>Connection</h2></div>{periods}{since}<div class="charts">{round_trip}{connections}</div>"#,
-        periods = periods(href, p),
+        periods = periods(href, p, history_days),
         since = since_note(series),
         connections = connections.render(),
     )

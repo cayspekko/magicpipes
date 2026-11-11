@@ -16,7 +16,8 @@ pub async fn machine(user: UiUser, State(app): State<AppState>, Path(id): Path<S
     let Some(a) = app.control.agents(&user.who).into_iter().find(|a| a.id == id) else {
         return not_there(&user, "/machines", "Machines", gone);
     };
-    let Some(series) = app.control.agent_history(&user.who, &a.id, q.period()) else {
+    let history_days = app.control.config().monitoring.history_days;
+    let Some(series) = app.control.agent_history(&user.who, &a.id, q.period(&app)) else {
         return not_there(&user, "/machines", "Machines", gone);
     };
     let tunnels: Vec<_> = app.control.tunnels(&user.who).into_iter().filter(|t| t.agent_id == a.id).collect();
@@ -63,7 +64,7 @@ pub async fn machine(user: UiUser, State(app): State<AppState>, Path(id): Path<S
     let question = format!("Revoke {}? Its tunnels are deleted, and it can't connect again until it is enrolled again.", a.name);
     let body = format!(
         r#"{back}
-<h1>{name}</h1><p class="lede">{what}</p>
+<h1>{name}</h1><p class="lede">{what}</p>{notices}
 <div class="stats">
 <div class="stat"><div class="k">Status</div><div class="v sm">{state}</div></div>
 <div class="stat"><div class="k">Connections</div><div class="v">{connections}</div></div>
@@ -83,7 +84,8 @@ pub async fn machine(user: UiUser, State(app): State<AppState>, Path(id): Path<S
         connections = a.connections,
         round_trip = round_trip.unwrap_or_else(|| "—".to_string()),
         since = esc(&since),
-        history = presence_section(&href, &series),
+        history = presence_section(&href, &series, history_days),
+        notices = super::health::notices(&app.control.alerts_about(&user.who, "machine", &a.id)),
         n = tunnels.len(),
         list = table(
             &[Text("Tunnel"), Text("Status"), Number("Requests")],

@@ -417,7 +417,8 @@ cause, alert, or way for a monitoring system to read any of it. Decided 2026-11-
   `--probe-path`. Later the agent checks its own targets and reports (a protocol bump), and an
   outside probe sees what the server can't: its own DNS, firewall and proxy.
 * **Certificate changes** come from comparing each hostname's fingerprint and expiry between
-  samples: renewed, replaced, expiring, renewal failed.
+  samples: renewed, replaced, expiring, renewal failed. (Expiring and failing are alerts since
+  11c; renewed and replaced are still to do.)
 * **The dashboard says what's wrong first:** one sentence of overall health, open alerts, then
   machines (connections, round trip, reconnects, uptime), tunnels (requests per minute, errors by
   cause, latency, last check) and only the certificates in trouble or expiring within 30 days, each
@@ -506,6 +507,6 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 10d | An Ingress / Gateway API controller (`ingressClassName: magicpipes`) | none (a separate binary) | planned |
 | 11 | Monitoring, measure: counters for errors by cause, latency and bytes, ping round trips, `/metrics` ([plan](#monitoring-health-history-alerts-and-synthetic-checks)) | yes | done |
 | 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | done |
-| 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | planned |
+| 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
 | 11d | Monitoring, probe: synthetic checks from the server, on by default; then the agent's own (protocol bump) | yes; agent for its own | planned |
 | 11e | Monitoring, tell: email and webhooks; an outside probe | yes | planned |

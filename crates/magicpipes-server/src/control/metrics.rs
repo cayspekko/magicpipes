@@ -183,6 +183,11 @@ impl ControlPlane {
             }
         }
 
+        let (warn, bad) = self.open_alerts_by_severity();
+        m.family("magicpipes_alerts_open", "gauge", "Alerts open on the Health page, by severity.");
+        m.line("magicpipes_alerts_open", &[("severity", "warn")], warn);
+        m.line("magicpipes_alerts_open", &[("severity", "bad")], bad);
+
         m.family("magicpipes_certificate_ready", "gauge", "Whether the hostname has a certificate in use.");
         for (host, ready, _) in &certs {
             m.line("magicpipes_certificate_ready", &[("hostname", host)], u8::from(*ready));

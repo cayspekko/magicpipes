@@ -238,6 +238,7 @@ async fn log_in(dp: &DataPlane, o: &Opening, login: &str, (cols, rows): (u32, u3
                 && *kept != shown
             {
                 tracing::warn!(tunnel = %o.tunnel_id, %kept, %shown, "browser terminal refused a changed host key");
+                let _ = dp.ssh_reports.try_send(Report::KeyRefused { tunnel_id: o.tunnel_id.clone() });
                 return Err(refusal(
                     ErrorCode::Forbidden,
                     format!(

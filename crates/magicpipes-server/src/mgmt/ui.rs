@@ -182,7 +182,17 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
                         href if href == section => r#" aria-current="true""#,
                         _ => "",
                     };
-                    format!(r#"<a class="btn ghost" href="{href}"{current}>{label}</a>"#)
+                    // Health carries a count of open alerts; a serious one fills it in.
+                    let count = match u.alerts {
+                        (0, _) => String::new(),
+                        (n, bad) if *href == "/health" => format!(
+                            r#"<span class="pill{}">{n}<span class="sr"> open {}</span></span>"#,
+                            if bad { " bad" } else { "" },
+                            if n == 1 { "alert" } else { "alerts" }
+                        ),
+                        _ => String::new(),
+                    };
+                    format!(r#"<a class="btn ghost" href="{href}"{current}>{label}{count}</a>"#)
                 })
                 .collect();
             let me = u.user.as_ref().map_or("admin token".to_string(), |v| v.email.clone());
@@ -460,18 +470,21 @@ pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): 
     let Some(t) = app.control.tunnel(&user.who, &id) else {
         return not_there(&user, "/", "Tunnels", gone);
     };
-    let Some(series) = app.control.tunnel_history(&user.who, &t.id, q.period()) else {
+    let Some(series) = app.control.tunnel_history(&user.who, &t.id, q.period(&app)) else {
         return not_there(&user, "/", "Tunnels", gone);
     };
-    let traffic = super::health::traffic_section(&format!("/tunnels/{}", t.id), &series, t.kind.is_http());
+    let history_days = app.control.config().monitoring.history_days;
+    let traffic = super::health::traffic_section(&format!("/tunnels/{}", t.id), &series, t.kind.is_http(), history_days);
+    let notices = super::health::notices(&app.control.alerts_about(&user.who, "tunnel", &t.id));
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
     let ssh_ca = app.control.ssh_ca();
     let viewer_email = user.user.as_ref().map(|u| u.email.as_str()).unwrap_or("you@example.com");
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &traffic))
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &notices, &traffic))
 }
 
-fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, traffic: &str) -> String {
+#[allow(clippy::too_many_arguments)] // one page's parts
+fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, notices: &str, traffic: &str) -> String {
     let field = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", esc(k), v);
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
@@ -530,7 +543,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     let last = t.last_request_at.as_deref().map(when).unwrap_or_else(|| "never".into());
     format!(
         r#"{back}
-<h1>{name}</h1><p class="lede">{address}</p>
+<h1>{name}</h1><p class="lede">{address}</p>{notices}
 <div class="stats">
 <div class="stat"><div class="k">Status</div><div class="v sm">{status}</div></div>
 <div class="stat"><div class="k">{requests_label}</div><div class="v">{requests}</div></div>

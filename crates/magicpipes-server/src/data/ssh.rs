@@ -68,6 +68,8 @@ pub enum Report {
     Terminal { user_id: String, tunnel_id: String, login: String, client: std::net::IpAddr },
     /// The first host key a tunnel's sshd showed a browser terminal, to be kept.
     HostKey { tunnel_id: String, fingerprint: String },
+    /// A browser terminal or desktop refused a machine's key for not being the one kept.
+    KeyRefused { tunnel_id: String },
     /// Someone reached a private TCP or UDP tunnel with `magicpipes connect`.
     Connect { user_id: String, tunnel_id: String, client: std::net::IpAddr },
     /// Someone opened a remote desktop in the browser: `rdp.desktop` or `vnc.desktop`.
