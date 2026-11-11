@@ -505,7 +505,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 10c | Several agents per tunnel (replicas, rolling updates, a highly available gateway) | yes | planned |
 | 10d | An Ingress / Gateway API controller (`ingressClassName: magicpipes`) | none (a separate binary) | planned |
 | 11 | Monitoring, measure: counters for errors by cause, latency and bytes, ping round trips, `/metrics` ([plan](#monitoring-health-history-alerts-and-synthetic-checks)) | yes | done |
-| 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | planned |
+| 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | done |
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | planned |
 | 11d | Monitoring, probe: synthetic checks from the server, on by default; then the agent's own (protocol bump) | yes; agent for its own | planned |
 | 11e | Monitoring, tell: email and webhooks; an outside probe | yes | planned |

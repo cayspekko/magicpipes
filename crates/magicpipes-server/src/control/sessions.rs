@@ -78,11 +78,16 @@ impl ControlPlane {
         let conn_id = st.next_conn_id;
         let round_trip = Arc::new(AtomicU64::new(0));
         let session = |handle| Session { conn_id, handle, connected_at: unix_now(), remote, protocol, last_ping: Instant::now(), round_trip: round_trip.clone() };
+        let joined = match st.sessions.get(agent_id) {
+            Some(link) if instance.is_some() && link.instance == instance => Some(link.lanes.len()),
+            _ => None,
+        };
+        if joined.is_some_and(|n| n >= self.cfg.agents.max_connections) {
+            return Attached::Full;
+        }
+        self.history.lock().unwrap().attached(agent_id, instance.as_deref(), joined);
         let connections = match st.sessions.get_mut(agent_id) {
             Some(link) if instance.is_some() && link.instance == instance => {
-                if link.lanes.len() >= self.cfg.agents.max_connections {
-                    return Attached::Full;
-                }
                 // Clients' shares and returning connections count across the run's connections.
                 let handle = handle.join(&link.first().handle);
                 link.lanes.push(session(handle));

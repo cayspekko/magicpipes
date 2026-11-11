@@ -84,6 +84,11 @@ pub struct AgentView {
     pub last_seen_at: Option<String>,
     pub tunnels: usize,
     pub created_at: String,
+    /// `connected_at` and `last_seen_at` as Unix time, for pages.
+    #[serde(skip)]
+    pub connected_since: Option<i64>,
+    #[serde(skip)]
+    pub last_seen: Option<i64>,
 }
 
 /// A tunnel shared with someone who doesn't manage it: no target, agent or statistics.
@@ -212,6 +217,8 @@ impl ControlPlane {
                     default_private: a.default_private,
                     owner_user_id: a.owner_user_id,
                     last_seen_at: a.last_seen_at.map(rfc3339),
+                    connected_since: s.map(|s| s.connected_at),
+                    last_seen: a.last_seen_at,
                     tunnels: st.tunnels.values().filter(|t| t.row.agent_id == a.id).count(),
                     created_at: rfc3339(a.created_at),
                     id: a.id,

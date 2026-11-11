@@ -714,6 +714,72 @@ async fn metrics_count_what_tunnels_carry() {
     assert!(metrics_with(&after, "magicpipes_agent_ping_seconds", "agent_id=").is_empty(), "{after}");
 }
 
+/// The Health page lists tunnels and machines with what they did lately, and the tunnel's and the
+/// machine's pages chart it; the history comes from samples taken every 10 seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_and_history_show_what_tunnels_carried() {
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let web = add_json(&env, &[&app.port.to_string(), "--name", "web"]).await;
+    let host = hostname(web["public_url"].as_str().unwrap());
+    let id = web["id"].as_str().unwrap().to_string();
+    let admin = env.admin_token();
+    let (_, agents) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent = agents["agents"][0]["id"].as_str().unwrap().to_string();
+    let cookie = admin_session(&env).await;
+
+    for _ in 0..3 {
+        assert_eq!(env.get_public(&host, "/").await.0, StatusCode::OK);
+    }
+    // Requests show once a sample has seen them: a number, and the tiny chart beside it. `add`'s
+    // readiness probe was one too.
+    let row = format!(r#"<a class="name" href="/tunnels/{id}">web</a>"#);
+    env.eventually("a sample with the requests", Duration::from_secs(25), || async {
+        let html = env.ui("/health", Some(&cookie), None).await.html;
+        html.split(&row).nth(1).is_some_and(|rest| rest.contains(r#"<td class="num">4<svg class="spark""#))
+    })
+    .await;
+    let health = env.ui("/health", Some(&cookie), None).await;
+    assert_eq!(health.status, StatusCode::OK);
+    assert!(health.html.contains(r#"href="/health" aria-current="page">Health</a>"#), "in the navigation");
+    assert!(health.html.contains("Everything is working: no failures in the last 15 minutes"), "{}", health.html);
+    assert!(health.html.contains(&format!(r#"href="/machines/{agent}""#)) && health.html.contains("Round trip"), "{}", health.html);
+    assert!(health.html.contains(r#"<a class="btn small ghost" href="/health" aria-current="page">Last 15 minutes</a>"#));
+
+    let page = env.ui(&format!("/tunnels/{id}"), Some(&cookie), None).await;
+    assert!(page.html.contains("<h2>Traffic</h2>") && page.html.contains("4 requests in all"), "{}", page.html);
+    assert!(page.html.contains(r#"<svg viewBox="0 0 900 100" preserveAspectRatio="none" role="img""#), "a chart of 90 slots: {}", page.html);
+    assert!(page.html.contains("Couldn't reach app</h3><p class=\"sum\">None in the last 15 minutes."), "{}", page.html);
+    let day = env.ui(&format!("/tunnels/{id}?period=24h"), Some(&cookie), None).await;
+    assert!(day.html.contains(r#"aria-current="page">Last 24 hours</a>"#) && day.html.contains("4 requests in all"), "{}", day.html);
+    assert!(day.html.contains(r#"<svg viewBox="0 0 2880 100""#), "288 slots of 5 minutes");
+
+    // A machine's page: its connections, and the round trips timed on them.
+    env.eventually("a round trip in a sample", Duration::from_secs(25), || async {
+        env.ui(&format!("/machines/{agent}"), Some(&cookie), None).await.html.contains(r#"<h3>Round trip</h3><p class="sum">Average"#)
+    })
+    .await;
+    let machine = env.ui(&format!("/machines/{agent}"), Some(&cookie), None).await;
+    assert!(machine.html.contains("<h3>Connections</h3>") && machine.html.contains(&format!(r#"href="/tunnels/{id}">web</a>"#)), "{}", machine.html);
+    assert!(machine.html.contains(&format!(r#"action="/agents/{agent}/revoke""#)));
+    let nobody = env.ui("/machines/ag_nobody", Some(&cookie), None).await;
+    assert_eq!(nobody.status, StatusCode::NOT_FOUND, "{}", nobody.html);
+    assert!(env.ui("/machines", Some(&cookie), None).await.html.contains(&format!(r#"<a class="name" href="/machines/{agent}">"#)));
+
+    // The app gone: the page says which tunnel, and why.
+    app.stop();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(env.get_public(&host, "/").await.1.as_deref(), Some("local_unreachable"));
+    env.eventually("the failure in a sample", Duration::from_secs(25), || async {
+        let html = env.ui("/health", Some(&cookie), None).await.html;
+        html.contains("1 tunnel couldn't reach its app in the last 15 minutes") && html.contains("app down 1")
+    })
+    .await;
+    // Without a session, the sign-in page.
+    assert_eq!(env.ui("/health", None, None).await.location.as_deref(), Some("/login?next=%2Fhealth"));
+}
+
 async fn tcp_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return Vec::new() };

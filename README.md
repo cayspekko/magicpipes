@@ -1241,6 +1241,18 @@ Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `vi
 Tunnels are created by agents, not through the API: the target is a port on the agent's
 machine, and only the agent may decide what it connects to.
 
+### Health and history
+
+The **Health** page leads with one line on what's wrong, if anything, then lists tunnels (requests,
+failures by cause, response time) and machines (connections, round trip, reconnects), those in
+trouble first, and only the certificates that failed or expire within 14 days. A tunnel's page
+charts its requests, failures and response times, and a machine's page its round trips and
+connections, over the last 15 minutes (by 10 seconds) or 24 hours (by 5 minutes). People see their
+own machines and tunnels; administrators see everything.
+
+The server samples every 10 seconds and keeps history in memory, so it starts again when the
+server does. For longer, or for alerts outside the app, scrape `/metrics`.
+
 ### Metrics for Prometheus
 
 `GET /metrics` on the management host answers administrators, with a bearer token (the admin token

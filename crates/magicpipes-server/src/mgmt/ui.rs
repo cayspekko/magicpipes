@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use axum::Form;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use http::{HeaderValue, StatusCode, Uri, header};
 use magicpipes_core::error::ErrorCode;
@@ -154,6 +154,7 @@ fn nav_section(path: &str) -> &'static str {
     match path.split('/').nth(1).unwrap_or("") {
         "" | "tunnels" => "/",
         "machines" | "agents" | "enrollments" => "/machines",
+        "health" => "/health",
         "users" | "invitations" => "/users",
         "tags" => "/tags",
         "hostnames" => "/hostnames",
@@ -168,9 +169,9 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     let nav = user
         .map(|u| {
             let links: &[(&str, &str)] = if u.who.is_admin() {
-                &[("/", "Tunnels"), ("/machines", "Machines"), ("/users", "Users"), ("/tags", "Tags"), ("/hostnames", "Hostnames"), ("/audit", "Audit log"), ("/settings", "Settings"), ("/account", "Account")]
+                &[("/", "Tunnels"), ("/machines", "Machines"), ("/health", "Health"), ("/users", "Users"), ("/tags", "Tags"), ("/hostnames", "Hostnames"), ("/audit", "Audit log"), ("/settings", "Settings"), ("/account", "Account")]
             } else {
-                &[("/", "Tunnels"), ("/machines", "Machines"), ("/account", "Account")]
+                &[("/", "Tunnels"), ("/machines", "Machines"), ("/health", "Health"), ("/account", "Account")]
             };
             let section = nav_section(&u.path);
             let nav: String = links
@@ -197,13 +198,14 @@ pub(super) fn page(title: &str, user: Option<&UiUser>, body: &str) -> Response {
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><title>{} · MagicPipes</title>
-<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{icon_style}{picker}{shared}</style><script src="{script}" defer></script></head><body>
+<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>{STYLE}{icon_style}{picker}{shared}{charts}</style><script src="{script}" defer></script></head><body>
 <header class="top"><div class="top-in"><a class="brand" href="/">{GLYPH}MagicPipes</a>{nav}</div></header>
 <main>{done}{body}</main><footer class="foot">MagicPipes {version} · self-hosted HTTPS tunnels</footer></body></html>"#,
         esc(title),
         icon_style = icons::STYLE,
         picker = picker::STYLE,
         shared = html::STYLE,
+        charts = super::chart::STYLE,
         script = SCRIPT_URL.as_str(),
         version = esc(magicpipes_core::VERSION),
     ))
@@ -430,7 +432,7 @@ fn machines_page(app: &AppState, user: &UiUser, attempt: Option<EnrollAttempt>) 
             )
         };
         rows.push_str(&format!(
-            r#"<tr><td><span class="name">{name}</span><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num">{actions}</td></tr>"#,
+            r#"<tr><td><a class="name" href="/machines/{id}">{name}</a><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num">{actions}</td></tr>"#,
             name = esc(&a.name),
             status = badge(if a.connected { "connected" } else { "disconnected" }),
             tunnels = a.tunnels,
@@ -453,22 +455,27 @@ pub async fn machines(user: UiUser, State(app): State<AppState>) -> Response {
     machines_page(&app, &user, None)
 }
 
-pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): Path<String>, Query(q): Query<super::health::PeriodQuery>) -> Response {
+    let gone = "There is no tunnel with that id or name. It may have been deleted.";
     let Some(t) = app.control.tunnel(&user.who, &id) else {
-        return not_there(&user, "/", "Tunnels", "There is no tunnel with that id or name. It may have been deleted.");
+        return not_there(&user, "/", "Tunnels", gone);
     };
+    let Some(series) = app.control.tunnel_history(&user.who, &t.id, q.period()) else {
+        return not_there(&user, "/", "Tunnels", gone);
+    };
+    let traffic = super::health::traffic_section(&format!("/tunnels/{}", t.id), &series, t.kind.is_http());
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
     let ssh_ca = app.control.ssh_ca();
     let viewer_email = user.user.as_ref().map(|u| u.email.as_str()).unwrap_or("you@example.com");
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email))
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &traffic))
 }
 
-fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str) -> String {
+fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, traffic: &str) -> String {
     let field = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", esc(k), v);
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
-    dl.push_str(&field("Machine", &format!(r#"{} <code class="sub">{}</code>"#, esc(agent), esc(&t.agent_id))));
+    dl.push_str(&field("Machine", &format!(r#"<a href="/machines/{id}">{}</a> <code class="sub">{id}</code>"#, esc(agent), id = esc(&t.agent_id))));
     // SSH tunnels and desktops are always private: only their tags change.
     let change = if t.kind == Kind::Ssh || t.kind.is_desktop() {
         r#"<p class="note">To change it, run the same <code>magicpipes add</code> on that machine with <code>--tag</code>.</p>"#
@@ -530,6 +537,7 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
 <div class="stat"><div class="k">Couldn't reach app</div><div class="v">{errors}</div></div>
 <div class="stat"><div class="k">Last request</div><div class="v sm">{last}</div></div>
 </div>
+{traffic}
 <div class="section"><h2>Details</h2></div>
 <div class="card"><dl>{dl}</dl></div>
 <div class="card panel danger spaced"><div><h3>Delete tunnel</h3><p>The public URL stops working at once and the agent stops serving it. In-flight requests finish.</p></div>

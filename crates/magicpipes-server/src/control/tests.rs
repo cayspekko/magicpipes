@@ -114,6 +114,27 @@ async fn only_administrators_read_the_metrics() {
     assert!(!text.contains("magicpipes_agent_ping_seconds{") && !text.contains("magicpipes_agent_connections{"), "{text}");
 }
 
+/// The Health page and the history on tunnel and machine pages show only what `who` manages.
+#[tokio::test]
+async fn history_is_for_those_who_manage_it() {
+    use crate::control::history::Period;
+    let f = fixture();
+    let a = f.agent("a");
+    let t = f.cp.register(&a, &http("app")).unwrap();
+    f.cp.sample();
+    let admin = Principal::AdminToken;
+    let member = Principal::User { id: "us_x".into(), role: crate::authz::Role::Member, tags: vec![] };
+    let seen = f.cp.health(&admin, Period::Minutes15);
+    assert_eq!((seen.tunnels.len(), seen.machines.len()), (1, 1));
+    assert_eq!(seen.tunnels[0].recent.points.len(), crate::control::history::FINE_SLOTS);
+    assert!(seen.since.is_some(), "the server just started");
+    let theirs = f.cp.health(&member, Period::Hours24);
+    assert!(theirs.tunnels.is_empty() && theirs.machines.is_empty() && theirs.certificates.is_empty());
+    assert!(f.cp.tunnel_history(&admin, &t.id, Period::Hours24).is_some() && f.cp.tunnel_history(&member, &t.id, Period::Minutes15).is_none());
+    assert!(f.cp.agent_history(&admin, &a, Period::Minutes15).is_some() && f.cp.agent_history(&member, &a, Period::Minutes15).is_none());
+    assert!(f.cp.agent_history(&admin, "ag_nobody", Period::Minutes15).is_none(), "an unknown machine is not found");
+}
+
 /// A changed target retires the tunnel's pooled connections; nothing else does.
 #[tokio::test]
 async fn a_tunnels_version_follows_its_own_settings() {

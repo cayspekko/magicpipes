@@ -292,6 +292,27 @@ registry lock (strings and `Arc`s) and writes the text after letting go; certifi
 from the certificate manager's own locks. Series are labeled by tunnel name and agent id, which are
 unique, so a scrape never has two series with the same labels.
 
+### History (`control/history.rs`, `control/health.rs`)
+
+Every 10 seconds the control loop reads each tunnel's counters and each agent's connections (open,
+average round trip) under the registry lock, lets go, and records the differences in `History`,
+which has its own lock and is never held while taking the registry's. It keeps two views: 90 slots
+of 10 seconds and 288 of 5 minutes, the second filled from the first. Only a slot with something in
+it is stored, so an idle tunnel costs a few counters and a busy one at most 378 samples (about 38 KB
+with their latency buckets). Tunnels and agents that are gone are dropped at the next sample.
+History lives in memory and starts with the server; rollups in SQLite are phase 11c.
+
+A tunnel's counters start at zero with its record, so its first sample counts everything since.
+Percentiles come from the latency buckets, interpolated within one; anything in the first bucket is
+shown as "under 1 ms" rather than an invented figure. A reconnect is an agent connection attached
+after one of the same run was lost, or from a new run (a restart, a network change) once the agent
+had connected since the server started; a run's first connections aren't.
+
+The pages draw history as SVG on the server, one series per chart (the accent and the "bad" color
+are too close to share one), with the marks stretched to the card (`preserveAspectRatio="none"`,
+strokes that don't scale) and all text in HTML around them. Hovering a slot shows its values
+(`<title>`), and each chart has a table for keyboards and screen readers. No script is involved.
+
 ## Management UI
 
 Server-rendered pages (`mgmt/`) with one small script, which only enhances them. The aims are that

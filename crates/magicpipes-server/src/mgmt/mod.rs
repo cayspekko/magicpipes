@@ -15,11 +15,14 @@
 mod accounts;
 mod api;
 mod certificates;
+mod chart;
 mod desktop;
 mod email;
 mod extract;
+mod health;
 mod html;
 mod icons;
+mod machine;
 mod novnc;
 mod oidc;
 mod picker;
@@ -118,6 +121,8 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/invite/provider/{id}", post(email::invitation_provider))
         .route("/logout", post(ui::logout))
         .route("/machines", get(ui::machines))
+        .route("/machines/{id}", get(machine::machine))
+        .route("/health", get(health::health))
         .route("/tunnels/{id}", get(ui::tunnel_detail))
         .route("/tunnels/{id}/delete", post(ui::delete_tunnel))
         .route("/tunnels/{id}/host-key/forget", post(terminal::forget_host_key))

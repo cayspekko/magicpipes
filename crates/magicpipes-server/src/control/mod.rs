@@ -22,6 +22,8 @@
 mod device;
 mod directory;
 mod email;
+pub mod health;
+pub mod history;
 mod hostnames;
 mod metrics;
 mod oidc;
@@ -87,6 +89,8 @@ pub struct ControlPlane {
     oidc_exchanges: Semaphore,
     proxy_auth: Option<crate::proxy_auth::ProxyAuth>,
     mail: email::MailState,
+    /// What tunnels and machines did lately ([`history`]). Never locked while taking `state`.
+    history: Mutex<history::History>,
 }
 
 #[derive(Default)]
@@ -247,6 +251,7 @@ impl ControlPlane {
             oidc_exchanges: Semaphore::new(oidc::MAX_EXCHANGES),
             proxy_auth,
             mail: email::MailState::default(),
+            history: Mutex::new(history::History::new(unix_now())),
         });
         cp.publish(&cp.state.lock().unwrap());
         Ok(cp)
@@ -288,12 +293,15 @@ impl ControlPlane {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             let mut pings = tokio::time::interval(sessions::PING_EVERY);
+            let mut samples = tokio::time::interval(Duration::from_secs(history::SAMPLE_SECS as u64));
+            samples.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut hourly = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = tick.tick() => me.reap_sessions(),
                     _ = pings.tick() => me.ping_agents(),
+                    _ = samples.tick() => me.sample(),
                     _ = hourly.tick() => me.prune(),
                 }
             }
