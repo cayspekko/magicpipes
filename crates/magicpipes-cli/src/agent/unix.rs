@@ -179,9 +179,19 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert_eq!(check(&link, false).await.unwrap(), link);
 
-        // A socket file with nothing behind it, as an application leaves when it crashes.
+        // A socket file with nothing behind it, as an application leaves when it crashes. Another
+        // test starting a program may fork while it's open, and the child holds it until it runs
+        // that program: give it a moment to let go.
         drop(listener);
-        let e = check(&path, false).await.unwrap_err();
+        let mut checked = check(&path, false).await;
+        for _ in 0..100 {
+            if checked.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            checked = check(&path, false).await;
+        }
+        let e = checked.unwrap_err();
         assert!(e.code == "local_unreachable" && e.message.contains("Start your application"), "{e:?}");
 
         // Refused by what it is, and before it's connected to.
