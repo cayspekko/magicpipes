@@ -871,7 +871,9 @@ async fn the_server_checks_tunnels_and_says_when_one_fails() {
     app.stop();
     env.eventually("the check alert", Duration::from_secs(60), || async {
         // However many it has been by the time it opens.
-        env.ui("/health", Some(&cookie), None).await.html.contains(" checks failed: The app isn&#39;t accepting connections.")
+        // With what the machine saw.
+        let refused = format!(" checks failed: Couldn&#39;t reach the app: connection refused by 127.0.0.1:{}.", app.port);
+        env.ui("/health", Some(&cookie), None).await.html.contains(&refused)
     })
     .await;
     let page = env.ui(&format!("/tunnels/{}", id(&web)), Some(&cookie), None).await.html;

@@ -454,7 +454,13 @@ impl Agent {
                 ev.step(Step::Check, StepState::Failed).await;
                 let err = match e {
                     RpcError::Server(b) if b.is(ErrorCode::LocalUnreachable) => {
-                        ErrorInfo::new(ErrorCode::LocalUnreachable, format!("the server reached this agent, but {} refused the connection", t.describe()))
+                        // A server at protocol 10 says what this agent saw; an older one doesn't.
+                        let why = b.message.split_once(": ").map(|(_, why)| why.to_string());
+                        let message = match why {
+                            Some(why) => format!("the server reached this agent, but it couldn't reach {}: {why}", t.describe()),
+                            None => format!("the server reached this agent, but {} refused the connection", t.describe()),
+                        };
+                        ErrorInfo::new(ErrorCode::LocalUnreachable, message)
                     }
                     RpcError::Server(b) => ErrorInfo::wire(&b.code, b.message),
                     RpcError::Unavailable(m) => ErrorInfo::new(ErrorCode::ServerUnreachable, m),

@@ -390,10 +390,22 @@ impl ControlPlane {
             stream.read_u8().await
         };
         let status = tokio::time::timeout(Duration::from_secs(15), status).await;
+        let status = status.ok().and_then(Result::ok).and_then(StreamStatus::from_byte);
+        // The agent asking is the tunnel's own: it hears what it said.
+        let why = match status {
+            Some(StreamStatus::LocalUnreachable) => proto::read_unreachable(&mut stream).await,
+            _ => None,
+        };
         let _ = stream.shutdown().await;
-        match status.ok().and_then(Result::ok).and_then(StreamStatus::from_byte) {
+        match status {
             Some(StreamStatus::Ok) => Ok(()),
-            Some(StreamStatus::LocalUnreachable) => Err(err(ErrorCode::LocalUnreachable, "the agent could not connect to the local service")),
+            Some(StreamStatus::LocalUnreachable) => Err(err(
+                ErrorCode::LocalUnreachable,
+                match why {
+                    Some(why) => format!("the agent could not connect to the local service: {}", super::checks::reason_words(&why)),
+                    None => "the agent could not connect to the local service".to_string(),
+                },
+            )),
             Some(StreamStatus::UnknownTunnel) => Err(err(ErrorCode::NotFound, "the agent does not serve this tunnel")),
             Some(StreamStatus::Unsupported) => Err(err(ErrorCode::AgentOutdated, "the agent is too old for this check; update magicpipes")),
             None => Err(err(ErrorCode::AgentUnavailable, "the agent did not answer the check")),

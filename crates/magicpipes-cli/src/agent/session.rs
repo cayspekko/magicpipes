@@ -304,7 +304,7 @@ impl Session {
         } else {
             tracing::debug!(lane, "another connection to the server");
         }
-        let fwd = tokio::spawn(forward::serve(inbound, self.tunnels.clone()));
+        let fwd = tokio::spawn(forward::serve(inbound, self.tunnels.clone(), server_protocol));
 
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;

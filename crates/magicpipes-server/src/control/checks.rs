@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use magicpipes_core::mux::MuxHandle;
-use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus};
+use magicpipes_core::proto::{self, Kind, ServerOpen, StreamStatus, UnreachableReason};
 use magicpipes_core::unix_now;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -167,7 +167,12 @@ async fn check(handle: &MuxHandle, t: &Target) -> Result<String, String> {
     proto::write_frame(&mut s, &header).await.map_err(|_| "Its machine closed the stream.".to_string())?;
     match s.read_u8().await.ok().and_then(StreamStatus::from_byte) {
         Some(StreamStatus::Ok) => {}
-        Some(StreamStatus::LocalUnreachable) => return Err("The app isn't accepting connections.".into()),
+        Some(StreamStatus::LocalUnreachable) => {
+            return Err(match proto::read_unreachable(&mut s).await {
+                Some(why) => format!("Couldn't reach the app: {}.", reason_words(&why)),
+                None => "The app isn't accepting connections.".into(),
+            });
+        }
         Some(StreamStatus::UnknownTunnel) => return Err("Its machine doesn't serve this tunnel.".into()),
         Some(StreamStatus::Unsupported) => return Err("Its machine's agent is too old to be checked.".into()),
         None => return Err("Its machine didn't answer.".into()),
@@ -216,6 +221,25 @@ async fn check(handle: &MuxHandle, t: &Target) -> Result<String, String> {
     Ok(said)
 }
 
+/// Why an agent couldn't reach an app, for its owner: what it saw, or the kind of failure if it
+/// said nothing more. An agent is trusted with no more than its own text: kept short and plain.
+pub(super) fn reason_words(why: &proto::Unreachable) -> String {
+    let detail = printable(why.detail.as_bytes());
+    if !detail.is_empty() {
+        return detail;
+    }
+    match why.reason {
+        UnreachableReason::Refused => "the connection was refused",
+        UnreachableReason::TimedOut => "it didn't accept a connection in time",
+        UnreachableReason::NotFound => "there's nothing at its address",
+        UnreachableReason::Permission => "the agent's user may not connect to it",
+        UnreachableReason::CertificateChanged => "it showed a certificate other than the one kept",
+        UnreachableReason::Tls => "TLS with it failed",
+        UnreachableReason::Other => "something went wrong",
+    }
+    .to_string()
+}
+
 /// The app's first line, at most [`MAX_ANSWER`] bytes in.
 async fn first_line<R: AsyncRead + Unpin>(r: &mut R) -> Result<String, String> {
     let mut got = Vec::with_capacity(128);
@@ -235,10 +259,10 @@ async fn first_line<R: AsyncRead + Unpin>(r: &mut R) -> Result<String, String> {
     }
 }
 
-/// What an app said, safe to show: printable ASCII, trimmed and short.
+/// What an app or agent said, safe to show: printable ASCII, trimmed and short.
 fn printable(bytes: &[u8]) -> String {
     let s: String = bytes.iter().map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { ' ' }).collect();
-    s.trim().chars().take(80).collect()
+    s.trim().chars().take(200).collect()
 }
 
 #[cfg(test)]
@@ -247,7 +271,8 @@ mod tests {
 
     use super::*;
 
-    /// A machine that answers a check stream with `status`, then plays `app`.
+    /// A machine that answers a check stream with `status`, then plays `app` (or, for an app it
+    /// couldn't reach, says why).
     async fn machine(status: StreamStatus, app: impl Fn(Vec<u8>) -> Vec<u8> + Send + 'static) -> MuxHandle {
         let (a, b) = tokio::io::duplex(1 << 16);
         let (server, _rpcs) = mux::spawn(a, Mode::Server);
@@ -303,7 +328,15 @@ mod tests {
     #[tokio::test]
     async fn failures_say_why() {
         let down = machine(StreamStatus::LocalUnreachable, |_| Vec::new()).await;
-        assert_eq!(check(&down, &target(Kind::Http)).await, Err("The app isn't accepting connections.".into()));
+        assert_eq!(check(&down, &target(Kind::Http)).await, Err("The app isn't accepting connections.".into()), "an agent from before reasons");
+        let said = |why: serde_json::Value| move |_: Vec<u8>| {
+            let body = serde_json::to_vec(&why).unwrap();
+            [(body.len() as u32).to_be_bytes().to_vec(), body].concat()
+        };
+        let refused = machine(StreamStatus::LocalUnreachable, said(serde_json::json!({ "reason": "refused", "detail": "connection refused by 127.0.0.1:8080" }))).await;
+        assert_eq!(check(&refused, &target(Kind::Http)).await, Err("Couldn't reach the app: connection refused by 127.0.0.1:8080.".into()));
+        let terse = machine(StreamStatus::LocalUnreachable, said(serde_json::json!({ "reason": "permission", "detail": "\u{1b}[31m" }))).await;
+        assert_eq!(check(&terse, &target(Kind::Ssh)).await, Err("Couldn't reach the app: [31m.".into()), "an agent's text is kept plain");
         let silent = machine(StreamStatus::Ok, |_| Vec::new()).await;
         assert_eq!(check(&silent, &target(Kind::Http)).await, Err("The app closed the connection without answering.".into()));
         let garbage = machine(StreamStatus::Ok, |_| b"\x00\x01 hello\n".to_vec()).await;

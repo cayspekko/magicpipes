@@ -810,9 +810,10 @@ tunnel, never an address.
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 9: 2 added the handshake and
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 10: 2 added the handshake and
   answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
-  and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels, 9 several connections per agent). A peer without the header is
+  and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels, 9 several connections per agent, 10 why an app
+  couldn't be reached). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,
@@ -827,7 +828,13 @@ Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgrad
 * **Server-opened stream = data or push**: a `ServerOpen` frame. For `Data { tunnel_id }` the
   agent looks the id up in **its own** table, connects to the local target and writes one status
   byte (`StreamStatus`: `0` ok, `1` local unreachable, `2` unknown tunnel, `3` unsupported), then
-  raw bytes flow both ways.
+  raw bytes flow both ways. After `1`, an agent talking to a server at version 10 sends an
+  `Unreachable` frame: a reason (refused, timed out, not found, permission, certificate changed,
+  TLS, other) and what it saw, such as `connection refused by 127.0.0.1:8080`. The server reads it
+  where the tunnel's owner will see it (its checks, and the check behind `add`), never for a
+  visitor: the detail can name local addresses and paths, and the HTTP path reads the status byte
+  inside `StatusPrefixed`, where it stays one byte. An older agent closes the stream after the
+  byte, so reading the frame ends at once.
   `Datagram { tunnel_id }` is the same for one UDP client, followed by `u16`-length framed
   datagrams. `TunnelRemoved` tells the agent an administrator deleted a tunnel.
 * The status byte is read lazily by the server (`StatusPrefixed`): the HTTP request is written

@@ -1265,7 +1265,9 @@ at 30, "Last 30 days") to the charts and brings the last day back after a restar
 app through its machine, as a visitor's request reaches it, unless the tunnel was added with
 `--no-check` or `[monitoring] synthetics = false`. The check is marked `User-Agent:
 MagicPipes-Check` and `X-Magicpipes-Probe: check`, so an app can leave it out of its logs. A
-tunnel whose machine is offline isn't checked: that has its own alert. These checks start where
+tunnel whose machine is offline isn't checked: that has its own alert. When the app can't be
+reached, the machine says why (refused, timed out, a missing socket, permissions, a changed
+certificate), and the tunnel's page and the alert say it too. These checks start where
 the server is, so they can't see a problem in DNS or a firewall in front of it.
 
 **Alerts.** Rules judge every sample, and an alert opens once a problem shows on two samples in a
@@ -1335,7 +1337,7 @@ Alerts to start from: `magicpipes_agent_up == 0` for 5 minutes,
 
 | Symptom | What to check |
 |---|---|
-| `local_unreachable` (exit 4) | Is the app running? `curl http://127.0.0.1:<port>`. If it only listens on another address, pass `--host`. |
+| `local_unreachable` (exit 4) | Is the app running? `curl http://127.0.0.1:<port>`. If it only listens on another address, pass `--host`. The tunnel's page shows why the machine couldn't reach it, from its last check: refused, timed out, a missing socket, permissions, or a changed certificate. |
 | `server_unreachable` | `magicpipes status` shows the last connection error. Check that port 8443 is reachable and the server URL matches `management.hostname`. |
 | `unauthorized` | The agent credential was revoked or the server database was reset: run `magicpipes login` again. |
 | `tls_failed` | `ACME challenge could not be completed`: port 80 must reach `magicpipesd` for `<name>.<base_domain>` (wildcard DNS correct? firewall?). Look at the server log and the tunnel's `tls_error` in the UI/API. After a failure the hostname is not retried for `failure_backoff_secs`. |

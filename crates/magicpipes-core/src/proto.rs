@@ -62,7 +62,13 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 /// * 9: several connections per agent. Each carries [`INSTANCE_HEADER`], and the server keeps an
 ///   instance's connections together (up to [`MAX_CONNECTIONS`]) instead of the newest replacing
 ///   the others, as an older server does: so the agent opens more than one only once it knows.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// * 10: after [`StreamStatus::LocalUnreachable`], an [`Unreachable`] frame saying why. An older
+///   server closes the stream after the status byte and never reads it; the agent sends it only to
+///   a server at [`REASONS_PROTOCOL`] or newer anyway.
+pub const PROTOCOL_VERSION: u32 = 10;
+
+/// The first protocol version whose servers read why the app couldn't be reached.
+pub const REASONS_PROTOCOL: u32 = 10;
 
 /// The first protocol version that keeps an agent's connections together.
 pub const CONNECTIONS_PROTOCOL: u32 = 9;
@@ -389,6 +395,43 @@ pub struct EnrollResponse {
     pub base_domain: String,
 }
 
+/// Why an agent couldn't reach a tunnel's app (protocol 10), sent as a frame after
+/// [`StreamStatus::LocalUnreachable`]. For the tunnel's owner: the server shows it in checks and
+/// alerts, never to a visitor, since `detail` can name local addresses and paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Unreachable {
+    pub reason: UnreachableReason,
+    /// What the agent saw, such as `connection refused by 127.0.0.1:8080`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreachableReason {
+    /// Nothing accepts connections there.
+    Refused,
+    /// No connection within the agent's time limit.
+    TimedOut,
+    /// No such socket, or the name doesn't resolve.
+    NotFound,
+    /// The agent's user may not connect.
+    Permission,
+    /// An HTTPS app (`--local-https`) showed a certificate other than the one kept.
+    CertificateChanged,
+    /// An HTTPS app's TLS failed otherwise.
+    Tls,
+    /// Anything else, including a reason from a newer agent.
+    #[serde(other)]
+    Other,
+}
+
+/// Reads an agent's [`Unreachable`] after its status byte, if it sends one: an older agent closes
+/// the stream instead, so this returns `None` at once rather than waiting.
+pub async fn read_unreachable<R: AsyncRead + Unpin>(r: &mut R) -> Option<Unreachable> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(r)).await.ok().and_then(Result::ok)
+}
+
 pub async fn write_frame<W, T>(w: &mut W, value: &T) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -543,6 +586,11 @@ mod tests {
         // A ping the server times: plain, so that an agent which doesn't know it answers at once.
         assert_eq!(serde_json::to_string(&ServerOpen::Ping).unwrap(), r#"{"kind":"ping"}"#);
         assert_eq!(serde_json::from_str::<ServerOpen>(r#"{"kind":"ping"}"#).unwrap(), ServerOpen::Ping);
+        // Protocol 10: why the app couldn't be reached, and a reason from a newer agent is "other".
+        let u: Unreachable = serde_json::from_str(r#"{"reason":"refused","detail":"connection refused by 127.0.0.1:8080"}"#).unwrap();
+        assert_eq!(u.reason, UnreachableReason::Refused);
+        let u: Unreachable = serde_json::from_str(r#"{"reason":"from_the_future"}"#).unwrap();
+        assert_eq!((u.reason, u.detail.as_str()), (UnreachableReason::Other, ""));
         // Protocol 8: the same for VNC.
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"pi","target":"x","kind":"vnc"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { kind: Kind::Vnc, .. })));

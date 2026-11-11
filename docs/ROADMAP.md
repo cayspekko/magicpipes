@@ -414,9 +414,10 @@ cause, alert, or way for a monitoring system to read any of it. Decided 2026-11-
   `add --no-check`): once a minute the server opens a stream through each tunnel's machine to its
   app, as a visitor's request does, and has a short exchange: `GET <--probe-path>` on HTTP (any
   answer counts), SSH's banner, VNC's greeting, RDP's answer. Marked `x-magicpipes-probe`. Done in
-  11d; going through the machine reaches private tunnels too. Still to do: the agent checks its
-  own targets and reports (a protocol bump), and an outside probe sees what the server can't: its
-  own DNS, firewall and proxy.
+  11d; going through the machine reaches private tunnels too. Instead of checks of its own, which
+  would repeat the server's, the agent says why it couldn't reach an app (protocol 10): what
+  only it can see. Still to do: an outside probe sees what the server can't: its own DNS,
+  firewall and proxy.
 * **Certificate changes** come from comparing each hostname's fingerprint and expiry between
   samples: renewed, replaced, expiring, renewal failed. (Expiring and failing are alerts since
   11c; renewed and replaced are still to do.)
@@ -509,5 +510,5 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 11 | Monitoring, measure: counters for errors by cause, latency and bytes, ping round trips, `/metrics` ([plan](#monitoring-health-history-alerts-and-synthetic-checks)) | yes | done |
 | 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | done |
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
-| 11d | Monitoring, probe: synthetic checks from the server, on by default (done); then the agent's own (protocol bump) | yes; agent for its own | server's done |
+| 11d | Monitoring, probe: synthetic checks from the server, on by default; the agent says why it couldn't reach an app (protocol 10) | yes | done |
 | 11e | Monitoring, tell: email and webhooks; an outside probe | yes | planned |
