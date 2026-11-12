@@ -5921,3 +5921,97 @@ async fn browser_opens_an_ssh_terminal() {
     assert_eq!(result["status"], "Running", "{result}");
     env.cli_ok(&["agent", "stop"]).await;
 }
+
+/// What a probe on the agent's health port gets: `None` until something listens there.
+async fn health_get(port: u16, path: &str) -> Option<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n").as_bytes()).await.ok()?;
+    let mut text = String::new();
+    s.read_to_string(&mut text).await.ok()?;
+    let status = text.split(' ').nth(1)?.parse().ok()?;
+    Some((status, text.split_once("\r\n\r\n").map(|(_, body)| body.to_string()).unwrap_or_default()))
+}
+
+/// In a container: `agent run` enrolls itself from its environment the first time, serves the
+/// tunnels declared there (trying again while an app is still starting), says when it's ready, and
+/// at its next start removes what isn't declared any more. A mistake in a declaration stops it at
+/// once, and another home can run as the same machine from a config file kept elsewhere, as a
+/// Kubernetes Secret would hold it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_in_a_container_serves_what_its_environment_declares() {
+    let env = Env::new(Tls::DevCa).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let late_port = common::free_port();
+    let health = common::free_port();
+    let run = |home: &str, vars: &[(&str, String)]| {
+        let home = env.root.join(home);
+        let mut cmd = tokio::process::Command::new(common::bin("magicpipes"));
+        cmd.args(["agent", "run"])
+            .env("MAGICPIPES_HOME", &home)
+            .env("MAGICPIPES_SOCKET", env.root.join(format!("{}.sock", home.file_name().unwrap().to_string_lossy())))
+            .env("MAGICPIPES_PROBE_ADDR", "127.0.0.1")
+            .env("MAGICPIPES_LOG", "info,magicpipes=debug")
+            .env("MAGICPIPES_HEALTH_LISTEN", format!("127.0.0.1:{health}"))
+            .env_remove("MAGICPIPES_TOKEN")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(env.root.join(format!("{}.log", home.file_name().unwrap().to_string_lossy()))).unwrap())
+            .kill_on_drop(true);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("start the agent")
+    };
+    let stop = async |mut agent: tokio::process::Child| {
+        unsafe { libc::kill(agent.id().unwrap() as i32, libc::SIGTERM) };
+        tokio::time::timeout(Duration::from_secs(15), agent.wait()).await.expect("the agent stops").unwrap();
+    };
+    let ready = async || health_get(health, "/readyz").await;
+    let host = |name: &str| format!("{name}.{BASE}");
+
+    // The first start enrolls, and serves the shop at once; the other app isn't up yet.
+    let declared = format!("# the shop, and one whose app starts later\n{} --name shop --public\n{late_port} --name late --public\n", app.port);
+    let first = run("pod", &[
+        ("MAGICPIPES_SERVER", env.server_url()),
+        ("MAGICPIPES_TOKEN", env.enrollment_token()),
+        ("MAGICPIPES_CA_CERT", env.ca_path.to_string_lossy().to_string()),
+        ("MAGICPIPES_AGENT_NAME", "pod-1".to_string()),
+        ("MAGICPIPES_TUNNELS", declared),
+    ]);
+    env.eventually("the agent to be live", Duration::from_secs(20), || async { health_get(health, "/livez").await.is_some_and(|(s, _)| s == 200) }).await;
+    env.eventually("the shop", Duration::from_secs(30), || async { env.get_public(&host("shop"), "/").await.0 == StatusCode::OK }).await;
+    env.eventually("the late app to be waited for", Duration::from_secs(20), || async {
+        ready().await.is_some_and(|(s, body)| s == 503 && body.contains(r#"{"error":"local_unreachable","tunnel":"late"}"#))
+    })
+    .await;
+    let (_, agents) = env.api("GET", "/api/v1/agents", Some(&env.admin_token())).await;
+    assert!(agents["agents"].as_array().unwrap().iter().any(|a| a["name"] == "pod-1"), "{agents}");
+
+    // Once its app is up, the next try serves it, and the agent is ready.
+    let _late = common::http_app_at(late_port).await;
+    env.eventually("the agent to be ready", Duration::from_secs(30), || async { ready().await.is_some_and(|(s, _)| s == 200) }).await;
+    assert_eq!(env.get_public(&host("late"), "/").await.0, StatusCode::OK);
+    stop(first).await;
+
+    // Started again with one tunnel fewer: enrolled already, it removes the other.
+    let second = run("pod", &[("MAGICPIPES_TUNNELS", format!("{} --name shop --public", app.port))]);
+    env.eventually("the agent to be ready again", Duration::from_secs(30), || async { ready().await.is_some_and(|(s, _)| s == 200) }).await;
+    env.eventually("the late tunnel to go", Duration::from_secs(15), || async { env.get_public(&host("late"), "/").await.0 == StatusCode::NOT_FOUND }).await;
+    assert_eq!(env.get_public(&host("shop"), "/").await.0, StatusCode::OK);
+    stop(second).await;
+
+    // A mistake stops it at once, saying where.
+    let wrong = run("pod", &[("MAGICPIPES_TUNNELS", format!("{} --name shop --public\n8080 --public", app.port))]);
+    let out = tokio::time::timeout(Duration::from_secs(10), wrong.wait_with_output()).await.expect("it stops").unwrap();
+    assert!(!out.status.success());
+    let log = std::fs::read_to_string(env.root.join("pod.log")).unwrap();
+    assert!(log.contains("MAGICPIPES_TUNNELS, line 2: give it a --name or --hostname"), "{log}");
+
+    // Another home, with the same machine's config kept elsewhere.
+    let config = env.root.join("pod").join("config.json");
+    let elsewhere = run("other-pod", &[("MAGICPIPES_CONFIG", config.to_string_lossy().to_string()), ("MAGICPIPES_TUNNELS", format!("{} --name shop --public", app.port))]);
+    env.eventually("the same machine to be ready from another home", Duration::from_secs(30), || async { ready().await.is_some_and(|(s, _)| s == 200) }).await;
+    assert!(!env.root.join("other-pod").join("config.json").exists());
+    stop(elsewhere).await;
+}

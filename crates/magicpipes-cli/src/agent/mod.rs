@@ -6,6 +6,8 @@
 //! * `shell` — web terminal for `add --shell` (xterm.js page + pty per browser session).
 //! * `udp` — relays a UDP tunnel's datagram streams to the local UDP service.
 //! * `ops` — operations exposed over IPC, including the readiness-gated `add`.
+//! * `declared` — tunnels declared in the environment for `agent run` in a container.
+//! * `health` — `/livez` and `/readyz` for a container's probes.
 //!
 //! Single instance: the agent holds an exclusive `flock` on `agent.lock` for its lifetime.
 //! A second agent (e.g. from two concurrent `magicpipes add` invocations) fails to take the lock
@@ -14,7 +16,9 @@
 //! file can always be removed safely by the lock holder. An agent the CLI started (`--detached`)
 //! that gets the lock when no CLI is waiting for one any more exits too.
 
+mod declared;
 mod forward;
+mod health;
 mod local_tls;
 mod ops;
 mod probe;
@@ -48,6 +52,18 @@ pub enum Start {
 }
 
 pub fn run(detached: bool) -> anyhow::Result<Start> {
+    // Only `agent run` itself reads what a container declares: an agent a command starts in the
+    // background could have them in its environment by chance, and would remove other tunnels.
+    let (declared, health) = if detached {
+        (None, None)
+    } else {
+        let declared = crate::declared::from_env().map_err(anyhow::Error::msg)?;
+        let health = match std::env::var(health::HEALTH_ENV) {
+            Ok(text) if !text.trim().is_empty() => Some(health::address(&text).map_err(anyhow::Error::msg)?),
+            _ => None,
+        };
+        (declared, health)
+    };
     state::ensure_home()?;
     let lock = File::options().create(true).truncate(false).write(true).open(state::lock_path())?;
     match lock.try_lock() {
@@ -61,11 +77,19 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
     if detached && !awaited() {
         return Ok(Start::Unwanted);
     }
-    let Some(cfg) = AgentConfig::load()? else {
-        bail!("not logged in; run `magicpipes login --server <url> --token <token>` first");
-    };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let res = rt.block_on(serve(cfg, detached));
+    let res = rt.block_on(async {
+        let cfg = match AgentConfig::load()? {
+            Some(cfg) => cfg,
+            // In a container, the first start enrolls it.
+            None if !detached => match crate::enroll_from_env().await.map_err(|e| anyhow::anyhow!("enrolling: {}", e.message))? {
+                Some(cfg) => cfg,
+                None => bail!("not logged in; run `magicpipes login --server <url> --token <token>` first, or set MAGICPIPES_SERVER and MAGICPIPES_TOKEN"),
+            },
+            None => bail!("not logged in; run `magicpipes login --server <url> --token <token>` first"),
+        };
+        serve(cfg, detached, declared, health).await
+    });
     platform::cleanup_ipc();
     let _ = std::fs::remove_file(state::pid_path());
     drop(lock);
@@ -82,9 +106,14 @@ fn awaited() -> bool {
     }
 }
 
-async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
+async fn serve(cfg: AgentConfig, detached: bool, declared: Option<Vec<crate::declared::Declared>>, health: Option<std::net::SocketAddr>) -> anyhow::Result<()> {
     // We hold the lock, so any existing socket is stale.
     let mut listener = IpcListener::bind()?;
+    // Before anything starts, so a port in use stops the agent with an error.
+    let health = match health {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listening on {addr} ({})", health::HEALTH_ENV))?),
+        None => None,
+    };
     state::write_private(&state::pid_path(), std::process::id().to_string().as_bytes())?;
 
     let shutdown = CancellationToken::new();
@@ -92,9 +121,13 @@ async fn serve(cfg: AgentConfig, detached: bool) -> anyhow::Result<()> {
     let tls = crate::https::tls_config(cfg.ca_cert_pem.as_deref())?;
     let session = session::Session::new(cfg, tunnels.clone())?;
     let agent = Agent::new(session.clone(), tunnels.clone(), tls, shutdown.clone());
-    tracing::info!(pid = std::process::id(), tunnels = tunnels.len(), detached, "agent started");
+    tracing::info!(pid = std::process::id(), tunnels = tunnels.len(), declared = declared.as_ref().map(Vec::len), detached, "agent started");
 
     let session_task = tokio::spawn(session.clone().run(shutdown.clone()));
+    let declarations = declared.map(|d| declared::spawn(agent.clone(), d, shutdown.clone()));
+    if let Some(listener) = health {
+        health::spawn(listener, agent.clone(), declarations, shutdown.clone());
+    }
     let terminate = platform::terminate();
     tokio::pin!(terminate);
     loop {

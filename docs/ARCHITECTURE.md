@@ -951,6 +951,18 @@ a connection to the public port that must arrive back at the agent (a warning, n
 * Registration is serialized inside the agent, so concurrent `add`s of one port yield one
   tunnel.
 * Agent state (`tunnels.json`) is written atomically (temp file plus rename, mode 0600).
+* **In a container** (`agent run` in the foreground; [KUBERNETES.md](KUBERNETES.md)): tunnels can be
+  declared in `MAGICPIPES_TUNNELS` or `MAGICPIPES_TUNNELS_FILE`, one per line as `add` arguments,
+  parsed by the same clap definition and checks as the command (`declared.rs`), so a declaration
+  can't ask for anything `add` can't. They're checked before anything starts, and a bad line stops
+  the agent. Once connected, `agent/declared.rs` removes the tunnels in `tunnels.json` that aren't
+  declared, then runs each declaration through the same `Agent::add` as IPC, with steps discarded,
+  retrying at 1 s doubling to 30 s; at most 100. `MAGICPIPES_HEALTH_LISTEN` starts a small HTTP/1
+  listener (`agent/health.rs`: 16 connections, 5 s for headers, 10 s each, no keep-alive) for
+  `/livez` and `/readyz`, which reads the session state and each declared tunnel's registration.
+  None of it touches the data path. A `--detached` agent ignores all of these, as it does the
+  first-start enrollment from `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`. `MAGICPIPES_CONFIG` moves
+  `config.json`, which the agent only reads, to a read-only Secret.
 
 ## Lifecycle policies
 

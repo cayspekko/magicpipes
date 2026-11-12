@@ -480,7 +480,9 @@ own identity, or to be reached pod by pod.
 
 1. **Container packaging:** a scratch image of the static agent; tunnels declared in a file or in
    environment variables instead of `add` commands; a readiness endpoint. For sidecars and
-   gateways alike.
+   gateways alike. *Done 2026-11-12* ([KUBERNETES.md](KUBERNETES.md)): the declarations are `add`
+   arguments, one per line; the first start enrolls from the environment, or the identity comes
+   from a Secret (`MAGICPIPES_CONFIG`).
 2. **Several connections per agent:** a session over a few TCP connections lifts the 224-stream and
    one-connection ceiling and spreads TLS across cores. A data-path change: benchmarked, and the
    mux's one-queue design (`SEND_QUEUE`, batching) revisited per connection.
@@ -523,7 +525,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 7 | UDP | yes | done (with phase 3) |
 | 8 | Custom hostnames (`add --hostname`, registered by an administrator; exact names, HTTP only) | yes | done, with your own certificates per name (Settings page or `[[tls.certificates]]`); wildcard names (DNS-01) planned |
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |
-| 10 | Kubernetes: container image, tunnels declared in a file or environment, a readiness endpoint ([plan](#kubernetes-magicpipes-as-a-clusters-ingress)) | none | planned |
+| 10 | Kubernetes: container image, tunnels declared in a file or environment, a readiness endpoint ([plan](#kubernetes-magicpipes-as-a-clusters-ingress)) | none | done ([KUBERNETES.md](KUBERNETES.md)) |
 | 10b | Several connections per agent (past one connection and 224 streams) | yes | done (4 by default, `agents.max_connections` on the server) |
 | 10c | Several agents per tunnel (replicas, rolling updates, a highly available gateway) | yes | planned |
 | 10d | An Ingress / Gateway API controller (`ingressClassName: magicpipes`) | none (a separate binary) | planned |

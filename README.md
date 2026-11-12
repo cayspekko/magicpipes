@@ -547,7 +547,8 @@ files, and pass it with `--config`; its providers are then locked on that server
 
 The [`Dockerfile`](Dockerfile) builds static musl binaries in `rust:1.99-alpine` and copies
 them into a `FROM scratch` image (~30 MB). The image contains only both binaries, a CA bundle
-(ACME has to verify the CA's HTTPS endpoint) and `/data`. It runs as UID 65532.
+(ACME has to verify the CA's HTTPS endpoint) and `/data`. It runs as UID 65532. Its `agent` target
+is the agent alone ([in a container or Kubernetes](#in-a-container-or-kubernetes)).
 
 ```bash
 $EDITOR docker/magicpipesd.toml        # base_domain, management.hostname, acme_email
@@ -1217,6 +1218,30 @@ WantedBy=default.target
 The CLI talks to whichever agent holds the lock: a supervised `agent run` and CLI-started
 agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
+### In a container or Kubernetes
+
+`docker build --target agent -t magicpipes-agent .` builds an image of the agent alone, which runs
+`magicpipes agent run` set up by its environment:
+
+```bash
+docker run -d -v magicpipes-agent:/data -e MAGICPIPES_SERVER=https://mp.example.com \
+  -e MAGICPIPES_TOKEN=mpe_… -e MAGICPIPES_TUNNELS="80 --host shop --name shop --public" \
+  -e MAGICPIPES_HEALTH_LISTEN=9090 magicpipes-agent
+```
+
+* **`MAGICPIPES_TUNNELS`** (or a file named by `MAGICPIPES_TUNNELS_FILE`) declares the tunnels, one
+  per line, written as the arguments of `magicpipes add`, each with a `--name` or `--hostname`. At
+  each start the agent adds them, trying again while an app is still starting, and removes those it
+  served that aren't declared any more. A wrong line stops it, naming the line.
+* **`MAGICPIPES_HEALTH_LISTEN`** answers `/livez`, and `/readyz` once it's connected and serving
+  every declared tunnel (503 until then, saying what it waits for).
+* **The first start enrolls** with `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`, keeping the identity
+  in `/data`. In Kubernetes, keep `config.json` as a Secret instead and point `MAGICPIPES_CONFIG` at
+  it.
+
+These are read only by `agent run` in the foreground. [docs/KUBERNETES.md](docs/KUBERNETES.md) has a
+gateway Deployment, a sidecar, and the limits for now: one replica per machine.
+
 ### Connections to the server
 
 The agent holds 4 connections to the server, and the server spreads its tunnels' traffic across
@@ -1239,7 +1264,11 @@ others go on serving while it reconnects. `magicpipes status` shows how many are
 |---|---|
 | `MAGICPIPES_HOME` | State directory (default `~/.magicpipes`, mode 0700): `config.json`, `tunnels.json`, `connect.json`, `agent.sock`, `agent.lock`, `agent-start.lock`, `agent.pid`, `agent.log` |
 | `MAGICPIPES_SOCKET` | IPC endpoint override: Unix socket path (limited to ~104 bytes), or a named pipe name (`\\.\pipe\...`) on Windows |
-| `MAGICPIPES_TOKEN` | Enrollment token for `login` |
+| `MAGICPIPES_TOKEN` | Enrollment token for `login`, and for `agent run`'s first start (or `MAGICPIPES_TOKEN_FILE`) |
+| `MAGICPIPES_SERVER`, `MAGICPIPES_CA_CERT`, `MAGICPIPES_AGENT_NAME` | `login`'s `--server`, `--ca-cert` and `--name`; with a token, `agent run` enrolls with them at its first start |
+| `MAGICPIPES_CONFIG` | Read `config.json`, the machine's identity, from this file instead (a Kubernetes Secret) |
+| `MAGICPIPES_TUNNELS`, `MAGICPIPES_TUNNELS_FILE` | Tunnels `agent run` serves, one per line as `add` arguments ([containers](#in-a-container-or-kubernetes)) |
+| `MAGICPIPES_HEALTH_LISTEN` | `agent run` answers `/livez` and `/readyz` here: a port, or `address:port` |
 | `MAGICPIPES_API_TOKEN` | API token for `connect`, instead of signing in in a browser |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |
 | `MAGICPIPES_CONNECTIONS` | Connections the agent holds to the server, 1 to 8 (default 4, or `connections` in `config.json`) |

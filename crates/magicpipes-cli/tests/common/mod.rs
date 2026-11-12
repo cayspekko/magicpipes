@@ -679,9 +679,17 @@ impl Drop for App {
 /// `GET /status/401` -> 401, `GET /conn` -> the number of the TCP connection it came on,
 /// `GET /headers` -> the names of the request's headers, anything else -> 404.
 pub async fn http_app(release: Arc<tokio::sync::Notify>) -> App {
+    http_app_on(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(), release)
+}
+
+/// The same app on a port chosen beforehand, as if it started after whatever forwards to it.
+pub async fn http_app_at(port: u16) -> App {
+    http_app_on(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap(), Arc::new(tokio::sync::Notify::new()))
+}
+
+fn http_app_on(listener: tokio::net::TcpListener, release: Arc<tokio::sync::Notify>) -> App {
     use http_body_util::combinators::BoxBody;
     use hyper::service::service_fn;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
         let mut accepted = 0u64;

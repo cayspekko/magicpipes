@@ -3,6 +3,7 @@
 mod agent;
 mod client;
 mod connect;
+mod declared;
 mod https;
 mod ipc;
 mod platform;
@@ -64,7 +65,7 @@ enum Command {
   magicpipes login --server https://mp.example.com --token-file token  With an enrollment token")]
     Login {
         /// Management URL of the server, e.g. https://example.com:8443
-        #[arg(long)]
+        #[arg(long, env = "MAGICPIPES_SERVER")]
         server: String,
         /// Single-use enrollment token (from `magicpipesd enroll` or the UI). Without one, the
         /// CLI opens the server's sign-in page so you can approve this machine as yours.
@@ -78,10 +79,10 @@ enum Command {
         #[arg(long, conflicts_with_all = ["token", "token_file"])]
         browser: bool,
         /// Extra CA certificate (PEM) to trust, e.g. the server's development CA.
-        #[arg(long)]
+        #[arg(long, env = "MAGICPIPES_CA_CERT")]
         ca_cert: Option<PathBuf>,
         /// Name for this agent (defaults to the hostname).
-        #[arg(long)]
+        #[arg(long, env = "MAGICPIPES_AGENT_NAME")]
         name: Option<String>,
         #[command(flatten)]
         out: Output,
@@ -362,45 +363,158 @@ fn main() -> ExitCode {
 /// (it has a default), so `requires = "shell"` would never fire.
 fn check_add_args(cmd: &Command) {
     use clap::CommandFactory;
-    use clap::error::ErrorKind;
-    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, ssh, rdp, vnc, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
-    else {
-        return;
-    };
-    let fail = |kind, msg: &str| {
+    if let Some((kind, msg)) = add_args_problem(cmd) {
         let mut cli = Cli::command();
         // Gives the subcommand's usage line its full name.
         cli.build();
         cli.find_subcommand_mut("add").expect("add subcommand").error(kind, msg).exit()
+    }
+}
+
+/// What's wrong with an `add` command's arguments that clap can't tell, if anything.
+fn add_args_problem(cmd: &Command) -> Option<(clap::error::ErrorKind, &'static str)> {
+    use clap::error::ErrorKind;
+    let Command::Add { port, unix, allow_sensitive_socket, tcp, udp, ssh, rdp, vnc, remote_port, allow_cidr, allow_any, serve, no_list, list, site, allow_sensitive_root, shell, write, max_clients, command, .. } = cmd
+    else {
+        return None;
     };
     if port.is_none() && unix.is_none() && serve.is_none() && !shell {
-        fail(ErrorKind::MissingRequiredArgument, "give a local <PORT>, --unix <PATH>, --serve <DIR> or --shell");
+        return Some((ErrorKind::MissingRequiredArgument, "give a local <PORT>, --unix <PATH>, --serve <DIR> or --shell"));
     }
     if *ssh && port.is_none() {
-        fail(ErrorKind::MissingRequiredArgument, "--ssh needs the local port of sshd, usually: magicpipes add 22 --ssh");
+        return Some((ErrorKind::MissingRequiredArgument, "--ssh needs the local port of sshd, usually: magicpipes add 22 --ssh"));
     }
     if *rdp && port.is_none() {
-        fail(ErrorKind::MissingRequiredArgument, "--rdp needs the port of Remote Desktop, usually: magicpipes add 3389 --rdp");
+        return Some((ErrorKind::MissingRequiredArgument, "--rdp needs the port of Remote Desktop, usually: magicpipes add 3389 --rdp"));
     }
     if *vnc && port.is_none() {
-        fail(ErrorKind::MissingRequiredArgument, "--vnc needs the port of the VNC server, usually: magicpipes add 5900 --vnc");
+        return Some((ErrorKind::MissingRequiredArgument, "--vnc needs the port of the VNC server, usually: magicpipes add 5900 --vnc"));
     }
     if unix.is_none() && *allow_sensitive_socket {
-        fail(ErrorKind::ArgumentConflict, "--allow-sensitive-socket can only be used with --unix");
+        return Some((ErrorKind::ArgumentConflict, "--allow-sensitive-socket can only be used with --unix"));
     }
     if !shell && (*write || max_clients.is_some() || !command.is_empty()) {
-        fail(ErrorKind::ArgumentConflict, "--write, --max-clients and a `-- <PROGRAM>` can only be used with --shell");
+        return Some((ErrorKind::ArgumentConflict, "--write, --max-clients and a `-- <PROGRAM>` can only be used with --shell"));
     }
     // Not clap's `requires`: it doesn't fire when the required flag conflicts with one that's given.
     if serve.is_none() && (*no_list || *list || *site || *allow_sensitive_root) {
-        fail(ErrorKind::ArgumentConflict, "--no-list, --list, --site and --allow-sensitive-root can only be used with --serve");
+        return Some((ErrorKind::ArgumentConflict, "--no-list, --list, --site and --allow-sensitive-root can only be used with --serve"));
     }
     if !tcp && !udp && (remote_port.is_some() || !allow_cidr.is_empty() || *allow_any) {
-        fail(ErrorKind::ArgumentConflict, "--remote-port, --allow-cidr and --allow-any can only be used with --tcp or --udp");
+        return Some((ErrorKind::ArgumentConflict, "--remote-port, --allow-cidr and --allow-any can only be used with --tcp or --udp"));
     }
     if remote_port == &Some(0) {
-        fail(ErrorKind::InvalidValue, "--remote-port must be between 1 and 65535");
+        return Some((ErrorKind::InvalidValue, "--remote-port must be between 1 and 65535"));
     }
+    None
+}
+
+/// The request an `add` command makes of the agent, and how it asked for output.
+fn add_request(cmd: Command) -> Option<(AddRequest, Output)> {
+    let Command::Add {
+        port,
+        unix,
+        allow_sensitive_socket,
+        tcp,
+        udp,
+        ssh,
+        rdp,
+        vnc,
+        remote_port,
+        allow_cidr,
+        allow_any,
+        serve,
+        no_list,
+        list,
+        site,
+        allow_sensitive_root,
+        shell,
+        write,
+        max_clients,
+        command,
+        private,
+        public,
+        tags,
+        name,
+        hostname,
+        no_verify,
+        host,
+        local_https,
+        probe_path,
+        no_check,
+        timeout,
+        out,
+    } = cmd
+    else {
+        return None;
+    };
+    let visibility = match (private || !tags.is_empty(), public) {
+        (true, _) => Some(Visibility::Private),
+        (_, true) => Some(Visibility::Public),
+        _ => None,
+    };
+    let kind = match (tcp, udp, ssh, rdp, vnc) {
+        (true, ..) => Kind::Tcp,
+        (_, true, ..) => Kind::Udp,
+        (_, _, true, ..) => Kind::Ssh,
+        (_, _, _, true, _) => Kind::Rdp,
+        (.., true) => Kind::Vnc,
+        _ => Kind::Http,
+    };
+    let req = AddRequest {
+        port,
+        unix,
+        allow_sensitive_socket,
+        kind,
+        remote_port,
+        allow: allow_cidr,
+        allow_any,
+        serve,
+        list: !no_list,
+        keep_list: !no_list && !list,
+        site,
+        allow_sensitive_root,
+        shell: shell.then(|| if command.is_empty() { login_shell() } else { command }),
+        cwd: None,
+        writable: write,
+        max_clients,
+        host,
+        local_https,
+        name,
+        probe_path,
+        timeout_secs: timeout,
+        visibility,
+        tags,
+        hostname,
+        no_verify,
+        no_check,
+    };
+    Some((req, out))
+}
+
+/// Paths in a request made absolute, as the agent needs them: it runs in another directory.
+fn resolve_paths(req: &mut AddRequest) -> Result<(), ErrorInfo> {
+    if let Some(dir) = &req.serve {
+        let abs = std::fs::canonicalize(dir)
+            .map_err(|e| ErrorInfo::new(ErrorCode::InvalidDirectory, format!("cannot serve {}: {e}", dir.display())))?;
+        req.serve = Some(abs);
+    }
+    if let Some(path) = &req.unix {
+        if !platform::UNIX_SOCKETS {
+            return Err(ErrorInfo::new(ErrorCode::Unsupported, "--unix needs macOS or Linux: Windows has no Unix socket support here yet"));
+        }
+        // Absolute, but with its links as they are: they may point somewhere new after a deploy.
+        let abs = std::path::absolute(path).map_err(|e| ErrorInfo::new(ErrorCode::InvalidSocket, format!("cannot use {}: {e}", path.display())))?;
+        if abs.to_str().is_none() {
+            return Err(ErrorInfo::new(ErrorCode::InvalidSocket, format!("{} isn't valid UTF-8, which the agent needs its paths to be", abs.display())));
+        }
+        req.unix = Some(abs);
+    }
+    if req.shell.is_some() {
+        let cwd = std::env::current_dir().and_then(std::fs::canonicalize);
+        req.cwd = Some(cwd.map_err(|e| ErrorInfo::new(ErrorCode::InvalidCommand, format!("cannot use the current directory: {e}")))?);
+    }
+    Ok(())
 }
 
 fn parse_tag(s: &str) -> Result<String, String> {
@@ -448,81 +562,8 @@ fn read_pid() -> Option<String> {
 async fn dispatch(cmd: Command) -> ExitCode {
     let (out, result) = match cmd {
         Command::Login { server, token, token_file, browser, ca_cert, name, out } => (out, login(server, token, token_file, browser, ca_cert, name, out).await),
-        Command::Add {
-            port,
-            unix,
-            allow_sensitive_socket,
-            tcp,
-            udp,
-            ssh,
-            rdp,
-            vnc,
-            remote_port,
-            allow_cidr,
-            allow_any,
-            serve,
-            no_list,
-            list,
-            site,
-            allow_sensitive_root,
-            shell,
-            write,
-            max_clients,
-            command,
-            private,
-            public,
-            tags,
-            name,
-            hostname,
-            no_verify,
-            host,
-            local_https,
-            probe_path,
-            no_check,
-            timeout,
-            out,
-        } => {
-            let visibility = match (private || !tags.is_empty(), public) {
-                (true, _) => Some(Visibility::Private),
-                (_, true) => Some(Visibility::Public),
-                _ => None,
-            };
-            let kind = match (tcp, udp, ssh, rdp, vnc) {
-                (true, ..) => Kind::Tcp,
-                (_, true, ..) => Kind::Udp,
-                (_, _, true, ..) => Kind::Ssh,
-                (_, _, _, true, _) => Kind::Rdp,
-                (.., true) => Kind::Vnc,
-                _ => Kind::Http,
-            };
-            let req = AddRequest {
-                port,
-                unix,
-                allow_sensitive_socket,
-                kind,
-                remote_port,
-                allow: allow_cidr,
-                allow_any,
-                serve,
-                list: !no_list,
-                keep_list: !no_list && !list,
-                site,
-                allow_sensitive_root,
-                shell: shell.then(|| if command.is_empty() { login_shell() } else { command }),
-                cwd: None,
-                writable: write,
-                max_clients,
-                host,
-                local_https,
-                name,
-                probe_path,
-                timeout_secs: timeout,
-                visibility,
-                tags,
-                hostname,
-                no_verify,
-                no_check,
-            };
+        cmd @ Command::Add { .. } => {
+            let (req, out) = add_request(cmd).expect("an add command");
             (out, add(req, out).await)
         }
         Command::Connect { tunnel, local, server, ca_cert, no_browser, api_token, api_token_file, out } => {
@@ -637,6 +678,52 @@ fn unreachable_server(e: &anyhow::Error) -> ErrorInfo {
     ErrorInfo::new(ErrorCode::ServerUnreachable, format!("{text}.{hint}"))
 }
 
+/// Enrolls this machine with an enrollment token, and saves the identity the server gives it.
+async fn enroll(server: &str, token: &str, ca_pem: Option<String>, tls: &Arc<rustls::ClientConfig>, agent_name: &str) -> Result<magicpipes_core::proto::EnrollResponse, ErrorInfo> {
+    let body = json!({ "enrollment_token": token.trim(), "agent_name": agent_name });
+    let (status, resp) = https::post_json(server, "/api/v1/enroll", tls, &body).await.map_err(|e| unreachable_server(&e))?;
+    if !status.is_success() {
+        let msg = resp["error"]["message"].as_str().unwrap_or("enrollment failed").to_string();
+        let code = resp["error"]["code"].as_str().unwrap_or(ErrorCode::InvalidEnrollmentToken.as_str());
+        return Err(ErrorInfo::wire(code, msg));
+    }
+    let enrolled: magicpipes_core::proto::EnrollResponse =
+        serde_json::from_value(resp).map_err(|e| ErrorInfo::new(ErrorCode::Protocol, e.to_string()))?;
+    let cfg = AgentConfig {
+        server: server.to_string(),
+        agent_id: enrolled.agent_id.clone(),
+        agent_token: enrolled.agent_token.clone(),
+        base_domain: enrolled.base_domain.clone(),
+        ca_cert_pem: ca_pem,
+        // Logging in again keeps how many connections were asked for.
+        connections: AgentConfig::load().ok().flatten().and_then(|c| c.connections),
+    };
+    cfg.save().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
+    Ok(enrolled)
+}
+
+/// For `agent run` in a container that hasn't enrolled yet: enrolls with `MAGICPIPES_SERVER` and
+/// `MAGICPIPES_TOKEN` (or `MAGICPIPES_TOKEN_FILE`), also trusting `MAGICPIPES_CA_CERT`, named
+/// `MAGICPIPES_AGENT_NAME` or the hostname. `None` when there's no server or token to do it with.
+async fn enroll_from_env() -> Result<Option<AgentConfig>, ErrorInfo> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let read = |path: &str| std::fs::read_to_string(path).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("reading {path}: {e}")));
+    let Some(server) = var("MAGICPIPES_SERVER") else { return Ok(None) };
+    let token = match (var("MAGICPIPES_TOKEN"), var("MAGICPIPES_TOKEN_FILE")) {
+        (Some(token), _) => token,
+        (None, Some(path)) => read(&path)?,
+        (None, None) => return Ok(None),
+    };
+    let server = server.trim().trim_end_matches('/').to_string();
+    https::parse_server(&server).map_err(|e| ErrorInfo::new(ErrorCode::InvalidServer, e.to_string()))?;
+    let ca_pem = var("MAGICPIPES_CA_CERT").map(|path| read(&path)).transpose()?;
+    let tls = https::tls_config(ca_pem.as_deref()).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
+    let name = var("MAGICPIPES_AGENT_NAME").unwrap_or_else(platform::hostname);
+    let enrolled = enroll(&server, &token, ca_pem, &tls, &name).await?;
+    tracing::info!(%server, agent = %enrolled.agent_id, "enrolled this machine");
+    AgentConfig::load().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))
+}
+
 async fn login(
     server: String,
     token: Option<String>,
@@ -674,33 +761,13 @@ async fn login(
             ));
         }
     };
-    let body = json!({ "enrollment_token": token.trim(), "agent_name": agent_name });
-    let (status, resp) = https::post_json(&server, "/api/v1/enroll", &tls, &body)
-        .await
-        .map_err(|e| unreachable_server(&e))?;
-    if !status.is_success() {
-        let msg = resp["error"]["message"].as_str().unwrap_or("enrollment failed").to_string();
-        let code = resp["error"]["code"].as_str().unwrap_or(ErrorCode::InvalidEnrollmentToken.as_str());
-        return Err(ErrorInfo::wire(code, msg));
-    }
-    let enrolled: magicpipes_core::proto::EnrollResponse =
-        serde_json::from_value(resp).map_err(|e| ErrorInfo::new(ErrorCode::Protocol, e.to_string()))?;
     // A running agent still uses the previous identity: stop it; the next command restarts it.
     let was_running = client::connect().await.is_some();
+    let enrolled = enroll(&server, &token, ca_pem, &tls, &agent_name).await?;
     if was_running {
         let _ = client::request(&IpcRequest::Shutdown { if_idle: false }, |_, _| {}).await;
         client::wait_stopped(Duration::from_secs(5)).await;
     }
-    let cfg = AgentConfig {
-        server: server.clone(),
-        agent_id: enrolled.agent_id.clone(),
-        agent_token: enrolled.agent_token,
-        base_domain: enrolled.base_domain.clone(),
-        ca_cert_pem: ca_pem,
-        // Logging in again keeps how many connections were asked for.
-        connections: AgentConfig::load().ok().flatten().and_then(|c| c.connections),
-    };
-    cfg.save().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     if out.json {
         print_json(&json!({ "server": server, "agent_id": enrolled.agent_id, "base_domain": enrolled.base_domain }));
     } else {
@@ -754,27 +821,7 @@ impl Progress {
 
 async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
     client::require_login()?;
-    // The agent runs elsewhere (another working directory), so it needs an absolute path.
-    if let Some(dir) = &req.serve {
-        let abs = std::fs::canonicalize(dir)
-            .map_err(|e| ErrorInfo::new(ErrorCode::InvalidDirectory, format!("cannot serve {}: {e}", dir.display())))?;
-        req.serve = Some(abs);
-    }
-    if let Some(path) = &req.unix {
-        if !platform::UNIX_SOCKETS {
-            return Err(ErrorInfo::new(ErrorCode::Unsupported, "--unix needs macOS or Linux: Windows has no Unix socket support here yet"));
-        }
-        // Absolute, but with its links as they are: they may point somewhere new after a deploy.
-        let abs = std::path::absolute(path).map_err(|e| ErrorInfo::new(ErrorCode::InvalidSocket, format!("cannot use {}: {e}", path.display())))?;
-        if abs.to_str().is_none() {
-            return Err(ErrorInfo::new(ErrorCode::InvalidSocket, format!("{} isn't valid UTF-8, which the agent needs its paths to be", abs.display())));
-        }
-        req.unix = Some(abs);
-    }
-    if req.shell.is_some() {
-        let cwd = std::env::current_dir().and_then(std::fs::canonicalize);
-        req.cwd = Some(cwd.map_err(|e| ErrorInfo::new(ErrorCode::InvalidCommand, format!("cannot use the current directory: {e}")))?);
-    }
+    resolve_paths(&mut req)?;
     let kind = req.kind;
     let serving = req.serve.clone();
     let listing = serving.is_some() && req.list;

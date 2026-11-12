@@ -89,7 +89,7 @@ export MAGICPIPES_HOME
 MAGICPIPES_HOME=$(native "$WORK/home")
 export MAGICPIPES_PROBE_ADDR=127.0.0.1
 
-SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP="" CONNVNC="" HTTPSAPP=""
+SRV="" APPPID="" ECHOPID="" SOCKPID="" CONNTCP="" CONNUDP="" CONNRDP="" CONNVNC="" HTTPSAPP="" PODPID=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -103,10 +103,12 @@ cleanup() {
   stop_pid "$CONNRDP"
   stop_pid "$CONNVNC"
   stop_pid "$HTTPSAPP"
+  stop_pid "$PODPID"
   if [[ $status -ne 0 ]]; then
     echo "smoke test FAILED during step: $STEP (exit $status)"
     echo "---- server.log"; cat server.log 2>/dev/null || true
     echo "---- agent.log"; cat "$WORK/home/agent.log" 2>/dev/null || true
+    echo "---- pod.log"; cat "$WORK/pod.log" 2>/dev/null || true
     annotate "smoke test failed at: $STEP" "$WORK/transcript.log"
     annotate "server.log" "$WORK/server.log"
     annotate "agent.log" "$WORK/home/agent.log"
@@ -514,6 +516,27 @@ run "$MP" remove term
 run "$MP" remove ptcp
 run "$MP" remove pudp
 run "$MP" agent stop
+
+step "agent run as in a container"
+# In the foreground, in a home of its own, with everything in its environment: it enrolls the
+# first time, serves the declared tunnel and answers its readiness probe once it does.
+run "$MPD" --config "$(native "$WORK/server.toml")" enroll
+POD_TOKEN=$(awk '{print $NF}' cmd.out | tr -d '\r' | tail -n 1)
+HEALTH=39096
+MAGICPIPES_HOME=$(native "$WORK/pod") MAGICPIPES_SERVER="https://localhost:$MGMT" MAGICPIPES_TOKEN="$POD_TOKEN" \
+  MAGICPIPES_CA_CERT="$CA" MAGICPIPES_TUNNELS="$APP --name declared --public" MAGICPIPES_HEALTH_LISTEN="127.0.0.1:$HEALTH" \
+  "$MP" agent run > pod.log 2>&1 < /dev/null &
+PODPID=$!
+for _ in $(seq 1 300); do
+  "${CURL[@]}" -f -o /dev/null "http://127.0.0.1:$HEALTH/readyz" 2>/dev/null && break
+  sleep 0.2
+done
+run "${CURL[@]}" -f "http://127.0.0.1:$HEALTH/readyz"
+grep -q '"ready":true' cmd.out
+run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "declared.t.test:$HTTPS:127.0.0.1" "https://declared.t.test:$HTTPS/"
+grep -q "hello from smoke test" cmd.out
+stop_pid "$PODPID"
+PODPID=""
 
 # A freshly started agent must not keep the CLI's output open: `magicpipes ... | cat` has to
 # finish when the CLI exits, even though the agent keeps running.

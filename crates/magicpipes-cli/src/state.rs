@@ -3,7 +3,7 @@
 //!
 //! | file          | contents                                         |
 //! |---------------|--------------------------------------------------|
-//! | `config.json` | server URL, agent credentials, extra CA (0600)   |
+//! | `config.json` | server URL, agent credentials, extra CA (0600; `MAGICPIPES_CONFIG` names another file, such as a Kubernetes Secret) |
 //! | `tunnels.json`| tunnels this agent serves (0600)                 |
 //! | `agent.sock`  | IPC socket on Unix (0600, peer uid checked; `MAGICPIPES_SOCKET` overrides; a named pipe on Windows) |
 //! | `agent.lock`  | exclusive lock held by the running agent         |
@@ -58,7 +58,10 @@ pub fn log_path() -> PathBuf {
     home().join("agent.log")
 }
 fn config_path() -> PathBuf {
-    home().join("config.json")
+    match std::env::var_os("MAGICPIPES_CONFIG") {
+        Some(p) => PathBuf::from(p),
+        None => home().join("config.json"),
+    }
 }
 pub fn tunnels_path() -> PathBuf {
     home().join("tunnels.json")

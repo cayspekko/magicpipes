@@ -132,6 +132,14 @@ magicpipes remove <name|port|socket path> # stop publishing
 magicpipes status --json      # login/agent/connection state
 ```
 
+In a container, `magicpipes agent run` takes its tunnels from `MAGICPIPES_TUNNELS`: one per line,
+written as `add` arguments, each with `--name` or `--hostname` (for example
+`8080 --name shop --public`). It removes tunnels that aren't declared any more, and keeps trying a
+declared one until its app answers. `MAGICPIPES_HEALTH_LISTEN=9090` serves `/readyz` (200 once
+every declared tunnel works; 503 with `waiting` entries, each a `tunnel` and an error code, until
+then). The first start enrolls with `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`. See
+`docs/KUBERNETES.md`.
+
 To check whether tunnels are reachable from the internet, not just from the server, run
 `magicpipes probe --json` with an API token in `MAGICPIPES_API_TOKEN` (add `--server <management
 URL>` off an enrolled machine). It checks HTTP tunnels and public TCP ports the token's user manages,

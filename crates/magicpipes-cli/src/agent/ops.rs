@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::declared::Declarations;
 use super::local_tls;
 use super::probe;
 use super::serve;
@@ -539,6 +540,33 @@ impl Agent {
             ConnState::Connecting { last_error, .. } => ("connecting", last_error),
             ConnState::Unauthorized(m) => ("unauthorized", Some(m)),
         }
+    }
+
+    /// Whether the agent serves what it should, for the readiness endpoint: connected, and every
+    /// declared tunnel (without declarations, every tunnel) registered on this session. With what
+    /// it's waiting for.
+    pub fn readiness(&self, declared: Option<&Declarations>) -> (bool, Value) {
+        let (conn, _) = self.connection();
+        let snapshots = self.tunnels.snapshots();
+        let mut waiting: Vec<Value> = Vec::new();
+        match declared {
+            Some(d) => {
+                let pending = d.waiting();
+                for label in d.labels() {
+                    let registered = snapshots.iter().any(|s| {
+                        (s.tunnel.name == label || (s.tunnel.custom_hostname && s.tunnel.hostname == label)) && s.registration == Registration::Registered
+                    });
+                    match pending.iter().find(|(l, _)| l == label) {
+                        Some((_, why)) => waiting.push(json!({ "tunnel": label, "error": why })),
+                        None if !registered => waiting.push(json!({ "tunnel": label })),
+                        None => {}
+                    }
+                }
+            }
+            None => waiting.extend(snapshots.iter().filter(|s| s.registration != Registration::Registered).map(|s| json!({ "tunnel": s.tunnel.name }))),
+        }
+        let ready = conn == "connected" && waiting.is_empty();
+        (ready, json!({ "ready": ready, "connection": conn, "waiting": waiting }))
     }
 
     pub fn list(&self) -> Value {
