@@ -298,7 +298,7 @@ impl ControlPlane {
 
     /// Starts certificate provisioning for known hostnames, the stale-session reaper, the queue of
     /// requests for sign-in links, and hourly pruning of the audit log, expired UI sessions and
-    /// emailed links.
+    /// emailed links, and disabling accounts single sign-on has gone quiet about.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) {
         let hosts: Vec<String> = self
             .state
@@ -333,6 +333,7 @@ impl ControlPlane {
                     _ = hourly.tick() => {
                         me.prune();
                         me.prune_history();
+                        me.disable_idle_accounts();
                     }
                 }
             }

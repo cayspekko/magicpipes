@@ -10,6 +10,13 @@
 //! refresh token is kept. A provider that can't be reached leaves sessions as they are until the
 //! next round. GitHub and the proxy have no refresh tokens: their sessions last as long as a
 //! session does.
+//!
+//! With `[users] disable_idle_after_days`, an account that signs in only through single sign-on is
+//! disabled once nothing has vouched for it in that long: no sign-in, no re-check its provider
+//! answered, no administrator enabling it. Someone a provider dropped never signs in again, so
+//! what they left here (API tokens, machines, tags an administrator gave) stops with the account.
+//! Anyone else signs in, which enables it again at once; until then their machines serve nothing,
+//! so whoever owns one is told by email how to get back in.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ControlPlane, OrLog};
 use crate::authz::Principal;
+use crate::mail;
 use crate::oidc::{Provider, Refused, Tokens};
 use crate::store::RecheckRow;
 
@@ -27,6 +35,9 @@ use crate::store::RecheckRow;
 const BATCH: usize = 500;
 /// Checks under way at once.
 const AT_ONCE: usize = 8;
+/// People told their account was disabled, in one hourly round. The rest of the server's hourly
+/// mail allowance stays for sign-in links and invitations.
+const MAX_TOLD: usize = 100;
 
 impl ControlPlane {
     /// The provider the sign-in page goes straight to, if one does and people can use it.
@@ -82,7 +93,7 @@ impl ControlPlane {
         };
         // A provider that's gone, or no longer offered, can't be asked; the session lasts its age.
         let Some(provider) = self.oidc_providers().into_iter().find(|p| p.issuer == row.issuer && p.kind.is_oidc()) else {
-            self.store.session_rechecked(&row.id_hash, &row.tokens).or_log();
+            self.store.session_rechecked(&row.id_hash, &row.tokens, false).or_log();
             return;
         };
         let Some(subject) = self.store.identity_subject(&row.user_id, &row.issuer).or_log().flatten() else {
@@ -96,15 +107,50 @@ impl ControlPlane {
                     self.match_tag_rules(&row.issuer, &row.user_id, &person.claims);
                 }
                 if let Ok(plain) = serde_json::to_vec(&kept) {
-                    self.store.session_rechecked(&row.id_hash, &signer.encrypt(&plain)).or_log();
+                    self.store.session_rechecked(&row.id_hash, &signer.encrypt(&plain), true).or_log();
                 }
             }
             Err(Refused::Grant) => self.end_sso_session(&row, &format!("{} no longer vouches for it", provider.label)),
             Err(Refused::Unavailable(why)) => {
                 tracing::warn!(provider = %provider.id, %why, "couldn't check a session with its provider; trying again next round");
-                self.store.session_rechecked(&row.id_hash, &row.tokens).or_log();
+                self.store.session_rechecked(&row.id_hash, &row.tokens, false).or_log();
             }
         }
+    }
+
+    /// Disables the accounts nothing has vouched for in `disable_idle_after_days` (hourly), and tells
+    /// those who own machines, which stop with it, how to get back in.
+    pub(super) fn disable_idle_accounts(self: &Arc<Self>) {
+        let days = self.cfg.users.disable_idle_after_days;
+        if days == 0 {
+            return;
+        }
+        let before = unix_now().saturating_sub(i64::try_from(days.saturating_mul(86_400)).unwrap_or(i64::MAX));
+        let why = format!("no single sign-on in {days} days");
+        // The audit entries are written with the change, in one transaction however many there are.
+        let idle = self.store.disable_idle(before, &why).or_log().unwrap_or_default();
+        if idle.is_empty() {
+            return;
+        }
+        tracing::info!(accounts = idle.len(), "disabled accounts: {why}");
+        // Their machines stop, and their tunnel cookies with them.
+        self.refresh();
+        if !self.mail_on() {
+            return;
+        }
+        let to: Vec<String> = idle.into_iter().filter(|(u, machines)| u.email_verified && *machines > 0).map(|(u, _)| u.email).collect();
+        if to.len() > MAX_TOLD {
+            tracing::warn!(told = MAX_TOLD, left = to.len() - MAX_TOLD, "too many disabled accounts to email them all");
+        }
+        let message = mail::account_disabled(&self.cfg.management_url(), days);
+        let me = self.clone();
+        tokio::spawn(async move {
+            for address in to.into_iter().take(MAX_TOLD) {
+                if let Err(e) = me.deliver(&address, &message).await {
+                    tracing::warn!(error = %e.message, "couldn't email someone whose account was disabled");
+                }
+            }
+        });
     }
 
     /// Ends a session its provider stopped vouching for, and what its rules gave from there.

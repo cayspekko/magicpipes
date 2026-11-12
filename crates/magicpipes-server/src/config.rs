@@ -356,6 +356,8 @@ pub struct OidcConfig {
 /// What a sign-in asks for when nothing says otherwise.
 pub const DEFAULT_SCOPES: [&str; 3] = ["openid", "email", "profile"];
 const MAX_SCOPES: usize = 20;
+/// Ten years: the most `users.disable_idle_after_days` can be.
+const MAX_IDLE_DAYS: u64 = 3650;
 
 /// Scopes as typed (space- or comma-separated), checked: `openid` among them, each a scope token
 /// (RFC 6749 3.3). The default comes back empty.
@@ -641,6 +643,10 @@ pub struct UsersConfig {
     /// How often a single sign-on's session is checked with its provider, through the refresh token
     /// it gave: a refusal ends the session, and an answer updates tag rules. 0: never.
     pub sso_recheck_secs: u64,
+    /// Accounts that sign in only through single sign-on are disabled after this many days in
+    /// which nothing vouched for them: no sign-in, no re-check their provider answered, no
+    /// administrator enabling them. Their next single sign-on enables them again. 0: never.
+    pub disable_idle_after_days: u64,
 }
 
 impl Default for UsersConfig {
@@ -653,6 +659,7 @@ impl Default for UsersConfig {
             allowed_email_domains: Vec::new(),
             max_agents_per_user: 25,
             sso_recheck_secs: 3600,
+            disable_idle_after_days: 0,
         }
     }
 }
@@ -806,6 +813,14 @@ impl Config {
         }
         if self.users.sso_recheck_secs != 0 && !(10..=86_400).contains(&self.users.sso_recheck_secs) {
             bail!("users.sso_recheck_secs must be 0 (never) or between 10 and 86400");
+        }
+        let idle = self.users.disable_idle_after_days;
+        if idle > MAX_IDLE_DAYS {
+            bail!("users.disable_idle_after_days must be 0 (never) or at most {MAX_IDLE_DAYS}");
+        }
+        // Without a re-check, nothing vouches for someone while they stay signed in.
+        if idle != 0 && idle * 86_400 <= self.users.session_max_age_secs {
+            bail!("users.disable_idle_after_days must be longer than users.session_max_age_secs, or people who stay signed in would be disabled");
         }
         self.base_domain = self.base_domain.trim().trim_end_matches('.').to_ascii_lowercase();
         self.management.hostname = self.management.hostname.trim().to_ascii_lowercase();
@@ -978,6 +993,11 @@ mod tests {
         assert_eq!(c.users.sso_recheck_secs, 3600);
         assert!(load("[users]\nsso_recheck_secs = 0").is_ok(), "never");
         assert!(load("[users]\nsso_recheck_secs = 5").is_err());
+        assert_eq!(c.users.disable_idle_after_days, 0, "off unless asked for");
+        assert_eq!(load("[users]\ndisable_idle_after_days = 90").unwrap().users.disable_idle_after_days, 90);
+        assert!(load("[users]\ndisable_idle_after_days = 4000").is_err());
+        assert!(load("[users]\ndisable_idle_after_days = 1\nsession_max_age_secs = 86400").is_err(), "outlasted by a session");
+        assert!(load("[users]\ndisable_idle_after_days = 2\nsession_max_age_secs = 86400").is_ok());
     }
 
     #[test]

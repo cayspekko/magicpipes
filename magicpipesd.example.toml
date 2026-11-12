@@ -85,6 +85,7 @@ acme_directory = "letsencrypt"
 # members_can_publish = true           # may members' machines create public tunnels? (checked on every new or changed one)
 # max_agents_per_user = 25              # machines a member may enroll themself, counting unused tokens (0: no limit)
 # sso_recheck_secs = 3600              # how often a single sign-on's session is checked with its provider (0: never)
+# disable_idle_after_days = 0          # disable accounts that sign in only through single sign-on after this many days without one or a re-check (0: never); their next sign-in enables them
 
 [ports]
 # Raw TCP and UDP tunnels (`magicpipes add 5432 --tcp`, `add 53 --udp`). Off unless `range` is

@@ -134,7 +134,12 @@ connections:
   the same small client as the sign-in (4 s each). `invalid_grant` ends the session and clears that
   provider's rule matches; a provider that can't be reached is tried next round. Signing out reads
   the session's ID token for the provider's `end_session_endpoint`, and leaves through a page of
-  ours, since a form's redirect can't leave the management host.
+  ours, since a form's redirect can't leave the management host. With `disable_idle_after_days`,
+  the hourly prune disables, in one transaction, accounts with no password and an outside identity
+  whose `users.vouched_at` (a single sign-on, a re-check the provider answered, an administrator
+  enabling them) is older, marking them `disabled_reason = 'idle'`, then refreshes once. The next
+  single sign-on through a known identity clears that in the same transaction that records it, so a
+  sign-in and the sweep can't leave a session for a disabled account.
 * Private tunnels (`data/gate.rs`, `tunnel_auth.rs`): the management cookie never leaves the
   management host, so a private tunnel's host gets its own signed cookie (`__Host-mp_tunnel`,
   HMAC-SHA256 with `data_dir/session-key`) through a redirect to `/auth/tunnel` and a one-time,

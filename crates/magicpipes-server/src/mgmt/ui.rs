@@ -61,6 +61,7 @@ done_messages! {
     RoleChanged "role-changed" "Role changed.",
     UserDisabled "user-disabled" "User disabled. They were signed out, and their machines stopped serving tunnels.",
     UserEnabled "user-enabled" "User enabled.",
+    UserKeptDisabled "user-kept-disabled" "User kept disabled. Signing in won't enable it again.",
     TokensRevoked "tokens-revoked" "Their API tokens were revoked.",
     TagCreated "tag-created" "Tag created.",
     TagDeleted "tag-deleted" "Tag deleted.",

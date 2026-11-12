@@ -178,7 +178,11 @@ impl ControlPlane {
         if person.vouched_for && !user.email_verified && person.verified_email.as_deref().and_then(normalize_email).as_deref() == Some(user.email.as_str()) {
             self.store.mark_email_verified(&user.id).map_err(logged(SignInError::Internal))?;
         }
-        self.store.finish_sso_login(&user.id, source.issuer).map_err(logged(SignInError::Internal))?;
+        if self.store.finish_sso_login(&user.id, source.issuer).map_err(logged(SignInError::Internal))? {
+            self.audit(&Principal::Anonymous, "user.enable", &user.id, &format!("signed in again through {}", source.name));
+            // Their machines serve again.
+            self.refresh();
+        }
         self.match_tag_rules(source.issuer, &user.id, &person.claims);
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(SignInError::Internal))?;
         let kept = tokens.filter(|t| !t.is_empty());
@@ -197,7 +201,8 @@ impl ControlPlane {
         let refused = || SignInError::NotAllowed(email.clone());
         let known = self.store.identity_user(source.issuer, &person.subject).map_err(logged(SignInError::Internal))?;
         if let Some(user) = known {
-            return if user.disabled { Err(refused()) } else { Ok(user) };
+            // Going without a sign-in disabled it, and this is one.
+            return if user.disabled && !user.disabled_idle { Err(refused()) } else { Ok(user) };
         }
         let Some(address) = email.as_deref() else { return Err(refused()) };
         let may_be_admin = person.vouched_for || source.allow_unverified_admin;

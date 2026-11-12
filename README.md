@@ -356,6 +356,19 @@ The admin token works regardless.
   it, so it's off unless you turn it on. Register `https://<management hostname>/signed-out` there
   as a post-logout redirect URI; the provider comes back to it.
 
+**When someone leaves.** Removing a person at the provider stops their sign-ins, and with re-checks
+their sessions, but not what they left here: API tokens, machines, and tags an administrator gave
+them. Set `[users] disable_idle_after_days` (say 30; 0, the default, is off) and an account that
+signs in only through single sign-on is disabled once nothing has vouched for it in that many days:
+no sign-in, no re-check its provider answered, no administrator enabling it. That signs them out,
+stops their API tokens, and their machines stop serving tunnels. Someone still there just signs in
+again, which enables the account at once, and their machines start serving again by themselves.
+Whoever owns a machine is told by email (if mail is set up), since otherwise they'd only see their
+tunnels stop. On the Users page such an account says "no sign-in in 30 days", and **Keep disabled**
+stops a sign-in from enabling it. Accounts with a password aren't affected: a provider can't vouch
+for those. It has to be longer than `session_max_age_secs`, since a session without re-checks
+vouches for nobody while it lasts.
+
 **In the configuration file.** The same settings can go in `magicpipesd.toml`. They show on the
 Settings page as locked, and a provider there wins over one of the same id on the page. Lists from
 the file and the page are combined. A missing `client_secret_file` stops the server from starting.
@@ -1278,7 +1291,9 @@ answer `403 forbidden` to members.
 | GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 
-User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`,
+User object: `id`, `email`, `display_name`, `role`, `disabled`, `disabled_reason` (only `idle`, when
+`disable_idle_after_days` did it rather than an administrator: their next single sign-on enables it
+again), `must_change_password`,
 `has_password` (false for someone who only signs in with single sign-on), `email_verified` (they
 proved the address is theirs), `tags` (assigned), `rule_tags` (given by tag rules now), `personal_tag`,
 `created_at`, `last_login_at`.

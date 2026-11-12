@@ -3407,6 +3407,66 @@ async fn sso_sessions_are_checked_again_and_sign_out_at_the_provider() {
     assert!(edit.contains(r#"name="scopes" value="openid email groups""#) && edit.contains(r#"name="sign_out" checked"#), "{edit}");
 }
 
+/// `[users] disable_idle_after_days`: an account single sign-on went quiet about is disabled, and
+/// its machines with it, and its owner is told. Signing in again enables it; an administrator can
+/// keep it disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accounts_single_sign_on_went_quiet_about_are_disabled() {
+    let idp = common::FakeOidc::start().await;
+    let smtp = common::FakeSmtp::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-idle-{}", std::process::id()));
+    let users = "allowed_email_domains = [\"team.example.com\"]\ndisable_idle_after_days = 30";
+    let mut env = Env::with_config(Tls::DevCa, &format!("{}{}", idp.config(&dir, users, true), smtp.config())).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string(), "--public"]).await;
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let email = "dev@team.example.com";
+    *idp.person.lock().unwrap() = common::OidcPerson::new("dev-1", email);
+    let cookie = session_of(&oidc_sign_in(&env, None).await);
+    let id = user_named(&env, email).await["id"].as_str().unwrap().to_string();
+    assert_eq!(env.get_public(&host, "/").await.0, StatusCode::OK);
+
+    // The machine is theirs, and 31 days pass with nothing vouching for them.
+    env.stop_server().await;
+    let db = rusqlite::Connection::open(env.root.join("server/magicpipes.db")).unwrap();
+    db.execute("UPDATE users SET vouched_at = vouched_at - 31 * 86400 WHERE id = ?1", [&id]).unwrap();
+    db.execute("UPDATE agents SET owner_user_id = ?1", [&id]).unwrap();
+    env.start_server().await;
+
+    // The hourly round, which starts with the server, disables the account and stops the machine.
+    env.eventually("the account to be disabled", Duration::from_secs(10), || async { user_named(&env, email).await["disabled"] == true }).await;
+    let disabled = user_named(&env, email).await;
+    assert_eq!((disabled["disabled"].as_bool(), disabled["disabled_reason"].as_str()), (Some(true), Some("idle")), "{disabled}");
+    let told = smtp.wait_for(email, 1).await;
+    assert!(told.text.contains("hasn't been signed in to for 30 days") && told.text.contains(&format!("{}/login", env.server_url())), "{}", told.text);
+    env.eventually("the machine to stop serving", Duration::from_secs(15), || async { env.get_public(&host, "/").await.0 != StatusCode::OK }).await;
+    assert!(env.ui("/account", Some(&cookie), None).await.location.as_deref().is_some_and(|l| l.starts_with("/login")), "signed out");
+    let admin = env.admin_token();
+    let (_, audit) = env.api("GET", "/api/v1/audit?limit=20", Some(&admin)).await;
+    assert!(audit["entries"].as_array().unwrap().iter().any(|e| e["action"] == "user.disable" && e["detail"] == "no single sign-on in 30 days"), "{audit}");
+    let admin_cookie = admin_session(&env).await;
+    let page = env.ui("/users", Some(&admin_cookie), None).await;
+    assert!(page.html.contains("no sign-in in 30 days") && page.html.contains("Keep disabled"), "{}", page.html);
+
+    // Signing in again enables it, and the machine serves again by itself.
+    session_of(&oidc_sign_in(&env, None).await);
+    let back = user_named(&env, email).await;
+    assert!(back["disabled"] == false && back.get("disabled_reason").is_none(), "{back}");
+    env.eventually("the machine to serve again", Duration::from_secs(30), || async { env.get_public(&host, "/").await.0 == StatusCode::OK }).await;
+    let (_, audit) = env.api("GET", "/api/v1/audit?limit=20", Some(&admin)).await;
+    assert!(audit["entries"].as_array().unwrap().iter().any(|e| e["action"] == "user.enable" && e["detail"] == "signed in again through oidc:fake"), "{audit}");
+
+    // An administrator who knows they've left keeps it disabled, and signing in no longer helps.
+    db.execute("UPDATE users SET disabled_at = unixepoch(), disabled_reason = 'idle' WHERE id = ?1", [&id]).unwrap();
+    let page = env.ui("/users", Some(&admin_cookie), None).await;
+    let kept = env.ui(&format!("/users/{id}"), Some(&admin_cookie), Some(&[("csrf", &page.csrf()), ("action", "keep-disabled")])).await;
+    assert_eq!(kept.location.as_deref(), Some("/users?done=user-kept-disabled"), "{}", kept.html);
+    let kept = user_named(&env, email).await;
+    assert!(kept["disabled"] == true && kept.get("disabled_reason").is_none(), "{kept}");
+    assert_eq!(oidc_sign_in(&env, None).await.status, StatusCode::FORBIDDEN);
+}
+
 /// GitHub isn't OpenID Connect, but who gets in is decided the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn github_sign_in_admits_only_who_it_should() {

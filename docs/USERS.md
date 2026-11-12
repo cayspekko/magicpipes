@@ -436,6 +436,18 @@ the file:
   (RP-Initiated Logout) with `client_id`, `id_token_hint` and `post_logout_redirect_uri` =
   `<management>/signed-out`. Off by default, since it signs people out of everything else using
   that provider. Not after "Switch account", which means to sign in again.
+- **`[users] disable_idle_after_days`** (*built 2026-11-12*; 0, off, by default). An account with no
+  password and an identity from a provider is disabled once nothing has vouched for it in that many
+  days: `users.vouched_at`, set by a single sign-on, a re-check its provider answered, and an
+  administrator enabling it (migration 15 starts it from the last single sign-on). The hourly
+  prune does it, as disabling does: sessions, emailed links and invitations they sent end, and the
+  directory refresh stops their API tokens, tunnel cookies, SSH keys and machines. It's recorded as
+  `disabled_reason = 'idle'`, and the person's next single sign-on through an identity they already
+  have clears it, so someone still there is back at once; a first sign-in that would link by email
+  doesn't. **Keep disabled** (an administrator disabling it) clears the reason, so it sticks. Owners
+  of machines with a confirmed address are emailed, at most 100 an hour, out of the server's 500.
+  It must be longer than `session_max_age_secs`: a session without re-checks vouches for nobody
+  while it lasts.
 
 **Not built:**
 - **`groups_claim`.** Not needed: a tag rule names its claim, `groups` or any other. Tag rules
@@ -903,6 +915,7 @@ allowed_email_domains = ["example.com"]   # SSO/social/proxy users created on fi
 members_can_publish = true                # may members' agents create public tunnels?
 session_max_age_secs = 43200
 sso_recheck_secs = 3600                   # check single sign-ons with their provider; 0: never
+disable_idle_after_days = 0               # disable SSO-only accounts nothing vouched for in this long; 0: never
 audit_retention_days = 90
 
 [proxy_auth]                              # method 2; off unless present
@@ -1064,10 +1077,12 @@ End-to-end tests, at minimum:
   configuration file, and controls for the admin token in the UI.
 - **Password accounts have no second factor** until TOTP lands. For stronger login, put the
   server behind SSO or an authenticating proxy.
-- **No offboarding from the provider.** Removing someone at a provider stops their next sign-in
-  there, but their account here stays: API tokens they made keep working, and so do tags an
-  administrator assigned them, until an administrator disables the account. There's no SCIM
-  and no back-channel logout. Disable the account here when someone leaves.
+- **Offboarding from the provider waits.** Removing someone at a provider stops their next sign-in
+  there, and with re-checks their sessions, but their account here stays: API tokens they made and
+  their machines keep working, and so do tags an administrator assigned them. With
+  `disable_idle_after_days`, that lasts until the account has gone that long without a single
+  sign-on; without it, until an administrator disables the account. There's no SCIM and no
+  back-channel logout. Accounts with a password are never disabled for going without.
 - **Rules see only top-level claims.** A nested one, such as Keycloak's `realm_access.roles`,
   can't be matched; configure the provider to send it as a top-level claim (Keycloak's group or
   role mappers can).

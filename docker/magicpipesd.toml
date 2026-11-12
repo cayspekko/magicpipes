@@ -28,6 +28,7 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # [users]
 # session_max_age_secs = 43200
 # sso_recheck_secs = 3600
+# disable_idle_after_days = 0
 # audit_retention_days = 90
 # members_can_publish = true
 # bootstrap_admins = ["you@example.com"]

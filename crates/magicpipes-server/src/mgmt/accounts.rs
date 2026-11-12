@@ -261,12 +261,18 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
     // Behind an authenticating proxy, nobody signs in with a password.
     let passwords = app.control.proxy_auth().is_none();
     let mail = app.control.mail_on();
+    // Said of an account disabled for going without a single sign-on, which the next one enables.
+    let idle = match app.control.config().users.disable_idle_after_days {
+        0 => "no recent sign-in".to_string(),
+        days => format!("no sign-in in {days} days"),
+    };
     let mut rows = String::new();
     for u in &users {
         let state = match (u.disabled, u.must_change_password) {
-            (true, _) => r#"<span class="status bad">disabled</span>"#,
-            (false, true) => r#"<span class="status warn">must change password</span>"#,
-            (false, false) => r#"<span class="status ok">active</span>"#,
+            (true, _) if u.disabled_reason.is_some() => format!(r#"<span class="status bad">disabled</span><span class="sub">{idle}</span>"#),
+            (true, _) => r#"<span class="status bad">disabled</span>"#.to_string(),
+            (false, true) => r#"<span class="status warn">must change password</span>"#.to_string(),
+            (false, false) => r#"<span class="status ok">active</span>"#.to_string(),
         };
         let me = matches!(&user.who, Principal::User { id, .. } if *id == u.id);
         let edit = picker::Edit {
@@ -304,6 +310,11 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
                 let also = if sent > 0 { format!(" {} they sent end.", count(sent, "invitation", "invitations")) } else { String::new() };
                 post("disable", "Disable", true, Some(format!("Disable {}? They are signed out, and their machines stop serving tunnels.{also}", u.email)))
             });
+            // Going without a sign-in disabled it, so the next one would enable it again.
+            if u.disabled_reason.is_some() {
+                let keep = format!("Keep {} disabled? Signing in through single sign-on won't enable it again; only an administrator can.", u.email);
+                items.push(post("keep-disabled", "Keep disabled", true, Some(keep)));
+            }
         }
         let you = if me { r#"<span class="sub you">you</span>"# } else { "" };
         let actions = format!("{you}{}", row_menu(&u.email, &items));
@@ -466,6 +477,7 @@ pub async fn update_user(State(app): State<AppState>, Path(id): Path<String>, Po
         "member" => (app.control.update_user(&user.who, &id, Some(Role::Member), None).map(drop), Done::RoleChanged),
         "disable" => (app.control.update_user(&user.who, &id, None, Some(true)).map(drop), Done::UserDisabled),
         "enable" => (app.control.update_user(&user.who, &id, None, Some(false)).map(drop), Done::UserEnabled),
+        "keep-disabled" => (app.control.update_user(&user.who, &id, None, Some(true)).map(drop), Done::UserKeptDisabled),
         _ => return failed(&user, StatusCode::BAD_REQUEST, "/users", "Users", "That isn't something that can be done to a user."),
     };
     match result {

@@ -113,6 +113,10 @@ pub struct UserView {
     pub display_name: String,
     pub role: Role,
     pub disabled: bool,
+    /// Why, when it wasn't an administrator: `idle`, for going without a single sign-on for
+    /// `disable_idle_after_days`. The next one enables it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<&'static str>,
     pub must_change_password: bool,
     /// False for someone who only signs in with single sign-on.
     pub has_password: bool,
@@ -138,6 +142,7 @@ impl From<UserRow> for UserView {
             display_name: u.display_name,
             role: u.role,
             disabled: u.disabled,
+            disabled_reason: u.disabled_idle.then_some("idle"),
             must_change_password: u.must_change_password,
             has_password: u.has_password,
             email_verified: u.email_verified,

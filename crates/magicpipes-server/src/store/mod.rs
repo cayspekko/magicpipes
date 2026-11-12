@@ -455,6 +455,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN checked_at INTEGER;
     CREATE INDEX sessions_checked ON sessions(checked_at) WHERE tokens IS NOT NULL;
     "#,
+    // 15: disabling accounts a single sign-on has gone quiet about (`disable_idle_after_days`).
+    // When something last vouched for the account (a single sign-on, a session re-check its
+    // provider answered, an administrator enabling it), starting from its last single sign-on; and
+    // why it's disabled: NULL for an administrator, 'idle' for going without, which the next
+    // single sign-on undoes.
+    r#"
+    ALTER TABLE users ADD COLUMN vouched_at INTEGER;
+    ALTER TABLE users ADD COLUMN disabled_reason TEXT;
+    UPDATE users SET vouched_at = (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = users.id AND i.issuer != 'local');
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -1004,6 +1014,79 @@ mod tests {
         store.set_rule_matches(&user, "https://b", &ids(&["tr_b"])).unwrap();
         assert!(store.delete_tag_rule("tr_b").unwrap());
         assert!(store.rule_matches(0).unwrap().is_empty(), "its matches went with it");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn accounts_single_sign_on_went_quiet_about_are_disabled_until_the_next_one() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(14) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        // Before vouching was kept: who signed in through single sign-on, and when.
+        let now = unix_now();
+        let account = |id: &str, last_sso: Option<i64>, password: bool| {
+            c.execute("INSERT INTO users (id, email, created_at) VALUES (?1, ?1 || '@example.com', 100)", [id]).unwrap();
+            c.execute("INSERT INTO memberships (org_id, user_id, role, created_at) VALUES ('org_default', ?1, 'member', 100)", [id]).unwrap();
+            c.execute("INSERT INTO identities (issuer, subject, user_id, last_login_at) VALUES ('https://idp', ?1, ?1, ?2)", params![id, last_sso]).unwrap();
+            if password {
+                c.execute("INSERT INTO identities (issuer, subject, user_id, last_login_at) VALUES ('local', ?1 || '@example.com', ?1, ?2)", params![id, now]).unwrap();
+                c.execute("INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, 'h', 0, 100)", [id]).unwrap();
+            }
+        };
+        account("us_gone", Some(1000), false);
+        account("us_never", None, false);
+        account("us_recent", Some(now), false);
+        account("us_password", Some(1000), true);
+        c.execute("INSERT INTO agents (id, name, token_hash, created_at, owner_user_id) VALUES ('ag_1', 'laptop', 'x', 100, 'us_gone')", []).unwrap();
+        drop(c);
+
+        let store = Store::open(&path).unwrap();
+        let vouched = |id: &str| -> Option<i64> { store.with(|c| c.query_row("SELECT vouched_at FROM users WHERE id = ?1", [id], |r| r.get(0))).unwrap() };
+        assert_eq!((vouched("us_gone"), vouched("us_never")), (Some(1000), None), "from the last single sign-on");
+        let (cookie, _) = store.create_session(Some("us_gone"), 3600).unwrap();
+
+        // Only accounts that sign in through single sign-on alone, and that nothing vouched for since.
+        let idle = store.disable_idle(now - 60, "quiet").unwrap();
+        let mut got: Vec<(&str, i64)> = idle.iter().map(|(u, n)| (u.id.as_str(), *n)).collect();
+        got.sort();
+        assert_eq!(got, [("us_gone", 1), ("us_never", 0)]);
+        let gone = store.user("us_gone").unwrap().unwrap();
+        assert!(gone.disabled && gone.disabled_idle);
+        assert!(store.session(&cookie).unwrap().is_none(), "signed out");
+        assert!(!store.user("us_password").unwrap().unwrap().disabled, "a password is for an administrator to look after");
+        assert!(store.disable_idle(now - 60, "quiet").unwrap().is_empty(), "once");
+        let audit = store.audit_entries(10).unwrap();
+        assert_eq!(audit.iter().filter(|a| a.action == "user.disable" && a.detail == "quiet").count(), 2);
+
+        // A single sign-on enables it again; one an administrator disabled stays disabled.
+        assert!(store.finish_sso_login("us_gone", "https://idp").unwrap());
+        let back = store.user("us_gone").unwrap().unwrap();
+        assert!(!back.disabled && !back.disabled_idle && vouched("us_gone") >= Some(now));
+        assert!(!store.finish_sso_login("us_gone", "https://idp").unwrap(), "already enabled");
+        assert!(store.set_disabled("us_never", true).unwrap());
+        assert!(!store.user("us_never").unwrap().unwrap().disabled_idle, "an administrator's now");
+        assert!(!store.finish_sso_login("us_never", "https://idp").unwrap());
+        assert!(store.user("us_never").unwrap().unwrap().disabled);
+
+        // An administrator enabling an account, and a re-check its provider answered, vouch for it.
+        assert!(store.set_disabled("us_never", false).unwrap());
+        assert!(vouched("us_never") >= Some(now));
+        store.with(|c| c.execute("UPDATE users SET vouched_at = 1000 WHERE id = 'us_recent'", [])).unwrap();
+        let (cookie, _) = store.create_session(Some("us_recent"), 3600).unwrap();
+        let id_hash = secret::sha256_hex(&cookie);
+        store.session_rechecked(&id_hash, b"sealed", false).unwrap();
+        assert_eq!(vouched("us_recent"), Some(1000), "a provider that couldn't be asked vouches for nobody");
+        store.session_rechecked(&id_hash, b"sealed", true).unwrap();
+        assert!(vouched("us_recent") >= Some(now));
+        assert!(store.disable_idle(now - 60, "quiet").unwrap().is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 

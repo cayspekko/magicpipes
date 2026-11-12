@@ -206,6 +206,18 @@ pub fn alert_digest(server: &str, lines: &[AlertLine], more: usize) -> Mail {
     Mail { subject, body }
 }
 
+/// To someone whose account was disabled for going without a single sign-on, which stopped their
+/// machines.
+pub fn account_disabled(server: &str, days: u64) -> Mail {
+    Mail {
+        subject: "Your MagicPipes account was disabled".to_string(),
+        body: format!(
+            "Your account at {host} hasn't been signed in to for {days} days, so it was disabled and your machines stopped serving tunnels.\n\nSign in to enable it again, and your machines start serving again by themselves:\n{server}/login\n\nIf you no longer use it, there's nothing to do.\n",
+            host = host(server),
+        ),
+    }
+}
+
 pub fn test_message(server: &str) -> Mail {
     Mail {
         subject: "MagicPipes test message".to_string(),

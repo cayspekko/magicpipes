@@ -19,6 +19,8 @@ pub const MAX_API_TOKENS_PER_USER: i64 = 20;
 pub const MAX_USERS: i64 = 10_000;
 /// The audit log never grows beyond this many entries, whatever the retention.
 const MAX_AUDIT_ROWS: i64 = 100_000;
+/// `users.disabled_reason` for an account disabled for going without a single sign-on.
+const IDLE: &str = "idle";
 
 #[derive(Debug, Clone)]
 pub struct UserRow {
@@ -27,6 +29,9 @@ pub struct UserRow {
     pub display_name: String,
     pub role: Role,
     pub disabled: bool,
+    /// Disabled for going without a single sign-on for `disable_idle_after_days`, not by an
+    /// administrator: the next one enables it again.
+    pub disabled_idle: bool,
     pub must_change_password: bool,
     /// Sessions created before this are no longer valid ("log out everywhere").
     pub sessions_valid_after: i64,
@@ -41,7 +46,7 @@ pub struct UserRow {
 
 pub(super) const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
     u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id),
-    p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL
+    p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL, u.disabled_reason IS 'idle'
     FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = 'org_default'
     LEFT JOIN passwords p ON p.user_id = u.id";
 
@@ -56,6 +61,7 @@ pub(super) fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         // A role that can't be read grants the least.
         role: Role::parse(&role).unwrap_or(Role::Member),
         disabled: disabled.is_some(),
+        disabled_idle: disabled.is_some() && r.get::<_, bool>(11)?,
         must_change_password: must_change != 0,
         sessions_valid_after: r.get(6)?,
         created_at: r.get(7)?,
@@ -200,15 +206,20 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// Records a single sign-on. A temporary password an administrator set stops working here:
-    /// its owner no longer needs it, and nobody else should keep a way in.
-    pub fn finish_sso_login(&self, user_id: &str, issuer: &str) -> anyhow::Result<()> {
+    /// Records a single sign-on, which vouches for the account: one disabled for going without
+    /// ([`Self::disable_idle`]) is enabled again, and `true` says so. A temporary password an
+    /// administrator set stops working here: its owner no longer needs it, and nobody else should
+    /// keep a way in.
+    pub fn finish_sso_login(&self, user_id: &str, issuer: &str) -> anyhow::Result<bool> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
-        tx.execute("UPDATE identities SET last_login_at = ?1 WHERE user_id = ?2 AND issuer = ?3", params![unix_now(), user_id, issuer])?;
+        let now = unix_now();
+        tx.execute("UPDATE identities SET last_login_at = ?1 WHERE user_id = ?2 AND issuer = ?3", params![now, user_id, issuer])?;
         tx.execute("DELETE FROM passwords WHERE user_id = ?1 AND must_change = 1", [user_id])?;
+        let woke = tx.execute("UPDATE users SET disabled_at = NULL, disabled_reason = NULL WHERE id = ?1 AND disabled_reason = ?2", params![user_id, IDLE])? == 1;
+        tx.execute("UPDATE users SET vouched_at = ?1 WHERE id = ?2", params![now, user_id])?;
         tx.commit()?;
-        Ok(())
+        Ok(woke)
     }
 
     pub fn users(&self) -> anyhow::Result<Vec<UserRow>> {
@@ -271,19 +282,57 @@ impl Store {
     }
 
     /// Disabling also ends every session and the invitations they sent; the user's API tokens stop
-    /// working while disabled.
+    /// working while disabled. An administrator enabling an account vouches for it, so it has
+    /// `disable_idle_after_days` from now.
     pub fn set_disabled(&self, user_id: &str, disabled: bool) -> anyhow::Result<bool> {
         let n = self.with(|c| {
-            let at = disabled.then(unix_now);
             if disabled {
                 c.execute("DELETE FROM invitations WHERE created_by = ?1", [user_id])?;
+                c.execute("UPDATE users SET disabled_at = ?1, disabled_reason = NULL WHERE id = ?2", params![unix_now(), user_id])
+            } else {
+                c.execute("UPDATE users SET disabled_at = NULL, disabled_reason = NULL, vouched_at = ?1 WHERE id = ?2", params![unix_now(), user_id])
             }
-            c.execute("UPDATE users SET disabled_at = ?1 WHERE id = ?2", params![at, user_id])
         })?;
         if disabled {
             self.end_sessions(user_id)?;
         }
         Ok(n == 1)
+    }
+
+    /// Disables, as [`Self::set_disabled`] does, every account that signs in only through single
+    /// sign-on (no password, an identity from elsewhere) and that nothing has vouched for since
+    /// `before`, with an audit entry saying `why`. Returns them as they were, with how many machines
+    /// each owns.
+    pub fn disable_idle(&self, before: i64, why: &str) -> anyhow::Result<Vec<(UserRow, i64)>> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        let idle: Vec<(UserRow, i64)> = {
+            let mut st = tx.prepare(&format!(
+                "{USER_SELECT} WHERE u.disabled_at IS NULL AND p.user_id IS NULL AND COALESCE(u.vouched_at, u.created_at) < ?1
+                 AND EXISTS (SELECT 1 FROM identities i WHERE i.user_id = u.id AND i.issuer != ?2)"
+            ))?;
+            let rows = st.query_map(params![before, LOCAL_ISSUER], user_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut machines = tx.prepare("SELECT COUNT(*) FROM agents WHERE owner_user_id = ?1")?;
+            let mut idle = Vec::with_capacity(rows.len());
+            for u in rows {
+                let n: i64 = machines.query_row([&u.id], |r| r.get(0))?;
+                idle.push((u, n));
+            }
+            idle
+        };
+        let now = unix_now();
+        for (u, _) in &idle {
+            tx.execute("UPDATE users SET disabled_at = ?1, disabled_reason = ?2, sessions_valid_after = ?1 WHERE id = ?3", params![now, IDLE, u.id])?;
+            tx.execute("DELETE FROM invitations WHERE created_by = ?1", [&u.id])?;
+            tx.execute("DELETE FROM email_tokens WHERE user_id = ?1", [&u.id])?;
+            tx.execute("DELETE FROM sessions WHERE user_id = ?1", [&u.id])?;
+            tx.execute(
+                "INSERT INTO audit_log (at, org_id, actor, action, resource, detail) VALUES (?1, ?2, 'anonymous', 'user.disable', ?3, ?4)",
+                params![now, DEFAULT_ORG, u.id, why],
+            )?;
+        }
+        tx.commit()?;
+        Ok(idle)
     }
 
     /// Ends every UI session of a user ("log out everywhere", password changes), and the emailed
@@ -373,9 +422,16 @@ impl Store {
         })
     }
 
-    /// The provider vouched for a session again: its tokens now, encrypted.
-    pub fn session_rechecked(&self, id_hash: &str, tokens: &[u8]) -> anyhow::Result<()> {
-        self.with(|c| c.execute("UPDATE sessions SET tokens = ?2, checked_at = ?3 WHERE id_hash = ?1", params![id_hash, tokens, unix_now()]))?;
+    /// A session was checked with its provider: its tokens now, encrypted. `vouched`: the provider
+    /// answered for it, which vouches for the account too, rather than couldn't be asked.
+    pub fn session_rechecked(&self, id_hash: &str, tokens: &[u8], vouched: bool) -> anyhow::Result<()> {
+        self.with(|c| {
+            let now = unix_now();
+            if vouched {
+                c.execute("UPDATE users SET vouched_at = ?2 WHERE id = (SELECT user_id FROM sessions WHERE id_hash = ?1)", params![id_hash, now])?;
+            }
+            c.execute("UPDATE sessions SET tokens = ?2, checked_at = ?3 WHERE id_hash = ?1", params![id_hash, tokens, now])
+        })?;
         Ok(())
     }
 
