@@ -65,6 +65,16 @@ pub(super) fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
     })
 }
 
+/// A session to check with its provider.
+#[derive(Debug, Clone)]
+pub struct RecheckRow {
+    pub id_hash: String,
+    pub user_id: String,
+    pub issuer: String,
+    /// Encrypted.
+    pub tokens: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     /// `None` for a session created with an admin token.
@@ -327,6 +337,56 @@ impl Store {
     pub fn delete_session(&self, cookie: &str) -> anyhow::Result<()> {
         self.with(|c| c.execute("DELETE FROM sessions WHERE id_hash = ?1", [secret::sha256_hex(cookie)]))?;
         Ok(())
+    }
+
+    /// Marks a session as a single sign-on's: its source (the issuer), and the provider's tokens,
+    /// encrypted by the caller. `rechecks`: they include a refresh token to check it with.
+    pub fn set_session_source(&self, cookie: &str, issuer: &str, tokens: Option<&[u8]>, rechecks: bool) -> anyhow::Result<()> {
+        let checked_at = rechecks.then(unix_now);
+        self.with(|c| {
+            c.execute("UPDATE sessions SET source = ?2, tokens = ?3, checked_at = ?4 WHERE id_hash = ?1", params![secret::sha256_hex(cookie), issuer, tokens, checked_at])
+        })?;
+        Ok(())
+    }
+
+    /// A session's source and its tokens, still encrypted.
+    pub fn session_source(&self, cookie: &str) -> anyhow::Result<Option<(String, Option<Vec<u8>>)>> {
+        self.with(|c| {
+            c.query_row("SELECT source, tokens FROM sessions WHERE id_hash = ?1 AND source IS NOT NULL", [secret::sha256_hex(cookie)], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()
+        })
+    }
+
+    /// Sessions with tokens whose provider last vouched for them before `before`, the longest ago
+    /// first, at most `limit`.
+    pub fn sessions_to_recheck(&self, before: i64, limit: usize) -> anyhow::Result<Vec<RecheckRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id_hash, user_id, source, tokens FROM sessions
+                 WHERE tokens IS NOT NULL AND user_id IS NOT NULL AND source IS NOT NULL AND expires_at >= ?1 AND checked_at IS NOT NULL AND checked_at < ?2
+                 ORDER BY checked_at LIMIT ?3",
+            )?;
+            st.query_map(params![unix_now(), before, i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok(RecheckRow { id_hash: r.get(0)?, user_id: r.get(1)?, issuer: r.get(2)?, tokens: r.get(3)? })
+            })?
+            .collect()
+        })
+    }
+
+    /// The provider vouched for a session again: its tokens now, encrypted.
+    pub fn session_rechecked(&self, id_hash: &str, tokens: &[u8]) -> anyhow::Result<()> {
+        self.with(|c| c.execute("UPDATE sessions SET tokens = ?2, checked_at = ?3 WHERE id_hash = ?1", params![id_hash, tokens, unix_now()]))?;
+        Ok(())
+    }
+
+    /// Ends a session the provider stopped vouching for. `false` if it was gone.
+    pub fn end_session(&self, id_hash: &str) -> anyhow::Result<bool> {
+        Ok(self.with(|c| c.execute("DELETE FROM sessions WHERE id_hash = ?1", [id_hash]))? == 1)
+    }
+
+    /// Who a user is at an issuer.
+    pub fn identity_subject(&self, user_id: &str, issuer: &str) -> anyhow::Result<Option<String>> {
+        self.with(|c| c.query_row("SELECT subject FROM identities WHERE user_id = ?1 AND issuer = ?2", params![user_id, issuer], |r| r.get(0)).optional())
     }
 
     // ---- API tokens -----------------------------------------------------------------------

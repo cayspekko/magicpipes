@@ -121,6 +121,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/invite/accept", post(email::accept_invitation))
         .route("/invite/provider/{id}", post(email::invitation_provider))
         .route("/logout", post(ui::logout))
+        .route("/signed-out", get(ui::signed_out))
         .route("/machines", get(ui::machines))
         .route("/machines/{id}", get(machine::machine))
         .route("/health", get(health::health))

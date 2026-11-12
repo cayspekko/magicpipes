@@ -202,8 +202,9 @@ An email typed in by an admin is not verified.
 - **Revocation lag for rule-based tags.** A match counts for the session's maximum age
   (`session_max_age_secs`, default 12 h) after the sign-on that made it, and is then pruned (hourly)
   unless the person signed in through that source again. So it's bounded whichever way they sign in
-  meanwhile: a password or an API token doesn't keep a group's tag. Re-checking through the refresh
-  token every hour is a later improvement.
+  meanwhile: a password or an API token doesn't keep a group's tag. While a session has a refresh
+  token, each re-check with the provider (`sso_recheck_secs`) renews or drops its matches, so a group
+  taken away there goes within a round.
 - **No self-assignment.** Only admins create tags, assign them to users, and write
   rules. A member can't add a tag to themselves, and an IdP claim can only map to tags that an
   admin has wired up.
@@ -417,11 +418,29 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
   say what to do at the provider; discovery does the rest. See "Settings" in
   `docs/ARCHITECTURE.md` for where these settings live.
 
-**Not built yet, on purpose:**
+**Past the sign-in** (*built 2026-11-12*, `control/sso.rs`), per provider on the Settings page or in
+the file:
+- **`scopes`**: what a sign-in asks for, `openid email profile` by default; `openid` is required.
+- **Re-checks** (`[users] sso_recheck_secs`, an hour; 0: never). A session keeps the provider's
+  refresh token and ID token, encrypted (AES-256-GCM under a key derived from `session-key`). Each
+  round trades the refresh token at the provider (a batch of 500, 8 at once). `invalid_grant`, or
+  an ID token naming someone else, ends the session and clears that person's rule matches from the
+  provider; anything else leaves it for the next round. A refreshed ID token (checked as at sign-in,
+  without a nonce) or UserInfo updates their tags from rules. Providers that give no refresh token
+  (most only with `offline_access`; Google only with `access_type=offline`, which isn't asked for)
+  leave sessions to their maximum age.
+- **`auto_redirect`**, on one provider at most: `/login` goes straight to it. Other ways in stay
+  at `/login?method=password` and `?method=token`. Signing out lands on `/signed-out`, the sign-in
+  page without going anywhere, so it doesn't sign straight back in.
+- **`sign_out`**: signing out here continues to the provider's `end_session_endpoint`
+  (RP-Initiated Logout) with `client_id`, `id_token_hint` and `post_logout_redirect_uri` =
+  `<management>/signed-out`. Off by default, since it signs people out of everything else using
+  that provider. Not after "Switch account", which means to sign in again.
+
+**Not built:**
 - **`groups_claim`.** Not needed: a tag rule names its claim, `groups` or any other. Tag rules
   themselves were built on 2026-11-12 (see "Where tags come from").
-- **`scopes` and `auto_redirect` settings.** The scopes are `openid email profile`.
-- **Signing out at the provider.** Signing out here ends the session here only.
+- **Revoking the refresh token** (RFC 7009) when someone signs out here; it lapses at the provider.
 
 ### 4. Social login
 
@@ -523,8 +542,8 @@ the management host, so it is the same page whether they started at the UI or at
 └───────────────────────────────────────────┘
 ```
 
-- **It shows only the methods that are configured.** With a single SSO provider and no local
-  users, the page can send the browser straight to the provider (`[users] auto_redirect`).
+- **It shows only the methods that are configured.** It can send the browser straight to one
+  provider (that provider's `auto_redirect`).
   With proxy auth, the user is normally already signed in and never sees this page.
 - **It is server-rendered, under the same strict CSP as the UI**, with no third-party scripts.
   It works on phones. Error messages are generic ("email or password is incorrect").
@@ -883,7 +902,7 @@ bootstrap_admins = ["doug@example.com"]   # verified emails that become admin on
 allowed_email_domains = ["example.com"]   # SSO/social/proxy users created on first login; empty = none
 members_can_publish = true                # may members' agents create public tunnels?
 session_max_age_secs = 43200
-auto_redirect = false                     # single SSO provider, no local users: skip the login page
+sso_recheck_secs = 3600                   # check single sign-ons with their provider; 0: never
 audit_retention_days = 90
 
 [proxy_auth]                              # method 2; off unless present
@@ -909,7 +928,9 @@ label = "Company SSO"                     # button text
 issuer = "https://login.example.com"
 client_id = "…"
 client_secret_file = "/etc/magicpipes/company-oidc-secret"
-# scopes = ["openid", "email", "profile"] # not built yet
+# scopes = ["openid", "email", "profile"] # add "groups" or "offline_access" if the provider needs asking
+# auto_redirect = false                   # the sign-in page goes straight here; one provider at most
+# sign_out = false                        # signing out here signs out there too
 # link_by_email = false
 
 [[oidc]]
@@ -1002,9 +1023,9 @@ useful.
    may log in as, from their email (`AuthorizedPrincipalsFile`).
 10. **Tag rules:** OIDC and proxy claims, GitHub organizations and teams, and confirmed address
     domains, on the Tags page and at `/api/v1/tag-rules`. *Done* (2026-11-12). With it the phase is
-    done; what's left for later is listed under "Known limitations": TOTP, refresh-token re-checks,
-    signing out at the provider, `apply_to_tunnels`, `scopes` and `auto_redirect`, `magicpipes ls
-    --all`, and controls for the admin token.
+    done; what's left for later is listed under "Known limitations".
+11. **Past the sign-in:** provider scopes, re-checks through refresh tokens, `auto_redirect`, and
+    signing out at the provider. *Done* (2026-11-12).
 
 End-to-end tests, at minimum:
 
@@ -1034,15 +1055,27 @@ End-to-end tests, at minimum:
   unguessable names, when the names themselves are sensitive.
 - **A private tunnel's existence is visible.** An anonymous request gets a login redirect where
   an unknown name gets 404. Hiding that would break the login flow.
-- **IdP-driven revocation lags** by up to `session_max_age_secs` until refresh-token
-  re-checks exist. With proxy auth there is no lag for who someone is: every request carries the
-  proxy's current assertion. Their groups, for tag rules, are read when a session starts, so tags
-  from them lag the same way.
-- **Left for later:** TOTP (below), refresh-token re-checks, signing out at the provider,
-  `apply_to_tunnels`, `scopes` and `auto_redirect` for providers, `magicpipes ls --all`, tag rules
-  in the configuration file, and controls for the admin token in the UI.
+- **IdP-driven revocation lags** by up to `sso_recheck_secs` (plus a quarter of it) for a session
+  whose provider gave a refresh token, and by up to `session_max_age_secs` for one that didn't
+  (GitHub, Google without offline access). With proxy auth there is no lag for who someone is:
+  every request carries the proxy's current assertion. Their groups, for tag rules, are read when a
+  session starts, so tags from them lag up to `session_max_age_secs`.
+- **Left for later:** TOTP (below), `apply_to_tunnels`, `magicpipes ls --all`, tag rules in the
+  configuration file, and controls for the admin token in the UI.
 - **Password accounts have no second factor** until TOTP lands. For stronger login, put the
   server behind SSO or an authenticating proxy.
+- **No offboarding from the provider.** Removing someone at a provider stops their next sign-in
+  there, but their account here stays: API tokens they made keep working, and so do tags an
+  administrator assigned them, until an administrator disables the account. There's no SCIM
+  and no back-channel logout. Disable the account here when someone leaves.
+- **Rules see only top-level claims.** A nested one, such as Keycloak's `realm_access.roles`,
+  can't be matched; configure the provider to send it as a top-level claim (Keycloak's group or
+  role mappers can).
+- **Microsoft Entra users in more than 200 groups** get no `groups` claim: Entra puts a pointer
+  to Microsoft Graph in its place (`_claim_names`), which isn't followed. Rules on their groups
+  don't match. Entra's "groups assigned to the application" option keeps the list short.
+- **Google Workspace groups** aren't in Google's ID tokens, so rules can't use them; the domain
+  (`hd`) is there.
 - **One org per server in the UI.** The schema already allows more.
 
 ## Decisions (settled 2026-11-01)

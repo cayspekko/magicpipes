@@ -864,6 +864,8 @@ pub struct OidcPerson {
     /// As GitHub: their organizations, and teams as `org/team`, read only with `read:org`.
     pub orgs: Vec<String>,
     pub teams: Vec<String>,
+    /// Refuse refresh tokens (`invalid_grant`), as for someone removed at the provider.
+    pub refresh_refused: bool,
 }
 
 impl OidcPerson {
@@ -880,6 +882,7 @@ impl OidcPerson {
             userinfo_claims: serde_json::json!({}),
             orgs: Vec::new(),
             teams: Vec::new(),
+            refresh_refused: false,
         }
     }
 }
@@ -901,6 +904,10 @@ pub struct FakeOidc {
     pub issuer: String,
     pub person: Arc<std::sync::Mutex<OidcPerson>>,
     pub token_requests: Arc<std::sync::atomic::AtomicUsize>,
+    /// The scope the last sign-in asked for.
+    pub last_scope: Arc<std::sync::Mutex<String>>,
+    /// Refresh tokens traded.
+    pub refreshes: Arc<std::sync::atomic::AtomicUsize>,
     pub task: tokio::task::JoinHandle<()>,
     key: Arc<ring::signature::EcdsaKeyPair>,
     other_key: Arc<ring::signature::EcdsaKeyPair>,
@@ -927,14 +934,18 @@ impl FakeOidc {
         let person = Arc::new(std::sync::Mutex::new(OidcPerson::new("sub-1", "ann@example.com")));
         let codes: Arc<std::sync::Mutex<std::collections::HashMap<String, Code>>> = Arc::default();
         let token_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (iss, who, requests) = (issuer.clone(), person.clone(), token_requests.clone());
+        let last_scope: Arc<std::sync::Mutex<String>> = Arc::default();
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (iss, who, requests, scope_seen, refreshed) = (issuer.clone(), person.clone(), token_requests.clone(), last_scope.clone(), refreshes.clone());
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { return };
-                let (iss, who, codes, key, other, requests) = (iss.clone(), who.clone(), codes.clone(), key.clone(), other.clone(), requests.clone());
+                let (iss, who, codes, key, other, requests, scope_seen, refreshed) =
+                    (iss.clone(), who.clone(), codes.clone(), key.clone(), other.clone(), requests.clone(), scope_seen.clone(), refreshed.clone());
                 tokio::spawn(async move {
                     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let (iss, who, codes, key, other, requests) = (iss.clone(), who.clone(), codes.clone(), key.clone(), other.clone(), requests.clone());
+                        let (iss, who, codes, key, other, requests, scope_seen, refreshed) =
+                            (iss.clone(), who.clone(), codes.clone(), key.clone(), other.clone(), requests.clone(), scope_seen.clone(), refreshed.clone());
                         async move {
                             let path = req.uri().path().to_string();
                             let query: std::collections::HashMap<String, String> = parse_form(req.uri().query().unwrap_or(""));
@@ -950,6 +961,7 @@ impl FakeOidc {
                                     "token_endpoint": format!("{iss}/token"),
                                     "jwks_uri": format!("{iss}/keys"),
                                     "userinfo_endpoint": format!("{iss}/userinfo"),
+                                    "end_session_endpoint": format!("{iss}/logout"),
                                 })),
                                 "/keys" if who.lock().unwrap().no_signing_keys => json(StatusCode::OK, serde_json::json!({ "keys": [] })),
                                 "/keys" => {
@@ -959,6 +971,7 @@ impl FakeOidc {
                                 "/authorize" | "/login/oauth/authorize" => {
                                     let code = format!("code-{}", magicpipes_core_rand());
                                     let scope = query.get("scope").cloned().unwrap_or_default();
+                                    *scope_seen.lock().unwrap() = scope.clone();
                                     let entry = (query.get("nonce").cloned().unwrap_or_default(), who.lock().unwrap().clone(), query["code_challenge"].clone(), query["redirect_uri"].clone(), scope);
                                     assert_eq!(query["code_challenge_method"], "S256");
                                     assert_eq!(query["client_id"], OIDC_CLIENT);
@@ -971,9 +984,32 @@ impl FakeOidc {
                                     let form = parse_form(&body);
                                     let enc = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
                                     let basic = format!("Basic {}", STANDARD.encode(format!("{}:{}", enc(OIDC_CLIENT), enc(OIDC_SECRET))));
+                                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                    let sign = |claims: &Value| {
+                                        let msg = format!("{}.{}", B64.encode(r#"{"alg":"ES256","kid":"k1"}"#), B64.encode(claims.to_string()));
+                                        let sig = key.sign(&SystemRandom::new(), msg.as_bytes()).unwrap();
+                                        format!("{msg}.{}", B64.encode(sig.as_ref()))
+                                    };
+                                    // A refresh: a new ID token about whoever is signed in now, and the next refresh token.
+                                    if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+                                        refreshed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        let p = who.lock().unwrap().clone();
+                                        let given = form.get("refresh_token").cloned().unwrap_or_default();
+                                        let resp = if auth.as_deref() != Some(&basic) {
+                                            json(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "invalid_client" }))
+                                        } else if p.refresh_refused || !given.starts_with(&format!("rt-{}-", p.sub)) {
+                                            json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "invalid_grant" }))
+                                        } else {
+                                            let mut claims = serde_json::json!({ "iss": iss, "aud": OIDC_CLIENT, "sub": p.sub, "exp": now + 300, "iat": now, "email": p.email, "email_verified": p.verified });
+                                            merge(&mut claims, &p.claims);
+                                            let next = format!("rt-{}-{}", p.sub, magicpipes_core_rand());
+                                            json(StatusCode::OK, serde_json::json!({ "id_token": sign(&claims), "access_token": p.sub, "refresh_token": next, "token_type": "Bearer" }))
+                                        };
+                                        return Ok::<_, std::convert::Infallible>(resp);
+                                    }
                                     let entry = codes.lock().unwrap().remove(form.get("code").map_or("", |c| c.as_str()));
                                     match entry {
-                                        Some((nonce, p, challenge, redirect, _))
+                                        Some((nonce, p, challenge, redirect, scope))
                                             if auth.as_deref() == Some(&basic)
                                                 && form.get("redirect_uri") == Some(&redirect)
                                                 && B64.encode(sha2::Sha256::digest(form["code_verifier"].as_bytes())) == challenge =>
@@ -991,7 +1027,12 @@ impl FakeOidc {
                                             let msg = format!("{}.{}", B64.encode(r#"{"alg":"ES256","kid":"k1"}"#), B64.encode(claims.to_string()));
                                             let signer = if p.wrong_key { &other } else { &key };
                                             let sig = signer.sign(&SystemRandom::new(), msg.as_bytes()).unwrap();
-                                            json(StatusCode::OK, serde_json::json!({ "id_token": format!("{msg}.{}", B64.encode(sig.as_ref())), "access_token": p.sub, "token_type": "Bearer" }))
+                                            let mut answer = serde_json::json!({ "id_token": format!("{msg}.{}", B64.encode(sig.as_ref())), "access_token": p.sub, "token_type": "Bearer" });
+                                            // A refresh token only when asked for, as many providers do.
+                                            if scope.split(' ').any(|s| s == "offline_access") {
+                                                answer["refresh_token"] = format!("rt-{}-0", p.sub).into();
+                                            }
+                                            json(StatusCode::OK, answer)
                                         }
                                         _ => refuse(),
                                     }
@@ -1063,7 +1104,7 @@ impl FakeOidc {
                 });
             }
         });
-        FakeOidc { issuer, person, token_requests, task, key: signing_key, other_key }
+        FakeOidc { issuer, person, token_requests, last_scope, refreshes, task, key: signing_key, other_key }
     }
 
     /// A token with these claims, signed with the key this provider publishes.

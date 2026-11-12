@@ -3321,6 +3321,92 @@ async fn tag_rules_give_tags_from_what_a_sign_in_says() {
     assert_eq!(member().await["rule_tags"], serde_json::json!(["gh:platform"]));
 }
 
+/// Single sign-on past the sign-in: a provider's own scopes, the sign-in page going straight to it,
+/// sessions checked with it again (a group gone takes its tag; a refusal ends the session), and
+/// signing out there too, coming back to a page that stays put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sso_sessions_are_checked_again_and_sign_out_at_the_provider() {
+    let idp = common::FakeOidc::start().await;
+    let other = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-sso-{}", std::process::id()));
+    let users = "allowed_email_domains = [\"team.example.com\"]\nsso_recheck_secs = 10";
+    let config = format!("{}scopes = [\"openid\", \"email\", \"groups\", \"offline_access\"]\nauto_redirect = true\nsign_out = true\n", idp.config(&dir, users, true));
+    let env = Env::with_config(Tls::DevCa, &config).await;
+    let admin = env.admin_token();
+    env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": "team:eng" })).await;
+    let (s, v) = env.api_json("POST", "/api/v1/tag-rules", Some(&admin), serde_json::json!({ "source": idp.issuer, "claim": "groups", "value": "eng", "tag": "team:eng" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+
+    // The sign-in page goes straight to the provider, keeping where to go next; other ways in stay.
+    assert_eq!(env.ui("/login", None, None).await.location.as_deref(), Some("/auth/oidc/fake"));
+    assert_eq!(env.ui("/login?next=/account", None, None).await.location.as_deref(), Some("/auth/oidc/fake?next=%2Faccount"));
+    let password = env.ui("/login?method=password", None, None).await;
+    assert!(password.status == StatusCode::OK && password.html.contains("Continue with Fake ID") && password.html.contains(r#"name="password""#), "{}", password.html);
+    assert!(env.ui("/login?method=token", None, None).await.html.contains(r#"name="token""#));
+
+    // Signing in asks for the provider's own scopes, and a group gives its tag.
+    let mut dev = common::OidcPerson::new("dev-1", "dev@team.example.com");
+    dev.claims = serde_json::json!({ "groups": ["eng"] });
+    *idp.person.lock().unwrap() = dev.clone();
+    let cookie = session_of(&oidc_sign_in(&env, None).await);
+    assert_eq!(*idp.last_scope.lock().unwrap(), "openid email groups offline_access");
+    let member = async || user_named(&env, "dev@team.example.com").await;
+    assert_eq!(member().await["rule_tags"], serde_json::json!(["team:eng"]));
+
+    // Out of the group at the provider: a re-check takes the tag, without signing in again.
+    dev.claims = serde_json::json!({ "groups": [] });
+    *idp.person.lock().unwrap() = dev.clone();
+    env.eventually("a re-check to take the tag", Duration::from_secs(45), || async { member().await["rule_tags"] == serde_json::json!([]) }).await;
+    assert!(idp.refreshes.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.status, StatusCode::OK, "the session goes on");
+
+    // Removed at the provider: the next re-check ends the session.
+    dev.refresh_refused = true;
+    *idp.person.lock().unwrap() = dev.clone();
+    env.eventually("a refused re-check to end the session", Duration::from_secs(45), || async {
+        env.ui("/account", Some(&cookie), None).await.location.as_deref().is_some_and(|l| l.starts_with("/login"))
+    })
+    .await;
+    let (_, audit) = env.api("GET", "/api/v1/audit?limit=20", Some(&admin)).await;
+    assert!(audit["entries"].as_array().unwrap().iter().any(|e| e["action"] == "session.ended"), "{audit}");
+
+    // Signing out continues to the provider's sign-out, which comes back to a page that stays put.
+    dev.refresh_refused = false;
+    *idp.person.lock().unwrap() = dev.clone();
+    let cookie = session_of(&oidc_sign_in(&env, None).await);
+    let account = env.ui("/account", Some(&cookie), None).await;
+    let out = env.ui("/logout", Some(&cookie), Some(&[("csrf", &account.csrf())])).await;
+    let to = out.refresh.clone().unwrap_or_else(|| panic!("a page moving on: {} {}", out.status, out.html));
+    let back = format!("https%3A%2F%2Flocalhost%3A{}%2Fsigned-out", env.mgmt_port);
+    assert!(to.contains(&format!("{}/logout?client_id={}&post_logout_redirect_uri={back}&id_token_hint=", idp.issuer, common::OIDC_CLIENT)), "{to}");
+    assert!(out.html.contains("Continuing to <em>Fake ID</em>"), "{}", out.html);
+    assert_eq!(env.ui("/account", Some(&cookie), None).await.status, StatusCode::SEE_OTHER, "signed out here");
+    let signed_out = env.ui("/signed-out", None, None).await;
+    assert!(signed_out.status == StatusCode::OK && signed_out.html.contains("You&#39;re signed out.") && signed_out.html.contains("Continue with Fake ID"), "{}", signed_out.html);
+
+    // On the Settings page: a provider's scopes and options, and only one way straight in.
+    let admin_cookie = admin_session(&env).await;
+    let form = env.ui("/settings/providers/new?type=oidc", Some(&admin_cookie), None).await;
+    assert!(form.html.contains(r#"name="scopes" value="openid email profile""#) && form.html.contains("/signed-out"), "{}", form.html);
+    let fields = |extra: &[(&'static str, &'static str)]| {
+        let mut f = vec![("csrf", form.csrf()), ("type", "oidc".into()), ("id", "other".into()), ("url", other.issuer.clone()), ("label", "Other".into()), ("client_id", common::OIDC_CLIENT.into()), ("client_secret", common::OIDC_SECRET.into())];
+        f.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        f
+    };
+    let send = async |f: Vec<(&str, String)>| {
+        let pairs: Vec<(&str, &str)> = f.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        env.ui("/settings/providers/new", Some(&admin_cookie), Some(&pairs)).await
+    };
+    let straight = send(fields(&[("auto_redirect", "on")])).await;
+    assert!(straight.status == StatusCode::BAD_REQUEST && straight.html.contains("already goes straight to Fake ID"), "{}", straight.html);
+    let bad = send(fields(&[("scopes", "email profile")])).await;
+    assert!(bad.status == StatusCode::BAD_REQUEST && bad.html.contains("must include openid"), "{}", bad.html);
+    let added = send(fields(&[("scopes", "openid, email groups"), ("sign_out", "on")])).await;
+    assert_eq!(added.location.as_deref(), Some("/settings?done=provider-added"), "{}", added.html);
+    let edit = env.ui("/settings/providers/other", Some(&admin_cookie), None).await.html;
+    assert!(edit.contains(r#"name="scopes" value="openid email groups""#) && edit.contains(r#"name="sign_out" checked"#), "{edit}");
+}
+
 /// GitHub isn't OpenID Connect, but who gets in is decided the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn github_sign_in_admits_only_who_it_should() {

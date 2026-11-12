@@ -22,7 +22,7 @@ pub use rules::{ANY_SOURCE, EMAIL_DOMAIN, MAX_TAG_RULES, NewRule, NotAdded, TagR
 pub use ssh_keys::{AddedSshKey, NewSshKey, SshKeyRow};
 pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
-pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, UserRow};
+pub use users::{ApiTokenRow, LOCAL_ISSUER, MAX_API_TOKENS_PER_USER, RecheckRow, UserRow};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -441,6 +441,19 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user_id, rule_id)
     ) WITHOUT ROWID;
     CREATE INDEX user_rule_matches_rule ON user_rule_matches(rule_id);
+    "#,
+    // 14: single sign-on past signing in. A provider's scopes (space-separated; empty: the
+    // default), whether the sign-in page goes straight to it, and whether signing out here signs
+    // out there. A session from a single sign-on keeps its source (the issuer), the provider's
+    // tokens, encrypted with a key from `session-key`, and when the provider last vouched for it.
+    r#"
+    ALTER TABLE oidc_providers ADD COLUMN scopes TEXT NOT NULL DEFAULT '';
+    ALTER TABLE oidc_providers ADD COLUMN auto_redirect INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE oidc_providers ADD COLUMN sign_out INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN source TEXT;
+    ALTER TABLE sessions ADD COLUMN tokens BLOB;
+    ALTER TABLE sessions ADD COLUMN checked_at INTEGER;
+    CREATE INDEX sessions_checked ON sessions(checked_at) WHERE tokens IS NOT NULL;
     "#,
 ];
 

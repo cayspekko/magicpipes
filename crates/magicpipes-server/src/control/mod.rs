@@ -15,6 +15,7 @@
 //! * `rules` — tag rules: tags from what a sign-in says;
 //! * `sessions` — agent sessions;
 //! * `ssh` — public keys for the SSH gateway, and what it reports back;
+//! * `sso` — checking single sign-ons again, and signing out at the provider;
 //! * `settings` — sign-in settings and certificates made on the Settings page, and the generated
 //!   configuration;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
@@ -39,6 +40,7 @@ mod sessions;
 pub use sessions::Attached;
 mod settings;
 mod ssh;
+mod sso;
 mod tags;
 mod users;
 mod views;
@@ -312,6 +314,7 @@ impl ControlPlane {
         }
         self.start_mail_queue(shutdown.clone());
         self.start_webhooks(shutdown.clone());
+        self.start_sso_rechecks(shutdown.clone());
         self.start_checks(shutdown.clone());
         self.start_gateway_reports(shutdown.clone());
         let me = self.clone();

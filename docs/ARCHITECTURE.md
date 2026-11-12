@@ -126,6 +126,15 @@ connections:
   only a change in what matched refreshes. A sign-in asks for what rules want (UserInfo, GitHub's
   `read:org`) only when a rule wants it. The hourly prune drops stale matches and refreshes, so a
   group's tag can't outlive a session's age by more than an hour, however the person signs in.
+* Single sign-on past the sign-in (`control/sso.rs`): a session an OpenID Connect provider signed
+  in keeps its source and the provider's refresh and ID tokens, AES-256-GCM-encrypted under a key
+  derived from `session-key` (`Signer::encrypt`), in `sessions.tokens`; only sessions with a refresh
+  token get `checked_at`. A task on the control threads wakes every quarter of `sso_recheck_secs`
+  (5 s to 5 min) and trades the refresh token of each session due, 500 a round, 8 at once, through
+  the same small client as the sign-in (4 s each). `invalid_grant` ends the session and clears that
+  provider's rule matches; a provider that can't be reached is tried next round. Signing out reads
+  the session's ID token for the provider's `end_session_endpoint`, and leaves through a page of
+  ours, since a form's redirect can't leave the management host.
 * Private tunnels (`data/gate.rs`, `tunnel_auth.rs`): the management cookie never leaves the
   management host, so a private tunnel's host gets its own signed cookie (`__Host-mp_tunnel`,
   HMAC-SHA256 with `data_dir/session-key`) through a redirect to `/auth/tunnel` and a one-time,

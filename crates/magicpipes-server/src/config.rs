@@ -338,9 +338,52 @@ pub struct OidcConfig {
     /// default: anyone who can choose their address there could then claim one here.
     #[serde(default)]
     pub trust_email: bool,
+    /// What a sign-in asks for. Empty: `openid email profile`. Add `groups` for a provider that
+    /// only sends groups when asked, or `offline_access` for one that only gives a refresh token
+    /// then. OpenID Connect providers only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// The sign-in page goes straight to this provider. At most one provider.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_redirect: bool,
+    /// Signing out here also signs out at the provider, if it says where (`end_session_endpoint`).
+    /// Off by default: that also signs people out of everything else using it. OpenID Connect
+    /// providers only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_out: bool,
+}
+
+/// What a sign-in asks for when nothing says otherwise.
+pub const DEFAULT_SCOPES: [&str; 3] = ["openid", "email", "profile"];
+const MAX_SCOPES: usize = 20;
+
+/// Scopes as typed (space- or comma-separated), checked: `openid` among them, each a scope token
+/// (RFC 6749 3.3). The default comes back empty.
+pub fn clean_scopes(raw: &str) -> Result<Vec<String>, String> {
+    let mut scopes: Vec<String> = Vec::new();
+    for s in raw.split([' ', ',', '\n', '\t']).map(str::trim).filter(|s| !s.is_empty()) {
+        if s.len() > 100 || !s.bytes().all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b)) {
+            return Err(format!("'{s}' isn't a scope"));
+        }
+        if !scopes.iter().any(|x| x == s) {
+            scopes.push(s.to_string());
+        }
+    }
+    if scopes.len() > MAX_SCOPES {
+        return Err(format!("at most {MAX_SCOPES} scopes"));
+    }
+    if !scopes.iter().any(|s| s == "openid") {
+        return Err("the scopes must include openid".into());
+    }
+    Ok(if scopes == DEFAULT_SCOPES { Vec::new() } else { scopes })
 }
 
 impl OidcConfig {
+    /// The scopes a sign-in asks for.
+    pub fn scopes(&self) -> Vec<String> {
+        if self.scopes.is_empty() { DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect() } else { self.scopes.clone() }
+    }
+
     /// The checks every provider passes, from the configuration file or the Settings page.
     pub fn check(&self) -> Result<(), String> {
         if self.id.is_empty() || self.id.len() > 40 || !self.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
@@ -360,6 +403,12 @@ impl OidcConfig {
         }
         if self.kind == ProviderKind::Github && self.trust_email {
             return Err("GitHub says which addresses it verified, so trust_email doesn't apply".into());
+        }
+        if self.kind == ProviderKind::Github && (!self.scopes.is_empty() || self.sign_out) {
+            return Err("GitHub's scopes follow tag rules, and it has no sign-out to send people to, so scopes and sign_out don't apply".into());
+        }
+        if !self.scopes.is_empty() {
+            clean_scopes(&self.scopes.join(" "))?;
         }
         Ok(())
     }
@@ -589,6 +638,9 @@ pub struct UsersConfig {
     /// Machines a member may enroll for themself, counting tokens not used yet, since limits per
     /// agent would otherwise multiply with every machine. 0: no limit. Administrators aren't limited.
     pub max_agents_per_user: usize,
+    /// How often a single sign-on's session is checked with its provider, through the refresh token
+    /// it gave: a refusal ends the session, and an answer updates tag rules. 0: never.
+    pub sso_recheck_secs: u64,
 }
 
 impl Default for UsersConfig {
@@ -600,6 +652,7 @@ impl Default for UsersConfig {
             bootstrap_admins: Vec::new(),
             allowed_email_domains: Vec::new(),
             max_agents_per_user: 25,
+            sso_recheck_secs: 3600,
         }
     }
 }
@@ -747,6 +800,12 @@ impl Config {
             if self.oidc[..i].iter().any(|o| o.id == p.id) {
                 bail!("oidc.id: '{}' is used twice", p.id);
             }
+        }
+        if self.oidc.iter().filter(|p| p.auto_redirect).count() > 1 {
+            bail!("oidc: auto_redirect can be on for one provider at most");
+        }
+        if self.users.sso_recheck_secs != 0 && !(10..=86_400).contains(&self.users.sso_recheck_secs) {
+            bail!("users.sso_recheck_secs must be 0 (never) or between 10 and 86400");
         }
         self.base_domain = self.base_domain.trim().trim_end_matches('.').to_ascii_lowercase();
         self.management.hostname = self.management.hostname.trim().to_ascii_lowercase();
@@ -906,6 +965,30 @@ mod tests {
         let github = format!("{}kind = \"github\"\n", provider("github", "https://github.com"));
         assert_eq!(load(&github).unwrap().oidc[0].kind, ProviderKind::Github);
         assert!(load(&format!("{github}trust_email = true\n")).is_err(), "it says which it verified");
+
+        // Scopes, going straight to a provider, signing out there, and re-checks.
+        assert_eq!(c.oidc[0].scopes(), ["openid", "email", "profile"], "the default");
+        let scoped = load(&format!("{google}scopes = [\"openid\", \"groups\", \"offline_access\"]\nauto_redirect = true\nsign_out = true\n")).unwrap();
+        assert_eq!((scoped.oidc[0].scopes(), scoped.oidc[0].auto_redirect, scoped.oidc[0].sign_out), (vec!["openid".into(), "groups".into(), "offline_access".into()], true, true));
+        assert!(load(&format!("{google}scopes = [\"email\"]\n")).is_err(), "openid is required");
+        assert!(load(&format!("{github}scopes = [\"openid\", \"read:org\"]\n")).is_err(), "GitHub's follow rules");
+        assert!(load(&format!("{github}sign_out = true\n")).is_err());
+        let two = format!("{google}auto_redirect = true\n{}auto_redirect = true\n", provider("other", "https://other.example.com"));
+        assert!(load(&two).is_err(), "straight to one provider at most");
+        assert_eq!(c.users.sso_recheck_secs, 3600);
+        assert!(load("[users]\nsso_recheck_secs = 0").is_ok(), "never");
+        assert!(load("[users]\nsso_recheck_secs = 5").is_err());
+    }
+
+    #[test]
+    fn scopes_are_scope_tokens_with_openid() {
+        assert_eq!(clean_scopes("openid email profile").unwrap(), Vec::<String>::new(), "the default is kept as none");
+        assert_eq!(clean_scopes(" openid,groups\noffline_access groups ").unwrap(), ["openid", "groups", "offline_access"]);
+        assert_eq!(clean_scopes("openid api://abc/read").unwrap(), ["openid", "api://abc/read"]);
+        let too_many = format!("openid {}", (0..MAX_SCOPES).map(|i| format!("s{i}")).collect::<Vec<_>>().join(" "));
+        for bad in ["", "email", "openid \"quoted\"", "openid back\\slash", &too_many] {
+            assert!(clean_scopes(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

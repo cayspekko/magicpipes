@@ -792,7 +792,12 @@ pub async fn create_enrollment(State(app): State<AppState>, Posted(user, fields)
 }
 
 pub(super) fn login_page(app: &AppState, error: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
-    let err = alert(error);
+    login_page_saying(app, error, None, admin_token, next)
+}
+
+/// The sign-in page, with `said` above it: what just happened.
+fn login_page_saying(app: &AppState, error: Option<&str>, said: Option<&str>, admin_token: bool, next: Option<&str>) -> Response {
+    let err = format!("{}{}", said.map(|s| format!(r#"<div class="done" role="status">{}</div>"#, esc(s))).unwrap_or_default(), alert(error));
     let next = safe_path(next);
     let proxied = app.control.proxy_auth().is_some();
     let providers = app.control.oidc_providers();
@@ -841,7 +846,23 @@ pub struct LoginQuery {
 }
 
 pub async fn login_form(State(app): State<AppState>, axum::extract::Query(q): axum::extract::Query<LoginQuery>) -> Response {
+    // Straight to the provider, unless another way in was asked for.
+    if q.method.is_none()
+        && let Some(p) = app.control.auto_redirect_provider()
+    {
+        let to = match safe_path(q.next.as_deref()) {
+            Some(n) => format!("/auth/oidc/{}?next={}", p.id, url::encode(n)),
+            None => format!("/auth/oidc/{}", p.id),
+        };
+        return Redirect::to(&to).into_response();
+    }
     login_page(&app, None, q.method.as_deref() == Some("token"), q.next.as_deref())
+}
+
+/// Where signing out lands when the sign-in page would go straight back to a provider, and where
+/// a provider's own sign-out returns: the sign-in page, without going anywhere by itself.
+pub async fn signed_out(State(app): State<AppState>) -> Response {
+    login_page_saying(&app, None, Some("You're signed out."), false, None)
 }
 
 #[derive(Deserialize)]
@@ -991,12 +1012,22 @@ pub struct LogoutForm {
 }
 
 pub async fn logout(State(app): State<AppState>, Posted(user, f): Posted<LogoutForm>) -> Response {
+    let next = safe_path(f.next.as_deref());
+    // Signing out at the provider too, where it's set to: asked before the session goes.
+    let back = format!("{}/signed-out", server_url(&app));
+    let at_provider = if next.is_none() { app.control.provider_sign_out(&user.cookie, &back).await } else { None };
     app.control.logout(&user.who, &user.cookie);
-    let to = match safe_path(f.next.as_deref()) {
+    let to = match next {
         Some(n) => format!("/login?next={}", url::encode(n)),
+        // The sign-in page would only go straight back to the provider.
+        None if app.control.auto_redirect_provider().is_some() => "/signed-out".to_string(),
         None => "/login".to_string(),
     };
-    let mut resp = Redirect::to(&to).into_response();
+    // A form's redirect can't leave this host, so a page of ours moves on to the provider.
+    let mut resp = match at_provider {
+        Some((url, label)) => leaving_page(&url, &label),
+        None => Redirect::to(&to).into_response(),
+    };
     resp.headers_mut().insert(header::SET_COOKIE, session_cookie("", 0));
     resp
 }

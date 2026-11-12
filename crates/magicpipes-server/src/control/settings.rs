@@ -96,6 +96,9 @@ fn row_config(cfg: &Config, row: &OidcProviderRow) -> OidcConfig {
         link_by_email: row.link_by_email,
         trust_email: row.trust_email,
         allow_unverified_admin: row.allow_unverified_admin,
+        scopes: row.scopes.clone(),
+        auto_redirect: row.auto_redirect,
+        sign_out: row.sign_out,
     }
 }
 
@@ -168,6 +171,10 @@ pub struct ProviderView {
     pub link_by_email: bool,
     pub trust_email: bool,
     pub allow_unverified_admin: bool,
+    /// What its sign-ins ask for.
+    pub scopes: Vec<String>,
+    pub auto_redirect: bool,
+    pub sign_out: bool,
     /// In the configuration file: it can't be changed on the page.
     pub from_file: bool,
     /// Its button is on the sign-in page. If not, its client secret can't be read.
@@ -194,6 +201,10 @@ pub struct NewProvider<'a> {
     pub link_by_email: bool,
     pub trust_email: bool,
     pub allow_unverified_admin: bool,
+    /// As typed: space- or comma-separated. Empty: the default.
+    pub scopes: &'a str,
+    pub auto_redirect: bool,
+    pub sign_out: bool,
 }
 
 /// The mail server in effect, for the Settings page.
@@ -234,6 +245,18 @@ pub struct ProviderChanges<'a> {
     pub link_by_email: bool,
     pub trust_email: bool,
     pub allow_unverified_admin: bool,
+    /// As typed. Empty: the default.
+    pub scopes: &'a str,
+    pub auto_redirect: bool,
+    pub sign_out: bool,
+}
+
+/// Scopes as typed, for a provider of `kind`: GitHub's follow tag rules.
+fn typed_scopes(kind: ProviderKind, raw: &str) -> Result<Vec<String>, ErrorBody> {
+    if kind == ProviderKind::Github || raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::config::clean_scopes(raw).map_err(|m| err(ErrorCode::InvalidRequest, format!("Scopes: {m}.")))
 }
 
 impl ControlPlane {
@@ -272,6 +295,9 @@ impl ControlPlane {
                     link_by_email: p.link_by_email,
                     trust_email: p.trust_email,
                     allow_unverified_admin: p.allow_unverified_admin,
+                    scopes: p.scopes(),
+                    auto_redirect: p.auto_redirect,
+                    sign_out: p.sign_out,
                     from_file: self.cfg.oidc.iter().any(|f| f.id == p.id),
                     available: sign_in.providers.iter().any(|l| l.id == p.id),
                     only_way_in: self.store.users_only_through(&p.issuer).map_err(internal)?,
@@ -321,7 +347,11 @@ impl ControlPlane {
             link_by_email: new.link_by_email,
             trust_email: new.trust_email,
             allow_unverified_admin: new.allow_unverified_admin,
+            scopes: typed_scopes(new.kind, new.scopes)?,
+            auto_redirect: new.auto_redirect,
+            sign_out: new.sign_out && new.kind == ProviderKind::Oidc,
         };
+        self.may_go_straight_to(row.auto_redirect)?;
         // The Settings page's own routes take this one.
         if row.id == "new" {
             return Err(err(ErrorCode::InvalidRequest, "that id is reserved"));
@@ -361,7 +391,18 @@ impl ControlPlane {
         let label = clean_name(changes.label, 60);
         let client_id = changes.client_id.trim();
         let secret = clean_secret(changes.client_secret)?;
-        let new = OidcProviderRow { label, client_id: client_id.to_string(), link_by_email: changes.link_by_email, trust_email: changes.trust_email, allow_unverified_admin: changes.allow_unverified_admin, ..row.clone() };
+        let new = OidcProviderRow {
+            label,
+            client_id: client_id.to_string(),
+            link_by_email: changes.link_by_email,
+            trust_email: changes.trust_email,
+            allow_unverified_admin: changes.allow_unverified_admin,
+            scopes: typed_scopes(row.kind, changes.scopes)?,
+            auto_redirect: changes.auto_redirect,
+            sign_out: changes.sign_out && row.kind == ProviderKind::Oidc,
+            ..row.clone()
+        };
+        self.may_go_straight_to(new.auto_redirect)?;
         row_config(&self.cfg, &new).check().map_err(|m| err(ErrorCode::InvalidRequest, m))?;
         if !secret.is_empty() {
             write_secret(&self.cfg, id, secret).map_err(internal)?;
@@ -372,6 +413,16 @@ impl ControlPlane {
         let what = if secret.is_empty() { "" } else { "new client secret" };
         self.audit(who, "settings.oidc.update", id, what);
         self.settings_changed().map_err(internal)
+    }
+
+    /// A provider on the page can't be the one the sign-in page goes straight to while the
+    /// configuration file names one.
+    #[allow(clippy::result_large_err)]
+    fn may_go_straight_to(&self, auto_redirect: bool) -> Result<(), ErrorBody> {
+        match self.cfg.oidc.iter().find(|p| p.auto_redirect) {
+            Some(f) if auto_redirect => Err(err(ErrorCode::InvalidRequest, format!("The sign-in page already goes straight to {}, in the configuration file.", f.label))),
+            _ => Ok(()),
+        }
     }
 
     /// Removes a provider from the Settings page. Its people keep their accounts, and adding the

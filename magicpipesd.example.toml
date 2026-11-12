@@ -84,6 +84,7 @@ acme_directory = "letsencrypt"
 # allowed_email_domains = ["example.com"] # verified emails here get a member's account at their first single sign-on (exact domain)
 # members_can_publish = true           # may members' machines create public tunnels? (checked on every new or changed one)
 # max_agents_per_user = 25              # machines a member may enroll themself, counting unused tokens (0: no limit)
+# sso_recheck_secs = 3600              # how often a single sign-on's session is checked with its provider (0: never)
 
 [ports]
 # Raw TCP and UDP tunnels (`magicpipes add 5432 --tcp`, `add 53 --udp`). Off unless `range` is
@@ -121,6 +122,9 @@ acme_directory = "letsencrypt"
 # link_by_email = false                # a first sign-in with a verified email reaches the account with that email
 # trust_email = false                  # accept addresses it doesn't say it verified: anyone who can choose theirs there can use an address listed above
 # allow_unverified_admin = false       # with trust_email: let those addresses become or take over administrators
+# scopes = ["openid", "email", "profile"]  # add "groups" or "offline_access" if the provider needs asking
+# auto_redirect = false                # the sign-in page goes straight here (one provider at most)
+# sign_out = false                     # signing out here signs out there too; register <management>/signed-out
 # kind = "github"                     # GitHub isn't OpenID Connect: its issuer is its address, such as
 #                                      # https://github.com or a GitHub Enterprise Server's
 

@@ -282,6 +282,29 @@ fn toggles(kind: ProviderKind, trust_email: bool, allow_unverified_admin: bool, 
     )
 }
 
+/// What sign-ins ask for, and where the sign-in page and signing out lead.
+fn more_fields(app: &AppState, kind: ProviderKind, scopes: &str, auto_redirect: bool, sign_out: bool) -> String {
+    let on = |b: bool| if b { " checked" } else { "" };
+    let straight = format!(
+        r#"<label><input type="checkbox" name="auto_redirect"{}> Go straight here from the sign-in page</label>
+<p class="note">People skip choosing how to sign in. Passwords and the admin token stay at <code>/login?method=password</code>. Only one provider can do this, so it moves here from any other.</p>"#,
+        on(auto_redirect)
+    );
+    if kind == ProviderKind::Github {
+        return straight;
+    }
+    format!(
+        r#"<label for="pz">Scopes</label><input id="pz" name="scopes" value="{scopes}" maxlength="1000" spellcheck="false" autocomplete="off">
+<p class="note">What a sign-in asks for, with <code>openid</code>. Add <code>groups</code> if the provider only sends groups when asked, and <code>offline_access</code> if it only gives the refresh token that re-checks use then.</p>
+{straight}
+<label><input type="checkbox" name="sign_out"{sign_out}> Signing out here signs out at the provider too</label>
+<p class="note">That also signs people out of everything else that uses it. Register <code>{signed_out}</code> there as a post-logout redirect URI.</p>"#,
+        scopes = esc(scopes),
+        sign_out = on(sign_out),
+        signed_out = esc(&format!("{}/signed-out", app.control.config().management_url())),
+    )
+}
+
 #[derive(Deserialize)]
 pub struct NewQuery {
     #[serde(rename = "type", default)]
@@ -307,6 +330,10 @@ pub struct ProviderForm {
     trust_email: Option<String>,
     allow_unverified_admin: Option<String>,
     link_by_email: Option<String>,
+    #[serde(default)]
+    scopes: String,
+    auto_redirect: Option<String>,
+    sign_out: Option<String>,
 }
 
 /// The page for adding a provider. A secret that was typed isn't sent back.
@@ -330,6 +357,7 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
 <label for="pc">Client ID</label><input id="pc" name="client_id" value="{client_id}" maxlength="512" autocomplete="off" required>
 <label for="ps">Client secret</label><input id="ps" type="password" name="client_secret" maxlength="4096" autocomplete="new-password" required>
 {toggles}
+{more}
 <button class="btn primary">Check and add</button></form>
 <p class="note">Adding it asks the provider about itself first, so a wrong address or an unusable signing key shows up now. A wrong client ID or secret only shows at the first sign-in.</p></div>"#,
         back = back("/settings", "Settings"),
@@ -343,6 +371,13 @@ fn new_provider_page(user: &UiUser, app: &AppState, p: &Preset, id: &str, typed:
         label = esc(typed.map_or(p.label(), |f| &f.label)),
         client_id = esc(typed.map_or("", |f| &f.client_id)),
         toggles = toggles(p.kind, typed.is_some_and(|f| f.trust_email.is_some()), typed.is_some_and(|f| f.allow_unverified_admin.is_some()), typed.is_some_and(|f| f.link_by_email.is_some())),
+        more = more_fields(
+            app,
+            p.kind,
+            &typed.map_or_else(|| crate::config::DEFAULT_SCOPES.join(" "), |f| f.scopes.clone()),
+            typed.is_some_and(|f| f.auto_redirect.is_some()),
+            typed.is_some_and(|f| f.sign_out.is_some()),
+        ),
     );
     page(&title_of(&format!("Add {}", p.name), error.is_some()), Some(user), &body)
 }
@@ -369,6 +404,9 @@ pub async fn create_provider(State(app): State<AppState>, AdminPosted(user, f): 
                 link_by_email: f.link_by_email.is_some(),
                 trust_email: f.trust_email.is_some(),
                 allow_unverified_admin: f.allow_unverified_admin.is_some(),
+                scopes: &f.scopes,
+                auto_redirect: f.auto_redirect.is_some(),
+                sign_out: f.sign_out.is_some(),
             };
             app.control.add_oidc_provider(&user.who, new).await.map_err(|e| e.message)
         }
@@ -393,6 +431,7 @@ fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, typed: Op
 <label for="ps">New client secret</label><input id="ps" type="password" name="client_secret" maxlength="4096" autocomplete="new-password">
 <p class="note">Leave it empty to keep the current one, which can't be shown.</p>
 {toggles}
+{more}
 <button class="btn primary">Save</button></form></div>"#,
         back = back("/settings", "Settings"),
         label = esc(&p.label),
@@ -406,6 +445,10 @@ fn edit_provider_page(user: &UiUser, app: &AppState, p: &ProviderView, typed: Op
         toggles = match typed {
             Some(f) => toggles(p.kind, f.trust_email.is_some(), f.allow_unverified_admin.is_some(), f.link_by_email.is_some()),
             None => toggles(p.kind, p.trust_email, p.allow_unverified_admin, p.link_by_email),
+        },
+        more = match typed {
+            Some(f) => more_fields(app, p.kind, &f.scopes, f.auto_redirect.is_some(), f.sign_out.is_some()),
+            None => more_fields(app, p.kind, &p.scopes.join(" "), p.auto_redirect, p.sign_out),
         },
     );
     page(&title_of(&p.label, error.is_some()), Some(user), &body)
@@ -424,7 +467,17 @@ pub async fn edit_provider(AdminUser(user): AdminUser, State(app): State<AppStat
 }
 
 pub async fn update_provider(State(app): State<AppState>, Path(id): Path<String>, AdminPosted(user, f): AdminPosted<ProviderForm>) -> Response {
-    let changes = ProviderChanges { label: &f.label, client_id: &f.client_id, client_secret: &f.client_secret, link_by_email: f.link_by_email.is_some(), trust_email: f.trust_email.is_some(), allow_unverified_admin: f.allow_unverified_admin.is_some() };
+    let changes = ProviderChanges {
+        label: &f.label,
+        client_id: &f.client_id,
+        client_secret: &f.client_secret,
+        link_by_email: f.link_by_email.is_some(),
+        trust_email: f.trust_email.is_some(),
+        allow_unverified_admin: f.allow_unverified_admin.is_some(),
+        scopes: &f.scopes,
+        auto_redirect: f.auto_redirect.is_some(),
+        sign_out: f.sign_out.is_some(),
+    };
     match app.control.update_oidc_provider(&user.who, &id, changes) {
         Ok(()) => done("/settings", Done::ProviderSaved),
         Err(e) => match editable(&user, &app, &id) {

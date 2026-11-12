@@ -23,6 +23,10 @@ pub struct OidcProviderRow {
     pub link_by_email: bool,
     pub trust_email: bool,
     pub allow_unverified_admin: bool,
+    /// Empty: the default.
+    pub scopes: Vec<String>,
+    pub auto_redirect: bool,
+    pub sign_out: bool,
 }
 
 /// Who a first sign-in may create an account for.
@@ -37,10 +41,29 @@ impl Store {
     /// someone in with the wrong protocol is worse than a button that's missing.
     pub fn oidc_provider_rows(&self) -> anyhow::Result<Vec<OidcProviderRow>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, kind FROM oidc_providers WHERE org_id = ?1 ORDER BY created_at, id")?;
+            let mut st = c.prepare(
+                "SELECT id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, kind, scopes, auto_redirect, sign_out
+                 FROM oidc_providers WHERE org_id = ?1 ORDER BY created_at, id",
+            )?;
             let rows = st.query_map([DEFAULT_ORG], |r| {
                 let kind: String = r.get(7)?;
-                Ok((kind, OidcProviderRow { id: r.get(0)?, kind: ProviderKind::Oidc, label: r.get(1)?, issuer: r.get(2)?, client_id: r.get(3)?, link_by_email: r.get(4)?, trust_email: r.get(5)?, allow_unverified_admin: r.get(6)? }))
+                let scopes: String = r.get(8)?;
+                Ok((
+                    kind,
+                    OidcProviderRow {
+                        id: r.get(0)?,
+                        kind: ProviderKind::Oidc,
+                        label: r.get(1)?,
+                        issuer: r.get(2)?,
+                        client_id: r.get(3)?,
+                        link_by_email: r.get(4)?,
+                        trust_email: r.get(5)?,
+                        allow_unverified_admin: r.get(6)?,
+                        scopes: scopes.split_whitespace().map(str::to_string).collect(),
+                        auto_redirect: r.get(9)?,
+                        sign_out: r.get(10)?,
+                    },
+                ))
             })?;
             let mut known = Vec::new();
             for row in rows {
@@ -54,31 +77,56 @@ impl Store {
         })
     }
 
-    /// `false` if the id or issuer is taken, or there are [`MAX_OIDC_PROVIDERS`].
+    /// `false` if the id or issuer is taken, or there are [`MAX_OIDC_PROVIDERS`]. A provider the
+    /// sign-in page goes straight to takes that from any other.
     pub fn create_oidc_provider(&self, p: &OidcProviderRow) -> anyhow::Result<bool> {
-        let n = self.with(|c| {
-            let count: i64 = c.query_row("SELECT COUNT(*) FROM oidc_providers WHERE org_id = ?1", [DEFAULT_ORG], |r| r.get(0))?;
-            if count as usize >= MAX_OIDC_PROVIDERS {
-                return Ok(0);
-            }
-            c.execute(
-                "INSERT INTO oidc_providers (id, org_id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, created_at, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT DO NOTHING",
-                params![p.id, DEFAULT_ORG, p.label, p.issuer, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, unix_now(), p.kind.as_str()],
-            )
-        })?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM oidc_providers WHERE org_id = ?1", [DEFAULT_ORG], |r| r.get(0))?;
+        if count as usize >= MAX_OIDC_PROVIDERS {
+            return Ok(false);
+        }
+        if p.auto_redirect {
+            tx.execute("UPDATE oidc_providers SET auto_redirect = 0 WHERE org_id = ?1", [DEFAULT_ORG])?;
+        }
+        let n = tx.execute(
+            "INSERT INTO oidc_providers (id, org_id, label, issuer, client_id, link_by_email, trust_email, allow_unverified_admin, created_at, kind, scopes, auto_redirect, sign_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT DO NOTHING",
+            params![
+                p.id,
+                DEFAULT_ORG,
+                p.label,
+                p.issuer,
+                p.client_id,
+                p.link_by_email,
+                p.trust_email,
+                p.allow_unverified_admin,
+                unix_now(),
+                p.kind.as_str(),
+                p.scopes.join(" "),
+                p.auto_redirect,
+                p.sign_out
+            ],
+        )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
-    /// Changes what can change about a provider: its id and issuer stay.
+    /// Changes what can change about a provider: its id and issuer stay. One the sign-in page goes
+    /// straight to now takes that from any other.
     pub fn update_oidc_provider(&self, p: &OidcProviderRow) -> anyhow::Result<bool> {
-        let n = self.with(|c| {
-            c.execute(
-                "UPDATE oidc_providers SET label = ?2, client_id = ?3, link_by_email = ?4, trust_email = ?5, allow_unverified_admin = ?6 WHERE org_id = ?7 AND id = ?1",
-                params![p.id, p.label, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, DEFAULT_ORG],
-            )
-        })?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        if p.auto_redirect {
+            tx.execute("UPDATE oidc_providers SET auto_redirect = 0 WHERE org_id = ?1 AND id != ?2", params![DEFAULT_ORG, p.id])?;
+        }
+        let n = tx.execute(
+            "UPDATE oidc_providers SET label = ?2, client_id = ?3, link_by_email = ?4, trust_email = ?5, allow_unverified_admin = ?6, scopes = ?8, auto_redirect = ?9, sign_out = ?10
+             WHERE org_id = ?7 AND id = ?1",
+            params![p.id, p.label, p.client_id, p.link_by_email, p.trust_email, p.allow_unverified_admin, DEFAULT_ORG, p.scopes.join(" "), p.auto_redirect, p.sign_out],
+        )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
@@ -140,7 +188,19 @@ mod tests {
     use crate::authz::Role;
 
     fn provider(id: &str, issuer: &str) -> OidcProviderRow {
-        OidcProviderRow { id: id.into(), kind: ProviderKind::Oidc, label: "L".into(), issuer: issuer.into(), client_id: "c".into(), link_by_email: false, trust_email: true, allow_unverified_admin: false }
+        OidcProviderRow {
+            id: id.into(),
+            kind: ProviderKind::Oidc,
+            label: "L".into(),
+            issuer: issuer.into(),
+            client_id: "c".into(),
+            link_by_email: false,
+            trust_email: true,
+            allow_unverified_admin: false,
+            scopes: Vec::new(),
+            auto_redirect: false,
+            sign_out: false,
+        }
     }
 
     #[test]
@@ -171,6 +231,17 @@ mod tests {
         let row = s.oidc_provider_rows().unwrap().remove(0);
         assert_eq!((row.label.as_str(), row.client_id.as_str(), row.link_by_email, row.trust_email), ("New", "c2", true, false));
         assert_eq!(row.issuer, "https://a.example.com", "the issuer stays");
+
+        // Scopes and sign-out are kept; going straight to a provider moves from one to the next.
+        let first = OidcProviderRow { scopes: vec!["openid".into(), "groups".into()], auto_redirect: true, sign_out: true, ..row.clone() };
+        assert!(s.update_oidc_provider(&first).unwrap());
+        assert!(s.create_oidc_provider(&OidcProviderRow { auto_redirect: true, ..provider("straight", "https://straight.example.com") }).unwrap());
+        let rows = s.oidc_provider_rows().unwrap();
+        assert_eq!((rows[0].scopes.clone(), rows[0].auto_redirect, rows[0].sign_out), (vec!["openid".to_string(), "groups".to_string()], false, true));
+        assert!(rows[1].auto_redirect, "the newest one");
+        assert!(s.update_oidc_provider(&first).unwrap());
+        assert_eq!(s.oidc_provider_rows().unwrap().iter().filter(|r| r.auto_redirect).map(|r| r.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert!(s.delete_oidc_provider("straight").unwrap());
 
         for i in s.oidc_provider_rows().unwrap().len()..MAX_OIDC_PROVIDERS {
             assert!(s.create_oidc_provider(&provider(&format!("p{i}"), &format!("https://{i}.example.com"))).unwrap());

@@ -333,6 +333,29 @@ If a provider goes away, an administrator can give its users a password with "Re
 which also revokes their API tokens.
 The admin token works regardless.
 
+**More for each provider** (OpenID Connect providers; on the Settings page or in the file):
+
+* **Scopes** (`scopes`): what a sign-in asks for, `openid email profile` unless you say otherwise.
+  Add `groups` for a provider that only sends groups when asked (Okta, for one), for
+  [tag rules](#users), and `offline_access` for one that only gives a refresh token then (Okta,
+  Microsoft Entra, authentik), for re-checks.
+* **Re-checks.** Every `[users] sso_recheck_secs` (an hour; 0 turns them off), the server asks the
+  provider about each session again with the refresh token it gave. If the provider no longer
+  honors it, because the person was removed or disabled there, the session ends at once, and the
+  tags rules gave them from that provider go. Otherwise their current claims update their tags from
+  rules. A provider that can't be reached changes nothing until the next round. The tokens are kept
+  encrypted with the session, under a key from `<data_dir>/session-key`. A provider that gives no
+  refresh token (Google without offline access, GitHub, the proxy) leaves a session to its
+  `session_max_age_secs`.
+* **Go straight here from the sign-in page** (`auto_redirect`), for one provider at most:
+  `/login` goes to it, keeping where to go next. Passwords and other providers stay at
+  `/login?method=password`, and the admin token at `/login?method=token`. Signing out then lands on
+  `/signed-out`, which doesn't go anywhere by itself.
+* **Signing out here signs out at the provider too** (`sign_out`), if it says where in its
+  discovery document (`end_session_endpoint`). That also signs people out of everything else using
+  it, so it's off unless you turn it on. Register `https://<management hostname>/signed-out` there
+  as a post-logout redirect URI; the provider comes back to it.
+
 **In the configuration file.** The same settings can go in `magicpipesd.toml`. They show on the
 Settings page as locked, and a provider there wins over one of the same id on the page. Lists from
 the file and the page are combined. A missing `client_secret_file` stops the server from starting.
@@ -351,6 +374,9 @@ client_secret_file = "/etc/magicpipes/google-secret"
 # link_by_email = true
 # trust_email = true
 # allow_unverified_admin = true            # needs trust_email
+# scopes = ["openid", "email", "profile", "groups", "offline_access"]
+# auto_redirect = true                     # the sign-in page goes straight here
+# sign_out = true                          # signing out here signs out there too
 ```
 
 GitHub isn't OpenID Connect, so it says so, and its issuer is its address:

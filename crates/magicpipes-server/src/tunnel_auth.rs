@@ -93,6 +93,35 @@ impl Signer {
         Self { key: secret::random_string(64).into_bytes() }
     }
 
+    /// The key for what's kept encrypted at rest, derived so it's never the signing key itself.
+    fn sealing_key(&self) -> ring::aead::LessSafeKey {
+        use sha2::Digest;
+        let derived = Sha256::new().chain_update(b"magicpipes provider tokens\0").chain_update(&self.key).finalize();
+        ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &derived).expect("a 256-bit key"))
+    }
+
+    /// Encrypts something kept at rest, such as a provider's tokens for a session (AES-256-GCM,
+    /// a random nonce first), so that a copy of the database alone can't use it.
+    pub fn encrypt(&self, plain: &[u8]) -> Vec<u8> {
+        use ring::rand::SecureRandom;
+        let mut nonce = [0u8; ring::aead::NONCE_LEN];
+        ring::rand::SystemRandom::new().fill(&mut nonce).expect("the system's randomness");
+        let mut sealed = plain.to_vec();
+        self.sealing_key()
+            .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), ring::aead::Aad::from(b"tokens"), &mut sealed)
+            .expect("sealing fits in memory");
+        [nonce.as_slice(), &sealed].concat()
+    }
+
+    /// What [`Self::encrypt`] sealed; `None` if it's been changed, or was sealed with another key.
+    pub fn decrypt(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+        let (nonce, rest) = sealed.split_at_checked(ring::aead::NONCE_LEN)?;
+        let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
+        let mut buf = rest.to_vec();
+        let plain = self.sealing_key().open_in_place(nonce, ring::aead::Aad::from(b"tokens"), &mut buf).ok()?;
+        Some(plain.to_vec())
+    }
+
     fn mac(&self, payload: &str) -> String {
         let mut m = <hmac::Hmac<Sha256> as KeyInit>::new_from_slice(&self.key).expect("HMAC takes any key length");
         m.update(payload.as_bytes());
@@ -185,6 +214,20 @@ pub fn cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_is_kept_encrypted_opens_only_unchanged_and_with_its_key() {
+        let s = Signer::for_tests();
+        let sealed = s.encrypt(b"refresh token");
+        assert_eq!(s.decrypt(&sealed).as_deref(), Some(b"refresh token".as_slice()));
+        assert_ne!(s.encrypt(b"refresh token"), sealed, "a fresh nonce each time");
+        assert!(!sealed.windows(7).any(|w| w == b"refresh"), "not in the clear");
+        let mut changed = sealed.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert_eq!(s.decrypt(&changed), None);
+        assert_eq!(Signer::for_tests().decrypt(&sealed), None, "another server's key");
+        assert_eq!(s.decrypt(&sealed[..5]), None);
+    }
 
     #[test]
     fn a_browser_is_only_sent_to_paths_on_this_host() {

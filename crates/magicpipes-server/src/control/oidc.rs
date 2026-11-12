@@ -23,7 +23,7 @@ use magicpipes_core::secret;
 use super::users::{Login, clean_name, normalize_email};
 use super::{ControlPlane, logged};
 use crate::authz::{Principal, Role};
-use crate::oidc::{Attempt, Person, Provider};
+use crate::oidc::{Attempt, Person, Provider, Tokens};
 use crate::proxy_auth::ProxyAuth;
 use crate::store::UserRow;
 
@@ -103,7 +103,7 @@ impl ControlPlane {
         if current == Some(user.id.as_str()) {
             return Ok(None);
         }
-        self.sso_session(&source, &user, person).map(Some)
+        self.sso_session(&source, &user, person, None).map(Some)
     }
 
     /// Starts a sign-in: where to send the browser, and the cookie to set for the way back.
@@ -146,7 +146,7 @@ impl ControlPlane {
         }
         let _permit = self.oidc_exchanges.try_acquire().map_err(|_| SignInError::Busy)?;
         let wanted = self.wanted_claims(&provider.issuer);
-        let person = match tokio::time::timeout(FINISH_TIMEOUT, provider.finish(attempt, code, redirect_uri, &wanted)).await {
+        let (person, tokens) = match tokio::time::timeout(FINISH_TIMEOUT, provider.finish(attempt, code, redirect_uri, &wanted)).await {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
                 tracing::info!(provider = %provider.id, error = %format!("{e:#}"), "a sign-in failed");
@@ -160,25 +160,31 @@ impl ControlPlane {
         // doesn't matter: it goes to the address the invitation went to.
         if let Some(invite) = &attempt.invite {
             let user = self.accept_invitation_with(invite, &source, &person)?;
-            return self.sso_session(&source, &user, &person);
+            return self.sso_session(&source, &user, &person, Some(&tokens));
         }
         let user = self.sso_account(&source, &person).inspect_err(|e| {
             if let SignInError::NotAllowed(email) = e {
                 self.audit(&Principal::Anonymous, "login.failed", &source.name, email.as_deref().unwrap_or(""));
             }
         })?;
-        self.sso_session(&source, &user, &person)
+        self.sso_session(&source, &user, &person, Some(&tokens))
     }
 
     /// A new session for someone a single sign-on vouched for. Where it vouched for the account's own
     /// address, that address counts as verified from now on.
-    fn sso_session(&self, source: &Source, user: &UserRow, person: &Person) -> Result<Login, SignInError> {
+    /// `tokens`: what the provider gave, kept encrypted with the session for re-checks and signing
+    /// out there.
+    fn sso_session(&self, source: &Source, user: &UserRow, person: &Person, tokens: Option<&Tokens>) -> Result<Login, SignInError> {
         if person.vouched_for && !user.email_verified && person.verified_email.as_deref().and_then(normalize_email).as_deref() == Some(user.email.as_str()) {
             self.store.mark_email_verified(&user.id).map_err(logged(SignInError::Internal))?;
         }
         self.store.finish_sso_login(&user.id, source.issuer).map_err(logged(SignInError::Internal))?;
         self.match_tag_rules(source.issuer, &user.id, &person.claims);
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(SignInError::Internal))?;
+        let kept = tokens.filter(|t| !t.is_empty());
+        let sealed = kept.and_then(|t| serde_json::to_vec(t).ok()).map(|plain| self.data.signer().encrypt(&plain));
+        let rechecks = kept.is_some_and(|t| t.refresh.is_some()) && self.cfg.users.sso_recheck_secs > 0;
+        self.store.set_session_source(&cookie, source.issuer, sealed.as_deref(), rechecks).map_err(logged(SignInError::Internal))?;
         let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };
         self.audit(&who, "session.login", &user.id, &source.name);
         // Finishing can have removed a temporary password, which was forcing a change.

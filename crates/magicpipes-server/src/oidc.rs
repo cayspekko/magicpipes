@@ -23,8 +23,8 @@ use magicpipes_core::{secret, unix_now, url};
 use ring::signature;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -70,6 +70,8 @@ struct Discovery {
     userinfo_endpoint: Option<String>,
     token_endpoint_auth_methods_supported: Option<Vec<String>>,
     id_token_signing_alg_values_supported: Option<Vec<String>>,
+    /// Where signing out at the provider happens (RP-Initiated Logout).
+    end_session_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,6 +166,12 @@ pub struct Provider {
     trust_email: bool,
     /// Those addresses may also reach administrators' accounts.
     pub allow_unverified_admin: bool,
+    /// What a sign-in asks for.
+    scopes: Vec<String>,
+    /// The sign-in page goes straight here.
+    pub auto_redirect: bool,
+    /// Signing out here also signs out there.
+    pub sign_out: bool,
     client_secret: String,
     metadata: Published<Metadata>,
 }
@@ -301,6 +309,7 @@ impl RawClaims {
 struct TokenResponse {
     id_token: Option<String>,
     access_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -329,6 +338,9 @@ impl Provider {
             client_id: cfg.client_id.clone(),
             trust_email: cfg.trust_email,
             allow_unverified_admin: cfg.allow_unverified_admin,
+            scopes: cfg.scopes(),
+            auto_redirect: cfg.auto_redirect,
+            sign_out: cfg.sign_out,
             client_secret,
             metadata: Published::new(),
         })
@@ -359,7 +371,8 @@ impl Provider {
         let endpoint = &m.discovery.authorization_endpoint;
         let sep = if endpoint.contains('?') { '&' } else { '?' };
         Ok(format!(
-            "{endpoint}{sep}response_type=code&scope=openid%20email%20profile&client_id={}&redirect_uri={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
+            "{endpoint}{sep}response_type=code&scope={}&client_id={}&redirect_uri={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
+            url::encode(&self.scopes.join(" ")),
             url::encode(&self.client_id),
             url::encode(redirect_uri),
             attempt.state,
@@ -368,13 +381,68 @@ impl Provider {
         ))
     }
 
-    /// Trades the code for tokens and returns the verified person. `wanted`: the claims tag rules
-    /// for this provider look at, read from the UserInfo endpoint when the ID token lacks them.
-    pub async fn finish(&self, attempt: &Attempt, code: &str, redirect_uri: &str, wanted: &[String]) -> anyhow::Result<Person> {
+    /// The client's credentials for the token endpoint: a `Basic` header, or fields added to `body`.
+    fn client_auth(&self, m: &Metadata, body: &mut String) -> Option<String> {
+        // `client_secret_basic` is the default when a provider doesn't list its methods.
+        let basic = m.discovery.token_endpoint_auth_methods_supported.as_ref().is_none_or(|l| l.iter().any(|a| a == "client_secret_basic"));
+        if basic {
+            let pair = format!("{}:{}", url::encode(&self.client_id), url::encode(&self.client_secret));
+            Some(format!("Basic {}", STANDARD.encode(pair)))
+        } else {
+            body.push_str(&format!("&client_id={}&client_secret={}", url::encode(&self.client_id), url::encode(&self.client_secret)));
+            None
+        }
+    }
+
+    /// Checks an ID token with the provider's keys, fetching newer ones once if a key is unknown.
+    async fn checked(&self, m: Arc<Metadata>, check: impl Fn(&[Jwk]) -> Result<RawClaims, TokenError>) -> anyhow::Result<RawClaims> {
+        match check(&m.keys) {
+            Err(TokenError::UnknownKey) => {
+                let newer = self.metadata(true).await?;
+                check(&newer.keys)
+            }
+            other => other,
+        }
+        .map_err(|e| anyhow!("ID token refused: {e:?}"))
+    }
+
+    /// Fills in from the UserInfo endpoint what the ID token left out: the address if it has none,
+    /// and claims rules want (OpenID Connect Core 5.3).
+    async fn with_userinfo(&self, m: &Metadata, mut person: Person, access: Option<&str>, wanted: &[String]) -> anyhow::Result<Person> {
+        let missing = wanted.iter().any(|c| !person.claims.contains_key(c));
+        let (Some(endpoint), Some(access)) = (&m.discovery.userinfo_endpoint, access) else { return Ok(person) };
+        if person.verified_email.is_some() && !missing {
+            return Ok(person);
+        }
+        let info: RawClaims = get_json(endpoint, Some(&format!("Bearer {access}"))).await.context("userinfo")?;
+        if info.sub != person.subject {
+            bail!("UserInfo describes someone else");
+        }
+        let info = info.into_person(self.trust_email);
+        if person.verified_email.is_none() {
+            person.verified_email = info.verified_email;
+            person.vouched_for = info.vouched_for;
+        }
+        if person.name.is_empty() {
+            person.name = info.name;
+        }
+        for (name, values) in info.claims {
+            if person.claims.len() < MAX_CLAIMS && !person.claims.contains_key(&name) {
+                person.claims.insert(name, values);
+            }
+        }
+        Ok(person)
+    }
+
+    /// Trades the code for tokens and returns the verified person, and the tokens worth keeping for
+    /// re-checks and signing out. `wanted`: the claims tag rules for this provider look at, read
+    /// from the UserInfo endpoint when the ID token lacks them.
+    pub async fn finish(&self, attempt: &Attempt, code: &str, redirect_uri: &str, wanted: &[String]) -> anyhow::Result<(Person, Tokens)> {
         if self.kind == ProviderKind::Github {
             let wants = |claim: &str| wanted.iter().any(|c| c == claim);
             let (orgs, teams) = (wants(crate::github::ORG), wants(crate::github::TEAM));
-            return crate::github::person(&self.issuer, &self.client_id, &self.client_secret, code, redirect_uri, &attempt.verifier, orgs, teams).await;
+            let person = crate::github::person(&self.issuer, &self.client_id, &self.client_secret, code, redirect_uri, &attempt.verifier, orgs, teams).await?;
+            return Ok((person, Tokens::default()));
         }
         let m = self.metadata(false).await?;
         let mut body = format!(
@@ -383,54 +451,110 @@ impl Provider {
             url::encode(redirect_uri),
             url::encode(&attempt.verifier),
         );
-        // `client_secret_basic` is the default when a provider doesn't list its methods.
-        let basic = m.discovery.token_endpoint_auth_methods_supported.as_ref().is_none_or(|l| l.iter().any(|a| a == "client_secret_basic"));
-        let auth = if basic {
-            let pair = format!("{}:{}", url::encode(&self.client_id), url::encode(&self.client_secret));
-            Some(format!("Basic {}", STANDARD.encode(pair)))
-        } else {
-            body.push_str(&format!("&client_id={}&client_secret={}", url::encode(&self.client_id), url::encode(&self.client_secret)));
-            None
-        };
+        let auth = self.client_auth(&m, &mut body);
         let bytes = request(Method::POST, &m.discovery.token_endpoint, auth.as_deref(), Some(body)).await.context("token request")?;
         let tokens: TokenResponse = serde_json::from_slice(&bytes).context("token response")?;
         let id_token = tokens.id_token.ok_or_else(|| anyhow!("the token response has no ID token"))?;
-
         let now = unix_now();
-        let claims = match verify_id_token(&id_token, &m.keys, &self.issuer, &self.client_id, &attempt.nonce, now) {
-            Err(TokenError::UnknownKey) => {
-                let newer = self.metadata(true).await?;
-                verify_id_token(&id_token, &newer.keys, &self.issuer, &self.client_id, &attempt.nonce, now)
-            }
-            other => other,
-        };
-        let mut person = claims.map_err(|e| anyhow!("ID token refused: {e:?}"))?.into_person(self.trust_email);
+        let claims = self.checked(m.clone(), |keys| verify_id_token(&id_token, keys, &self.issuer, &self.client_id, &attempt.nonce, now)).await?;
+        let person = self.with_userinfo(&m, claims.into_person(self.trust_email), tokens.access_token.as_deref(), wanted).await?;
+        let kept = Tokens::keep(tokens.refresh_token, Some(id_token));
+        Ok((person, kept))
+    }
 
-        // Providers may keep the email, or the claims rules want, for the UserInfo endpoint
-        // (OpenID Connect Core 5.3).
-        let missing = wanted.iter().any(|c| !person.claims.contains_key(c));
-        if (person.verified_email.is_none() || missing)
-            && let (Some(endpoint), Some(access)) = (&m.discovery.userinfo_endpoint, &tokens.access_token)
-        {
-            let info: RawClaims = get_json(endpoint, Some(&format!("Bearer {access}"))).await.context("userinfo")?;
-            if info.sub != person.subject {
-                bail!("UserInfo describes someone else");
-            }
-            let info = info.into_person(self.trust_email);
-            if person.verified_email.is_none() {
-                person.verified_email = info.verified_email;
-                person.vouched_for = info.vouched_for;
-            }
-            if person.name.is_empty() {
-                person.name = info.name;
-            }
-            for (name, values) in info.claims {
-                if person.claims.len() < MAX_CLAIMS && !person.claims.contains_key(&name) {
-                    person.claims.insert(name, values);
-                }
-            }
+    /// Asks the provider about someone again, with the refresh token a sign-in gave: who they are
+    /// now, if it says (an ID token, or UserInfo), and the tokens to keep from here.
+    pub async fn refresh(&self, refresh_token: &str, subject: &str, wanted: &[String]) -> Result<(Option<Person>, Tokens), Refused> {
+        let unavailable = |e: anyhow::Error| Refused::Unavailable(format!("{e:#}"));
+        let m = self.metadata(false).await.map_err(unavailable)?;
+        let mut body = format!("grant_type=refresh_token&refresh_token={}", url::encode(refresh_token));
+        let auth = self.client_auth(&m, &mut body);
+        let mut headers = Vec::new();
+        if let Some(a) = auth {
+            headers.push((header::AUTHORIZATION, a));
         }
-        Ok(person)
+        let form = Some(("application/x-www-form-urlencoded", Bytes::from(body)));
+        let (status, bytes) =
+            tokio::time::timeout(HTTP_TIMEOUT, send(Method::POST, &m.discovery.token_endpoint, &headers, form)).await.map_err(|_| Refused::Unavailable("timed out".into()))?.map_err(unavailable)?;
+        if !status.is_success() {
+            #[derive(Deserialize)]
+            struct Answer {
+                error: Option<String>,
+            }
+            // Only this means the grant itself is gone; anything else may be the provider's trouble.
+            let error = serde_json::from_slice::<Answer>(&bytes).ok().and_then(|a| a.error);
+            return Err(if error.as_deref() == Some("invalid_grant") { Refused::Grant } else { Refused::Unavailable(format!("the provider answered {status}")) });
+        }
+        let tokens: TokenResponse = serde_json::from_slice(&bytes).map_err(|e| Refused::Unavailable(format!("token response: {e}")))?;
+        let person = match &tokens.id_token {
+            Some(id_token) => {
+                let now = unix_now();
+                let claims = self.checked(m.clone(), |keys| verify_refreshed_id_token(id_token, keys, &self.issuer, &self.client_id, now)).await.map_err(unavailable)?;
+                Some(claims.into_person(self.trust_email))
+            }
+            None => None,
+        };
+        let person = match person {
+            Some(p) => Some(self.with_userinfo(&m, p, tokens.access_token.as_deref(), wanted).await.map_err(unavailable)?),
+            // Without an ID token, UserInfo says who it is, when the provider has it.
+            None => match (&m.discovery.userinfo_endpoint, &tokens.access_token) {
+                (Some(endpoint), Some(access)) => {
+                    let info: RawClaims = get_json(endpoint, Some(&format!("Bearer {access}"))).await.context("userinfo").map_err(unavailable)?;
+                    Some(info.into_person(self.trust_email))
+                }
+                _ => None,
+            },
+        };
+        if person.as_ref().is_some_and(|p| p.subject != subject) {
+            return Err(Refused::Grant);
+        }
+        // A provider that doesn't rotate refresh tokens keeps the one it gave.
+        let kept = Tokens::keep(tokens.refresh_token.or_else(|| Some(refresh_token.to_string())), tokens.id_token);
+        Ok((person, kept))
+    }
+
+    /// Where to send a browser to sign out at the provider too, if it says (`end_session_endpoint`,
+    /// RP-Initiated Logout), coming back to `back`.
+    pub async fn sign_out_url(&self, id_token: Option<&str>, back: &str) -> Option<String> {
+        let m = self.metadata(false).await.ok()?;
+        let endpoint = m.discovery.end_session_endpoint.as_deref()?;
+        let sep = if endpoint.contains('?') { '&' } else { '?' };
+        let hint = id_token.map(|t| format!("&id_token_hint={}", url::encode(t))).unwrap_or_default();
+        Some(format!("{endpoint}{sep}client_id={}&post_logout_redirect_uri={}{hint}", url::encode(&self.client_id), url::encode(back)))
+    }
+}
+
+/// Why a re-check didn't vouch for someone.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The provider no longer honors the grant (`invalid_grant`), or names someone else.
+    Grant,
+    /// It couldn't be asked, or answered something else; it may be fine later.
+    Unavailable(String),
+}
+
+/// The longest token kept: they're kept per session.
+const MAX_KEPT_TOKEN: usize = 8 * 1024;
+
+/// What a single sign-on leaves for later, encrypted with its session: the refresh token for
+/// re-checks, and the ID token for signing out at the provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tokens {
+    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<String>,
+    #[serde(rename = "i", default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+}
+
+impl Tokens {
+    /// Those of a size worth keeping.
+    fn keep(refresh: Option<String>, id_token: Option<String>) -> Self {
+        let fits = |t: &String| !t.is_empty() && t.len() <= MAX_KEPT_TOKEN;
+        Self { refresh: refresh.filter(fits), id_token: id_token.filter(fits) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.refresh.is_none() && self.id_token.is_none()
     }
 }
 
@@ -438,7 +562,7 @@ async fn fetch_discovery(issuer: &str) -> anyhow::Result<Discovery> {
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     let discovery: Discovery = get_json(&url, None).await.context("discovery")?;
     let endpoints = [&discovery.authorization_endpoint, &discovery.token_endpoint, &discovery.jwks_uri];
-    if let Some(bad) = endpoints.into_iter().chain(discovery.userinfo_endpoint.as_ref()).find(|u| !allowed_url(u)) {
+    if let Some(bad) = endpoints.into_iter().chain(discovery.userinfo_endpoint.as_ref()).chain(discovery.end_session_endpoint.as_ref()).find(|u| !allowed_url(u)) {
         bail!("the provider's endpoint {bad} isn't HTTPS");
     }
     Ok(discovery)
@@ -630,6 +754,21 @@ fn verify_id_token(token: &str, keys: &[Jwk], issuer: &str, client_id: &str, non
     }
     if !checked.nonce.as_deref().is_some_and(|n| secret::constant_time_eq(n.as_bytes(), nonce.as_bytes())) {
         return Err(TokenError::Invalid("nonce"));
+    }
+    person_claims(&body)
+}
+
+/// Checks an ID token a refresh brought (OpenID Connect Core 12.2): as at the sign-in, but it
+/// carries no nonce of ours.
+fn verify_refreshed_id_token(token: &str, keys: &[Jwk], issuer: &str, client_id: &str, now: i64) -> Result<RawClaims, TokenError> {
+    let body = signed_claims(token, keys)?;
+    let checked = checked_claims(&body, issuer, client_id, now)?;
+    let azp_ok = match &checked.azp {
+        Some(azp) => azp == client_id,
+        None => !checked.aud.several(),
+    };
+    if !azp_ok {
+        return Err(TokenError::Invalid("audience"));
     }
     person_claims(&body)
 }
@@ -848,6 +987,33 @@ mod tests {
     }
 
     #[test]
+    fn an_id_token_from_a_refresh_needs_no_nonce_but_everything_else() {
+        let key = Key::new();
+        let keys = [key.jwk("k1")];
+        let mut c = claims();
+        c.as_object_mut().unwrap().remove("nonce");
+        c["groups"] = serde_json::json!(["eng"]);
+        let person = verify_refreshed_id_token(&key.token(&c), &keys, ISS, CLIENT, NOW).unwrap().into_person(false);
+        assert_eq!((person.subject.as_str(), person.claims.get("groups")), ("subject-1", Some(&vec!["eng".to_string()])));
+        let mut other = c.clone();
+        other["aud"] = "someone-else".into();
+        assert!(verify_refreshed_id_token(&key.token(&other), &keys, ISS, CLIENT, NOW).is_err());
+        let mut old = c.clone();
+        old["exp"] = (NOW - 3600).into();
+        assert!(verify_refreshed_id_token(&key.token(&old), &keys, ISS, CLIENT, NOW).is_err());
+        assert_eq!(verify_refreshed_id_token(&Key::new().token(&c), &keys, ISS, CLIENT, NOW).err(), Some(TokenError::Invalid("signature")));
+    }
+
+    #[test]
+    fn only_tokens_of_a_size_worth_keeping_are_kept() {
+        let kept = Tokens::keep(Some("rt".into()), Some("x".repeat(MAX_KEPT_TOKEN + 1)));
+        assert_eq!((kept.refresh.as_deref(), kept.id_token.as_deref()), (Some("rt"), None));
+        assert!(Tokens::keep(Some(String::new()), None).is_empty());
+        let json = serde_json::to_string(&kept).unwrap();
+        assert_eq!(json, r#"{"r":"rt"}"#);
+    }
+
+    #[test]
     fn id_tokens_are_checked() {
         let key = Key::new();
         let keys = [key.jwk("k1")];
@@ -1031,6 +1197,7 @@ mod tests {
             userinfo_endpoint: None,
             token_endpoint_auth_methods_supported: None,
             id_token_signing_alg_values_supported: algs.map(|l| l.iter().map(|a| a.to_string()).collect()),
+            end_session_endpoint: None,
         };
         let key = |v: serde_json::Value| -> Jwk { serde_json::from_value(v).unwrap() };
         let rsa = key(serde_json::json!({ "kty": "RSA", "alg": "RS256", "use": "sig", "n": "AQAB", "e": "AQAB" }));
