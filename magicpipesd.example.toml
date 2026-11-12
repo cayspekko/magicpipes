@@ -148,6 +148,7 @@ acme_directory = "letsencrypt"
 # user_header = "X-Forwarded-Email"    # with the shared secret, and with proxy_protocol off here
 # secret_header = "X-MagicPipes-Proxy-Secret"
 # secret_file = "/etc/magicpipes/proxy-secret"  # at least 16 characters
+# groups_header = "X-Forwarded-Groups" # comma-separated groups, the claim `groups` for tag rules
 # trust_email = false                  # accept addresses nothing says were verified: plain headers need this
 # allow_unverified_admin = false       # with trust_email: let those addresses become or take over administrators
 # auto_create = false                  # someone new with an accepted address gets a member account

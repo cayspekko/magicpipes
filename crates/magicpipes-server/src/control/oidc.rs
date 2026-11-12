@@ -120,7 +120,8 @@ impl ControlPlane {
     }
 
     async fn leave_for(&self, provider: &Provider, attempt: Attempt, redirect_uri: &str) -> Result<(String, String), SignInError> {
-        let url = provider.authorization_url(&attempt, redirect_uri).await.map_err(|e| {
+        let wanted = self.wanted_claims(&provider.issuer);
+        let url = provider.authorization_url(&attempt, redirect_uri, &wanted).await.map_err(|e| {
             tracing::warn!(provider = %provider.id, error = %format!("{e:#}"), "could not start a sign-in");
             SignInError::Unavailable
         })?;
@@ -144,7 +145,8 @@ impl ControlPlane {
             return Err(SignInError::Refused);
         }
         let _permit = self.oidc_exchanges.try_acquire().map_err(|_| SignInError::Busy)?;
-        let person = match tokio::time::timeout(FINISH_TIMEOUT, provider.finish(attempt, code, redirect_uri)).await {
+        let wanted = self.wanted_claims(&provider.issuer);
+        let person = match tokio::time::timeout(FINISH_TIMEOUT, provider.finish(attempt, code, redirect_uri, &wanted)).await {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
                 tracing::info!(provider = %provider.id, error = %format!("{e:#}"), "a sign-in failed");
@@ -175,6 +177,7 @@ impl ControlPlane {
             self.store.mark_email_verified(&user.id).map_err(logged(SignInError::Internal))?;
         }
         self.store.finish_sso_login(&user.id, source.issuer).map_err(logged(SignInError::Internal))?;
+        self.match_tag_rules(source.issuer, &user.id, &person.claims);
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(SignInError::Internal))?;
         let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };
         self.audit(&who, "session.login", &user.id, &source.name);

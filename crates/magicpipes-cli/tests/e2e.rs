@@ -3195,6 +3195,132 @@ async fn admin_session(env: &Env) -> String {
     env.ui("/login", None, Some(&[("token", token.as_str())])).await.cookie.expect("signed in")
 }
 
+/// Tag rules give tags from what a sign-in says: a provider's groups (in the ID token, or from
+/// UserInfo when it lacks them), GitHub's organizations and teams, and a confirmed address's
+/// domain. A sign-in without the group takes it away, and removing a rule takes its tag from
+/// whoever had it only through the rule, at once; access to a private tunnel follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tag_rules_give_tags_from_what_a_sign_in_says() {
+    let idp = common::FakeOidc::start().await;
+    let gh = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-rules-{}", std::process::id()));
+    let config = format!(
+        "{}\n[[oidc]]\nid = \"gh\"\nlabel = \"Our GitHub\"\nkind = \"github\"\nissuer = \"{}\"\nclient_id = \"{}\"\nclient_secret_file = \"{}\"\nlink_by_email = true\n",
+        idp.config(&dir, r#"allowed_email_domains = ["team.example.com"]"#, true),
+        gh.issuer,
+        common::OIDC_CLIENT,
+        dir.join("oidc-secret").display(),
+    );
+    let env = Env::with_config(Tls::DevCa, &config).await;
+    let admin = env.admin_token();
+    for tag in ["team:eng", "team:ops", "gh:platform"] {
+        let (s, v) = env.api_json("POST", "/api/v1/tags", Some(&admin), serde_json::json!({ "name": tag })).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+    }
+    let rule = async |source: &str, claim: &str, value: &str, tag: &str| {
+        env.api_json("POST", "/api/v1/tag-rules", Some(&admin), serde_json::json!({ "source": source, "claim": claim, "value": value, "tag": tag })).await
+    };
+
+    // What a rule can name.
+    let (_, v) = env.api("GET", "/api/v1/tag-rules", Some(&admin)).await;
+    let sources: Vec<(&str, &str)> = v["sources"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap(), s["kind"].as_str().unwrap())).collect();
+    assert_eq!(sources, vec![("Any sign-in", "any"), ("Fake ID", "oidc"), ("Our GitHub", "github")], "{v}");
+    let (s, v) = rule(&idp.issuer, "groups", "eng", "team:eng").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let eng_rule = v["rule"]["id"].as_str().unwrap().to_string();
+    for (source, claim, value, tag, code) in [
+        (idp.issuer.as_str(), "email", "dev@team.example.com", "team:eng", "invalid_request"),
+        ("https://nowhere.example.com", "groups", "eng", "team:eng", "invalid_request"),
+        (idp.issuer.as_str(), "groups", "eng", "no-such-tag", "tag_unknown"),
+        (gh.issuer.as_str(), "groups", "eng", "team:eng", "invalid_request"),
+        (idp.issuer.as_str(), "groups", "eng", "team:eng", "invalid_request"),
+    ] {
+        let (s, v) = rule(source, claim, value, tag).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some(code)), "{source} {claim}={value} {tag}: {v}");
+    }
+    let member = async || user_named(&env, "dev@team.example.com").await;
+    let set = |p: common::OidcPerson| *idp.person.lock().unwrap() = p;
+
+    // A machine's private tunnel for team:eng, which follows who holds it.
+    env.login().await;
+    let (_, agents) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent = agents["agents"][0]["id"].as_str().unwrap().to_string();
+    let (s, v) = env.api_json("PATCH", &format!("/api/v1/agents/{agent}"), Some(&admin), serde_json::json!({ "tags": ["team:eng"] })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    add_json(&env, &[&app.port.to_string(), "--private", "--tag", "team:eng", "--name", "eng-app"]).await;
+
+    // Signing in with the group gives the tag, and the tunnel.
+    let mut dev = common::OidcPerson::new("dev-1", "dev@team.example.com");
+    dev.claims = serde_json::json!({ "groups": ["eng", "other"] });
+    set(dev.clone());
+    let cookie = session_of(&oidc_sign_in(&env, None).await);
+    let token = api_token(&env, &cookie).await;
+    let shared = async || env.api("GET", "/api/v1/shared", Some(&token)).await.1["tunnels"].as_array().unwrap().iter().any(|t| t["name"] == "eng-app");
+    let u = member().await;
+    assert_eq!((u["rule_tags"].clone(), u["tags"].clone()), (serde_json::json!(["team:eng"]), serde_json::json!([])), "{u}");
+    assert!(shared().await, "the tunnel for team:eng");
+
+    // Signing in without it takes it away.
+    dev.claims = serde_json::json!({ "groups": ["other"] });
+    set(dev.clone());
+    oidc_sign_in(&env, None).await;
+    assert_eq!(member().await["rule_tags"], serde_json::json!([]));
+    assert!(!shared().await);
+
+    // Groups only UserInfo gives are read there, since a rule asks for them.
+    dev.claims = serde_json::json!({});
+    dev.userinfo_claims = serde_json::json!({ "groups": ["eng"] });
+    set(dev.clone());
+    oidc_sign_in(&env, None).await;
+    assert_eq!(member().await["rule_tags"], serde_json::json!(["team:eng"]));
+
+    // An address's domain: everyone confirmed there, at once.
+    let (s, v) = rule("*", "", "Team.Example.com", "team:ops").await;
+    assert_eq!((s, v["rule"]["claim"].as_str(), v["rule"]["value"].as_str(), v["rule"]["holders"].as_u64()), (StatusCode::CREATED, Some("email_domain"), Some("team.example.com"), Some(1)), "{v}");
+    assert_eq!(member().await["rule_tags"], serde_json::json!(["team:eng", "team:ops"]));
+
+    // GitHub: read:org is asked for only once a rule wants organizations or teams.
+    let gh_start = env.ui("/auth/oidc/gh", None, None).await.location.unwrap();
+    assert!(gh_start.contains("scope=user%3Aemail&"), "{gh_start}");
+    let (s, v) = rule(&gh.issuer, "github:team", "Acme/Platform", "gh:platform").await;
+    assert_eq!((s, v["rule"]["value"].as_str()), (StatusCode::CREATED, Some("acme/platform")), "{v}");
+    let gh_start = env.ui("/auth/oidc/gh", None, None).await.location.unwrap();
+    assert!(gh_start.contains("scope=user%3Aemail%20read%3Aorg"), "{gh_start}");
+    let mut on_github = common::OidcPerson::new("201", "dev@team.example.com");
+    on_github.teams = vec!["ACME/platform".into(), "acme/other".into()];
+    on_github.orgs = vec!["acme".into()];
+    *gh.person.lock().unwrap() = on_github;
+    oidc_sign_in_at(&env, "gh", None).await;
+    assert_eq!(member().await["rule_tags"], serde_json::json!(["gh:platform", "team:eng", "team:ops"]), "each source's matches stand side by side");
+
+    // The Tags page lists the rules, and says what removing one does.
+    let admin_cookie = admin_session(&env).await;
+    let page = env.ui("/tags", Some(&admin_cookie), None).await.html;
+    for want in [
+        "A confirmed address at <code>team.example.com</code>",
+        "<code>groups</code> has <code>eng</code><span class=\"sub wrap\">from Fake ID</span>",
+        "Remove this rule? 1 person holds team:eng only through it, and lose it.",
+    ] {
+        assert!(page.contains(want), "{want} in {page}");
+    }
+    let users_page = env.ui("/users", Some(&admin_cookie), None).await.html;
+    assert!(users_page.contains(r#"<div class="byrule"><span class="sub">by rule</span>"#), "{users_page}");
+    let typo = env.ui("/tags/rules", Some(&admin_cookie), Some(&[("csrf", &env.ui("/tags", Some(&admin_cookie), None).await.csrf()), ("tag", "team:ops"), ("source", "*"), ("claim", ""), ("value", "not a domain@")])).await;
+    assert!(typo.status == StatusCode::BAD_REQUEST && typo.html.contains("Enter a domain, like example.com.") && typo.html.contains(r#"value="not a domain@""#), "{}", typo.html);
+
+    // Removing the groups rule takes team:eng, and the tunnel, at once.
+    let (s, _) = env.api("DELETE", &format!("/api/v1/tag-rules/{eng_rule}"), Some(&admin)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(member().await["rule_tags"], serde_json::json!(["gh:platform", "team:ops"]));
+    assert!(!shared().await);
+    assert_eq!(env.api("DELETE", &format!("/api/v1/tag-rules/{eng_rule}"), Some(&admin)).await.0, StatusCode::NOT_FOUND);
+    // Deleting a tag takes its rules with it.
+    env.api("DELETE", "/api/v1/tags/team:ops", Some(&admin)).await;
+    assert_eq!(env.api("GET", "/api/v1/tag-rules", Some(&admin)).await.1["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(member().await["rule_tags"], serde_json::json!(["gh:platform"]));
+}
+
 /// GitHub isn't OpenID Connect, but who gets in is decided the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn github_sign_in_admits_only_who_it_should() {

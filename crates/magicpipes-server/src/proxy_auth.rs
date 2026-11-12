@@ -26,7 +26,7 @@ const MIN_SECRET: usize = 16;
 
 enum Method {
     Token { header: HeaderName, checker: AssertionChecker },
-    Headers { user_header: HeaderName, secret_header: HeaderName, secret: String, trusted: TrustedProxies, trust_email: bool },
+    Headers { user_header: HeaderName, secret_header: HeaderName, groups_header: Option<HeaderName>, secret: String, trusted: TrustedProxies, trust_email: bool },
 }
 
 pub struct ProxyAuth {
@@ -61,7 +61,20 @@ fn named_person(value: &str, trust_email: bool) -> Option<Person> {
         return None;
     }
     let verified_email = (trust_email && subject.contains('@')).then(|| subject.clone());
-    Some(Person { subject, verified_email, vouched_for: false, name: String::new() })
+    Some(Person { subject, verified_email, ..Person::default() })
+}
+
+/// A groups header's list, as the claim `groups`: comma-separated names, trimmed.
+fn groups(value: &str) -> crate::oidc::Claims {
+    use crate::oidc::{MAX_CLAIM_LEN, MAX_CLAIM_VALUES};
+    let names: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && g.len() <= MAX_CLAIM_LEN && !g.chars().any(char::is_control))
+        .take(MAX_CLAIM_VALUES)
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() { Default::default() } else { [("groups".to_string(), names)].into_iter().collect() }
 }
 
 impl ProxyAuth {
@@ -83,7 +96,8 @@ impl ProxyAuth {
                 let file = cfg.secret_file.as_ref().context("secret_file is missing")?;
                 let secret = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?.trim().to_string();
                 anyhow::ensure!(secret.len() >= MIN_SECRET, "{} must hold at least {MIN_SECRET} characters", file.display());
-                let method = Method::Headers { user_header: header(&cfg.user_header)?, secret_header: header(&cfg.secret_header)?, secret, trusted, trust_email: cfg.trust_email };
+                let groups_header = cfg.groups_header.as_ref().map(|_| header(&cfg.groups_header)).transpose()?;
+                let method = Method::Headers { user_header: header(&cfg.user_header)?, secret_header: header(&cfg.secret_header)?, groups_header, secret, trusted, trust_email: cfg.trust_email };
                 (PLAIN_HEADERS_ISSUER.to_string(), method)
             }
         };
@@ -101,7 +115,7 @@ impl ProxyAuth {
                     KeysUnavailable
                 })
             }
-            Method::Headers { user_header, secret_header, secret, trusted, trust_email } => {
+            Method::Headers { user_header, secret_header, groups_header, secret, trusted, trust_email } => {
                 let from_proxy = peer.is_some_and(|ip| trusted.trusts(ip.to_canonical()));
                 let knows_secret = single(headers, secret_header).is_some_and(|s| secret::constant_time_eq(s.as_bytes(), secret.as_bytes()));
                 if !from_proxy || !knows_secret {
@@ -110,7 +124,8 @@ impl ProxyAuth {
                     }
                     return Ok(None);
                 }
-                Ok(single(headers, user_header).and_then(|v| named_person(v, *trust_email)))
+                let groups = groups_header.as_ref().and_then(|h| single(headers, h)).map(groups).unwrap_or_default();
+                Ok(single(headers, user_header).and_then(|v| named_person(v, *trust_email)).map(|p| Person { claims: groups, ..p }))
             }
         }
     }
@@ -131,6 +146,7 @@ mod tests {
             method: Method::Headers {
                 user_header: HeaderName::from_static("x-forwarded-email"),
                 secret_header: HeaderName::from_static("x-proxy-secret"),
+                groups_header: Some(HeaderName::from_static("x-forwarded-groups")),
                 secret: SECRET.into(),
                 trusted: TrustedProxies::new(magicpipes_core::cidr::parse_list(&["10.0.0.1/32".to_string()]).unwrap()),
                 trust_email,
@@ -168,6 +184,19 @@ mod tests {
         assert_eq!(who(headers(&[("x-forwarded-email", "ann@example.com"), ("x-proxy-secret", SECRET), ("x-proxy-secret", SECRET)]), from_proxy).await, None);
     }
 
+    #[tokio::test]
+    async fn groups_come_only_with_a_person_the_proxy_named() {
+        let p = proxy(true);
+        let from_proxy = Some("10.0.0.1".parse().unwrap());
+        let named = headers(&[("x-forwarded-email", "ann@example.com"), ("x-proxy-secret", SECRET), ("x-forwarded-groups", " eng , ops,,eng-leads ")]);
+        let person = p.person(&named, from_proxy).await.unwrap().unwrap();
+        assert_eq!(person.claims.get("groups"), Some(&vec!["eng".to_string(), "ops".to_string(), "eng-leads".to_string()]));
+        let forged = headers(&[("x-forwarded-email", "ann@example.com"), ("x-forwarded-groups", "admins")]);
+        assert!(p.person(&forged, from_proxy).await.unwrap().is_none(), "without the secret, nobody, and no groups");
+        let none = headers(&[("x-forwarded-email", "ann@example.com"), ("x-proxy-secret", SECRET)]);
+        assert!(p.person(&none, from_proxy).await.unwrap().unwrap().claims.is_empty());
+    }
+
     #[test]
     fn a_named_person_is_only_as_verified_as_the_settings_say() {
         let person = named_person(" Ann@Example.com ", true).unwrap();
@@ -196,6 +225,7 @@ mod tests {
             user_header: Some("X-Forwarded-Email".into()),
             secret_header: Some("X-Proxy-Secret".into()),
             secret_file: Some(path.to_path_buf()),
+            groups_header: None,
             trust_email: false,
             allow_unverified_admin: false,
             auto_create: false,

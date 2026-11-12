@@ -211,6 +211,26 @@ administrator when they first sign in. With a mail server, they're invited by em
   you save, and saving applies only those changes, so another administrator's edit made
   meanwhile is kept. Without JavaScript, Edit opens a page
   of checkboxes instead.
+* **Tag rules** (Tags page → Rules) give tags from what a sign-in says, besides those assigned:
+  * **A provider's or the proxy's claims.** `groups` has `eng` gives `team:eng` to whoever that
+    provider says is in `eng`. Any claim that is a string or a list of strings works (`groups`,
+    Google's `hd`, Entra's `roles`, a namespaced one), and someone matches when the claim is the value
+    or lists it, exactly. A claim the ID token lacks is read from the provider's UserInfo endpoint.
+    With plain proxy headers, set `groups_header` (comma-separated); with a signed token, its claims
+    count.
+  * **GitHub's organizations and teams**: the claims `github:org` (`acme`) and `github:team`
+    (`acme/platform`), compared without case. Sign-ins ask GitHub to read organizations
+    (`read:org`) only once such a rule exists, and an organization that restricts OAuth apps has to
+    allow yours.
+  * **A confirmed address's domain**, from any sign-in: everyone whose address is shown to be theirs
+    at `example.com` gets the tag at once.
+
+  A claim rule applies at each person's next single sign-on through that source, which replaces what
+  they matched there before, and lasts `session_max_age_secs` (12 hours) unless they sign in that way
+  again: being taken out of a group at the provider takes the tag away by then at the latest, however
+  else they sign in meanwhile. Removing a rule takes its tag from whoever held it only through the
+  rule, at once. Only administrators write rules, and a rule only gives a tag an administrator made,
+  never a personal one. The Users page shows tags people hold by rule under those assigned.
 * **Sign-in protection**: passwords are stored as Argon2id hashes and need at least 12
   characters. After 10 failed attempts within 15 minutes, an account accepts one attempt every
   10 seconds, right password or not. An address with 10 failed attempts within 5 minutes
@@ -377,7 +397,8 @@ secret_file = "/etc/magicpipes/proxy-secret"
 ```
 
 The proxy must replace any copy of these headers a client sends. A header sent twice counts as
-nobody, in case a client's copy is beside the proxy's.
+nobody, in case a client's copy is beside the proxy's. `groups_header = "X-Forwarded-Groups"`
+also reads a comma-separated list of groups for [tag rules](#users), as the claim `groups`.
 
 **Who gets in** follows the single sign-on rules above: someone seen before is recognized by their
 identity, and a first visit needs a verified address. A token says so with `email_verified`; for a
@@ -1198,6 +1219,9 @@ answer `403 forbidden` to members.
 | GET | `/api/v1/tags` | `{"tags": [{"name", "description", "access", "created_at"}]}` (administrators; personal tags not listed) |
 | POST | `/api/v1/tags` | 201; body `{"name", "description"?, "access"?}` (`access` defaults to true; `user:` names are reserved) |
 | PATCH | `/api/v1/tags/{name}` | `{"access": bool}`: whether it grants access |
+| GET | `/api/v1/tag-rules` | `{"rules": [{"id", "source", "source_name", "claim", "value", "tag", "holders", "only_through", "created_at"}], "sources": [{"issuer", "name", "kind"}]}` (administrators) |
+| POST | `/api/v1/tag-rules` | 201 `{"rule"}`; body `{"source", "claim"?, "value", "tag"}`: `source` is a source's `issuer`, or `*` with a domain as `value` for an address's domain. At most 500 |
+| DELETE | `/api/v1/tag-rules/{id}` | 204; whoever held its tag only through it loses it |
 | DELETE | `/api/v1/tags/{name}` | 204; removes it from every user, agent and tunnel |
 | GET | `/api/v1/hostnames` | `{"hostnames": [{"hostname", "owner_user_id"?, "owner_email"?, "agent_id"?, "agent_name"?, "tunnel"?, "tls", "created_at"}]}` (administrators: all; others: those assigned to them) |
 | POST | `/api/v1/hostnames` | 201; body `{"hostname", "owner_user_id"? \| "agent_id"?}` (exactly one; administrators) |
@@ -1230,7 +1254,8 @@ answer `403 forbidden` to members.
 
 User object: `id`, `email`, `display_name`, `role`, `disabled`, `must_change_password`,
 `has_password` (false for someone who only signs in with single sign-on), `email_verified` (they
-proved the address is theirs), `tags` (assigned), `personal_tag`, `created_at`, `last_login_at`.
+proved the address is theirs), `tags` (assigned), `rule_tags` (given by tag rules now), `personal_tag`,
+`created_at`, `last_login_at`.
 
 Invitation object: `id`, `email`, `display_name`, `role`, `tags`, `invited_by` (a user's id or
 `admin-token`), `created_at`, `expires_at`, `expired`. Never its code.

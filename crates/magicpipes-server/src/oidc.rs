@@ -226,7 +226,7 @@ impl Attempt {
 }
 
 /// What the provider says about the person, checked.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Person {
     pub subject: String,
     /// An address the provider says it verified, or any it gives if it's trusted (`trust_email`);
@@ -235,6 +235,45 @@ pub struct Person {
     /// The provider itself said that address is verified.
     pub vouched_for: bool,
     pub name: String,
+    /// What else it says, for tag rules (`control::rules`).
+    pub claims: Claims,
+}
+
+/// Claims about someone besides who they are, for tag rules: each one a string or a list of
+/// strings, by name. Bounded: [`MAX_CLAIMS`] names, [`MAX_CLAIM_VALUES`] values each, values of at
+/// most [`MAX_CLAIM_LEN`] bytes; anything else is left out.
+pub type Claims = std::collections::BTreeMap<String, Vec<String>>;
+pub const MAX_CLAIMS: usize = 64;
+pub const MAX_CLAIM_VALUES: usize = 256;
+pub const MAX_CLAIM_LEN: usize = 256;
+
+/// Claims that are about the token, or the address, which has rules of its own: never matched.
+const NOT_FOR_RULES: &[&str] = &["iss", "sub", "aud", "exp", "iat", "nbf", "nonce", "azp", "at_hash", "c_hash", "auth_time", "sid", "jti", "email", "email_verified"];
+
+/// A claim's value, if it's text that fits.
+fn claim_text(v: &serde_json::Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty() && s.len() <= MAX_CLAIM_LEN && !s.chars().any(char::is_control)).map(str::to_string)
+}
+
+/// The claims rules can use, from a token's or an endpoint's JSON.
+pub fn rule_claims(rest: &serde_json::Map<String, serde_json::Value>) -> Claims {
+    let mut out = Claims::new();
+    for (name, value) in rest {
+        if out.len() >= MAX_CLAIMS {
+            break;
+        }
+        if NOT_FOR_RULES.contains(&name.as_str()) || name.is_empty() || name.len() > MAX_CLAIM_LEN || name.chars().any(char::is_control) {
+            continue;
+        }
+        let values: Vec<String> = match value {
+            serde_json::Value::Array(items) => items.iter().filter_map(claim_text).take(MAX_CLAIM_VALUES).collect(),
+            other => claim_text(other).into_iter().collect(),
+        };
+        if !values.is_empty() {
+            out.insert(name.clone(), values);
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -244,13 +283,17 @@ struct RawClaims {
     email: Option<String>,
     email_verified: Option<serde_json::Value>,
     name: Option<String>,
+    /// Everything else, for tag rules.
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
 }
 
 impl RawClaims {
     fn into_person(self, trust_email: bool) -> Person {
         // Some providers send the string "true".
         let vouched_for = matches!(&self.email_verified, Some(serde_json::Value::Bool(true))) || self.email_verified.as_ref().and_then(|v| v.as_str()) == Some("true");
-        Person { subject: self.sub, verified_email: self.email.filter(|_| vouched_for || trust_email), vouched_for, name: self.name.unwrap_or_default() }
+        let claims = rule_claims(&self.rest);
+        Person { subject: self.sub, verified_email: self.email.filter(|_| vouched_for || trust_email), vouched_for, name: self.name.unwrap_or_default(), claims }
     }
 }
 
@@ -306,9 +349,11 @@ impl Provider {
     }
 
     /// Where to send the browser for this attempt.
-    pub async fn authorization_url(&self, attempt: &Attempt, redirect_uri: &str) -> anyhow::Result<String> {
+    /// `wanted`: the claims tag rules for this provider look at.
+    pub async fn authorization_url(&self, attempt: &Attempt, redirect_uri: &str, wanted: &[String]) -> anyhow::Result<String> {
         if self.kind == ProviderKind::Github {
-            return Ok(crate::github::authorization_url(&self.issuer, &self.client_id, redirect_uri, &attempt.state, &pkce_challenge(&attempt.verifier)));
+            let orgs = wanted.iter().any(|c| c == crate::github::ORG || c == crate::github::TEAM);
+            return Ok(crate::github::authorization_url(&self.issuer, &self.client_id, redirect_uri, &attempt.state, &pkce_challenge(&attempt.verifier), orgs));
         }
         let m = self.metadata(false).await?;
         let endpoint = &m.discovery.authorization_endpoint;
@@ -323,10 +368,13 @@ impl Provider {
         ))
     }
 
-    /// Trades the code for tokens and returns the verified person.
-    pub async fn finish(&self, attempt: &Attempt, code: &str, redirect_uri: &str) -> anyhow::Result<Person> {
+    /// Trades the code for tokens and returns the verified person. `wanted`: the claims tag rules
+    /// for this provider look at, read from the UserInfo endpoint when the ID token lacks them.
+    pub async fn finish(&self, attempt: &Attempt, code: &str, redirect_uri: &str, wanted: &[String]) -> anyhow::Result<Person> {
         if self.kind == ProviderKind::Github {
-            return crate::github::person(&self.issuer, &self.client_id, &self.client_secret, code, redirect_uri, &attempt.verifier).await;
+            let wants = |claim: &str| wanted.iter().any(|c| c == claim);
+            let (orgs, teams) = (wants(crate::github::ORG), wants(crate::github::TEAM));
+            return crate::github::person(&self.issuer, &self.client_id, &self.client_secret, code, redirect_uri, &attempt.verifier, orgs, teams).await;
         }
         let m = self.metadata(false).await?;
         let mut body = format!(
@@ -358,8 +406,10 @@ impl Provider {
         };
         let mut person = claims.map_err(|e| anyhow!("ID token refused: {e:?}"))?.into_person(self.trust_email);
 
-        // Providers may keep the email for the UserInfo endpoint (OpenID Connect Core 5.3).
-        if person.verified_email.is_none()
+        // Providers may keep the email, or the claims rules want, for the UserInfo endpoint
+        // (OpenID Connect Core 5.3).
+        let missing = wanted.iter().any(|c| !person.claims.contains_key(c));
+        if (person.verified_email.is_none() || missing)
             && let (Some(endpoint), Some(access)) = (&m.discovery.userinfo_endpoint, &tokens.access_token)
         {
             let info: RawClaims = get_json(endpoint, Some(&format!("Bearer {access}"))).await.context("userinfo")?;
@@ -367,10 +417,17 @@ impl Provider {
                 bail!("UserInfo describes someone else");
             }
             let info = info.into_person(self.trust_email);
-            person.verified_email = info.verified_email;
-            person.vouched_for = info.vouched_for;
+            if person.verified_email.is_none() {
+                person.verified_email = info.verified_email;
+                person.vouched_for = info.vouched_for;
+            }
             if person.name.is_empty() {
                 person.name = info.name;
+            }
+            for (name, values) in info.claims {
+                if person.claims.len() < MAX_CLAIMS && !person.claims.contains_key(&name) {
+                    person.claims.insert(name, values);
+                }
             }
         }
         Ok(person)

@@ -8,6 +8,7 @@ mod email;
 mod history;
 mod hostnames;
 mod notify;
+mod rules;
 mod settings;
 mod ssh_keys;
 mod tags;
@@ -17,6 +18,7 @@ pub use email::{AcceptWith, Accepted, InvitationRow, Invited, LinkPurpose, NewIn
 pub use history::AlertRow;
 pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
 pub use notify::{AlertEmail, MAX_WEBHOOKS, WebhookRow};
+pub use rules::{ANY_SOURCE, EMAIL_DOMAIN, MAX_TAG_RULES, NewRule, NotAdded, TagRuleRow};
 pub use ssh_keys::{AddedSshKey, NewSshKey, SshKeyRow};
 pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
@@ -413,6 +415,32 @@ const MIGRATIONS: &[&str] = &[
         created_by TEXT NOT NULL,
         created_at INTEGER NOT NULL
     );
+    "#,
+    // 13: tag rules (docs/USERS.md, "Where tags come from"). A rule gives its tag to whoever the
+    // sign-in source `issuer` says has `value` in `claim`; one with the issuer `*` and the claim
+    // `email_domain`, to every account with a confirmed address at that domain. What each person
+    // matched at their last single sign-on through each source is kept, and counts for
+    // `session_max_age_secs`. A rule and its matches go with its tag.
+    r#"
+    CREATE TABLE tag_rules (
+        id         TEXT PRIMARY KEY,
+        org_id     TEXT NOT NULL DEFAULT 'org_default',
+        issuer     TEXT NOT NULL,
+        claim      TEXT NOT NULL,
+        value      TEXT NOT NULL,
+        tag        TEXT NOT NULL,
+        created_by TEXT,
+        created_at INTEGER NOT NULL,
+        UNIQUE (org_id, issuer, claim, value, tag),
+        FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
+    );
+    CREATE TABLE user_rule_matches (
+        user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        rule_id    TEXT NOT NULL REFERENCES tag_rules(id) ON DELETE CASCADE,
+        matched_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, rule_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX user_rule_matches_rule ON user_rule_matches(rule_id);
     "#,
 ];
 
@@ -922,6 +950,47 @@ mod tests {
         assert_eq!(store.webhooks().unwrap()[0], hook(0));
         assert!(store.delete_webhook("wh_0").unwrap() && !store.delete_webhook("wh_0").unwrap());
         assert_eq!(store.webhooks().unwrap().len(), MAX_WEBHOOKS - 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rule_matches_are_kept_per_source_and_go_with_their_rule() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(12) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        c.execute("INSERT INTO tags (org_id, name, created_at) VALUES ('org_default', 'team:eng', 0)", []).unwrap();
+        drop(c);
+
+        let store = Store::open(&path).unwrap();
+        assert!(store.tag_rules().unwrap().is_empty(), "a database from before rules has none");
+        let user = store.create_user("a@example.com", "", crate::authz::Role::Member, "not a real hash").unwrap().unwrap();
+        let new = |id: &'static str, issuer: &'static str, value: &'static str| NewRule { id, issuer, claim: "groups", value, tag: "team:eng", created_by: None };
+        assert_eq!(store.create_tag_rule(&new("tr_a", "https://a", "eng")).unwrap(), Ok(()));
+        assert_eq!(store.create_tag_rule(&new("tr_b", "https://b", "eng")).unwrap(), Ok(()));
+        assert_eq!(store.create_tag_rule(&new("tr_c", "https://a", "eng")).unwrap(), Err(rules::NotAdded::Exists));
+        assert_eq!(store.create_tag_rule(&NewRule { tag: "nope", ..new("tr_d", "https://a", "x") }).unwrap(), Err(rules::NotAdded::NoSuchTag));
+
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(store.set_rule_matches(&user, "https://a", &ids(&["tr_a"])).unwrap(), "new");
+        assert!(!store.set_rule_matches(&user, "https://a", &ids(&["tr_a"])).unwrap(), "the same again");
+        assert!(store.set_rule_matches(&user, "https://b", &ids(&["tr_b", "tr_a"])).unwrap(), "only b's own rule counts");
+        assert_eq!(store.rule_matches(0).unwrap(), vec![(user.clone(), "tr_a".into()), (user.clone(), "tr_b".into())]);
+        assert!(store.set_rule_matches(&user, "https://a", &[]).unwrap(), "a sign-in without the group");
+        assert_eq!(store.rule_matches(0).unwrap(), vec![(user.clone(), "tr_b".into())], "b's match stays");
+        // Old matches don't count, and are pruned.
+        assert!(store.rule_matches(unix_now() + 10).unwrap().is_empty());
+        assert_eq!(store.prune_rule_matches(unix_now() + 10).unwrap(), 1);
+        store.set_rule_matches(&user, "https://b", &ids(&["tr_b"])).unwrap();
+        assert!(store.delete_tag_rule("tr_b").unwrap());
+        assert!(store.rule_matches(0).unwrap().is_empty(), "its matches went with it");
         std::fs::remove_dir_all(dir).ok();
     }
 

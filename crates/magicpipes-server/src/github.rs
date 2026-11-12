@@ -5,17 +5,31 @@
 //!
 //! The identity is GitHub's numeric user id. A username can change hands, and a person's address can
 //! change. Only addresses GitHub says are verified count, and only one of them is used.
+//!
+//! When tag rules ask for them, a sign-in also asks to read organizations (`read:org`), and someone's
+//! organizations and teams become the claims [`ORG`] (`acme`) and [`TEAM`] (`acme/platform`),
+//! lowercased, as GitHub's names are compared without case. One that can't be read gives nothing,
+//! so its rules don't match.
 
 use anyhow::{Context, anyhow, bail};
 use http::Method;
 use magicpipes_core::url;
 use serde::Deserialize;
 
-use crate::oidc::{Person, allowed_url, get_json, request};
+use crate::oidc::{Claims, MAX_CLAIM_VALUES, Person, allowed_url, get_json, request};
 
 /// Enough to read someone's addresses, which `/user` doesn't always show. Nothing else.
 const SCOPE: &str = "user:email";
+/// Also their organizations and teams, for rules that need them.
+const SCOPE_WITH_ORGS: &str = "user:email read:org";
 const GITHUB_COM: &str = "https://github.com";
+/// The claims an organization's and a team's name are, for tag rules.
+pub const ORG: &str = "github:org";
+pub const TEAM: &str = "github:team";
+/// Teams are read this many to a page, which keeps a page well under the client's limit, for at
+/// most this many pages.
+const TEAMS_PER_PAGE: usize = 50;
+const TEAM_PAGES: usize = 4;
 
 /// github.com's API has a host of its own; a GitHub Enterprise Server's is a path.
 fn api_base(issuer: &str) -> String {
@@ -23,12 +37,12 @@ fn api_base(issuer: &str) -> String {
     if base == GITHUB_COM { "https://api.github.com".to_string() } else { format!("{base}/api/v3") }
 }
 
-/// Where to send the browser.
-pub(crate) fn authorization_url(issuer: &str, client_id: &str, redirect_uri: &str, state: &str, challenge: &str) -> String {
+/// Where to send the browser. `orgs`: also ask to read organizations and teams.
+pub(crate) fn authorization_url(issuer: &str, client_id: &str, redirect_uri: &str, state: &str, challenge: &str, orgs: bool) -> String {
     format!(
         "{}/login/oauth/authorize?response_type=code&scope={}&client_id={}&redirect_uri={}&state={state}&code_challenge={challenge}&code_challenge_method=S256",
         issuer.trim_end_matches('/'),
-        url::encode(SCOPE),
+        url::encode(if orgs { SCOPE_WITH_ORGS } else { SCOPE }),
         url::encode(client_id),
         url::encode(redirect_uri),
     )
@@ -57,14 +71,55 @@ struct Email {
     verified: bool,
 }
 
+#[derive(Deserialize)]
+struct Org {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct Team {
+    slug: String,
+    organization: Org,
+}
+
+/// The claims rules see: organizations and `organization/team` names, lowercased.
+fn group_claims(orgs: Option<Vec<Org>>, teams: Option<Vec<Team>>) -> Claims {
+    let mut claims = Claims::new();
+    if let Some(orgs) = orgs {
+        claims.insert(ORG.into(), orgs.into_iter().take(MAX_CLAIM_VALUES).map(|o| o.login.to_lowercase()).collect());
+    }
+    if let Some(teams) = teams {
+        let names = teams.into_iter().take(MAX_CLAIM_VALUES).map(|t| format!("{}/{}", t.organization.login, t.slug).to_lowercase()).collect();
+        claims.insert(TEAM.into(), names);
+    }
+    claims.retain(|_, v| !v.is_empty());
+    claims
+}
+
+/// Someone's teams, a page at a time.
+async fn teams(api: &str, auth: &str) -> anyhow::Result<Vec<Team>> {
+    let mut all = Vec::new();
+    for page in 1..=TEAM_PAGES {
+        let some: Vec<Team> = get_json(&format!("{api}/user/teams?per_page={TEAMS_PER_PAGE}&page={page}"), Some(auth)).await?;
+        let last = some.len() < TEAMS_PER_PAGE;
+        all.extend(some);
+        if last {
+            break;
+        }
+    }
+    Ok(all)
+}
+
 /// The address to go by: the primary one if GitHub verified it, or else the first it did.
 fn verified_address(emails: &[Email]) -> Option<&str> {
     let verified = || emails.iter().filter(|e| e.verified);
     verified().find(|e| e.primary).or_else(|| verified().next()).map(|e| e.email.as_str())
 }
 
-/// Trades the code for a token, and asks who that is. The token isn't kept.
-pub(crate) async fn person(issuer: &str, client_id: &str, client_secret: &str, code: &str, redirect_uri: &str, verifier: &str) -> anyhow::Result<Person> {
+/// Trades the code for a token, and asks who that is, and which organizations (`orgs`) and teams
+/// (`teams`) they're in, if rules want those. The token isn't kept.
+#[allow(clippy::too_many_arguments)] // one exchange's parts
+pub(crate) async fn person(issuer: &str, client_id: &str, client_secret: &str, code: &str, redirect_uri: &str, verifier: &str, orgs: bool, with_teams: bool) -> anyhow::Result<Person> {
     let form = format!(
         "client_id={}&client_secret={}&code={}&redirect_uri={}&code_verifier={}",
         url::encode(client_id),
@@ -86,7 +141,18 @@ pub(crate) async fn person(issuer: &str, client_id: &str, client_secret: &str, c
     }
     let emails: Vec<Email> = get_json(&format!("{api}/user/emails"), Some(&auth)).await.context("email addresses")?;
     let verified_email = verified_address(&emails).map(str::to_string);
-    Ok(Person { subject: user.id.to_string(), vouched_for: verified_email.is_some(), verified_email, name: user.name.filter(|n| !n.trim().is_empty()).unwrap_or(user.login) })
+    fn unread(what: &'static str) -> impl FnOnce(anyhow::Error) {
+        move |e| tracing::info!(error = %format!("{e:#}"), "couldn't read someone's GitHub {what}, so rules about them don't match")
+    }
+    let orgs = if orgs { get_json::<Vec<Org>>(&format!("{api}/user/orgs?per_page=100"), Some(&auth)).await.map_err(unread("organizations")).ok() } else { None };
+    let teams = if with_teams { teams(&api, &auth).await.map_err(unread("teams")).ok() } else { None };
+    Ok(Person {
+        subject: user.id.to_string(),
+        vouched_for: verified_email.is_some(),
+        verified_email,
+        name: user.name.filter(|n| !n.trim().is_empty()).unwrap_or(user.login),
+        claims: group_claims(orgs, teams),
+    })
 }
 
 /// Asks an address whether it's GitHub, before an administrator adds it. Returns it as identities
@@ -133,11 +199,24 @@ mod tests {
     }
 
     #[test]
+    fn organizations_and_teams_are_claims_in_lowercase() {
+        // From GitHub's documentation for `GET /user/orgs` and `GET /user/teams`, cut short.
+        let orgs: Vec<Org> = serde_json::from_str(r#"[{"login":"GitHub","id":1,"url":"https://api.github.com/orgs/github"}]"#).unwrap();
+        let teams: Vec<Team> = serde_json::from_str(r#"[{"id":1,"name":"Justice League","slug":"justice-league","organization":{"login":"GitHub","id":1}}]"#).unwrap();
+        let claims = group_claims(Some(orgs), Some(teams));
+        assert_eq!(claims.get(ORG), Some(&vec!["github".to_string()]));
+        assert_eq!(claims.get(TEAM), Some(&vec!["github/justice-league".to_string()]));
+        assert!(group_claims(None, Some(vec![])).is_empty(), "not asked, or in none");
+    }
+
+    #[test]
     fn github_com_and_enterprise_servers_have_their_own_addresses() {
         assert_eq!(api_base("https://github.com"), "https://api.github.com");
         assert_eq!(api_base("https://github.com/"), "https://api.github.com");
         assert_eq!(api_base("https://git.example.com"), "https://git.example.com/api/v3");
-        let to = authorization_url("https://github.com/", "client 1", "https://mp.example.com/auth/oidc/github/callback", "st", "ch");
+        let with_orgs = authorization_url("https://github.com/", "c", "https://mp.example.com/cb", "st", "ch", true);
+        assert!(with_orgs.contains("scope=user%3Aemail%20read%3Aorg"), "{with_orgs}");
+        let to = authorization_url("https://github.com/", "client 1", "https://mp.example.com/auth/oidc/github/callback", "st", "ch", false);
         assert!(to.starts_with("https://github.com/login/oauth/authorize?"), "{to}");
         for part in ["scope=user%3Aemail", "client_id=client%201", "redirect_uri=https%3A%2F%2Fmp.example.com%2Fauth%2Foidc%2Fgithub%2Fcallback", "state=st", "code_challenge=ch", "code_challenge_method=S256"] {
             assert!(to.contains(part), "{part} in {to}");

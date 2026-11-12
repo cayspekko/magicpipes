@@ -71,7 +71,7 @@ to someone else, and taking the original owner's access away, would be a change 
 policy, not to the model.
 
 **Who attaches tags.**
-- Users: only admins (and, later, admin-written rules). Nobody gives themselves a tag.
+- Users: only admins, directly or through rules they write. Nobody gives themselves a tag.
 - Service agents: only admins, through the enrollment token or by editing the agent.
 - Tunnels: the agent that registers them, with ordinary tags its publisher holds (the owner's
   tags for a personal agent, the agent's own for a service agent) and anyone's personal tag,
@@ -185,16 +185,25 @@ An email counts as verified in these cases:
 
 An email typed in by an admin is not verified.
 
-- **How rules work.** A rule is `(provider, claim, value) → tag`, created by an admin.
-  On every login the server re-evaluates every rule against the fresh claims (ID token, proxy
-  assertion or GitHub API) and replaces that user's rows in `user_rule_matches`. A user's tags
-  are their admin-assigned `user_tags` plus the tags of the rules they match. Deleting a rule
-  therefore revokes its tag from everyone at once, through the cascade.
-- **Matching is exact**: `claim == value`, or `value ∈ claim` when the claim is a list. The
-  email-domain rule compares the part after `@`, lowercased, with no subdomain wildcard.
-- **Revocation lag for rule-based tags.** It is bounded by the session's maximum age
-  (`session_max_age_secs`, default 12 h): after that the user must log in again, which
-  re-reads the IdP. Re-checking through the refresh token every hour is a later improvement.
+- **How rules work** (*built 2026-11-12*, `control/rules.rs`). A rule is `(issuer, claim, value) →
+  tag`, created by an admin. At every single sign-on through a source (an OIDC or GitHub
+  provider, or the proxy), the server checks that source's rules against the fresh claims (ID
+  token, plus UserInfo for a claim a rule wants and the token lacks; proxy assertion or groups
+  header; GitHub API) and replaces that user's rows in `user_rule_matches` for that source;
+  other sources' matches stay. A user's tags are their admin-assigned `user_tags` plus the tags of
+  the rules they match. Deleting a rule therefore revokes its tag from everyone at once, through
+  the cascade. Claims kept from a sign-in are strings or lists of strings, at most 64 names, 256
+  values each, 256 bytes a value.
+- **Matching is exact**: `claim == value`, or `value ∈ claim` when the claim is a list. GitHub's
+  `github:org` and `github:team` are lowercased on both sides, as GitHub compares them. The
+  email-domain rule (issuer `*`) compares the part after `@` of the account's own address, when
+  it's confirmed, with no subdomain wildcard; it applies to every such account at once, not at a
+  login.
+- **Revocation lag for rule-based tags.** A match counts for the session's maximum age
+  (`session_max_age_secs`, default 12 h) after the sign-on that made it, and is then pruned (hourly)
+  unless the person signed in through that source again. So it's bounded whichever way they sign in
+  meanwhile: a password or an API token doesn't keep a group's tag. Re-checking through the refresh
+  token every hour is a later improvement.
 - **No self-assignment.** Only admins create tags, assign them to users, and write
   rules. A member can't add a tag to themselves, and an IdP claim can only map to tags that an
   admin has wired up.
@@ -252,7 +261,7 @@ each open connection and closes the denied ones. An HTTP request in flight finis
 Every method ends the same way:
 1. The server resolves an **identity** to a user.
 2. It checks that the user isn't disabled and is a member of the org.
-3. It re-evaluates the tag rules.
+3. For a single sign-on, it re-evaluates that source's tag rules.
 4. It creates a `sessions` row and sets `__Host-mp_session` (with its CSRF token).
 
 Everything after login is the same whichever method was used. Identities are keyed by
@@ -305,7 +314,8 @@ The methods ship in this order, each usable on its own.
 
 *Built 2026-11-06, with these differences from the plan below:*
 
-- **Not built:** groups (they feed tag rules, which don't exist yet) and `apply_to_tunnels`.
+- **Groups** (*built 2026-11-12*): `groups_header` in plain-header mode; a signed token's own claims.
+- **Not built:** `apply_to_tunnels`.
 - **Added:** `allow_unverified_admin`, the same rule as for a provider, and `sign_out_url`, because
   a "Sign out" that only ends the session here signs you straight back in.
 - **Who gets in** is the same code as for OIDC. "Unknown users" means no account, no list and no
@@ -408,17 +418,17 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
   `docs/ARCHITECTURE.md` for where these settings live.
 
 **Not built yet, on purpose:**
-- **Tag rules** (groups and claims becoming tags). Administrators assign tags, as with passwords.
-  Everything below that mentions rules, including `groups_claim` and the `tag_rules` table, is
-  still a proposal.
+- **`groups_claim`.** Not needed: a tag rule names its claim, `groups` or any other. Tag rules
+  themselves were built on 2026-11-12 (see "Where tags come from").
 - **`scopes` and `auto_redirect` settings.** The scopes are `openid email profile`.
 - **Signing out at the provider.** Signing out here ends the session here only.
 
 ### 4. Social login
 
-*Built 2026-11-06. Not built: `/user/orgs` and `/user/teams`, which would feed tag rules that don't
-exist yet. A provider's `kind = "github"` takes the place of the `preset` below, and also covers GitHub
-Enterprise Server, whose `issuer` is its address.*
+*Built 2026-11-06; organizations and teams for tag rules on 2026-11-12, asked for (`read:org`) only
+once a rule wants them, teams 50 to a page for at most 4 pages. A provider's `kind = "github"` takes
+the place of the `preset` below, and also covers GitHub Enterprise Server, whose `issuer` is its
+address.*
 
 - **Google, Microsoft personal accounts and GitLab are OIDC.** They are presets of method 3
   with the issuer filled in. Microsoft personal accounts are that preset with the tenant ID
@@ -629,11 +639,11 @@ New entries are appended from there, one per implementation step:
 - **users and tags** (steps 2 and 3, migration 1): orgs, users, identities, memberships,
   passwords, sessions, API tokens, the audit log, ownership columns, the tag registry and the
   tag assignments;
-- **rules** (steps 4 and 5): tag rules and their matches;
-- **email** (step 7): invitations, email tokens and the mail server's settings.
+- **email** (step 7, migration 7): invitations, email tokens and the mail server's settings;
+- **rules** (step 10, migration 13): tag rules and their matches, with `UNIQUE (org_id, issuer,
+  claim, value, tag)` and an index on `user_rule_matches(rule_id)`.
 
-Migration 1 creates the default org. The whole target schema (`tag_rules` and
-`user_rule_matches` come with a later step):
+Migration 1 creates the default org. The whole target schema:
 
 ```sql
 CREATE TABLE orgs (
@@ -685,7 +695,7 @@ CREATE TABLE tag_rules (
     id          TEXT PRIMARY KEY,
     org_id      TEXT NOT NULL,
     issuer      TEXT NOT NULL,
-    claim       TEXT NOT NULL,              -- 'groups', 'hd', … or 'email_domain'
+    claim       TEXT NOT NULL,              -- 'groups', 'hd', …, 'github:team', or 'email_domain' (issuer '*')
     value       TEXT NOT NULL,
     tag         TEXT NOT NULL,
     created_by  TEXT,
@@ -701,7 +711,7 @@ CREATE TABLE user_tags (                    -- assigned by an admin, plus the pe
     PRIMARY KEY (org_id, user_id, tag),
     FOREIGN KEY (org_id, tag) REFERENCES tags(org_id, name) ON DELETE CASCADE
 );
-CREATE TABLE user_rule_matches (            -- rules the user matched at their last login
+CREATE TABLE user_rule_matches (            -- rules the user matched at their last sign-on through each source
     user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     rule_id     TEXT NOT NULL REFERENCES tag_rules(id) ON DELETE CASCADE,
     matched_at  INTEGER NOT NULL,
@@ -884,7 +894,7 @@ issuer = "https://team.cloudflareaccess.com"
 audience = "…"
 # mode = "headers":
 # user_header = "X-Forwarded-Email"
-# groups_header = "X-Forwarded-Groups"     # not built yet
+# groups_header = "X-Forwarded-Groups"     # comma-separated, the claim `groups` for tag rules
 # secret_header = "X-MagicPipes-Proxy-Secret"
 # secret_file = "/etc/magicpipes/proxy-secret"
 trust_email = false
@@ -899,7 +909,6 @@ label = "Company SSO"                     # button text
 issuer = "https://login.example.com"
 client_id = "…"
 client_secret_file = "/etc/magicpipes/company-oidc-secret"
-# groups_claim = "groups"                 # not built yet
 # scopes = ["openid", "email", "profile"] # not built yet
 # link_by_email = false
 
@@ -970,21 +979,19 @@ useful.
      otherwise.
    - `magicpipes ls --all` is not built yet: the CLI holds only its agent credential. The UI's
      "Shared with you" and `GET /api/v1/shared` cover discovery.
-   - Tag rules (IdP groups, claims, email domains) arrive with the SSO steps.
+   - Tag rules (IdP groups, claims, email domains) came after the SSO steps (step 10).
    - The tag registry and admin assignment.
    - Agent tags from enrollment tokens, and the device-style `magicpipes login`.
    - Tunnel visibility and tags. On 2026-11-03 the tag model was replaced (personal tags, an
      `access` setting per tag, no owner exception and no inheritance) and labels removed.
    - The tunnel cookie flow and the access-denied page.
    - Discovery filtering in the API, UI and `ls --all`.
-4. **SSO (OIDC)** (method 3). *Done;* claim, group and email-domain rules aren't built (see
-   method 3).
-5. **Authenticating proxy** (method 2). *Done;* groups-header rules and `apply_to_tunnels` aren't
-   built (see method 2). It moved behind OIDC on 2026-11-04: it needs TLS terminated in front of the
+4. **SSO (OIDC)** (method 3). *Done;* its rules came with step 10.
+5. **Authenticating proxy** (method 2). *Done;* `apply_to_tunnels` isn't built (see method 2). It moved behind OIDC on 2026-11-04: it needs TLS terminated in front of the
    management host, which a TLS-passthrough deployment can't do, and its signed-assertion mode
    reuses OIDC's token checks.
 6. **Social login** (method 4): presets, plus GitHub's OAuth flow. *Done;* GitHub organizations and
-   teams aren't built (see method 4).
+   teams came with step 10.
 7. **Email:** SMTP, invitations (method 5), then sign-in links and "forgot password"
    (method 6). *Done,* with the differences listed under those methods.
 8. **`magicpipes connect`** for private TCP and UDP tunnels. *Done.* It signs in with a connect pass
@@ -993,6 +1000,11 @@ useful.
    the SSH terminal in the browser are done* (see "SSH gateway" in ARCHITECTURE.md), ahead of step 8.
    Writing into a terminal needs no extra tag: the machine's sshd decides which account each person
    may log in as, from their email (`AuthorizedPrincipalsFile`).
+10. **Tag rules:** OIDC and proxy claims, GitHub organizations and teams, and confirmed address
+    domains, on the Tags page and at `/api/v1/tag-rules`. *Done* (2026-11-12). With it the phase is
+    done; what's left for later is listed under "Known limitations": TOTP, refresh-token re-checks,
+    signing out at the provider, `apply_to_tunnels`, `scopes` and `auto_redirect`, `magicpipes ls
+    --all`, and controls for the admin token.
 
 End-to-end tests, at minimum:
 
@@ -1023,8 +1035,12 @@ End-to-end tests, at minimum:
 - **A private tunnel's existence is visible.** An anonymous request gets a login redirect where
   an unknown name gets 404. Hiding that would break the login flow.
 - **IdP-driven revocation lags** by up to `session_max_age_secs` until refresh-token
-  re-checks exist. With proxy auth there is no lag: every request carries the proxy's
-  current assertion.
+  re-checks exist. With proxy auth there is no lag for who someone is: every request carries the
+  proxy's current assertion. Their groups, for tag rules, are read when a session starts, so tags
+  from them lag the same way.
+- **Left for later:** TOTP (below), refresh-token re-checks, signing out at the provider,
+  `apply_to_tunnels`, `scopes` and `auto_redirect` for providers, `magicpipes ls --all`, tag rules
+  in the configuration file, and controls for the admin token in the UI.
 - **Password accounts have no second factor** until TOTP lands. For stronger login, put the
   server behind SSO or an authenticating proxy.
 - **One org per server in the UI.** The schema already allows more.

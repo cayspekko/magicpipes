@@ -12,6 +12,7 @@
 //! * `notify` — alerts by email and webhook;
 //! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
+//! * `rules` — tag rules: tags from what a sign-in says;
 //! * `sessions` — agent sessions;
 //! * `ssh` — public keys for the SSH gateway, and what it reports back;
 //! * `settings` — sign-in settings and certificates made on the Settings page, and the generated
@@ -33,6 +34,7 @@ mod notify;
 mod oidc;
 pub mod outside;
 mod registry;
+pub mod rules;
 mod sessions;
 pub use sessions::Attached;
 mod settings;
@@ -68,7 +70,7 @@ pub use notify::WebhookView;
 pub use registry::TunnelSignIn;
 pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, NewSmtp, ProviderChanges, ProviderView, SmtpView};
 pub use ssh::looks_private as looks_like_private_key;
-pub use tags::EnrollmentOptions;
+pub use tags::{EnrollmentOptions, TagView};
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
 
@@ -230,7 +232,7 @@ impl<T> OrLog<T> for anyhow::Result<T> {
 
 impl ControlPlane {
     pub fn new(cfg: Arc<Config>, store: Store, certs: Arc<CertManager>, data: Arc<DataPlane>) -> anyhow::Result<Arc<Self>> {
-        let mut state = State { dir: directory::Directory::load(&store)?, host_keys: store.ssh_host_keys()?, ..State::default() };
+        let mut state = State { dir: directory::Directory::load(&store, cfg.users.session_max_age_secs)?, host_keys: store.ssh_host_keys()?, ..State::default() };
         for row in store.tunnels()? {
             if let Some(port) = row.public_port
                 && !cfg.port_range().is_some_and(|r| r.contains(port))

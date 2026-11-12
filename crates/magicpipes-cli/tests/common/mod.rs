@@ -857,11 +857,37 @@ pub struct OidcPerson {
     pub wrong_nonce: bool,
     /// Publish no signing keys, like authentik without a Signing Key.
     pub no_signing_keys: bool,
+    /// More claims in the ID token, such as `{"groups": ["eng"]}`.
+    pub claims: Value,
+    /// More claims only from the UserInfo endpoint.
+    pub userinfo_claims: Value,
+    /// As GitHub: their organizations, and teams as `org/team`, read only with `read:org`.
+    pub orgs: Vec<String>,
+    pub teams: Vec<String>,
 }
 
 impl OidcPerson {
     pub fn new(sub: &str, email: &str) -> Self {
-        Self { sub: sub.into(), email: email.into(), verified: true, email_in_userinfo: false, wrong_key: false, wrong_nonce: false, no_signing_keys: false }
+        Self {
+            sub: sub.into(),
+            email: email.into(),
+            verified: true,
+            email_in_userinfo: false,
+            wrong_key: false,
+            wrong_nonce: false,
+            no_signing_keys: false,
+            claims: serde_json::json!({}),
+            userinfo_claims: serde_json::json!({}),
+            orgs: Vec::new(),
+            teams: Vec::new(),
+        }
+    }
+}
+
+/// Copies an object's fields into another.
+fn merge(into: &mut Value, more: &Value) {
+    if let (Some(into), Some(more)) = (into.as_object_mut(), more.as_object()) {
+        into.extend(more.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 }
 
@@ -891,7 +917,7 @@ impl FakeOidc {
         use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING as ALG, EcdsaKeyPair, KeyPair};
         use sha2::Digest;
 
-        type Code = (String, OidcPerson, String, String);
+        type Code = (String, OidcPerson, String, String, String);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let rng = SystemRandom::new();
@@ -932,7 +958,8 @@ impl FakeOidc {
                                 }
                                 "/authorize" | "/login/oauth/authorize" => {
                                     let code = format!("code-{}", magicpipes_core_rand());
-                                    let entry = (query.get("nonce").cloned().unwrap_or_default(), who.lock().unwrap().clone(), query["code_challenge"].clone(), query["redirect_uri"].clone());
+                                    let scope = query.get("scope").cloned().unwrap_or_default();
+                                    let entry = (query.get("nonce").cloned().unwrap_or_default(), who.lock().unwrap().clone(), query["code_challenge"].clone(), query["redirect_uri"].clone(), scope);
                                     assert_eq!(query["code_challenge_method"], "S256");
                                     assert_eq!(query["client_id"], OIDC_CLIENT);
                                     codes.lock().unwrap().insert(code.clone(), entry);
@@ -946,7 +973,7 @@ impl FakeOidc {
                                     let basic = format!("Basic {}", STANDARD.encode(format!("{}:{}", enc(OIDC_CLIENT), enc(OIDC_SECRET))));
                                     let entry = codes.lock().unwrap().remove(form.get("code").map_or("", |c| c.as_str()));
                                     match entry {
-                                        Some((nonce, p, challenge, redirect))
+                                        Some((nonce, p, challenge, redirect, _))
                                             if auth.as_deref() == Some(&basic)
                                                 && form.get("redirect_uri") == Some(&redirect)
                                                 && B64.encode(sha2::Sha256::digest(form["code_verifier"].as_bytes())) == challenge =>
@@ -960,6 +987,7 @@ impl FakeOidc {
                                                 claims["email"] = p.email.clone().into();
                                                 claims["email_verified"] = p.verified.into();
                                             }
+                                            merge(&mut claims, &p.claims);
                                             let msg = format!("{}.{}", B64.encode(r#"{"alg":"ES256","kid":"k1"}"#), B64.encode(claims.to_string()));
                                             let signer = if p.wrong_key { &other } else { &key };
                                             let sig = signer.sign(&SystemRandom::new(), msg.as_bytes()).unwrap();
@@ -973,24 +1001,39 @@ impl FakeOidc {
                                     let form = parse_form(&body);
                                     let entry = codes.lock().unwrap().remove(form.get("code").map_or("", |c| c.as_str()));
                                     match entry {
-                                        Some((_, p, challenge, redirect))
+                                        Some((_, p, challenge, redirect, scope))
                                             if form.get("client_id").map(String::as_str) == Some(OIDC_CLIENT)
                                                 && form.get("client_secret").map(String::as_str) == Some(OIDC_SECRET)
                                                 && form.get("redirect_uri") == Some(&redirect)
                                                 && B64.encode(sha2::Sha256::digest(form["code_verifier"].as_bytes())) == challenge =>
                                         {
-                                            json(StatusCode::OK, serde_json::json!({ "access_token": format!("gho_{}", p.sub), "token_type": "bearer", "scope": "user:email" }))
+                                            // A token that may read organizations says so, for the fake's own checks.
+                                            let token = if scope.split(' ').any(|s| s == "read:org") { format!("gho_{}_org", p.sub) } else { format!("gho_{}", p.sub) };
+                                            json(StatusCode::OK, serde_json::json!({ "access_token": token, "token_type": "bearer", "scope": scope.replace(' ', ",") }))
                                         }
                                         _ => json(StatusCode::OK, serde_json::json!({ "error": "bad_verification_code", "error_description": "The code passed is incorrect or expired." })),
                                     }
                                 }
                                 "/api/v3/" => json(StatusCode::OK, serde_json::json!({ "current_user_url": format!("{iss}/api/v3/user") })),
-                                "/api/v3/user" | "/api/v3/user/emails" => {
+                                "/api/v3/user" | "/api/v3/user/emails" | "/api/v3/user/orgs" | "/api/v3/user/teams" => {
                                     let p = who.lock().unwrap().clone();
+                                    let with_orgs = format!("Bearer gho_{}_org", p.sub);
                                     if !has_agent {
                                         json(StatusCode::FORBIDDEN, Value::Null)
-                                    } else if auth.as_deref() != Some(&format!("Bearer gho_{}", p.sub)) {
+                                    } else if auth.as_deref() != Some(&format!("Bearer gho_{}", p.sub)) && auth.as_deref() != Some(&with_orgs) {
                                         json(StatusCode::UNAUTHORIZED, Value::Null)
+                                    } else if (path.ends_with("/orgs") || path.ends_with("/teams")) && auth.as_deref() != Some(&with_orgs) {
+                                        json(StatusCode::FORBIDDEN, serde_json::json!({ "message": "Resource not accessible by integration" }))
+                                    } else if path.ends_with("/orgs") {
+                                        json(StatusCode::OK, Value::Array(p.orgs.iter().map(|o| serde_json::json!({ "login": o, "id": 1 })).collect()))
+                                    } else if path.ends_with("/teams") {
+                                        let page: usize = query.get("page").and_then(|n| n.parse().ok()).unwrap_or(1);
+                                        let teams: Vec<Value> = if page == 1 {
+                                            p.teams.iter().filter_map(|t| t.split_once('/')).map(|(o, t)| serde_json::json!({ "slug": t, "name": t, "organization": { "login": o } })).collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        json(StatusCode::OK, Value::Array(teams))
                                     } else if path.ends_with("/emails") {
                                         // An address it didn't verify comes first, so taking the first would be wrong.
                                         json(StatusCode::OK, serde_json::json!([
@@ -1004,7 +1047,9 @@ impl FakeOidc {
                                 "/userinfo" => {
                                     let p = who.lock().unwrap().clone();
                                     if auth.as_deref() == Some(&format!("Bearer {}", p.sub)) {
-                                        json(StatusCode::OK, serde_json::json!({ "sub": p.sub, "email": p.email, "email_verified": p.verified }))
+                                        let mut info = serde_json::json!({ "sub": p.sub, "email": p.email, "email_verified": p.verified });
+                                        merge(&mut info, &p.userinfo_claims);
+                                        json(StatusCode::OK, info)
                                     } else {
                                         json(StatusCode::UNAUTHORIZED, Value::Null)
                                     }

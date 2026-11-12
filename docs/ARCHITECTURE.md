@@ -115,10 +115,17 @@ connections:
   `authorize`), which the data plane checks per HTTP request, TCP connection and UDP flow.
   Users and tags extend the same table ([USERS.md](USERS.md)); a check never bypasses it.
 * `control/directory.rs` keeps who owns which agent and which tags everyone holds in memory,
-  reloaded (`ControlPlane::refresh`) after every change to users, tags or agents, which also
+  reloaded (`ControlPlane::refresh`) after every change to users, tags, rules or agents, which also
   republishes. Each `RouteTable` carries the active users with their current tags, so the data
   plane decides private-tunnel access without the database, and a revocation applies on the
   next request.
+* Tag rules (`control/rules.rs`): a user's tags are those assigned plus those rules give, worked out
+  when the directory loads: from `user_rule_matches` rows newer than `session_max_age_secs`, and
+  from email-domain rules against confirmed addresses. A single sign-on carries the claims rules can
+  use (`oidc::Person::claims`, bounded), and replaces that source's matches in one transaction;
+  only a change in what matched refreshes. A sign-in asks for what rules want (UserInfo, GitHub's
+  `read:org`) only when a rule wants it. The hourly prune drops stale matches and refreshes, so a
+  group's tag can't outlive a session's age by more than an hour, however the person signs in.
 * Private tunnels (`data/gate.rs`, `tunnel_auth.rs`): the management cookie never leaves the
   management host, so a private tunnel's host gets its own signed cookie (`__Host-mp_tunnel`,
   HMAC-SHA256 with `data_dir/session-key`) through a redirect to `/auth/tunnel` and a one-time,

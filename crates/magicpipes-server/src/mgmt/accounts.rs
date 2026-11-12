@@ -9,11 +9,13 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::extract::{AdminPosted, AdminUser, Fields, NoFields, Posted, UiUser};
-use super::html::{Actions, Text, alert, back, badge, chips, count, esc, form_alert, invalid, menu_post, row_menu, table, title_of, when};
+use super::html::{Actions, Number, Text, alert, back, badge, chips, count, esc, form_alert, invalid, menu_post, row_menu, table, title_of, when};
 use super::picker::{self, Holder, Submitted};
 use super::ui::{Done, done, done_url, failed, logged_in_to, not_there, outcome, page, server_url};
 use crate::authz::{Principal, Role};
-use crate::control::{InvitationView, MIN_PASSWORD_CHARS, Purpose, TunnelSignIn, UserView};
+use crate::control::rules::TagRuleView;
+use crate::control::{InvitationView, MIN_PASSWORD_CHARS, Purpose, TagView, TunnelSignIn, UserView};
+use crate::store::ANY_SOURCE;
 use crate::tunnel_auth::safe_path;
 
 /// A page that shows a secret once, with a way back. `more`: HTML to follow it.
@@ -275,7 +277,7 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
             holder: Holder::User,
             reach: Some(&reach.by_tag),
         };
-        let tags = edit.cell(user);
+        let tags = edit.cell_and(user, &by_rule(&u.rule_tags));
         let post = |action: &str, label: &str, danger: bool, confirm: Option<String>| {
             menu_post(&format!("/users/{}", u.id), &user.csrf_field(), &[("action", action)], label, danger, confirm.as_deref())
         };
@@ -680,13 +682,105 @@ fn tag_reach(people: usize, tunnels: usize) -> String {
     }
 }
 
-/// `error`: about the list. `attempt`: the form that came back, and why.
-fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option<(&TagForm, &str)>) -> Response {
+/// Tags a person holds because of rules, under those assigned to them. Nothing when there are none.
+fn by_rule(tags: &[String]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    format!(r#"<div class="byrule"><span class="sub">by rule</span> {}</div>"#, chips(tags))
+}
+
+/// A form that came back on the Tags page, and why.
+enum TagsAttempt<'a> {
+    Tag(&'a TagForm, &'a str),
+    Rule(&'a RuleForm, &'a str),
+}
+
+/// What a rule says, in a cell: `groups has eng` from where.
+fn rule_says(r: &TagRuleView) -> String {
+    if r.source == ANY_SOURCE {
+        return format!(r#"A confirmed address at <code>{}</code>"#, esc(&r.value));
+    }
+    format!(r#"<code>{}</code> has <code>{}</code><span class="sub wrap">from {}</span>"#, esc(&r.claim), esc(&r.value), esc(&r.source_name))
+}
+
+/// The Tags page's rules: the list, and the form for another.
+fn rules_section(user: &UiUser, app: &AppState, tags: &[TagView], attempt: Option<(&RuleForm, &str)>) -> String {
+    let Ok(rules) = app.control.tag_rules(&user.who) else {
+        return r#"<div class="section" id="rules"><h2>Rules</h2></div><p class="note below-section">The rules can't be read right now. The server's log says why.</p>"#.to_string();
+    };
+    let rows: String = rules
+        .iter()
+        .map(|r| {
+            let effect = match r.only_through {
+                0 => format!("Nobody holds {} only through it.", r.tag),
+                n => format!("{} {} only through it, and lose it.", count(n, "person holds", "people hold"), r.tag),
+            };
+            format!(
+                r#"<tr><td class="tagcol">{tag}</td><td class="wrap">{says}</td><td class="num">{holders}</td><td class="num"><form method="post" action="/tags/rules/{id}/delete" data-confirm="Remove this rule? {effect}">{csrf}<button class="btn danger small" aria-label="Remove the rule giving {tag_text}">Remove</button></form></td></tr>"#,
+                tag = chips(std::slice::from_ref(&r.tag)),
+                tag_text = esc(&r.tag),
+                says = rule_says(r),
+                holders = r.holders,
+                id = esc(&r.id),
+                effect = esc(&effect),
+                csrf = user.csrf_field(),
+            )
+        })
+        .collect();
+    let list = table(&[Text("Gives"), Text("To whoever"), Number("People"), Actions], &rows, "No rules yet: people hold only the tags assigned to them.");
+    let form = if tags.is_empty() {
+        r#"<p class="note">Create a tag first, then add a rule that gives it.</p>"#.to_string()
+    } else {
+        let typed = |pick: fn(&RuleForm) -> &str| attempt.map_or("", |(f, _)| pick(f));
+        let tag_options: String = tags
+            .iter()
+            .map(|t| format!(r#"<option value="{n}"{s}>{n}</option>"#, n = esc(&t.name), s = if typed(|f| &f.tag) == t.name { " selected" } else { "" }))
+            .collect();
+        let source_options: String = app
+            .control
+            .rule_sources()
+            .iter()
+            .map(|s| format!(r#"<option value="{v}"{sel}>{n}</option>"#, v = esc(&s.issuer), n = esc(&s.name), sel = if typed(|f| &f.source) == s.issuer { " selected" } else { "" }))
+            .collect();
+        let hours = app.control.config().users.session_max_age_secs / 3600;
+        let error = attempt.map(|(_, why)| why);
+        format!(
+            r#"<div class="card form spaced">{alert}<form method="post" action="/tags/rules">{csrf}
+<label for="rt">Tag</label><select id="rt" name="tag">{tag_options}</select>
+<label for="rs">From</label><select id="rs" name="source">{source_options}</select>
+<label for="rc">Claim</label><input id="rc" name="claim" placeholder="groups" maxlength="200" spellcheck="false" autocomplete="off" value="{claim}">
+<label for="rv">Value</label><input id="rv" name="value" placeholder="engineering" maxlength="256" spellcheck="false" autocomplete="off" required value="{value}"{invalid}{focus}>
+<button class="btn primary">Add rule</button></form>
+<p class="note">From a provider or the proxy, the claim is one its sign-ins carry, such as <code>groups</code>, and someone matches when it is the value or lists it, exactly. From GitHub, it's <code>github:org</code> (<code>acme</code>) or <code>github:team</code> (<code>acme/platform</code>). From any sign-in, leave the claim empty and enter a domain: everyone with a confirmed address there gets the tag at once. Otherwise it comes at each person's next sign-in, and lasts {hours} hours unless they sign in that way again.</p></div>"#,
+            alert = form_alert(error),
+            csrf = user.csrf_field(),
+            claim = esc(typed(|f| &f.claim)),
+            value = esc(typed(|f| &f.value)),
+            invalid = invalid(error.is_some()),
+            // The form is under every rule; a refusal brings it, and why, into view.
+            focus = if error.is_some() { " autofocus" } else { "" },
+        )
+    };
+    format!(
+        r#"<div class="section" id="rules"><h2>Rules{count}</h2></div><p class="note below-section">A rule gives a tag to the people a sign-in says should have it.</p>{list}{form}"#,
+        count = if rules.is_empty() { String::new() } else { format!(r#"<span class="count">{}</span>"#, rules.len()) },
+    )
+}
+
+/// `error`: about the list. `attempt`: a form that came back, and why.
+fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option<TagsAttempt>) -> Response {
     let users = app.control.users(&user.who);
     let reach = app.control.private_reach(&user.who);
+    let tags = app.control.tags(&user.who);
+    let (attempt, rule_attempt) = match attempt {
+        Some(TagsAttempt::Tag(f, why)) => (Some((f, why)), None),
+        Some(TagsAttempt::Rule(f, why)) => (None, Some((f, why))),
+        None => (None, None),
+    };
     let mut rows = String::new();
-    for t in app.control.tags(&user.who) {
-        let holders = users.iter().filter(|u| u.tags.contains(&t.name)).count();
+    for t in &tags {
+        let holders = users.iter().filter(|u| u.tags.contains(&t.name) || u.rule_tags.contains(&t.name)).count();
         let tunnels = reach.by_tag.get(&t.name).copied().unwrap_or(0);
         let (state, flip, label, ask) = if t.access {
             let ask = (tunnels > 0).then(|| format!("Turn off access for {}? {} stop admitting people through it.", t.name, count(tunnels, "private tunnel", "private tunnels")));
@@ -718,7 +812,9 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option
 <label for="td">Description</label><input id="td" name="description" maxlength="200" value="{description}">
 <label><input type="checkbox" name="access" value="on"{access}> Grants access: people and private tunnels sharing it connect</label>
 <button class="btn primary">Create tag</button></form>
-<p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>; <code>user:</code> is for personal tags. Example tags: {examples}</p></div>"#,
+<p class="note">Lowercase <code>key</code> or <code>key:value</code> with a-z, 0-9 and <code>._-</code>; <code>user:</code> is for personal tags. Example tags: {examples}</p></div>
+{rules}"#,
+        rules = rules_section(user, app, &tags, rule_attempt),
         list = table(&[Text("Tag"), Text("Description"), Text("Access"), Text("Created"), Actions], &rows, "No tags yet. Create the first one below."),
         err = alert(error),
         form_error = form_alert(form_error),
@@ -729,7 +825,7 @@ fn tags_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option
         csrf = user.csrf_field(),
         examples = chips(&["team:dev".into(), "contractor:acme".into()]),
     );
-    page(&title_of("Tags", form_error.is_some()), Some(user), &body)
+    page(&title_of("Tags", form_error.is_some() || rule_attempt.is_some()), Some(user), &body)
 }
 
 pub async fn tags(AdminUser(user): AdminUser, State(app): State<AppState>) -> Response {
@@ -748,8 +844,31 @@ pub struct TagForm {
 pub async fn create_tag(State(app): State<AppState>, Posted(user, f): Posted<TagForm>) -> Response {
     match app.control.create_tag(&user.who, &f.name, &f.description, f.access.as_deref() == Some("on")) {
         Ok(_) => done("/tags", Done::TagCreated),
-        Err(e) => (StatusCode::BAD_REQUEST, tags_page(&user, &app, None, Some((&f, &e.message)))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, tags_page(&user, &app, None, Some(TagsAttempt::Tag(&f, &e.message)))).into_response(),
     }
+}
+
+#[derive(Deserialize, Default)]
+pub struct RuleForm {
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    claim: String,
+    #[serde(default)]
+    value: String,
+}
+
+pub async fn create_tag_rule(State(app): State<AppState>, Posted(user, f): Posted<RuleForm>) -> Response {
+    match app.control.create_tag_rule(&user.who, &f.source, &f.claim, &f.value, &f.tag) {
+        Ok(r) => done("/tags", if r.source == ANY_SOURCE { Done::RuleAddedNow } else { Done::RuleAdded }),
+        Err(e) => (StatusCode::BAD_REQUEST, tags_page(&user, &app, None, Some(TagsAttempt::Rule(&f, &e.message)))).into_response(),
+    }
+}
+
+pub async fn delete_tag_rule(State(app): State<AppState>, Path(id): Path<String>, Posted(user, _): Posted<NoFields>) -> Response {
+    outcome(&user, app.control.delete_tag_rule(&user.who, &id), "/tags", "Tags", Done::RuleRemoved, "That rule is already gone.")
 }
 
 pub async fn delete_tag(State(app): State<AppState>, Posted(user, f): Posted<TagForm>) -> Response {

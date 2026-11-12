@@ -23,6 +23,8 @@ pub(super) const STYLE: &str = r#"[hidden]{display:none!important}
 .access{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;white-space:normal}.access .taglist{display:contents}.access .status{margin-right:4px}
 td .access{min-width:15em;max-width:26em}.status.below{display:flex;margin-top:6px;font-size:12.5px}
 .chip.add{color:var(--ok)}.chip.remove{color:var(--bad);text-decoration:line-through}
+td.tagcol{min-width:12em;white-space:normal}
+.byrule{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:6px;white-space:normal}.byrule:first-child{margin-top:0}.byrule .sub{display:inline;margin:0}
 fieldset.tags{border:0;padding:0;margin:22px 0 0;min-width:0}
 fieldset.tags legend{padding:0;font-size:13.5px;font-weight:500;color:var(--ink-2);margin-bottom:8px}
 .tagboxes{display:flex;flex-wrap:wrap;gap:0 18px;max-height:18em;overflow:auto}.tagboxes label{margin:8px 0 0}.tagboxes .note{margin:0}
@@ -82,11 +84,18 @@ pub(super) struct Edit<'a> {
 impl Edit<'_> {
     /// The row's tags with a small Edit link next to them.
     pub fn cell(&self, user: &UiUser) -> String {
+        self.cell_and(user, "")
+    }
+
+    /// As [`Self::cell`], with `below` under the tags: those held some other way, which the picker
+    /// doesn't change. With some there, no tags here isn't "none".
+    pub fn cell_and(&self, user: &UiUser, below: &str) -> String {
+        let shown = if self.held.is_empty() && !below.is_empty() { String::new() } else { chips(self.held) };
         if self.held.is_empty() && !self.addable {
-            return chips(self.held);
+            return format!("{shown}{below}");
         }
         let label = format!("Edit tags of {}", self.subject);
-        format!(r#"<div class="tagcell"><span class="tagchips">{}</span>{}</div>"#, chips(self.held), self.link(user, "btn small ghost", "Edit", &label))
+        format!(r#"<div class="tagcell"><span class="tagchips">{shown}{below}</span>{}</div>"#, self.link(user, "btn small ghost", "Edit", &label))
     }
 
     /// A link that opens the picker; `aria` names it for screen readers when `text` is short.

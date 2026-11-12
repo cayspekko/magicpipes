@@ -120,6 +120,8 @@ pub struct UserView {
     pub email_verified: bool,
     /// Tags assigned by administrators.
     pub tags: Vec<String>,
+    /// Tags that tag rules give them now.
+    pub rule_tags: Vec<String>,
     /// The tag the server made with the account and puts on the tunnels of their machines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personal_tag: Option<String>,
@@ -140,6 +142,7 @@ impl From<UserRow> for UserView {
             has_password: u.has_password,
             email_verified: u.email_verified,
             tags: Vec::new(),
+            rule_tags: Vec::new(),
             personal_tag: None,
             created_at: rfc3339(u.created_at),
             last_login_at: u.last_login_at.map(rfc3339),
@@ -297,9 +300,9 @@ impl ControlPlane {
 
     fn user_view(&self, u: UserRow) -> UserView {
         let st = self.state.lock().unwrap();
-        let tags = st.dir.user_tags(&u.id).into_iter().filter(|t| !st.dir.is_personal(t)).collect();
+        let tags = st.dir.assigned_tags(&u.id).into_iter().filter(|t| !st.dir.is_personal(t)).collect();
         let personal_tag = st.dir.personal_tag(&u.id).map(str::to_string);
-        UserView { tags, personal_tag, ..u.into() }
+        UserView { tags, rule_tags: st.dir.rule_tags(&u.id), personal_tag, ..u.into() }
     }
 
     pub fn session(&self, cookie: &str) -> Option<UiSession> {
@@ -535,6 +538,7 @@ impl ControlPlane {
         if let Err(e) = self.store.prune(before) {
             tracing::error!(error = %format!("{e:#}"), "pruning the audit log failed");
         }
+        self.prune_rule_matches();
     }
 }
 

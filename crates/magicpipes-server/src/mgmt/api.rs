@@ -429,6 +429,34 @@ pub async fn create_tag(Caller(who): Caller, State(app): State<AppState>, Json(r
     Ok((StatusCode::CREATED, Json(tag)))
 }
 
+/// Every tag rule, and the sources a new one can name (administrators).
+pub async fn list_tag_rules(Caller(who): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let rules = app.control.tag_rules(&who).map_err(ApiError)?;
+    Ok(Json(json!({ "rules": rules, "sources": app.control.rule_sources() })))
+}
+
+#[derive(Deserialize)]
+pub struct NewTagRule {
+    source: String,
+    #[serde(default)]
+    claim: String,
+    value: String,
+    tag: String,
+}
+
+pub async fn create_tag_rule(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewTagRule>) -> Result<impl IntoResponse, ApiError> {
+    let rule = app.control.create_tag_rule(&who, &req.source, &req.claim, &req.value, &req.tag).map_err(ApiError)?;
+    Ok((StatusCode::CREATED, Json(json!({ "rule": rule }))))
+}
+
+pub async fn delete_tag_rule(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.control.delete_tag_rule(&who, &id) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(api_err(ErrorCode::NotFound, "no such rule")),
+        Err(e) => Err(ApiError(e)),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct TagChange {
     access: bool,

@@ -384,7 +384,8 @@ secret link until then):
 - an audit log of who opened which session and when; optional terminal session recording
   (asciinema format).
 
-The design, with tag-based access in place of per-user grants, is in [USERS.md](USERS.md).
+The design, with tag-based access in place of per-user grants, is in [USERS.md](USERS.md). Done in
+phase 4, apart from TOTP and terminal session recording, which are still to come.
 
 ## Monitoring: health, history, alerts and synthetic checks
 
@@ -500,7 +501,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | none for sockets | done |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
-| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | in progress (groundwork, password accounts, tags, private tunnels, OIDC sign-in, the Settings page, the authenticating proxy, GitHub sign-in, email and `magicpipes connect` for private TCP and UDP tunnels done) |
+| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | done (password accounts, tags, private tunnels, OIDC and GitHub sign-in, the Settings page, the authenticating proxy, email, `magicpipes connect`, and tag rules from groups, claims, GitHub teams and address domains); TOTP and the rest of "Left for later" in USERS.md to come |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
 | 5b | SSH files in the browser: an SFTP browser beside the terminal (`russh-sftp`) | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | done (RDP used against Windows 11 with NLA; VNC built, not yet tried against a real VNC server) |

@@ -81,6 +81,10 @@ pub struct ProxyAuthConfig {
     pub secret_header: Option<String>,
     /// `headers`: a file holding that secret.
     pub secret_file: Option<PathBuf>,
+    /// `headers`: the header listing the user's groups, comma-separated, such as
+    /// `X-Forwarded-Groups`, for tag rules (the claim `groups`). In `jwt` mode the token's own
+    /// claims are used.
+    pub groups_header: Option<String>,
     /// Accept the proxy's email addresses even when nothing says they were verified. Off by
     /// default: anyone who can choose their address behind the proxy could then claim one here.
     #[serde(default)]
@@ -129,6 +133,7 @@ impl ProxyAuthConfig {
                 unused("user_header", self.user_header.is_some())?;
                 unused("secret_header", self.secret_header.is_some())?;
                 unused("secret_file", self.secret_file.is_some())?;
+                unused("groups_header", self.groups_header.is_some())?;
             }
             ProxyAuthMode::Headers => {
                 let user = Self::header("user_header", &self.user_header)?;
@@ -138,6 +143,12 @@ impl ProxyAuthConfig {
                 }
                 if user == secret {
                     return Err("user_header and secret_header must differ".into());
+                }
+                if self.groups_header.is_some() {
+                    let groups = Self::header("groups_header", &self.groups_header)?;
+                    if groups == http::header::AUTHORIZATION || groups == user || groups == secret {
+                        return Err("groups_header must differ from user_header, secret_header and Authorization".into());
+                    }
                 }
                 if self.secret_file.is_none() {
                     return Err("secret_file is required in this mode".into());
@@ -164,7 +175,7 @@ impl ProxyAuthConfig {
     /// The headers that say who someone is, which never reach a tunnel's application. Except
     /// `Authorization`: there, an application's own credentials would be lost.
     pub fn identity_headers(&self) -> Vec<http::HeaderName> {
-        [&self.jwt_header, &self.user_header, &self.secret_header]
+        [&self.jwt_header, &self.user_header, &self.secret_header, &self.groups_header]
             .into_iter()
             .flatten()
             .filter_map(|h| http::HeaderName::from_bytes(h.trim().as_bytes()).ok())
