@@ -297,6 +297,16 @@ run "$MP" add "$ECHO_UDP" --udp --allow-any --name pudp --json --timeout 60
 PUDP=$(sed -n 's/.*"public_port": *\([0-9]*\).*/\1/p' cmd.out | head -n 1)
 run "$PY" ports.py udp "$PUDP" "smoke over udp"
 
+step "magicpipes probe"
+# Checks the public TCP port from here, as a visitor would, and tells the server, with the admin
+# token as its API token and the server this machine is enrolled with.
+MAGICPIPES_API_TOKEN=$(tr -d '\r\n' < server/admin-token)
+export MAGICPIPES_API_TOKEN
+run "$MP" probe ptcp --json
+unset MAGICPIPES_API_TOKEN
+grep -q '"ok": true' cmd.out
+grep -q '"reported": true' cmd.out
+
 step "private tcp and udp through magicpipes connect"
 # A person holding a tag that the machine's private tunnels carry reaches them with `magicpipes
 # connect`, here with an API token; signing in in a browser is in the end-to-end tests.

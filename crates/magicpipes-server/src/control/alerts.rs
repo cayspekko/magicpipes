@@ -36,10 +36,11 @@ pub enum Rule {
     PortsUsedUp,
     KeyRefused,
     CheckFailing,
+    OutsideFailing,
 }
 
 impl Rule {
-    const ALL: [Rule; 12] = [
+    const ALL: [Rule; 13] = [
         Rule::MachineOffline,
         Rule::FewerConnections,
         Rule::SlowRoundTrips,
@@ -52,6 +53,7 @@ impl Rule {
         Rule::PortsUsedUp,
         Rule::KeyRefused,
         Rule::CheckFailing,
+        Rule::OutsideFailing,
     ];
 
     /// Its name in the database.
@@ -69,6 +71,7 @@ impl Rule {
             Rule::PortsUsedUp => "ports_used_up",
             Rule::KeyRefused => "key_refused",
             Rule::CheckFailing => "check_failing",
+            Rule::OutsideFailing => "outside_failing",
         }
     }
 
@@ -91,6 +94,7 @@ impl Rule {
             Rule::PortsUsedUp => "Ports nearly used up",
             Rule::KeyRefused => "Key changed",
             Rule::CheckFailing => "Check failing",
+            Rule::OutsideFailing => "Unreachable from outside",
         }
     }
 }
@@ -109,7 +113,7 @@ impl Severity {
         }
     }
 
-    fn parse(s: &str) -> Severity {
+    pub(super) fn parse(s: &str) -> Severity {
         if s == "warn" { Severity::Warn } else { Severity::Bad }
     }
 }
@@ -272,7 +276,7 @@ impl Alerts {
 }
 
 /// The page an alert's subject has.
-fn href(subject: &str) -> Option<String> {
+pub(super) fn href(subject: &str) -> Option<String> {
     match subject.split_once(':') {
         Some(("machine", id)) => Some(format!("/machines/{id}")),
         Some(("tunnel" | "certificate", id)) => Some(format!("/tunnels/{id}")),
@@ -281,7 +285,7 @@ fn href(subject: &str) -> Option<String> {
 }
 
 /// `14:05 UTC` today, else `2026-11-08 14:05 UTC`.
-fn clock(at: i64, now: i64) -> String {
+pub(super) fn clock(at: i64, now: i64) -> String {
     let (ts, today) = (rfc3339(at), rfc3339(now));
     let (day, time) = (ts.get(..10).unwrap_or(""), ts.get(11..16).unwrap_or(""));
     if Some(day) == today.get(..10) { format!("{time} UTC") } else { format!("{day} {time} UTC") }
@@ -314,6 +318,8 @@ pub struct TunnelFacts {
     pub key_refused: bool,
     /// Its last check's failures in a row, and why it failed.
     pub check: Option<(u32, String)>,
+    /// The same from outside (`magicpipes probe`), while recent and failing.
+    pub outside: Option<(u32, String)>,
 }
 
 /// What the rules see on a sample.
@@ -387,6 +393,10 @@ pub fn judge(f: &Facts) -> Vec<Finding> {
             let detail = format!("The last {failures} checks failed: {why}");
             find(Rule::CheckFailing, format!("tunnel:{}", t.id), &t.name, Severity::Bad, detail);
         }
+        if let Some((failures, why)) = t.outside.as_ref().filter(|(n, _)| *n >= 2) {
+            let detail = format!("The last {failures} checks from outside failed: {why}");
+            find(Rule::OutsideFailing, format!("tunnel:{}", t.id), &t.name, Severity::Bad, detail);
+        }
         if t.key_refused {
             let detail = "Its machine showed a different key from the one kept, and the browser was refused. If the machine was reinstalled, forget the old key on this page.";
             find(Rule::KeyRefused, format!("tunnel:{}", t.id), &t.name, Severity::Bad, detail.to_string());
@@ -456,6 +466,7 @@ impl ControlPlane {
                     certificate: t.row.kind.is_http().then_some((CertStatus::Pending, None)),
                     key_refused: false,
                     check: None,
+                    outside: None,
                 })
                 .collect();
             let used = st.tunnels.values().filter(|t| t.row.public_port.is_some()).count();
@@ -477,6 +488,13 @@ impl ControlPlane {
                 t.check = checks.get(&t.id).map(|c| (c.failures, c.said.clone()));
             }
         }
+        {
+            let mut outside = self.outside.lock().unwrap();
+            outside.keep(|id| tunnels.iter().any(|t| t.id == id));
+            for t in &mut tunnels {
+                t.outside = outside.failing(&t.id, now);
+            }
+        }
         for t in tunnels.iter_mut().filter(|t| t.certificate.is_some()) {
             t.certificate = Some((self.certs.status(&t.hostname), self.certs.not_after(&t.hostname)));
         }
@@ -496,7 +514,11 @@ impl ControlPlane {
             Some(("tunnel" | "certificate", id)) => facts.tunnels.iter().any(|t| t.id == id),
             _ => true,
         };
-        let changes = self.alerts.lock().unwrap().apply(now, findings, exists);
+        let (before, changes) = {
+            let mut alerts = self.alerts.lock().unwrap();
+            (alerts.open(), alerts.apply(now, findings, exists))
+        };
+        self.tell(now, &before, &changes, exists);
         for change in changes {
             match change {
                 Change::Opened(row) => {
@@ -516,7 +538,7 @@ impl ControlPlane {
 
     /// Whether `who` may see an alert about `subject`: what they manage, and for administrators,
     /// also what's gone and the server's own.
-    fn may_see(&self, st: &super::State, who: &Principal, subject: &str) -> bool {
+    pub(super) fn may_see(&self, st: &super::State, who: &Principal, subject: &str) -> bool {
         match subject.split_once(':') {
             Some(("machine", id)) if st.dir.agent(id).is_some() => authz::authorize(who, Action::Manage, st.agent_resource(id)),
             Some(("tunnel" | "certificate", id)) if st.tunnels.contains_key(id) => st.tunnels.get(id).is_some_and(|t| st.may(who, Action::Manage, t)),
@@ -656,6 +678,7 @@ mod tests {
             certificate: None,
             key_refused: false,
             check: None,
+            outside: None,
         }
     }
 
@@ -737,7 +760,11 @@ mod tests {
         checked.check = Some((2, "The app isn't accepting connections.".into()));
         let mut once = tunnel("once", 0, 0);
         once.check = Some((1, "No answer within 10 seconds.".into()));
-        f.tunnels = vec![tunnel("down", 20, 2), tunnel("quiet", 19, 19), tunnel("edge", 20, 1), expiring, soon, later, failed, changed, checked, once];
+        let mut outside = tunnel("outside", 0, 0);
+        outside.outside = Some((2, "couldn't look up outside.t.test".into()));
+        let mut outside_once = tunnel("outside-once", 0, 0);
+        outside_once.outside = Some((1, "timed out".into()));
+        f.tunnels = vec![tunnel("down", 20, 2), tunnel("quiet", 19, 19), tunnel("edge", 20, 1), expiring, soon, later, failed, changed, checked, once, outside, outside_once];
         f.ports = Some((46, 50));
         assert_eq!(rules(&f), vec![
             (Rule::AppErrors, "tunnel:down".into(), Severity::Bad),
@@ -746,8 +773,10 @@ mod tests {
             (Rule::CertificateFailed, "certificate:failed".into(), Severity::Bad),
             (Rule::KeyRefused, "tunnel:changed".into(), Severity::Bad),
             (Rule::CheckFailing, "tunnel:checked".into(), Severity::Bad),
+            (Rule::OutsideFailing, "tunnel:outside".into(), Severity::Bad),
             (Rule::PortsUsedUp, "server".into(), Severity::Warn),
         ]);
+        assert_eq!(judge(&f)[6].detail, "The last 2 checks from outside failed: couldn't look up outside.t.test");
         assert_eq!(judge(&f)[5].detail, "The last 2 checks failed: The app isn't accepting connections.");
         assert_eq!(judge(&f)[0].detail, "2 of 20 requests in the last 5 minutes (10%).");
         f.tunnels.clear();

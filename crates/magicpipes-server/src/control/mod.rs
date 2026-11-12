@@ -9,6 +9,7 @@
 //! * `directory` — owners, tags and custom hostnames, kept in memory for access decisions;
 //! * `email` — invitations, sign-in links and confirming an address;
 //! * `hostnames` — custom hostnames and who may serve them;
+//! * `notify` — alerts by email and webhook;
 //! * `oidc` — who a single sign-on signs in as;
 //! * `registry` — registering, checking and removing tunnels;
 //! * `sessions` — agent sessions;
@@ -28,7 +29,9 @@ pub mod health;
 pub mod history;
 mod hostnames;
 mod metrics;
+mod notify;
 mod oidc;
+pub mod outside;
 mod registry;
 mod sessions;
 pub use sessions::Attached;
@@ -61,6 +64,7 @@ use crate::store::{Store, TunnelRow};
 pub use device::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, Purpose};
 pub use email::{AcceptError, INVITATION_DAYS, InvitationView, LinkError, OpenInvitation, SIGN_IN_LINK_MINUTES};
 pub use oidc::SignInError;
+pub use notify::WebhookView;
 pub use registry::TunnelSignIn;
 pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, NewSmtp, ProviderChanges, ProviderView, SmtpView};
 pub use ssh::looks_private as looks_like_private_key;
@@ -98,6 +102,10 @@ pub struct ControlPlane {
     alerts: Mutex<alerts::Alerts>,
     /// Each tunnel's last check ([`checks`]).
     checks: Mutex<checks::Checks>,
+    /// Each tunnel's last result from `magicpipes probe` ([`outside`]).
+    outside: Mutex<outside::Outside>,
+    /// Alert email waiting to go, and webhooks ([`notify`]).
+    notify: notify::Notifier,
 }
 
 #[derive(Default)]
@@ -261,6 +269,8 @@ impl ControlPlane {
             history: Mutex::new(history::History::new(unix_now())),
             alerts: Mutex::new(alerts::Alerts::default()),
             checks: Mutex::new(checks::Checks::default()),
+            outside: Mutex::new(outside::Outside::default()),
+            notify: notify::Notifier::default(),
         });
         cp.publish(&cp.state.lock().unwrap());
         cp.load_history();
@@ -299,6 +309,7 @@ impl ControlPlane {
             self.certs.ensure(&h);
         }
         self.start_mail_queue(shutdown.clone());
+        self.start_webhooks(shutdown.clone());
         self.start_checks(shutdown.clone());
         self.start_gateway_reports(shutdown.clone());
         let me = self.clone();

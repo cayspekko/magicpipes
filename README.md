@@ -411,8 +411,8 @@ as usual.
 
 ### Email
 
-With a mail server, administrators can invite people by email, and people can get a link to sign in
-if they forget their password. Set it up under **Settings → Email**, which connects and signs in
+With a mail server, administrators can invite people by email, people can get a link to sign in
+if they forget their password, and anyone can [get alerts by email](#health-and-history). Set it up under **Settings → Email**, which connects and signs in
 before saving, or in the configuration file, where it's then locked on the page:
 
 ```toml
@@ -1206,6 +1206,7 @@ answer `403 forbidden` to members.
 | POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`, or for `connect` a `pass` and `expires_at`), `denied` or `expired` |
 | POST | `/api/v1/passes` | 201 `{"pass", "expires_at"}`: a connect pass for 15 minutes, for your API token's user (used by `connect`) |
 | POST | `/api/v1/passes/device` | Starts a browser-approved sign-in for `magicpipes connect`; body `{"machine"}` |
+| POST | `/api/v1/probes` | `{"kept": n}`; body `{"results": [{"tunnel", "ok", "said"?}]}`, at most 200: what `magicpipes probe` found from outside. Results for tunnels you don't manage are left out |
 | GET | `/api/v1/connect/{name}` | With a connect pass: `{"name", "kind", "online"}` for a private TCP or UDP tunnel or a remote desktop you can reach, else 404; with `Upgrade: magicpipes-connect/1`, a connection to it (used by `connect`) |
 | GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |
 | POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
@@ -1270,6 +1271,24 @@ reached, the machine says why (refused, timed out, a missing socket, permissions
 certificate), and the tunnel's page and the alert say it too. These checks start where
 the server is, so they can't see a problem in DNS or a firewall in front of it.
 
+**From outside.** `magicpipes probe` checks the public address of each tunnel you manage from
+wherever it runs, the way a visitor reaches it: through DNS, firewalls, a proxy in front of the
+server, and the certificate visitors get. HTTP tunnels get `GET <--probe-path>` (any answer counts)
+and public TCP ports have to connect; other kinds go through the management address or the SSH
+gateway rather than an address of their own, and tunnels with `--no-check` are left alone. It
+reports to the server, and the tunnel's page shows the last result. Run it on another network, on a
+schedule, with an API token:
+
+```sh
+# crontab on a machine outside the server's network
+*/5 * * * *  MAGICPIPES_API_TOKEN=tok_... magicpipes probe --server https://example.com:8443 --quiet
+```
+
+`magicpipes probe web db` checks only those; `--no-report` only prints what it finds; `--json` prints
+`{"results": [{"tunnel_id", "name", "url", "ok", "said"}], "reported"}`. It exits with 8
+(`probe_failed`) when a check failed, and `--quiet` prints only those. A report counts for an alert
+for an hour, so a probe that stops running doesn't leave one open for long.
+
 **Alerts.** Rules judge every sample, and an alert opens once a problem shows on two samples in a
 row and closes after three fine ones. Open alerts lead the Health page, show as a count beside
 Health in the navigation, and sit at the top of the tunnel's or machine's page. People see those
@@ -1289,8 +1308,49 @@ about their own machines and tunnels; administrators see all of them.
 | Ports nearly used up | Over 90% of the `[ports]` range is in use |
 | Key changed | A browser terminal or desktop refused a machine's changed key, in the last day (serious) |
 | Check failing | The server's last two checks of a tunnel's app failed (serious) |
+| Unreachable from outside | The last two reports from `magicpipes probe` said its address failed (serious) |
 
-For alerts outside the app, scrape `/metrics`.
+**Alert email.** With [email](#email) set up, each person chooses on their Account page what alerts
+they get by email: none (the default), those about their own machines and tunnels (for an
+administrator, service agents' and the server's too), or, for administrators, every alert. Messages
+go only to a confirmed address. The first change waits 30 seconds for what comes with it, and nobody
+gets more than one message every 10 minutes; each lists what opened, got worse or closed since the
+last.
+
+**Webhooks.** Administrators add webhooks under **Settings → Alert webhooks**. Each alert that opens,
+gets worse or closes is posted at once to every webhook, as JSON:
+
+```json
+{
+  "event": "opened",
+  "text": "Opened: Check failing, web. The last 2 checks failed: Couldn't reach the app: connection refused by 127.0.0.1:3000. https://example.com:8443/tunnels/tn_abc",
+  "alert": {
+    "id": "al_x7Qe…",
+    "rule": "check_failing",
+    "title": "Check failing",
+    "severity": "bad",
+    "subject": "tunnel:tn_abc",
+    "name": "web",
+    "detail": "The last 2 checks failed: Couldn't reach the app: connection refused by 127.0.0.1:3000.",
+    "opened_at": "2026-11-11T14:05:10Z",
+    "closed_at": null,
+    "url": "https://example.com:8443/tunnels/tn_abc"
+  },
+  "server": "https://example.com:8443",
+  "sent_at": "2026-11-11T14:05:10Z"
+}
+```
+
+`event` is `opened`, `worse`, `closed`, or `test` from **Send test**. Slack, Mattermost and Google
+Chat show `text` as it is; for Discord, add `/slack` to the end of its webhook address. Each request
+has `X-MagicPipes-Event` and `X-MagicPipes-Signature: sha256=<hex>`, the HMAC-SHA256 of the body
+under a secret shown once, when the webhook is added. The address has to be HTTPS (or HTTP to the
+server's own machine), redirects aren't followed, and a delivery is tried three times, over about a minute.
+The Settings page shows how each webhook's last delivery went, and only the address's host, since
+an address like Slack's is a secret itself. Up to 10 webhooks.
+
+Alert email and deliveries waiting to go are kept in memory, so a restart loses them. For other
+systems, scrape `/metrics`.
 
 ### Metrics for Prometheus
 

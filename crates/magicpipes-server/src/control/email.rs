@@ -202,7 +202,7 @@ impl ControlPlane {
     }
 
     /// Sends one message, within the server's limit. The error says why, for an administrator.
-    async fn deliver(&self, to: &str, mail: &Mail) -> Result<(), ErrorBody> {
+    pub(super) async fn deliver(&self, to: &str, mail: &Mail) -> Result<(), ErrorBody> {
         let mailer = self.mailer()?;
         if !self.mail.by_server.allow(()) {
             return Err(err(ErrorCode::RateLimited, "this server has sent as much email as it may this hour; try again later"));

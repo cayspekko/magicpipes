@@ -11,8 +11,10 @@ use super::ui::page;
 use super::AppState;
 use crate::control::alerts::{AlertView, Severity};
 use crate::control::checks::{CheckResult, Outcome};
+use crate::control::outside::OutsideResult;
 use crate::control::health::{CertificateHealth, HealthView, MachineHealth, TunnelHealth};
 use crate::control::history::{Period, Presence, Series, Traffic};
+use crate::store::AlertEmail;
 
 /// Rows a list on the Health page shows: those in trouble first, then the busiest.
 const ROWS: usize = 50;
@@ -31,10 +33,12 @@ impl PeriodQuery {
 pub async fn health(user: UiUser, State(app): State<AppState>, Query(q): Query<PeriodQuery>) -> Response {
     let period = q.period(&app);
     let h = app.control.health(&user.who, period);
-    page("Health", Some(&user), &body(&h))
+    // Someone who could get these by email, and doesn't, is told where.
+    let by_email = user.user.is_some() && app.control.mail_on() && app.control.alert_email(&user.who) == AlertEmail::Off;
+    page("Health", Some(&user), &body(&h, by_email))
 }
 
-fn body(h: &HealthView) -> String {
+fn body(h: &HealthView, by_email: bool) -> String {
     let words = period_words(h.period);
     let mut tunnels: Vec<&TunnelHealth> = h.tunnels.iter().collect();
     tunnels.sort_by_cached_key(|t| {
@@ -83,7 +87,7 @@ fn body(h: &HealthView) -> String {
 {machine_table}{more_machines}
 {certificates}"#,
         line = health_line(h),
-        alerts = alerts_section(h),
+        alerts = alerts_section(h, by_email),
         periods = if nothing { String::new() } else { format!(r#"<div class="spaced">{}</div>"#, periods("/health", h.period, h.history_days)) },
         since = if nothing { String::new() } else { since },
         tunnels_note = note(format!("What the server saw in {words}.")),
@@ -106,13 +110,14 @@ fn body(h: &HealthView) -> String {
 }
 
 /// Open alerts, then those closed in the last 24 hours, folded away.
-fn alerts_section(h: &HealthView) -> String {
+fn alerts_section(h: &HealthView, by_email: bool) -> String {
     let open = if h.alerts.is_empty() {
         String::new()
     } else {
         let rows: String = h.alerts.iter().map(|a| alert_row(a, h.now)).collect();
+        let email = if by_email { r#" <a href="/account#alerts">Get them by email</a>."# } else { "" };
         format!(
-            r#"<div class="section" id="alerts"><h2>Alerts<span class="count">{}</span></h2></div><p class="note below-section">An alert opens once a problem shows on two samples in a row, 10 seconds apart, and closes after three fine ones.</p>{}"#,
+            r#"<div class="section" id="alerts"><h2>Alerts<span class="count">{}</span></h2></div><p class="note below-section">An alert opens once a problem shows on two samples in a row, 10 seconds apart, and closes after three fine ones.{email}</p>{}"#,
             h.alerts.len(),
             table(&[Text("Alert"), Text("About"), Text("Severity"), Text("Open for")], &rows, "")
         )
@@ -287,6 +292,24 @@ pub(super) fn check_field(t: &crate::control::TunnelView, check: Option<&CheckRe
             Outcome::Skipped => "Not checked: its machine is offline.".to_string(),
         },
     }
+}
+
+/// What a tunnel's page says about `magicpipes probe`'s checks of its public address: `None` for
+/// a tunnel the probe doesn't check (one without an address of its own, or with checks off).
+pub(super) fn outside_field(t: &crate::control::TunnelView, last: Option<&OutsideResult>, now: i64) -> Option<String> {
+    if !t.checks || !(t.kind.is_http() || (t.kind.has_port() && t.kind != magicpipes_core::proto::Kind::Udp && t.public_port.is_some())) {
+        return None;
+    }
+    Some(match last {
+        None => "Not checked. To check its address from outside this server's network, run <code>magicpipes probe</code> there with an API token.".to_string(),
+        Some(r) if r.ok => format!(r#"<span class="status ok">passed</span> {} ago<span class="sub wrap">{}</span>"#, ago(now - r.at), esc(&r.said)),
+        Some(r) => format!(
+            r#"<span class="status bad">failed</span> {} ago{}<span class="sub wrap">{}</span>"#,
+            ago(now - r.at),
+            if r.failures > 1 { format!(", {} times in a row", r.failures) } else { String::new() },
+            esc(&r.said)
+        ),
+    })
 }
 
 /// Why requests failed, and those turned away: `app down 3 · too slow 1 · busy 2`.
@@ -556,7 +579,7 @@ fn bytes(n: u64) -> String {
 }
 
 /// A length of time, roughly: `40 seconds`, `3 minutes`, `5 hours`, `2 days`.
-fn ago(secs: i64) -> String {
+pub(super) fn ago(secs: i64) -> String {
     let secs = secs.max(0);
     let (n, one, many) = match secs {
         0..60 => (secs, "second", "seconds"),

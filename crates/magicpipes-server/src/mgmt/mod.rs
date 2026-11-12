@@ -23,6 +23,7 @@ mod health;
 mod html;
 mod icons;
 mod machine;
+mod notify;
 mod novnc;
 mod oidc;
 mod picker;
@@ -149,6 +150,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/account/ssh-keys", post(ssh::add_key))
         .route("/account/ssh-keys/{id}/delete", post(ssh::delete_key))
         .route("/account/address", post(email::request_confirmation))
+        .route("/account/alerts", post(notify::save_alert_email))
         .route("/account/address/confirm", get(email::confirm_form).post(email::confirm))
         .route("/users", get(accounts::users).post(accounts::create_user))
         .route("/invitations/{id}/resend", post(accounts::resend_invitation))
@@ -165,6 +167,10 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/settings/email", get(email::email_form).post(email::save_email))
         .route("/settings/email/delete", post(email::delete_email))
         .route("/settings/email/test", post(email::test_email))
+        .route("/settings/webhooks", post(notify::create_webhook))
+        .route("/settings/webhooks/new", get(notify::new_webhook))
+        .route("/settings/webhooks/{id}/delete", post(notify::delete_webhook))
+        .route("/settings/webhooks/{id}/test", post(notify::test_webhook))
         .route("/settings/certificates/new", get(certificates::new_certificate).post(certificates::add_certificate))
         .route("/settings/certificates/{id}/delete", post(certificates::delete_certificate))
         .route("/cli", get(accounts::device).post(accounts::answer_device))
@@ -179,6 +185,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/tunnels", get(api::list_tunnels))
         .route("/api/v1/shared", get(api::shared_tunnels))
         .route("/api/v1/tunnels/{id}", get(api::get_tunnel).delete(api::delete_tunnel))
+        .route("/api/v1/probes", post(api::report_probes))
         .route("/api/v1/agents", get(api::list_agents))
         .route("/api/v1/agents/{id}", axum::routing::delete(api::revoke_agent).patch(api::update_agent))
         .route("/api/v1/tags", get(api::list_tags).post(api::create_tag))

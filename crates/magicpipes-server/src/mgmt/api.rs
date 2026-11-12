@@ -95,6 +95,18 @@ pub async fn list_tunnels(Caller(who): Caller, State(app): State<AppState>) -> i
     Json(json!({ "tunnels": app.control.tunnels(&who) }))
 }
 
+#[derive(Deserialize)]
+pub struct ProbeReport {
+    results: Vec<crate::control::outside::ProbeResult>,
+}
+
+/// What `magicpipes probe` found from outside. Results for tunnels the caller doesn't manage are
+/// left out, and `kept` says how many counted.
+pub async fn report_probes(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<ProbeReport>) -> Result<impl IntoResponse, ApiError> {
+    let kept = app.control.report_outside(&who, req.results).map_err(ApiError)?;
+    Ok(Json(json!({ "kept": kept })))
+}
+
 /// Tunnels you can reach but don't manage.
 pub async fn shared_tunnels(Caller(who): Caller, State(app): State<AppState>) -> impl IntoResponse {
     Json(json!({ "tunnels": app.control.shared(&who) }))

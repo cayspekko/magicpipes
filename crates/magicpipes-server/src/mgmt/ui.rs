@@ -84,6 +84,10 @@ done_messages! {
     EmailSaved "email-saved" "Email settings saved. Send a test message to make sure mail arrives.",
     EmailRemoved "email-removed" "Email settings removed.",
     TestMessageSent "test-message-sent" "Test message sent. Check that it arrived.",
+    AlertEmailOn "alert-email-on" "Saved. Alerts come by email, at most one message every 10 minutes.",
+    AlertEmailOff "alert-email-off" "Saved. Alerts no longer come by email.",
+    WebhookRemoved "webhook-removed" "Webhook removed.",
+    WebhookTested "webhook-tested" "The test arrived.",
 }
 
 /// The address of `to`, saying what a change did.
@@ -476,16 +480,28 @@ pub async fn tunnel_detail(user: UiUser, State(app): State<AppState>, Path(id): 
     let history_days = app.control.config().monitoring.history_days;
     let traffic = super::health::traffic_section(&format!("/tunnels/{}", t.id), &series, t.kind.is_http(), history_days);
     let notices = super::health::notices(&app.control.alerts_about(&user.who, "tunnel", &t.id));
-    let check = super::health::check_field(&t, app.control.check_result(&t.id).as_ref(), app.control.checks_on(), magicpipes_core::unix_now());
+    let now = magicpipes_core::unix_now();
+    let check = super::health::check_field(&t, app.control.check_result(&t.id).as_ref(), app.control.checks_on(), now);
+    let outside = super::health::outside_field(&t, app.control.outside_result(&t.id).as_ref(), now);
     let agent = app.control.agent_name(&user.who, &t.agent_id).unwrap_or_default();
     let people = app.control.people(&user.who);
     let ssh_ca = app.control.ssh_ca();
     let viewer_email = user.user.as_ref().map(|u| u.email.as_str()).unwrap_or("you@example.com");
-    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &notices, &traffic, &check))
+    let parts = Parts { notices: &notices, traffic: &traffic, check: &check, outside: outside.as_deref() };
+    page(&t.name, Some(&user), &detail_body(&t, &agent, &user.csrf_field(), &people, ssh_ca.as_deref(), viewer_email, &parts))
 }
 
-#[allow(clippy::too_many_arguments)] // one page's parts
-fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, notices: &str, traffic: &str, check: &str) -> String {
+/// What a tunnel's page shows about its health, ready.
+struct Parts<'a> {
+    notices: &'a str,
+    traffic: &'a str,
+    check: &'a str,
+    /// For a tunnel `magicpipes probe` checks.
+    outside: Option<&'a str>,
+}
+
+fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String, String>, ssh_ca: Option<&str>, viewer_email: &str, parts: &Parts<'_>) -> String {
+    let Parts { notices, traffic, check, outside } = *parts;
     let field = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", esc(k), v);
     let mut dl = String::new();
     dl.push_str(&field("Target", &format!("<code>{}</code>", esc(&t.target))));
@@ -537,6 +553,9 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
         dl.push_str(&field("TLS error", &esc(e)));
     }
     dl.push_str(&field("Check", check));
+    if let Some(outside) = outside {
+        dl.push_str(&field("From outside", outside));
+    }
     if let Some(e) = &t.port_error {
         dl.push_str(&field("Port error", &esc(e)));
     }

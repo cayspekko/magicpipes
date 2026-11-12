@@ -650,10 +650,29 @@ pub(crate) async fn request(method: Method, url: &str, auth: Option<&str>, form:
     if !allowed_url(url) {
         bail!("refusing to talk to {url}");
     }
-    tokio::time::timeout(HTTP_TIMEOUT, send(method, url, auth, form)).await.map_err(|_| anyhow!("timed out"))?
+    let mut headers = Vec::new();
+    if let Some(a) = auth {
+        headers.push((header::AUTHORIZATION, a.to_string()));
+    }
+    let body = form.map(|f| ("application/x-www-form-urlencoded", Bytes::from(f)));
+    let (status, body) = tokio::time::timeout(HTTP_TIMEOUT, send(method, url, &headers, body)).await.map_err(|_| anyhow!("timed out"))??;
+    // An error body can quote what we sent, so it never reaches a log.
+    anyhow::ensure!(status.is_success(), "the provider answered {status}");
+    Ok(body)
 }
 
-async fn send(method: Method, url: &str, auth: Option<&str>, form: Option<String>) -> anyhow::Result<Bytes> {
+/// POSTs `body` as JSON with `headers`, within `timeout`, and gives the status of the answer, whose
+/// body is read (at most [`MAX_RESPONSE`] bytes) and dropped. For webhooks: the caller has checked
+/// the URL with [`allowed_url`].
+pub(crate) async fn post_json(url: &str, headers: &[(header::HeaderName, String)], body: Bytes, timeout: Duration) -> anyhow::Result<http::StatusCode> {
+    if !allowed_url(url) {
+        bail!("refusing to talk to {url}");
+    }
+    let (status, _) = tokio::time::timeout(timeout, send(Method::POST, url, headers, Some(("application/json", body)))).await.map_err(|_| anyhow!("no answer within {} seconds", timeout.as_secs()))??;
+    Ok(status)
+}
+
+async fn send(method: Method, url: &str, headers: &[(header::HeaderName, String)], body: Option<(&str, Bytes)>) -> anyhow::Result<(http::StatusCode, Bytes)> {
     let uri: Uri = url.parse()?;
     let host = uri.host().ok_or_else(|| anyhow!("no host"))?;
     let tls = uri.scheme_str() == Some("https");
@@ -669,13 +688,17 @@ async fn send(method: Method, url: &str, auth: Option<&str>, form: Option<String
         .header(header::ACCEPT, "application/json")
         .header(header::USER_AGENT, "magicpipesd")
         .header(header::CONNECTION, "close");
-    if let Some(a) = auth {
-        b = b.header(header::AUTHORIZATION, a);
+    for (name, value) in headers {
+        b = b.header(name, value);
     }
-    if form.is_some() {
-        b = b.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
-    }
-    let req = b.body(Full::new(Bytes::from(form.unwrap_or_default())))?;
+    let body = match body {
+        Some((content_type, bytes)) => {
+            b = b.header(header::CONTENT_TYPE, content_type);
+            bytes
+        }
+        None => Bytes::new(),
+    };
+    let req = b.body(Full::new(body))?;
 
     let tcp = TcpStream::connect((bare, port)).await.with_context(|| format!("connecting to {authority}"))?;
     let resp = if tls {
@@ -688,7 +711,7 @@ async fn send(method: Method, url: &str, auth: Option<&str>, form: Option<String
     Ok(resp)
 }
 
-async fn exchange<I>(io: I, req: Request<Full<Bytes>>) -> anyhow::Result<Bytes>
+async fn exchange<I>(io: I, req: Request<Full<Bytes>>) -> anyhow::Result<(http::StatusCode, Bytes)>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -698,9 +721,7 @@ where
         let resp = sender.send_request(req).await?;
         let status = resp.status();
         let body = Limited::new(resp.into_body(), MAX_RESPONSE).collect().await.map_err(|e| anyhow!("reading the answer: {e}"))?.to_bytes();
-        // An error body can quote what we sent, so it never reaches a log.
-        anyhow::ensure!(status.is_success(), "the provider answered {status}");
-        Ok(body)
+        Ok((status, body))
     }
     .await;
     driver.abort();

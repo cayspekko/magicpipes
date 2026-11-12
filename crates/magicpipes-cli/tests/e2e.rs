@@ -887,6 +887,162 @@ async fn the_server_checks_tunnels_and_says_when_one_fails() {
     assert!(health.contains("check failed") && health.contains("not checked"), "{health}");
 }
 
+/// Each delivery's `X-MagicPipes-Event` and `X-MagicPipes-Signature` headers, and its body.
+type Deliveries = Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>;
+
+/// What an alert webhook received.
+struct Catcher {
+    port: u16,
+    got: Deliveries,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Catcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Catcher {
+    async fn start() -> Catcher {
+        use hyper::service::service_fn;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = got.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let kept = kept.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let kept = kept.clone();
+                        async move {
+                            let h = |n: &str| req.headers().get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                            let (event, signature) = (h("x-magicpipes-event"), h("x-magicpipes-signature"));
+                            let body = req.into_body().collect().await.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+                            kept.lock().unwrap().push((event, signature, body));
+                            Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
+                });
+            }
+        });
+        Catcher { port, got, task }
+    }
+
+    /// The bodies of deliveries for `event`, as JSON, each checked against `secret`.
+    fn deliveries(&self, event: &str, secret: &str) -> Vec<Value> {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        self.got
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, _, _)| e == event)
+            .map(|(_, signature, body)| {
+                let hex: String = ring::hmac::sign(&key, body).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                assert_eq!(*signature, format!("sha256={hex}"), "signed with the secret shown");
+                serde_json::from_slice(body).unwrap()
+            })
+            .collect()
+    }
+}
+
+/// Alerts reach people: as a signed webhook post when one opens or closes, and by email to an
+/// administrator who asked for it. `magicpipes probe` checks addresses from outside and reports,
+/// and two failed reports in a row open an alert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alerts_go_out_by_webhook_and_email_and_the_probe_reports_from_outside() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let echo = common::tcp_echo_app().await;
+    let web = add_json(&env, &[&app.port.to_string(), "--name", "web"]).await;
+    let port = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any", "--name", "echo"]).await;
+    let id = |t: &Value| t["id"].as_str().unwrap().to_string();
+
+    // Ann, an administrator, asks for alert email. The machine is a service agent, which is hers to
+    // hear about.
+    let body = serde_json::json!({ "email": "ann@example.com", "role": "admin" });
+    let (status, v) = env.api_json("POST", "/api/v1/invitations", Some(&env.admin_token()), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let code = smtp.wait_for("ann@example.com", 1).await.code();
+    let password = "a long password for ann";
+    let r = env.ui("/invite/accept", None, Some(&[("code", code.as_str()), ("display_name", ""), ("password", password), ("repeat", password)])).await;
+    let ann = r.cookie.unwrap_or_else(|| panic!("no session: {}", r.html));
+    let account = env.ui("/account", Some(&ann), None).await;
+    assert!(account.html.contains("Send alerts to ann@example.com") && account.html.contains("service agents and the server"), "{}", account.html);
+    let saved = env.ui("/account/alerts", Some(&ann), Some(&[("csrf", &account.csrf()), ("alert_email", "mine")])).await;
+    assert_eq!(saved.location.as_deref(), Some("/account?done=alert-email-on"), "{}", saved.html);
+    assert!(env.ui("/account", Some(&ann), None).await.html.contains(r#"value="mine" checked"#));
+
+    // A webhook, added on the Settings page, with a secret shown once; a test reaches it, signed.
+    let hook = Catcher::start().await;
+    let admin = admin_session(&env).await;
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains(r#"href="/settings/webhooks/new">Add webhook</a>"#), "{}", settings.html);
+    let form = env.ui("/settings/webhooks/new", Some(&admin), None).await;
+    let refused = env.ui("/settings/webhooks", Some(&admin), Some(&[("csrf", &form.csrf()), ("name", "ops"), ("url", "http://hooks.example.com/x")])).await;
+    assert!(refused.html.contains("Use an https:// address, or http:// to this machine.") && refused.html.contains(r#"value="ops""#), "{}", refused.html);
+    let url = format!("http://127.0.0.1:{}/hook", hook.port);
+    let added = env.ui("/settings/webhooks", Some(&admin), Some(&[("csrf", &form.csrf()), ("name", "ops"), ("url", &url)])).await;
+    let secret = shown_secret(&added.html);
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains("nothing sent yet") && !settings.html.contains(&url), "the address can be a secret too: {}", settings.html);
+    let test = settings.html.split(r#"action="/settings/webhooks/"#).nth(1).unwrap().split('"').next().unwrap().to_string();
+    let tested = env.ui(&format!("/settings/webhooks/{test}"), Some(&admin), Some(&[("csrf", &settings.csrf())])).await;
+    assert_eq!(tested.location.as_deref(), Some("/settings?done=webhook-tested"), "{}", tested.html);
+    assert_eq!(hook.deliveries("test", &secret).len(), 1);
+    assert!(env.ui("/settings", Some(&admin), None).await.html.contains("delivered "));
+
+    // The probe, run "outside": the TCP port connects, and the tunnel's page says so.
+    let token = api_token(&env, &ann).await;
+    let ca = env.ca_path.to_string_lossy().to_string();
+    let out = env.cli_with(&[("MAGICPIPES_API_TOKEN", &token)], &["probe", "echo", "--server", &env.server_url(), "--ca-cert", &ca, "--json"]).await;
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+    assert!(out.status.success(), "{v}");
+    assert_eq!((v["results"][0]["name"].as_str(), v["results"][0]["ok"].as_bool(), v["reported"].as_bool()), (Some("echo"), Some(true), Some(true)), "{v}");
+    let page = env.ui(&format!("/tunnels/{}", id(&port)), Some(&ann), None).await.html;
+    assert!(page.contains(r#"<dt>From outside</dt><dd><span class="status ok">passed</span>"#) && page.contains("connected in"), "{page}");
+    let out = env.cli_with(&[("MAGICPIPES_API_TOKEN", &token)], &["probe", "nothing-here", "--server", &env.server_url(), "--ca-cert", &ca]).await;
+    assert_eq!(out.status.code(), Some(6), "not_found: {}", String::from_utf8_lossy(&out.stderr));
+
+    // A member's report on tunnels that aren't theirs counts for nothing.
+    let (_, v) = env.api_json("POST", "/api/v1/users", Some(&env.admin_token()), serde_json::json!({ "email": "pat@example.com", "password": "correct horse battery" })).await;
+    assert!(v["user"]["id"].is_string(), "{v}");
+    let first = env.ui("/login", None, Some(&[("email", "pat@example.com"), ("password", "correct horse battery")])).await;
+    let pat = first.cookie.unwrap();
+    let form = env.ui("/password", Some(&pat), None).await;
+    let new = "another correct horse battery";
+    let pat = env.ui("/password", Some(&pat), Some(&[("csrf", &form.csrf()), ("current", "correct horse battery"), ("new", new), ("repeat", new)])).await.cookie.unwrap();
+    let pats = api_token(&env, &pat).await;
+    let report = |ok: bool| serde_json::json!({ "results": [{ "tunnel": id(&web), "ok": ok, "said": "couldn't look up web.t.test" }] });
+    for _ in 0..3 {
+        let (status, v) = env.api_json("POST", "/api/v1/probes", Some(&pats), report(false)).await;
+        assert_eq!((status, v["kept"].as_u64()), (StatusCode::OK, Some(0)), "{v}");
+    }
+
+    // Two failures in a row open an alert: the webhook hears at once, Ann by email shortly after.
+    for _ in 0..2 {
+        let (status, v) = env.api_json("POST", "/api/v1/probes", Some(&token), report(false)).await;
+        assert_eq!((status, v["kept"].as_u64()), (StatusCode::OK, Some(1)), "{v}");
+    }
+    env.eventually("the webhook to hear of the alert", Duration::from_secs(40), || async { !hook.deliveries("opened", &secret).is_empty() }).await;
+    let opened = hook.deliveries("opened", &secret).remove(0);
+    assert_eq!((opened["alert"]["rule"].as_str(), opened["alert"]["severity"].as_str()), (Some("outside_failing"), Some("bad")), "{opened}");
+    let text = opened["text"].as_str().unwrap();
+    assert!(text.starts_with("Opened: Unreachable from outside, web. The last 2 checks from outside failed: couldn't look up web.t.test"), "{text}");
+    assert!(text.ends_with(&format!("{}/tunnels/{}", env.server_url(), id(&web))), "{text}");
+    // Fine again: three fine samples close it, and the webhook hears that too.
+    env.api_json("POST", "/api/v1/probes", Some(&token), report(true)).await;
+    env.eventually("Ann's alert email", Duration::from_secs(60), || async { smtp.sent_to("ann@example.com").len() >= 2 }).await;
+    let mail = smtp.sent_to("ann@example.com").remove(1).text;
+    assert!(mail.contains("Unreachable from outside, web") && mail.contains(&format!("{}/tunnels/{}", env.server_url(), id(&web))), "{mail}");
+    env.eventually("the webhook to hear it closed", Duration::from_secs(60), || async { !hook.deliveries("closed", &secret).is_empty() }).await;
+}
+
 async fn tcp_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return Vec::new() };

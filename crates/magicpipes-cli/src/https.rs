@@ -107,6 +107,19 @@ pub async fn call(
     bearer: Option<&str>,
     body: Option<&serde_json::Value>,
 ) -> anyhow::Result<(http::StatusCode, serde_json::Value)> {
+    call_reading(server, method, path, tls, bearer, body, MAX_JSON_RESPONSE).await
+}
+
+/// As [`call`], reading at most `limit` bytes of the answer: for lists.
+pub async fn call_reading(
+    server: &str,
+    method: http::Method,
+    path: &str,
+    tls: &Arc<ClientConfig>,
+    bearer: Option<&str>,
+    body: Option<&serde_json::Value>,
+    limit: usize,
+) -> anyhow::Result<(http::StatusCode, serde_json::Value)> {
     let (host, port) = parse_server(server)?;
     let stream = connect(&host, port, tls, None).await?;
     let mut req = Request::builder().method(method).uri(path).header(http::header::HOST, host_header(&host, port)).header(http::header::USER_AGENT, USER_AGENT);
@@ -120,14 +133,18 @@ pub async fn call(
     let exchange = async {
         let resp = send(stream, req).await?;
         let status = resp.status();
-        anyhow::Ok((status, read_json(resp).await?))
+        anyhow::Ok((status, read_json_at_most(resp, limit).await?))
     };
     tokio::time::timeout(Duration::from_secs(30), exchange).await.map_err(|_| anyhow!("request timed out"))?
 }
 
 /// A response's JSON body, at most 64 KiB; `null` if it isn't JSON.
 pub async fn read_json(resp: Response<Incoming>) -> anyhow::Result<serde_json::Value> {
-    let body = http_body_util::Limited::new(resp.into_body(), MAX_JSON_RESPONSE);
+    read_json_at_most(resp, MAX_JSON_RESPONSE).await
+}
+
+async fn read_json_at_most(resp: Response<Incoming>, limit: usize) -> anyhow::Result<serde_json::Value> {
+    let body = http_body_util::Limited::new(resp.into_body(), limit);
     let bytes = body.collect().await.map_err(|e| anyhow!("reading the server's answer: {e}"))?.to_bytes();
     Ok(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
 }

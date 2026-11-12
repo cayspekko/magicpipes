@@ -39,13 +39,13 @@ pub struct UserRow {
     pub email_verified: bool,
 }
 
-const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
+pub(super) const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
     u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id),
     p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL
     FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = 'org_default'
     LEFT JOIN passwords p ON p.user_id = u.id";
 
-fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
+pub(super) fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
     let role: String = r.get(3)?;
     let disabled: Option<i64> = r.get(4)?;
     let must_change: i64 = r.get(5)?;

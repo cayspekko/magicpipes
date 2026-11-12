@@ -7,6 +7,7 @@
 mod email;
 mod history;
 mod hostnames;
+mod notify;
 mod settings;
 mod ssh_keys;
 mod tags;
@@ -15,6 +16,7 @@ mod users;
 pub use email::{AcceptWith, Accepted, InvitationRow, Invited, LinkPurpose, NewInvitation, SmtpRow};
 pub use history::AlertRow;
 pub use hostnames::{HostnameRow, MAX_HOSTNAMES};
+pub use notify::{AlertEmail, MAX_WEBHOOKS, WebhookRow};
 pub use ssh_keys::{AddedSshKey, NewSshKey, SshKeyRow};
 pub use settings::{MAX_OIDC_PROVIDERS, MAX_SIGN_IN_RULES, OidcProviderRow, SignInRules};
 pub use tags::{EnrollmentSpec, MAX_TAGS, TagRow};
@@ -397,6 +399,20 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE tunnels ADD COLUMN checks INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE tunnels ADD COLUMN check_path TEXT NOT NULL DEFAULT '/';
+    "#,
+    // 12: telling people about alerts. Each account's alert email (`off`, `mine`, or `all` for an
+    // administrator), and webhooks. A webhook's address and signing secret are a file in
+    // `<data_dir>/webhooks/`, like other secrets; `host` is the address's host, for the page.
+    r#"
+    ALTER TABLE users ADD COLUMN alert_email TEXT NOT NULL DEFAULT 'off';
+    CREATE TABLE webhooks (
+        id         TEXT PRIMARY KEY,
+        org_id     TEXT NOT NULL DEFAULT 'org_default',
+        name       TEXT NOT NULL,
+        host       TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
     "#,
 ];
 
@@ -869,6 +885,43 @@ mod tests {
         drop(c);
         let t = Store::open(&path).unwrap().tunnels().unwrap().remove(0);
         assert_eq!((t.id.as_str(), t.checks, t.check_path.as_str()), ("tn_a", true, "/"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn accounts_from_before_alert_email_get_none_and_webhooks_are_limited() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(11) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        c.execute("INSERT INTO users (id, email, created_at) VALUES ('us_a', 'a@example.com', 0)", []).unwrap();
+        c.execute("INSERT INTO memberships (org_id, user_id, role, created_at) VALUES ('org_default', 'us_a', 'admin', 0)", []).unwrap();
+        drop(c);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.alert_email("us_a").unwrap(), AlertEmail::Off);
+        assert!(store.alert_email_accounts().unwrap().is_empty());
+        assert!(store.set_alert_email("us_a", AlertEmail::All).unwrap());
+        assert!(!store.set_alert_email("us_nobody", AlertEmail::All).unwrap());
+        let accounts = store.alert_email_accounts().unwrap();
+        assert_eq!(accounts.iter().map(|(u, c)| (u.id.as_str(), *c)).collect::<Vec<_>>(), vec![("us_a", AlertEmail::All)]);
+        assert!(!accounts[0].0.email_verified, "the caller decides who can get one");
+
+        let hook = |i: usize| WebhookRow { id: format!("wh_{i}"), name: "ops".into(), host: "hooks.example.com".into(), created_by: "us_a".into(), created_at: i as i64 };
+        for i in 0..MAX_WEBHOOKS {
+            assert!(store.create_webhook(&hook(i)).unwrap());
+        }
+        assert!(!store.create_webhook(&hook(MAX_WEBHOOKS)).unwrap());
+        assert_eq!(store.webhooks().unwrap()[0], hook(0));
+        assert!(store.delete_webhook("wh_0").unwrap() && !store.delete_webhook("wh_0").unwrap());
+        assert_eq!(store.webhooks().unwrap().len(), MAX_WEBHOOKS - 1);
         std::fs::remove_dir_all(dir).ok();
     }
 

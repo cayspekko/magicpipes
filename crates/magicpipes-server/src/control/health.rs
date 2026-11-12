@@ -1,6 +1,7 @@
 //! The sampler behind history ([`super::history`]), and what the Health, tunnel and machine pages
 //! show of it. Every view goes through `authorize`, by way of the lists `who` may see.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use magicpipes_core::unix_now;
@@ -67,7 +68,7 @@ impl ControlPlane {
 
     /// Takes a sample of every tunnel's counters and every agent's connections ([`super::history`]),
     /// and keeps the 5-minute slots that closed in the database.
-    pub(super) fn sample(&self) {
+    pub(super) fn sample(self: &Arc<Self>) {
         let now = unix_now();
         let (tunnels, agents) = {
             let st = self.state.lock().unwrap();
@@ -78,6 +79,7 @@ impl ControlPlane {
         let closed = self.history.lock().unwrap().record(now, &tunnels, &agents);
         self.store.save_history(&closed.tunnels, &closed.agents).or_log();
         self.judge(now);
+        self.send_alert_mail(now);
     }
 
     /// Forgets history older than `monitoring.history_days`.

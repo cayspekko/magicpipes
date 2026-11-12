@@ -260,7 +260,7 @@ async fn first_line<R: AsyncRead + Unpin>(r: &mut R) -> Result<String, String> {
 }
 
 /// What an app or agent said, safe to show: printable ASCII, trimmed and short.
-fn printable(bytes: &[u8]) -> String {
+pub(super) fn printable(bytes: &[u8]) -> String {
     let s: String = bytes.iter().map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { ' ' }).collect();
     s.trim().chars().take(200).collect()
 }

@@ -341,6 +341,46 @@ offline is skipped. The last result per tunnel stays in memory; two failures in 
 alert. The check path goes into a request line as it is, so registration accepts only an
 absolute path of printable characters without spaces, at most 200.
 
+### From outside (`control/outside.rs`, `magicpipes-cli/src/probe.rs`)
+
+The probe from outside is the CLI, run wherever someone likes, not the server or the agent: the
+server can't see its own DNS, firewall or front proxy, and an agent on the server's network
+wouldn't either, while a CLI with an API token runs on any network, needs no protocol change, and
+keeps the agent from growing. `magicpipes probe` lists the tunnels its token's user manages
+(`GET /api/v1/tunnels`), checks those with an address of their own (HTTP tunnels with
+`GET <check path>`, public TCP ports by connecting), 16 at once within 10 seconds each, and reports
+in batches (`POST /api/v1/probes`, at most 200 results). The server keeps a result only for a
+tunnel its sender may manage (`authorize`), cleans the sentence like a check's, and keeps the last
+per tunnel in memory, bounded by the tunnels there are. Two failed reports in a row make a finding
+on the next sample while the last report is under an hour old, so a probe that stops running
+closes its alert rather than holding it open.
+
+### Telling people (`control/notify.rs`)
+
+`judge` hands each sample's changes to `tell`, with the alerts open before it: an alert that opened,
+got worse (warn to bad) or closed because its subject is fine is told; one that got better, or
+closed because its subject was removed, isn't. Webhooks hear at once and email comes as a digest.
+
+Each webhook has a task on the control threads and a queue of 100 deliveries; when it's full, a
+delivery is dropped with a line in the log, so one receiver that hangs can't hold up the others or
+grow memory. A delivery is one POST through the same small client as OpenID Connect (HTTPS, or HTTP
+to this machine; no redirects; 256 KiB read), tried three times, 10 and 60 seconds apart, and the
+last outcome is kept for the Settings page. The body is the same for every webhook and is signed
+for each: `X-MagicPipes-Signature` is HMAC-SHA256 under the webhook's secret. An address can be a
+capability (Slack's are), so the address and secret are a file in `<data_dir>/webhooks/` (0600,
+written atomically) like other secrets the server must read back, the database keeps only a name
+and the host, and the log and the page show only the host. At most 10 webhooks.
+
+Alert email goes to accounts that chose it (`users.alert_email`), have a confirmed address and
+aren't disabled, about what they may see (`may_see`, the same `authorize` as the pages) and chose:
+`mine` is subjects whose machine they own, and for an administrator also service agents and the
+server; `all` is everything, for administrators. Each person has an inbox in memory, bounded by the
+accounts there are and 50 changes each (more are counted): its first change waits 30 seconds for
+what comes with it, and a message goes at most every 10 minutes. Sending is after each sample, on
+the control threads, through the same limits as other email (500 an hour for the server, 4 at
+once), to the address and choice read again then. A restart loses what's waiting, which is
+acceptable for a digest; alerts themselves are kept.
+
 The pages draw history as SVG on the server, one series per chart (the accent and the "bad" color
 are too close to share one), with the marks stretched to the card (`preserveAspectRatio="none"`,
 strokes that don't scale) and all text in HTML around them. Hovering a slot shows its values

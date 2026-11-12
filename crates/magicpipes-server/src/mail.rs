@@ -165,6 +165,47 @@ pub fn confirm_address(server: &str, code: &str, hours: i64) -> Mail {
     }
 }
 
+/// One change in an alert digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertLine {
+    /// `Opened`, `Worse` or `Closed`.
+    pub word: &'static str,
+    /// When, as `14:05 UTC`.
+    pub at: String,
+    pub title: &'static str,
+    /// The machine, tunnel or hostname.
+    pub name: String,
+    pub detail: String,
+    pub link: Option<String>,
+}
+
+/// What changed with someone's alerts since their last message. `more`: changes left out.
+pub fn alert_digest(server: &str, lines: &[AlertLine], more: usize) -> Mail {
+    let subject = match lines {
+        [one] if more == 0 => format!("{}: {}, {}", one.word, one.title, one.name),
+        _ => {
+            let count = |word: &str| lines.iter().filter(|l| l.word == word).count();
+            let parts: Vec<String> = [("Opened", "opened"), ("Worse", "got worse"), ("Closed", "closed")]
+                .iter()
+                .filter_map(|(word, said)| Some(count(word)).filter(|n| *n > 0).map(|n| format!("{n} {said}")))
+                .collect();
+            format!("MagicPipes alerts: {}", parts.join(", "))
+        }
+    };
+    let mut body = format!("At {}:\n", host(server));
+    for l in lines {
+        body.push_str(&format!("\n{} {}: {}, {}\n  {}\n", l.word, l.at, l.title, l.name, l.detail));
+        if let Some(link) = &l.link {
+            body.push_str(&format!("  {link}\n"));
+        }
+    }
+    if more > 0 {
+        body.push_str(&format!("\nAnd {more} more.\n"));
+    }
+    body.push_str(&format!("\nOpen alerts: {server}/health\nTo change what you get, or stop: {server}/account#alerts\n"));
+    Mail { subject, body }
+}
+
 pub fn test_message(server: &str) -> Mail {
     Mail {
         subject: "MagicPipes test message".to_string(),
@@ -238,6 +279,26 @@ mod tests {
             assert!(!mail.subject.contains("mpi_abc"));
         }
         assert!(invitation(server, "ann@example.com", "c", 7).body.starts_with("ann@example.com invited you to MagicPipes at mp.example.com:8443."));
+    }
+
+    #[test]
+    fn an_alert_digest_lists_what_changed() {
+        let line = |word, title, name: &str, link: Option<&str>| AlertLine {
+            word,
+            at: "14:05 UTC".into(),
+            title,
+            name: name.into(),
+            detail: "Offline since 14:03 UTC.".into(),
+            link: link.map(str::to_string),
+        };
+        let server = "https://mp.example.com";
+        let one = alert_digest(server, &[line("Opened", "Offline", "studio-mac", Some("https://mp.example.com/machines/ag_1"))], 0);
+        assert_eq!(one.subject, "Opened: Offline, studio-mac");
+        assert!(one.body.starts_with("At mp.example.com:\n\nOpened 14:05 UTC: Offline, studio-mac\n  Offline since 14:03 UTC.\n  https://mp.example.com/machines/ag_1\n"), "{}", one.body);
+        assert!(one.body.ends_with("To change what you get, or stop: https://mp.example.com/account#alerts\n"));
+        let several = alert_digest(server, &[line("Opened", "Offline", "a", None), line("Opened", "Check failing", "b", None), line("Closed", "Offline", "c", None)], 4);
+        assert_eq!(several.subject, "MagicPipes alerts: 2 opened, 1 closed");
+        assert!(several.body.contains("\nAnd 4 more.\n"));
     }
 
     /// `lettre` should keep these out of the headers whatever a message says.

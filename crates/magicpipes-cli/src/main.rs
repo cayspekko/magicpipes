@@ -6,6 +6,7 @@ mod connect;
 mod https;
 mod ipc;
 mod platform;
+mod probe;
 mod state;
 
 use std::io::{IsTerminal, Write};
@@ -36,6 +37,7 @@ use crate::state::AgentConfig;
   magicpipes add 22 --tcp --allow-cidr 203.0.113.0/24   Open a raw TCP port to one network
   magicpipes add 5432 --tcp --tag team:dev           A private TCP tunnel, for people with that tag
   magicpipes connect db --local 5432                 Reach a private TCP or UDP tunnel from here
+  magicpipes probe                                   Check your tunnels' addresses from here
   magicpipes list                                    See what's running
   magicpipes remove <name>                           Stop one"
 )]
@@ -252,6 +254,35 @@ device with the address and code it prints. That lasts as long as a browser sess
         /// Read the API token from this file.
         #[arg(long, value_name = "FILE", conflicts_with = "api_token")]
         api_token_file: Option<PathBuf>,
+        #[command(flatten)]
+        out: Output,
+    },
+    /// Check your tunnels' public addresses from this computer, as a visitor would, and tell the server.
+    #[command(after_help = "Run it outside the server's network, on a schedule, with an API token from your Account page:
+  */5 * * * *  MAGICPIPES_API_TOKEN=tok_... magicpipes probe --server https://mp.example.com --quiet
+
+It checks HTTP tunnels (GET their check path; any answer counts) and public TCP ports (they
+connect). Two failures in a row open an \"Unreachable from outside\" alert. Exit status 8 when one
+failed.")]
+    Probe {
+        /// Only these tunnels (by name); otherwise every one you manage.
+        tunnels: Vec<String>,
+        /// The server's management URL (default: the server this machine is enrolled with).
+        #[arg(long)]
+        server: Option<String>,
+        /// Extra CA certificate (PEM) to trust, e.g. the server's development CA.
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        /// An API token from your Account page. Prefer the environment variable or --api-token-file,
+        /// which other programs can't see.
+        #[arg(long, env = "MAGICPIPES_API_TOKEN", hide_env_values = true)]
+        api_token: Option<String>,
+        /// Read the API token from this file.
+        #[arg(long, value_name = "FILE", conflicts_with = "api_token")]
+        api_token_file: Option<PathBuf>,
+        /// Only print what it finds; don't tell the server.
+        #[arg(long)]
+        no_report: bool,
         #[command(flatten)]
         out: Output,
     },
@@ -504,6 +535,22 @@ async fn dispatch(cmd: Command) -> ExitCode {
                 Err(e) => Err(e),
             };
             (out, result)
+        }
+        Command::Probe { tunnels, server, ca_cert, api_token, api_token_file, no_report, out } => {
+            let api_token = match api_token_file {
+                Some(path) => std::fs::read_to_string(&path).map(Some).map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("reading {}: {e}", path.display()))),
+                None => Ok(api_token),
+            };
+            let options = |api_token| probe::Options { tunnels, server, ca_cert, api_token, no_report, json: out.json, quiet: out.quiet };
+            match api_token {
+                // Its own report is all the output, failures included.
+                Ok(api_token) => match probe::run(options(api_token)).await {
+                    Ok(true) => return ExitCode::SUCCESS,
+                    Ok(false) => return ExitCode::from(ErrorCode::ProbeFailed.exit_code()),
+                    Err(e) => (out, Err(e)),
+                },
+                Err(e) => (out, Err(e)),
+            }
         }
         Command::List { out } => (out, list(out).await),
         Command::Status { out } => (out, status(out).await),

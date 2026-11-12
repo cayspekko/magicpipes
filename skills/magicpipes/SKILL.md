@@ -132,6 +132,13 @@ magicpipes remove <name|port|socket path> # stop publishing
 magicpipes status --json      # login/agent/connection state
 ```
 
+To check whether tunnels are reachable from the internet, not just from the server, run
+`magicpipes probe --json` with an API token in `MAGICPIPES_API_TOKEN` (add `--server <management
+URL>` off an enrolled machine). It checks HTTP tunnels and public TCP ports the token's user manages,
+from this computer, prints `{"results":[{"tunnel_id","name","url","ok","said"}],"reported"}`, and
+reports to the server. Exit 8 (`probe_failed`, with an `error` in the JSON) means a check failed:
+`said` gives why (DNS, refused, TLS, timeout). Run from the server's own network it proves little.
+
 ## Notes
 
 * Dev servers with host checks (e.g. Vite) must allow the public hostname, for example

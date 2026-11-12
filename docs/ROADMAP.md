@@ -416,8 +416,12 @@ cause, alert, or way for a monitoring system to read any of it. Decided 2026-11-
   answer counts), SSH's banner, VNC's greeting, RDP's answer. Marked `x-magicpipes-probe`. Done in
   11d; going through the machine reaches private tunnels too. Instead of checks of its own, which
   would repeat the server's, the agent says why it couldn't reach an app (protocol 10): what
-  only it can see. Still to do: an outside probe sees what the server can't: its own DNS,
-  firewall and proxy.
+  only it can see.
+* **From outside:** `magicpipes probe`, run with an API token on any network (cron, another
+  server, CI), checks each tunnel's public address as a visitor reaches it, through the DNS,
+  firewall and proxy the server can't see past, and reports to the server; two failed reports in a
+  row open an alert. The CLI rather than the agent, which would need a protocol change and more
+  memory, and is often on the server's own network. Done in 11e (decided 2026-11-11).
 * **Certificate changes** come from comparing each hostname's fingerprint and expiry between
   samples: renewed, replaced, expiring, renewal failed. (Expiring and failing are alerts since
   11c; renewed and replaced are still to do.)
@@ -425,7 +429,11 @@ cause, alert, or way for a monitoring system to read any of it. Decided 2026-11-
   machines (connections, round trip, reconnects, uptime), tunnels (requests per minute, errors by
   cause, latency, last check) and only the certificates in trouble or expiring within 30 days, each
   number with its period.
-* **Later:** email digests and webhooks for alerts.
+* **Telling people** (11e): each person chooses alert email on their Account page (off by default;
+  their own machines and tunnels, or for administrators everything), sent as a digest at most every
+  10 minutes; administrators add webhooks on the Settings page, which get each change at once as
+  signed JSON with a `text` field chat services show. Webhooks per person, and email for a change
+  of severity downward, are left out until someone needs them.
 
 ## Kubernetes: MagicPipes as a cluster's ingress
 
@@ -511,4 +519,4 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | done |
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
 | 11d | Monitoring, probe: synthetic checks from the server, on by default; the agent says why it couldn't reach an app (protocol 10) | yes | done |
-| 11e | Monitoring, tell: email and webhooks; an outside probe | yes | planned |
+| 11e | Monitoring, tell: alert email and webhooks; `magicpipes probe` from outside | yes | done |

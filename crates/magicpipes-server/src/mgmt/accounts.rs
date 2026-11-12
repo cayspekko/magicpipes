@@ -17,7 +17,7 @@ use crate::control::{InvitationView, MIN_PASSWORD_CHARS, Purpose, TunnelSignIn, 
 use crate::tunnel_auth::safe_path;
 
 /// A page that shows a secret once, with a way back. `more`: HTML to follow it.
-fn shown_once(user: &UiUser, title: &str, lede: &str, secret: &str, more: &str, to: &str) -> Response {
+pub(super) fn shown_once(user: &UiUser, title: &str, lede: &str, secret: &str, more: &str, to: &str) -> Response {
     let body = format!(
         r#"{back}<div class="eyebrow spaced">Shown once</div><h1>{title}</h1>
 <p class="lede">{lede}</p><pre class="term">{secret}</pre>{more}"#,
@@ -126,6 +126,7 @@ pub(super) fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&Toke
     let body = format!(
         r#"<div class="eyebrow">Account</div><h1>{name}</h1><p class="lede">{email} · {role}</p>
 {password}{confirm}
+{alerts}
 {ssh_keys}
 <div class="section"><h2>API tokens</h2></div>
 {list}
@@ -136,6 +137,7 @@ pub(super) fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&Toke
 <p class="note">Use it as <code>Authorization: Bearer &lt;token&gt;</code>. It acts as you, with your current role.</p></div>
 {sign_out_everywhere}"#,
         confirm = super::email::confirm_panel(app, user),
+        alerts = super::notify::account_section(user, app),
         ssh_keys = super::ssh::section(user, app, key_attempt),
         name = esc(if me.display_name.is_empty() { &me.email } else { &me.display_name }),
         email = esc(&me.email),

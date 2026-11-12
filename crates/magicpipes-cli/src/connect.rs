@@ -115,7 +115,7 @@ pub async fn approve_in_browser(server: &str, tls: &Arc<ClientConfig>, s: SignIn
 }
 
 /// The server's error, or what its status means when it sent none (an older server).
-fn error_from(status: StatusCode, v: &Value, otherwise: &str) -> ErrorInfo {
+pub(crate) fn error_from(status: StatusCode, v: &Value, otherwise: &str) -> ErrorInfo {
     match (v["error"]["code"].as_str(), v["error"]["message"].as_str()) {
         (Some(code), message) => ErrorInfo::wire(code, message.unwrap_or(otherwise).to_string()),
         (None, _) if matches!(status.as_u16(), 404 | 405) => outdated(),
