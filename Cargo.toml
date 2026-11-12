@@ -43,6 +43,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sha2 = "0.11"
 ring = "0.17"
 base64 = "0.22"
+# Sign-in codes: the key as an authenticator app reads it, and the QR code it scans.
+data-encoding = "2"
+qrcodegen = "1.8"
 argon2 = "0.6"
 hmac = "0.13"
 getrandom = "0.4"

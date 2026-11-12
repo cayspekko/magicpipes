@@ -42,11 +42,14 @@ pub struct UserRow {
     /// They proved the address is theirs: through a provider that vouched for it, an invitation or
     /// a link sent there. An address an administrator typed in hasn't been proved.
     pub email_verified: bool,
+    /// Signing in with a password or an emailed link also takes a code from an authenticator app.
+    pub has_totp: bool,
 }
 
 pub(super) const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
     u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id),
-    p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL, u.disabled_reason IS 'idle'
+    p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL, u.disabled_reason IS 'idle',
+    EXISTS (SELECT 1 FROM totp t WHERE t.user_id = u.id)
     FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = 'org_default'
     LEFT JOIN passwords p ON p.user_id = u.id";
 
@@ -68,6 +71,7 @@ pub(super) fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         last_login_at: r.get(8)?,
         has_password: r.get(9)?,
         email_verified: r.get(10)?,
+        has_totp: r.get(12)?,
     })
 }
 

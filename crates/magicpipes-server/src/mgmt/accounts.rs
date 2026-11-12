@@ -127,7 +127,7 @@ pub(super) fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&Toke
     let bad_expiry = error == Some(BAD_EXPIRY);
     let body = format!(
         r#"<div class="eyebrow">Account</div><h1>{name}</h1><p class="lede">{email} · {role}</p>
-{password}{confirm}
+{password}{codes}{confirm}
 {alerts}
 {ssh_keys}
 <div class="section"><h2>API tokens</h2></div>
@@ -139,6 +139,7 @@ pub(super) fn account_page(user: &UiUser, app: &AppState, attempt: Option<(&Toke
 <p class="note">Use it as <code>Authorization: Bearer &lt;token&gt;</code>. It acts as you, with your current role.</p></div>
 {sign_out_everywhere}"#,
         confirm = super::email::confirm_panel(app, user),
+        codes = super::codes::panel(user, app, me),
         alerts = super::notify::account_section(user, app),
         ssh_keys = super::ssh::section(user, app, key_attempt),
         name = esc(if me.display_name.is_empty() { &me.email } else { &me.display_name }),
@@ -297,7 +298,8 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
                 post("admin", "Make admin", false, Some(format!("Make {} an administrator? They can see and change everything here.", u.email)))
             });
             if passwords {
-                let reset = format!("Reset the password of {}? Their sessions end, their API tokens are revoked, and they must replace the new password when they next sign in.", u.email);
+                let codes = if u.has_totp { " their sign-in codes are turned off," } else { "" };
+                let reset = format!("Reset the password of {}? Their sessions end, their API tokens are revoked,{codes} and they must replace the new password when they next sign in.", u.email);
                 items.push(post("reset", "Reset password", false, Some(reset)));
             }
             let revoke = format!("Revoke every API token of {}? Anything using them stops working.", u.email);
@@ -463,7 +465,7 @@ pub async fn update_user(State(app): State<AppState>, Path(id): Path<String>, Po
                 return shown_once(
                     &user,
                     &format!("New password for {email}"),
-                    "Their sessions have ended and their API tokens are revoked. They must replace this password when they next sign in.",
+                    "Their sessions have ended, their API tokens are revoked and any sign-in codes are off. They must replace this password when they next sign in.",
                     &password,
                     &invitation(&app, &email, &password),
                     "/users",

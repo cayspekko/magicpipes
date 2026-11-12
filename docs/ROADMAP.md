@@ -379,13 +379,23 @@ Today the management UI has a single admin token. Desktops and SSH terminals in 
 need real accounts, which also own the SSH gateway keys (the agent shell manages with its
 secret link until then):
 
-- `users` table with web login (password, OIDC; TOTP later);
+- `users` table with web login (password, OIDC, sign-in codes);
 - per-user SSH keys and grants (which agents/tunnels, and whether terminal/desktop is allowed);
 - an audit log of who opened which session and when; optional terminal session recording
   (asciinema format).
 
 The design, with tag-based access in place of per-user grants, is in [USERS.md](USERS.md). Done in
-phase 4, apart from TOTP and terminal session recording, which are still to come.
+phase 4, apart from terminal session recording, which is still to come.
+
+**Passkeys.** Anyone who signs in through a provider (OpenID Connect, GitHub, an authenticating
+proxy) already gets the provider's passkeys, and its policies can require them: nothing to build
+here. Password accounts have sign-in codes (TOTP), which stop reused and guessed passwords but not
+phishing. Passkeys for them (phase 4b) mean WebAuthn on the server, most likely written on `ring`:
+the main Rust library, `webauthn-rs`, is MPL-2.0 and built on OpenSSL. They'd be bound to the
+management hostname, never the base domain that tunnels share. Signing in with one needs a script
+(`navigator.credentials`), so a password and code stay the way in without scripts. Tests would use
+Chrome's virtual authenticator through the headless Chrome script. Worth building when people run
+MagicPipes without an identity provider and ask for it.
 
 ## Monitoring: health, history, alerts and synthetic checks
 
@@ -501,7 +511,8 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 1c | Touch-friendly web terminal (key bar, mobile input, gestures) | none | planned |
 | 2 | Tunnel model refactor (`kind`) + Unix socket targets | none for sockets | done |
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
-| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | done (password accounts, tags, private tunnels, OIDC and GitHub sign-in, the Settings page, the authenticating proxy, email, `magicpipes connect`, tag rules from groups, claims, GitHub teams and address domains, and disabling accounts single sign-on went quiet about); TOTP and the rest of "Left for later" in USERS.md to come |
+| 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | done (password accounts, tags, private tunnels, OIDC and GitHub sign-in, the Settings page, the authenticating proxy, email, `magicpipes connect`, tag rules from groups, claims, GitHub teams and address domains, disabling accounts single sign-on went quiet about, and sign-in codes from an authenticator app); the rest of "Left for later" in USERS.md to come |
+| 4b | Passkeys for password accounts (WebAuthn; [why only these](#prerequisite-for-browser-access-and-the-ssh-gateway-users)) | yes | later, when asked for |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
 | 5b | SSH files in the browser: an SFTP browser beside the terminal (`russh-sftp`) | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | done (RDP used against Windows 11 with NLA; VNC built, not yet tried against a real VNC server) |

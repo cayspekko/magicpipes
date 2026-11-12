@@ -126,6 +126,14 @@ connections:
   only a change in what matched refreshes. A sign-in asks for what rules want (UserInfo, GitHub's
   `read:org`) only when a rule wants it. The hourly prune drops stale matches and refreshes, so a
   group's tag can't outlive a session's age by more than an hour, however the person signs in.
+* Sign-in codes (`totp.rs`, `control/totp.rs`, `mgmt/codes.rs`): TOTP keys sit in `totp`,
+  AES-256-GCM-encrypted under the `session-key`-derived key with `totp\0<user id>` as associated
+  data (`Signer::encrypt_for`); recovery codes as SHA-256 digests. A right password for such an
+  account returns `SignedIn::Code`, an HMAC-signed note (`k~user~issued~expires`) carried in a
+  `SameSite=Strict` cookie, and `finish_with_code` makes the session. Using a code is one
+  conditional `UPDATE` on `last_step`, so two requests with the same code can't both win. Wrong
+  codes go through a second `AccountLimiter` (5 per 15 minutes per account) as well as the
+  per-client limiter. None of this is on the data plane.
 * Single sign-on past the sign-in (`control/sso.rs`): a session an OpenID Connect provider signed
   in keeps its source and the provider's refresh and ID tokens, AES-256-GCM-encrypted under a key
   derived from `session-key` (`Signer::encrypt`), in `sessions.tokens`; only sessions with a refresh

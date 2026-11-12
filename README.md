@@ -237,6 +237,18 @@ administrator when they first sign in. With a mail server, they're invited by em
   (an IPv6 /64 counts as one) gets no password checked at all until it waits. A wrong password
   and an unknown email get the same answer. The sign-in form only accepts posts from its own
   page, so another site can't sign your browser into its account.
+* **Sign-in codes**: anyone with a password can turn them on from the Account page (**Sign-in
+  codes**, **Set up**). Scan the QR code with an authenticator app (1Password, Google
+  Authenticator, Microsoft Authenticator, or any other that does TOTP), then enter a code and your
+  password. From then on, signing in with the password, or with an emailed link, also takes the
+  6-digit code the app shows, and each code works once. You get 10 recovery codes, shown once,
+  each good once in place of a code; the Account page says how many are left and makes new ones.
+  After 5 wrong codes in 15 minutes, an account takes no more until those 15 minutes are over.
+  Turning codes on signs you out on other devices. If someone loses their phone and recovery
+  codes, an administrator's **Reset password** turns their codes off. The key is kept encrypted
+  under a key from `<data_dir>/session-key`; if that file is replaced, codes stop working and
+  recovery codes or a reset get people back in. Accounts that sign in through a provider rely on
+  the provider's own second factor.
 * **Single sign-on**: see below, or the **Settings** page.
 * **Sessions** last `[users] session_max_age_secs` (12 hours) and survive server restarts.
   Changing your password, being disabled, or "Sign out everywhere" ends them. Signing out here
@@ -1291,7 +1303,8 @@ answer `403 forbidden` to members.
 | GET | `/api/v1/audit?limit=N` | `{"entries": [{"at", "actor", "action", "resource", "detail"}]}`, newest first |
 | GET | `/api/v1/agent/connect` | Agent transport (HTTP upgrade); not for humans |
 
-User object: `id`, `email`, `display_name`, `role`, `disabled`, `disabled_reason` (only `idle`, when
+User object: `id`, `email`, `display_name`, `role`, `has_totp` (signing in with their password also
+takes a code), `disabled`, `disabled_reason` (only `idle`, when
 `disable_idle_after_days` did it rather than an administrator: their next single sign-on enables it
 again), `must_change_password`,
 `has_password` (false for someone who only signs in with single sign-on), `email_verified` (they

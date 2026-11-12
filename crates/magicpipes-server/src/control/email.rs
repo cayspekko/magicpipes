@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::oidc::{SignInError, Source};
 use super::users::{Login, check_password, clean_name, denied, normalize_email};
-use super::{ControlPlane, OrLog, err, internal, logged};
+use super::{CodeError, ControlPlane, OrLog, err, internal, logged};
 use crate::authz::{self, Action, Principal, Resource, Role};
 use crate::forwarded::client_key;
 use crate::mail::{self, Mail, Mailer};
@@ -178,6 +178,12 @@ pub enum LinkError {
     Password(String),
     /// An administrator set a password that's still waiting to be replaced: it needs a new one.
     MustChoosePassword,
+    /// The account takes a sign-in code too. The link is still good.
+    NeedsCode,
+    /// That code isn't right. The link is still good.
+    WrongCode,
+    /// Too many wrong codes for the account lately. The link is still good.
+    CodeThrottled,
     Internal,
 }
 
@@ -406,8 +412,9 @@ impl ControlPlane {
     }
 
     /// Signs in with an emailed link. With `new_password`, also replaces the password, which ends
-    /// other sessions. A password that can't be used leaves the link as it was.
-    pub async fn use_sign_in_link(&self, code: &str, new_password: Option<&str>) -> Result<Login, LinkError> {
+    /// other sessions. A password that can't be used leaves the link as it was. An account with
+    /// sign-in codes needs one too (`second`), checked before the link is used up.
+    pub async fn use_sign_in_link(&self, code: &str, new_password: Option<&str>, second: Option<&str>) -> Result<Login, LinkError> {
         let hash = digest(code);
         let user_id = self.store.email_token_user(&hash, LinkPurpose::SignIn).map_err(logged(LinkError::Internal))?.ok_or(LinkError::Invalid)?;
         let user = self.store.user(&user_id).map_err(logged(LinkError::Internal))?.ok_or(LinkError::Invalid)?;
@@ -422,6 +429,17 @@ impl ControlPlane {
             None if user.must_change_password => return Err(LinkError::MustChoosePassword),
             None => None,
         };
+        let mut with = "email link";
+        if user.has_totp {
+            let second = second.map(str::trim).filter(|c| !c.is_empty()).ok_or(LinkError::NeedsCode)?;
+            with = match self.second_factor(&user, second, "email link") {
+                Ok(true) => "email link and recovery code",
+                Ok(false) => "email link and code",
+                Err(CodeError::Wrong | CodeError::Expired) => return Err(LinkError::WrongCode),
+                Err(CodeError::Throttled) => return Err(LinkError::CodeThrottled),
+                Err(CodeError::Internal) => return Err(LinkError::Internal),
+            };
+        }
         // Whoever gets here first with a link is the one who used it.
         if self.store.take_email_token(&hash, LinkPurpose::SignIn).map_err(logged(LinkError::Internal))?.as_deref() != Some(user.id.as_str()) {
             return Err(LinkError::Invalid);
@@ -436,7 +454,7 @@ impl ControlPlane {
         }
         self.store.touch_login(&user.id, LOCAL_ISSUER).or_log();
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(LinkError::Internal))?;
-        self.audit(&who, "session.login", &user.id, "email link");
+        self.audit(&who, "session.login", &user.id, with);
         Ok(Login { cookie, must_change_password: false })
     }
 

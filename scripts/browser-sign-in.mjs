@@ -8,12 +8,31 @@
 //     "email": "…", "password": "…", "resolve": "MAP *.t.test 127.0.0.1", "profile": "/tmp/…"}'
 //
 // With "sso": "Continue with …" instead of an email and password, it follows that link on the
-// sign-in page, to a provider that answers at once and back (`browser_signs_in_with_oidc`).
+// sign-in page, to a provider that answers at once and back (`browser_signs_in_with_oidc`). With
+// "totp": an authenticator key (base 32), it enters the code on the page after the password
+// (`browser_signs_in_with_a_code`).
 //
 // Prints one JSON document: {"first": {url, text}, "second": {url, text}, "errors": [...]}.
 // Needs Node 22 or newer (built-in fetch and WebSocket) and Chrome; nothing to install.
 
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
+
+// The code an authenticator app shows for `key` (RFC 6238), for the next 30 seconds: the one
+// that turned codes on may have used this one up.
+const totp = (key) => {
+  let bits = 0, have = 0;
+  const bytes = [];
+  for (const c of key) {
+    bits = ((bits << 5) | "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".indexOf(c)) & 0xffff;
+    have += 5;
+    if (have >= 8) { have -= 8; bytes.push((bits >> have) & 0xff); }
+  }
+  const step = Buffer.alloc(8);
+  step.writeBigInt64BE(BigInt(Math.floor(Date.now() / 30000) + 1));
+  const mac = createHmac("sha1", Buffer.from(bytes)).update(step).digest();
+  return String((mac.readUInt32BE(mac[19] & 15) & 0x7fffffff) % 1000000).padStart(6, "0");
+};
 
 const opts = JSON.parse(process.argv[2]);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -77,6 +96,14 @@ try {
     f.submit();
     return true;
   })()`);
+  if (opts.totp) {
+    await settle(`${mgmt}/login/code`);
+    await evaluate(`(() => {
+      const f = document.querySelector('form[action="/login/code"]');
+      f.querySelector('[name=code]').value = ${JSON.stringify(totp(opts.totp))};
+      f.submit();
+    })()`);
+  }
   await settle(new URL(opts.first).origin);
   const first = await state();
 

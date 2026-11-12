@@ -103,22 +103,33 @@ impl Signer {
     /// Encrypts something kept at rest, such as a provider's tokens for a session (AES-256-GCM,
     /// a random nonce first), so that a copy of the database alone can't use it.
     pub fn encrypt(&self, plain: &[u8]) -> Vec<u8> {
+        self.encrypt_for(b"tokens", plain)
+    }
+
+    /// What [`Self::encrypt`] sealed; `None` if it's been changed, or was sealed with another key.
+    pub fn decrypt(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+        self.decrypt_for(b"tokens", sealed)
+    }
+
+    /// As [`Self::encrypt`], bound to `what` it is (its purpose and owner), so it opens only as that:
+    /// someone who can write to the database can't move it to another account.
+    pub fn encrypt_for(&self, what: &[u8], plain: &[u8]) -> Vec<u8> {
         use ring::rand::SecureRandom;
         let mut nonce = [0u8; ring::aead::NONCE_LEN];
         ring::rand::SystemRandom::new().fill(&mut nonce).expect("the system's randomness");
         let mut sealed = plain.to_vec();
         self.sealing_key()
-            .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), ring::aead::Aad::from(b"tokens"), &mut sealed)
+            .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), ring::aead::Aad::from(what), &mut sealed)
             .expect("sealing fits in memory");
         [nonce.as_slice(), &sealed].concat()
     }
 
-    /// What [`Self::encrypt`] sealed; `None` if it's been changed, or was sealed with another key.
-    pub fn decrypt(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+    /// What [`Self::encrypt_for`] sealed as `what`.
+    pub fn decrypt_for(&self, what: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
         let (nonce, rest) = sealed.split_at_checked(ring::aead::NONCE_LEN)?;
         let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
         let mut buf = rest.to_vec();
-        let plain = self.sealing_key().open_in_place(nonce, ring::aead::Aad::from(b"tokens"), &mut buf).ok()?;
+        let plain = self.sealing_key().open_in_place(nonce, ring::aead::Aad::from(what), &mut buf).ok()?;
         Some(plain.to_vec())
     }
 
@@ -227,6 +238,11 @@ mod tests {
         assert_eq!(s.decrypt(&changed), None);
         assert_eq!(Signer::for_tests().decrypt(&sealed), None, "another server's key");
         assert_eq!(s.decrypt(&sealed[..5]), None);
+        // Bound to what it is: another account's, or a session's tokens, don't open as it.
+        let key = s.encrypt_for(b"totp\0us_a", b"key");
+        assert_eq!(s.decrypt_for(b"totp\0us_a", &key).as_deref(), Some(b"key".as_slice()));
+        assert_eq!(s.decrypt_for(b"totp\0us_b", &key), None);
+        assert_eq!(s.decrypt(&key), None);
     }
 
     #[test]

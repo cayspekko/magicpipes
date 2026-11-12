@@ -16,6 +16,7 @@ mod accounts;
 mod api;
 mod certificates;
 mod chart;
+mod codes;
 mod desktop;
 mod email;
 mod extract;
@@ -117,6 +118,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/login", get(ui::login_form).post(ui::login))
         .route("/login/email", get(email::ask_form).post(email::ask))
         .route("/login/link", get(email::link_form).post(email::use_link))
+        .route("/login/code", get(codes::code_form).post(codes::use_code))
         .route("/invite", get(email::invitation_form).post(email::open_invitation))
         .route("/invite/accept", post(email::accept_invitation))
         .route("/invite/provider/{id}", post(email::invitation_provider))
@@ -147,6 +149,9 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/enrollments", post(ui::create_enrollment))
         .route("/password", get(accounts::password_form).post(accounts::change_password))
         .route("/account", get(accounts::account))
+        .route("/account/codes", get(codes::codes).post(codes::turn_on))
+        .route("/account/codes/recovery", post(codes::new_recovery_codes))
+        .route("/account/codes/off", post(codes::turn_off))
         .route("/account/tokens", post(accounts::create_token))
         .route("/account/tokens/{id}/delete", post(accounts::delete_token))
         .route("/account/logout-everywhere", post(accounts::logout_everywhere))

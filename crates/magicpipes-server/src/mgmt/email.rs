@@ -31,18 +31,18 @@ fn hidden_code(code: &str) -> String {
     format!(r#"<input type="hidden" name="code" value="{}">"#, esc(code.trim()))
 }
 
-fn client_of(client: Option<axum::Extension<ClientIp>>) -> Option<IpAddr> {
+pub(super) fn client_of(client: Option<axum::Extension<ClientIp>>) -> Option<IpAddr> {
     client.map(|c| c.0.0)
 }
 
 /// A bad code counts against the client, as any bad credential does. `true`: it's over the limit.
-fn over_limit_after_a_bad_code(app: &AppState, client: Option<IpAddr>) -> bool {
+pub(super) fn over_limit_after_a_bad_code(app: &AppState, client: Option<IpAddr>) -> bool {
     matches!(app.check_credential(Err::<(), ()>(()), client), Err(Rejected::RateLimited))
 }
 
-const TOO_MANY: &str = "Too many failed attempts. Try again later.";
-const FROM_ELSEWHERE: &str = "Use this from its own page, not from another site.";
-const WENT_WRONG: &str = "Something went wrong. Try again.";
+pub(super) const TOO_MANY: &str = "Too many failed attempts. Try again later.";
+pub(super) const FROM_ELSEWHERE: &str = "Use this from its own page, not from another site.";
+pub(super) const WENT_WRONG: &str = "Something went wrong. Try again.";
 
 // ---- asking for a sign-in link -------------------------------------------------------------------
 
@@ -93,11 +93,21 @@ pub async fn ask(State(app): State<AppState>, client: Option<axum::Extension<Cli
 
 // ---- using a sign-in link ------------------------------------------------------------------------
 
-/// `code`: one that's still good, which needn't be asked for again.
-fn link_page(error: Option<&str>, code: Option<&str>, choosing_password: bool) -> Response {
+/// `code`: one that's still good, which needn't be asked for again. `second`: the account takes a
+/// sign-in code too.
+fn link_page(error: Option<&str>, code: Option<&str>, choosing_password: bool, second: bool) -> Response {
+    let second_field = if second {
+        format!(
+            r#"<label for="lk">Code from your authenticator app</label><input id="lk" name="second" autocomplete="one-time-code" spellcheck="false" maxlength="40" required{}>
+<p class="note">Or one of your recovery codes.</p>"#,
+            if error.is_some_and(|e| e.contains("code")) { invalid(true) } else { " autofocus" }
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
         r#"<div class="auth"><h1>Sign <em>in</em></h1><p class="lede">You asked for this link by email. It works once.</p>
-<div class="card">{err}<form method="post" action="/login/link">{code}
+<div class="card">{err}<form method="post" action="/login/link">{code}{second_field}
 <details class="more"{open}><summary>Forgot your password? Choose a new one</summary><div>
 <label for="ln">New password</label><input id="ln" type="password" name="new" autocomplete="new-password" minlength="{MIN_PASSWORD_CHARS}">
 <label for="lr">Repeat it</label><input id="lr" type="password" name="repeat" autocomplete="new-password" minlength="{MIN_PASSWORD_CHARS}">
@@ -114,7 +124,7 @@ pub async fn link_form(State(app): State<AppState>) -> Response {
     if app.control.proxy_auth().is_some() {
         return Redirect::to("/").into_response();
     }
-    link_page(None, None, false)
+    link_page(None, None, false, false)
 }
 
 #[derive(Deserialize)]
@@ -125,6 +135,9 @@ pub struct LinkForm {
     new: String,
     #[serde(default)]
     repeat: String,
+    /// A sign-in code, for an account that takes one.
+    #[serde(default)]
+    second: String,
 }
 
 pub async fn use_link(State(app): State<AppState>, client: Option<axum::Extension<ClientIp>>, headers: HeaderMap, Form(f): Form<LinkForm>) -> Response {
@@ -133,29 +146,51 @@ pub async fn use_link(State(app): State<AppState>, client: Option<axum::Extensio
     }
     // Another site's form could sign this browser in to the attacker's account.
     if cross_site(&headers) {
-        return (StatusCode::FORBIDDEN, link_page(Some(FROM_ELSEWHERE), None, false)).into_response();
+        return (StatusCode::FORBIDDEN, link_page(Some(FROM_ELSEWHERE), None, false, false)).into_response();
     }
     let client = client_of(client);
+    let second = (!f.second.trim().is_empty()).then_some(f.second.as_str());
     if f.new != f.repeat {
-        return (StatusCode::BAD_REQUEST, link_page(Some("The new passwords don't match."), Some(&f.code), true)).into_response();
+        return (StatusCode::BAD_REQUEST, link_page(Some("The new passwords don't match."), Some(&f.code), true, second.is_some())).into_response();
     }
     let new_password = (!f.new.is_empty()).then_some(f.new.as_str());
-    match app.control.use_sign_in_link(&f.code, new_password).await {
+    let choosing = new_password.is_some();
+    match app.control.use_sign_in_link(&f.code, new_password, second).await {
         Ok(login) => {
             let landing = if new_password.is_some() { done_url("/", Done::PasswordChanged) } else { "/".to_string() };
             logged_in_to(&app, login, None, &landing)
         }
         Err(LinkError::Invalid) => {
             if over_limit_after_a_bad_code(&app, client) {
-                return (StatusCode::TOO_MANY_REQUESTS, link_page(Some(TOO_MANY), None, false)).into_response();
+                return (StatusCode::TOO_MANY_REQUESTS, link_page(Some(TOO_MANY), None, false, false)).into_response();
             }
-            (StatusCode::UNAUTHORIZED, link_page(Some("That link has expired or was already used. Ask for a new one on the sign-in page."), None, false)).into_response()
+            (StatusCode::UNAUTHORIZED, link_page(Some("That link has expired or was already used. Ask for a new one on the sign-in page."), None, false, false)).into_response()
         }
-        Err(LinkError::Password(m)) => (StatusCode::BAD_REQUEST, link_page(Some(&m), Some(&f.code), true)).into_response(),
+        Err(LinkError::Password(m)) => (StatusCode::BAD_REQUEST, link_page(Some(&m), Some(&f.code), true, second.is_some())).into_response(),
         Err(LinkError::MustChoosePassword) => {
-            (StatusCode::BAD_REQUEST, link_page(Some("An administrator set your password, so choose your own to finish signing in."), Some(&f.code), true)).into_response()
+            let msg = "An administrator set your password, so choose your own to finish signing in.";
+            (StatusCode::BAD_REQUEST, link_page(Some(msg), Some(&f.code), true, second.is_some())).into_response()
         }
-        Err(LinkError::Internal) => (StatusCode::INTERNAL_SERVER_ERROR, link_page(Some(WENT_WRONG), Some(&f.code), false)).into_response(),
+        Err(LinkError::NeedsCode) => {
+            let msg = if choosing {
+                "Your account takes a code from your authenticator app too. Enter it, and your new password again."
+            } else {
+                "Your account takes a code from your authenticator app too."
+            };
+            (StatusCode::BAD_REQUEST, link_page(Some(msg), Some(&f.code), choosing, true)).into_response()
+        }
+        Err(LinkError::WrongCode) => {
+            if over_limit_after_a_bad_code(&app, client) {
+                return (StatusCode::TOO_MANY_REQUESTS, link_page(Some(TOO_MANY), Some(&f.code), choosing, true)).into_response();
+            }
+            let msg = "That code isn't right. Enter the one your app shows now, or an unused recovery code.";
+            (StatusCode::UNAUTHORIZED, link_page(Some(msg), Some(&f.code), choosing, true)).into_response()
+        }
+        Err(LinkError::CodeThrottled) => {
+            let msg = "Too many wrong codes for this account. Try again in 15 minutes; the link works until it expires.";
+            (StatusCode::TOO_MANY_REQUESTS, link_page(Some(msg), Some(&f.code), choosing, true)).into_response()
+        }
+        Err(LinkError::Internal) => (StatusCode::INTERNAL_SERVER_ERROR, link_page(Some(WENT_WRONG), Some(&f.code), false, second.is_some())).into_response(),
     }
 }
 

@@ -12,6 +12,7 @@ mod rules;
 mod settings;
 mod ssh_keys;
 mod tags;
+mod totp;
 mod users;
 
 pub use email::{AcceptWith, Accepted, InvitationRow, Invited, LinkPurpose, NewInvitation, SmtpRow};
@@ -464,6 +465,22 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE users ADD COLUMN vouched_at INTEGER;
     ALTER TABLE users ADD COLUMN disabled_reason TEXT;
     UPDATE users SET vouched_at = (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = users.id AND i.issuer != 'local');
+    "#,
+    // 16: sign-in codes from an authenticator app. Its key, encrypted under a key from
+    // `session-key` and bound to its account; the last 30-second step a code was used for, so
+    // none works twice; and recovery codes as digests, each good once.
+    r#"
+    CREATE TABLE totp (
+        user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        secret     BLOB NOT NULL,
+        last_step  INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE recovery_codes (
+        user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code_hash TEXT NOT NULL,
+        PRIMARY KEY (user_id, code_hash)
+    ) WITHOUT ROWID;
     "#,
 ];
 
@@ -1087,6 +1104,53 @@ mod tests {
         store.session_rechecked(&id_hash, b"sealed", true).unwrap();
         assert!(vouched("us_recent") >= Some(now));
         assert!(store.disable_idle(now - 60, "quiet").unwrap().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sign_in_codes_are_used_once_and_go_with_the_account() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(15) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(c);
+        let store = Store::open(&path).unwrap();
+        let ann = store.create_user("ann@example.com", "", crate::authz::Role::Member, "not a real hash").unwrap().unwrap();
+        assert!(store.totp(&ann).unwrap().is_none() && !store.user(&ann).unwrap().unwrap().has_totp, "off in a database from before codes");
+
+        let digests: Vec<String> = ["a", "b", "c"].iter().map(|c| secret::sha256_hex(c)).collect();
+        assert!(store.set_totp(&ann, b"sealed", 100, &digests).unwrap());
+        assert!(!store.set_totp(&ann, b"other", 100, &digests).unwrap(), "on already");
+        assert!(!store.set_totp("us_nobody", b"sealed", 100, &digests).unwrap());
+        let row = store.totp(&ann).unwrap().unwrap();
+        assert_eq!((row.secret.as_slice(), row.last_step, row.recovery_left), (b"sealed".as_slice(), 100, 3));
+        assert!(store.user(&ann).unwrap().unwrap().has_totp);
+
+        // A step works once, and never an earlier one.
+        assert!(!store.use_totp_step(&ann, 100).unwrap(), "the code that turned them on");
+        assert!(store.use_totp_step(&ann, 101).unwrap());
+        assert!(!store.use_totp_step(&ann, 101).unwrap());
+        assert!(!store.use_totp_step(&ann, 99).unwrap());
+        // So does a recovery code.
+        assert!(store.use_recovery_code(&ann, &digests[0]).unwrap());
+        assert!(!store.use_recovery_code(&ann, &digests[0]).unwrap());
+        assert!(!store.use_recovery_code(&ann, &secret::sha256_hex("z")).unwrap());
+        assert_eq!(store.totp(&ann).unwrap().unwrap().recovery_left, 2);
+        assert!(store.set_recovery_codes(&ann, &[secret::sha256_hex("d")]).unwrap());
+        assert!(!store.use_recovery_code(&ann, &digests[1]).unwrap(), "replaced");
+        assert_eq!(store.totp(&ann).unwrap().unwrap().recovery_left, 1);
+
+        assert!(store.clear_totp(&ann).unwrap());
+        assert!(!store.clear_totp(&ann).unwrap());
+        assert!(!store.set_recovery_codes(&ann, &digests).unwrap(), "off");
+        assert!(!store.use_recovery_code(&ann, &secret::sha256_hex("d")).unwrap(), "went with them");
         std::fs::remove_dir_all(dir).ok();
     }
 

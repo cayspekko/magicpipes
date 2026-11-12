@@ -19,7 +19,7 @@ use super::html::{self, Actions, Number, Text, alert, back, badge, chips, count,
 use super::icons::{self, CHECK, GLOBE, LOCK, OPENS_ELSEWHERE};
 use super::picker::{self, Holder, Submitted};
 use super::{AppState, ClientIp, Rejected, SESSION_COOKIE};
-use crate::control::{EnrollmentOptions, Login, LoginError, TunnelView};
+use crate::control::{EnrollmentOptions, Login, LoginError, SignedIn, TunnelView};
 use crate::tunnel_auth::safe_path;
 
 /// What a change did, said in one quiet line on the page it redirects to. The address carries only
@@ -62,6 +62,9 @@ done_messages! {
     UserDisabled "user-disabled" "User disabled. They were signed out, and their machines stopped serving tunnels.",
     UserEnabled "user-enabled" "User enabled.",
     UserKeptDisabled "user-kept-disabled" "User kept disabled. Signing in won't enable it again.",
+    CodesOn "codes-on" "Sign-in codes are on. You'll enter one after your password from now on.",
+    CodesOff "codes-off" "Sign-in codes are off. Signing in needs only your password.",
+    RecoveryCodeUsed "recovery-code-used" "You signed in with a recovery code, which won't work again.",
     TokensRevoked "tokens-revoked" "Their API tokens were revoked.",
     TagCreated "tag-created" "Tag created.",
     TagDeleted "tag-deleted" "Tag deleted.",
@@ -1000,7 +1003,8 @@ pub async fn login(
         }
     };
     match app.check_credential(checked, client) {
-        Ok(login) => logged_in(&app, login, next),
+        Ok(SignedIn::Session(login)) => logged_in(&app, login, next),
+        Ok(SignedIn::Code(pending)) => super::codes::ask_for_code(&pending, next),
         Err(Rejected::RateLimited) => too_many(),
         Err(Rejected::Invalid(())) => (StatusCode::UNAUTHORIZED, login_page(&app, Some("Email or password is incorrect."), false, next)).into_response(),
     }

@@ -309,7 +309,32 @@ The methods ship in this order, each usable on its own.
   is checked: a correct password from a throttled account waits too. The cost is that an
   attacker can slow one account down. They can't lock it out, and the admin token is never
   affected.
-- **TOTP is not in this phase.** It can come later with `totp-rs` (MIT).
+- **Sign-in codes (TOTP)** were built on 2026-11-12, after this phase (`totp.rs`,
+  `control/totp.rs`, `mgmt/codes.rs`):
+  - **What.** RFC 6238 with HMAC-SHA1, 6 digits and 30-second steps, which every app does by
+    default, from `ring` rather than `totp-rs`. Keys are 160 bits, HMAC-SHA1's own size, as
+    RFC 4226 recommends and apps expect. A code is good for its step and the one on each side,
+    and only for a step later than the last one used (`totp.last_step`), so none works twice.
+  - **Setting up**, from the Account page, for anyone with a password (not behind a proxy): a QR
+    code (`qrcodegen`, drawn as inline SVG, dark on light whatever the theme), the key to type,
+    and an `otpauth://` link for an app on the same device. The key travels in the form signed
+    for that account for 30 minutes, so a mistake keeps the key the app already has. Turning
+    codes on takes a code and the password, ends other sessions, and shows 10 recovery codes once.
+    New recovery codes and turning off take the password.
+  - **Keeping them.** The key is AES-256-GCM-encrypted under the key derived from `session-key`,
+    with the account bound in (`Signer::encrypt_for`), so a copy of the database alone can't make
+    codes, and someone who can write to it can't move a key to another account. Recovery codes are
+    16 characters of Crockford's base 32 (80 bits), kept as SHA-256 digests, and read however
+    they're typed. A key that can't be read fails closed.
+  - **Signing in.** A right password for an account with codes starts no session. It gives a
+    signed note (`__Host-mp_code`, five minutes, `SameSite=Strict`) and goes to `/login/code`,
+    where an app code or a recovery code finishes it. The note doesn't count after a password
+    change or a reset (`sessions_valid_after`). An emailed link asks for the code with it, and
+    checks it before the link is used up, so a wrong code leaves the link working.
+  - **Limits.** Wrong codes count against the client like any credential, and per account: after
+    5 in 15 minutes the account takes none until they're over. That is a few hundred guesses a
+    day at most, each needing the password first.
+  - **Taking an account back.** An administrator's "Reset password" also turns codes off.
 
 ### 2. Authenticating proxy (forward auth)
 
@@ -848,6 +873,17 @@ CREATE TABLE smtp_settings (                -- the mail server, if set on the Se
     username     TEXT,                      -- the password is <data_dir>/smtp-password
     from_address TEXT NOT NULL
 );
+CREATE TABLE totp (                         -- sign-in codes, when someone turns them on
+    user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    secret     BLOB NOT NULL,                   -- the key, encrypted and bound to the account
+    last_step  INTEGER NOT NULL,                -- only a code for a later step works
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE recovery_codes (               -- each good once
+    user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    PRIMARY KEY (user_id, code_hash)
+) WITHOUT ROWID;
 CREATE TABLE audit_log (
     id          INTEGER PRIMARY KEY,
     at          INTEGER NOT NULL,
@@ -979,7 +1015,7 @@ identity services, and every one goes through `cargo deny check`.
 | JWT verification (proxy assertions, ID tokens) | `ring`, directly | ISC-style, already in the tree | RS256 and ES256 with `ring::signature`. `jsonwebtoken` was approved, but its current versions offer only `aws-lc-rs` or the RustCrypto `rsa` crate (which has an open timing advisory) as backends. |
 | HMAC for tunnel cookies and codes | `hmac` (RustCrypto) | MIT/Apache-2.0 | Approved; uses the existing `sha2` |
 | SMTP | `lettre` | MIT | rustls with the `ring` provider, per the TLS rule in CLAUDE.md; no connection pool |
-| TOTP (later) | `totp-rs` | MIT | not in this phase |
+| TOTP | `ring`, directly; `qrcodegen` for the QR code; `data-encoding` for base 32 | ISC-style; MIT; MIT | `totp-rs` wasn't needed: HMAC-SHA1 is in `ring` |
 
 **Not used:**
 - **`jsonwebtoken`, `openidconnect` / `oauth2`.** They bring a second HTTP client or the `rsa` crate. The
@@ -1073,10 +1109,12 @@ End-to-end tests, at minimum:
   (GitHub, Google without offline access). With proxy auth there is no lag for who someone is:
   every request carries the proxy's current assertion. Their groups, for tag rules, are read when a
   session starts, so tags from them lag up to `session_max_age_secs`.
-- **Left for later:** TOTP (below), `apply_to_tunnels`, `magicpipes ls --all`, tag rules in the
-  configuration file, and controls for the admin token in the UI.
-- **Password accounts have no second factor** until TOTP lands. For stronger login, put the
-  server behind SSO or an authenticating proxy.
+- **Left for later:** requiring sign-in codes (for administrators, or everyone), passkeys for
+  password accounts (roadmap phase 4b; through a provider, its own passkeys already work),
+  `apply_to_tunnels`, `magicpipes ls --all`, tag rules in the configuration file, and controls for
+  the admin token in the UI.
+- **Sign-in codes are each person's choice.** Nothing makes anyone turn them on yet, and the
+  Users page doesn't show who has (the API's `has_totp` does). The admin token takes no code.
 - **Offboarding from the provider waits.** Removing someone at a provider stops their next sign-in
   there, and with re-checks their sessions, but their account here stays: API tokens they made and
   their machines keep working, and so do tags an administrator assigned them. With

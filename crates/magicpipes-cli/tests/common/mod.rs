@@ -53,6 +53,29 @@ pub fn bin(name: &str) -> PathBuf {
     cli.with_file_name(name)
 }
 
+/// The code an authenticator app shows for a base 32 `key` at `unix` seconds (RFC 6238: HMAC-SHA1,
+/// 6 digits, 30 seconds).
+pub fn totp_code(key: &str, unix: i64) -> String {
+    let (mut bits, mut have, mut bytes) = (0u32, 0, Vec::new());
+    for c in key.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => panic!("not base 32: {key}"),
+        };
+        bits = ((bits << 5) | u32::from(v)) & 0xffff;
+        have += 5;
+        if have >= 8 {
+            have -= 8;
+            bytes.push((bits >> have) as u8);
+        }
+    }
+    let tag = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &bytes), &(unix / 30).to_be_bytes());
+    let m = tag.as_ref();
+    let at = usize::from(m[19] & 0x0f);
+    format!("{:06}", u32::from_be_bytes([m[at] & 0x7f, m[at + 1], m[at + 2], m[at + 3]]) % 1_000_000)
+}
+
 pub fn free_port() -> u16 {
     free_port_range(1).0
 }

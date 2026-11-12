@@ -20,6 +20,7 @@ mod mgmt;
 mod oidc;
 mod proxy_auth;
 mod store;
+mod totp;
 mod tunnel_auth;
 
 use std::path::{Path, PathBuf};

@@ -32,31 +32,50 @@ const ACCOUNT_FAILURES: u32 = 10;
 const ACCOUNT_WINDOW: Duration = Duration::from_secs(15 * 60);
 const ACCOUNT_SPACING: Duration = Duration::from_secs(10);
 const ACCOUNT_TRACKED: usize = 10_000;
+/// A code from an authenticator app is one in a million, so after this many wrong ones in
+/// [`CODE_WINDOW`] an account takes no more until it's over. That's at most a few hundred guesses
+/// a day, after the password.
+const CODE_FAILURES: u32 = 5;
+const CODE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 fn argon2() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(19 * 1024, 2, 1, None).expect("valid Argon2 parameters"))
 }
 
-/// Failed password logins per account (by email).
-#[derive(Default)]
+/// Failed password logins per account (by email), or wrong sign-in codes (by account id).
 pub(super) struct AccountLimiter {
     map: Mutex<HashMap<String, (u32, Instant, Instant)>>,
+    failures: u32,
+    window: Duration,
+    spacing: Duration,
+}
+
+impl Default for AccountLimiter {
+    /// For passwords.
+    fn default() -> Self {
+        Self { map: Mutex::default(), failures: ACCOUNT_FAILURES, window: ACCOUNT_WINDOW, spacing: ACCOUNT_SPACING }
+    }
 }
 
 impl AccountLimiter {
-    fn throttled(&self, email: &str) -> bool {
-        let map = self.map.lock().unwrap();
-        map.get(email).is_some_and(|(n, since, next)| *n >= ACCOUNT_FAILURES && since.elapsed() < ACCOUNT_WINDOW && Instant::now() < *next)
+    /// For codes from an authenticator app.
+    pub(super) fn for_codes() -> Self {
+        Self { map: Mutex::default(), failures: CODE_FAILURES, window: CODE_WINDOW, spacing: CODE_WINDOW }
     }
 
-    fn failed(&self, email: &str) {
+    pub(super) fn throttled(&self, email: &str) -> bool {
+        let map = self.map.lock().unwrap();
+        map.get(email).is_some_and(|(n, since, next)| *n >= self.failures && since.elapsed() < self.window && Instant::now() < *next)
+    }
+
+    pub(super) fn failed(&self, email: &str) {
         let mut map = self.map.lock().unwrap();
         if map.len() >= ACCOUNT_TRACKED && !map.contains_key(email) {
-            map.retain(|_, (_, since, _)| since.elapsed() < ACCOUNT_WINDOW);
+            map.retain(|_, (_, since, _)| since.elapsed() < self.window);
             if map.len() >= ACCOUNT_TRACKED {
                 // Make room by forgetting a few failures, never an account that is being slowed
                 // down: otherwise a flood of made-up emails would reset its throttle.
-                let oldest = map.iter().filter(|(_, (n, _, _))| *n < ACCOUNT_FAILURES).min_by_key(|(_, (_, since, _))| *since);
+                let oldest = map.iter().filter(|(_, (n, _, _))| *n < self.failures).min_by_key(|(_, (_, since, _))| *since);
                 match oldest.map(|(k, _)| k.clone()) {
                     Some(k) => {
                         map.remove(&k);
@@ -67,16 +86,16 @@ impl AccountLimiter {
         }
         let now = Instant::now();
         let e = map.entry(email.to_string()).or_insert((0, now, now));
-        if e.1.elapsed() >= ACCOUNT_WINDOW {
+        if e.1.elapsed() >= self.window {
             *e = (0, now, now);
         }
         e.0 = e.0.saturating_add(1);
-        if e.0 >= ACCOUNT_FAILURES {
-            e.2 = now + ACCOUNT_SPACING;
+        if e.0 >= self.failures {
+            e.2 = now + self.spacing;
         }
     }
 
-    fn succeeded(&self, email: &str) {
+    pub(super) fn succeeded(&self, email: &str) {
         self.map.lock().unwrap().remove(email);
     }
 }
@@ -122,6 +141,8 @@ pub struct UserView {
     pub has_password: bool,
     /// They proved the address is theirs. An address an administrator typed in hasn't been.
     pub email_verified: bool,
+    /// Signing in with their password also takes a code from an authenticator app.
+    pub has_totp: bool,
     /// Tags assigned by administrators.
     pub tags: Vec<String>,
     /// Tags that tag rules give them now.
@@ -146,6 +167,7 @@ impl From<UserRow> for UserView {
             must_change_password: u.must_change_password,
             has_password: u.has_password,
             email_verified: u.email_verified,
+            has_totp: u.has_totp,
             tags: Vec::new(),
             rule_tags: Vec::new(),
             personal_tag: None,
@@ -237,7 +259,7 @@ impl ControlPlane {
 
     /// Checks `password` against `hash`, or against a throwaway hash when there is no account,
     /// so an unknown email takes as long as a wrong password.
-    async fn password_matches(&self, password: String, hash: Option<String>) -> bool {
+    pub(super) async fn password_matches(&self, password: String, hash: Option<String>) -> bool {
         static DUMMY: OnceLock<String> = OnceLock::new();
         let Ok(_permit) = self.hashing.acquire().await else { return false };
         tokio::task::spawn_blocking(move || {
@@ -259,7 +281,8 @@ impl ControlPlane {
 
     // ---- logging in -------------------------------------------------------------------------
 
-    pub async fn login_password(&self, email: &str, password: &str) -> Result<Login, LoginError> {
+    /// Checks a password. An account with sign-in codes needs one of those next.
+    pub async fn login_password(&self, email: &str, password: &str) -> Result<super::SignedIn, LoginError> {
         let email = normalize_email(email).unwrap_or_default();
         if !email.is_empty() && self.accounts.throttled(&email) {
             return Err(LoginError::Throttled);
@@ -278,11 +301,14 @@ impl ControlPlane {
             }
         };
         self.accounts.succeeded(&email);
+        if user.has_totp {
+            return Ok(super::SignedIn::Code(self.pending_sign_in(&user)));
+        }
         self.store.touch_login(&user.id, LOCAL_ISSUER).or_log();
         let (cookie, _) = self.store.create_session(Some(&user.id), self.cfg.users.session_max_age_secs).map_err(logged(LoginError::Internal))?;
         let who = Principal::User { id: user.id.clone(), role: user.role, tags: Vec::new() };
         self.audit(&who, "session.login", &user.id, "password");
-        Ok(Login { cookie, must_change_password: user.must_change_password })
+        Ok(super::SignedIn::Session(Login { cookie, must_change_password: user.must_change_password }))
     }
 
     /// A UI session for an admin token; `None` if the token is not valid.
@@ -507,7 +533,8 @@ impl ControlPlane {
     }
 
     /// Sets a new generated password (shown once) that the user must change, ends the user's
-    /// sessions and revokes their API tokens: this is how an account is taken back.
+    /// sessions, revokes their API tokens and turns their sign-in codes off: this is how an account
+    /// is taken back.
     pub async fn reset_password(&self, who: &Principal, id: &str) -> Result<String, ErrorBody> {
         if !authz::authorize(who, Action::Manage, Resource::Org) {
             return Err(denied(who));
@@ -520,9 +547,11 @@ impl ControlPlane {
         self.store.set_password(id, &hash, true).map_err(internal)?;
         self.store.end_sessions(id).map_err(internal)?;
         let revoked = self.store.delete_api_tokens(id).map_err(internal)?;
+        // Taking an account back includes a lost phone.
+        let codes = if self.store.clear_totp(id).map_err(internal)? { ", sign-in codes turned off" } else { "" };
         // Tunnel cookies issued before now stop working too.
         self.refresh();
-        self.audit(who, "user.password_reset", id, &format!("{revoked} API tokens revoked"));
+        self.audit(who, "user.password_reset", id, &format!("{revoked} API tokens revoked{codes}"));
         Ok(password)
     }
 

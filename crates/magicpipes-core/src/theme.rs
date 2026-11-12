@@ -94,6 +94,7 @@ dt{color:var(--muted);font-size:13.5px}dd{overflow-wrap:anywhere}
 dl>:nth-last-child(-n+2){border-bottom:0}
 .term{background:var(--term);color:var(--term-ink);border-radius:14px;padding:20px 22px;margin:24px 0 0;overflow-x:auto;font:13.5px/1.6 var(--mono)}
 .term .p{color:#8e8a82;user-select:none}
+.qr{display:block;width:196px;height:196px;border-radius:6px;margin:4px 0 0}.qr rect{fill:#fff}.qr path{fill:#000}code.key{font-size:15px;word-spacing:.2em}
 .codebox{position:relative;margin:24px 0 0}.codebox .term{margin:0;padding-right:60px}
 .copy{position:absolute;top:12px;right:12px;display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border-radius:10px;border:1px solid #3a3834;background:var(--term);color:#8e8a82;cursor:pointer;transition:color .15s,border-color .15s}
 .copy:hover,.copy:focus-visible{color:var(--term-ink);border-color:#8e8a82;outline:none}
@@ -104,12 +105,12 @@ dl>:nth-last-child(-n+2){border-bottom:0}
 .card.form{padding:22px 24px 24px}
 label{display:block;font-size:13.5px;font-weight:500;color:var(--ink-2);margin:22px 0 8px}
 .card.form>:first-child,form>label:first-of-type,.alert+.note{margin-top:0}.note+form>label:first-of-type{margin-top:22px}
-form>.btn.primary{margin-top:18px}.btn.sso{margin-bottom:10px;white-space:normal;overflow-wrap:anywhere;line-height:1.3;text-align:center}
+form>.btn.primary,form>label+input+.btn{margin-top:18px}.btn.sso{margin-bottom:10px;white-space:normal;overflow-wrap:anywhere;line-height:1.3;text-align:center}
 input:not([type]),input[type=text],input[type=email],input[type=url],input[type=password],input[type=search],select,textarea{width:100%;font:15px var(--sans);padding:12px 14px;border-radius:10px;border:1px solid var(--field);background:var(--bg);color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
 input[type=password],textarea{font-family:var(--mono)}textarea{font-size:13.5px;line-height:1.5}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent)}
 input::placeholder,textarea::placeholder{color:var(--muted)}
-[aria-invalid=true]{border-color:var(--bad)}
+input[aria-invalid=true],select[aria-invalid=true],textarea[aria-invalid=true]{border-color:var(--bad)}
 input[type=checkbox],input[type=radio]{accent-color:var(--accent);width:16px;height:16px;margin:0 8px 0 0;vertical-align:-3px}
 label:has(input[type=checkbox]),label:has(input[type=radio]){font-weight:400;color:var(--ink);margin:14px 0 0}
 fieldset.choice{border:0;padding:0;margin:0;min-width:0}fieldset.choice legend{padding:0;font-size:13.5px;font-weight:500;color:var(--ink-2)}

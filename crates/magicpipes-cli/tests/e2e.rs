@@ -2378,6 +2378,18 @@ async fn private_tunnels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Chrome and Node"]
 async fn browser_signs_in_to_private_tunnels() {
+    browser_sign_in(false).await;
+}
+
+/// The same with sign-in codes on: the note between the password and the code is a
+/// `SameSite=Strict` cookie, which has to come along all the way from one to the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Chrome and Node"]
+async fn browser_signs_in_with_a_code() {
+    browser_sign_in(true).await;
+}
+
+async fn browser_sign_in(with_code: bool) {
     let chrome = std::env::var("MAGICPIPES_CHROME").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") { "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() } else { "google-chrome".into() }
     });
@@ -2388,8 +2400,19 @@ async fn browser_signs_in_to_private_tunnels() {
     let (_, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
     let ann = v["user"]["id"].as_str().unwrap().to_string();
     // She has already chosen her own password, like anyone signing in after their first time.
-    sign_in(&env, "ann@example.com", first_password).await;
+    let session = sign_in(&env, "ann@example.com", first_password).await;
     let password = format!("{first_password} again");
+    let key = if with_code {
+        let setup = env.ui("/account/codes", Some(&session), None).await;
+        let key = between(&setup.html, r#"<code class="key">"#, "</code>").replace(' ', "");
+        let sealed = between(&setup.html, r#"name="key" value=""#, "\"").to_string();
+        let code = common::totp_code(&key, magicpipes_now());
+        let on = env.ui("/account/codes", Some(&session), Some(&[("csrf", &setup.csrf()), ("key", &sealed), ("code", &code), ("password", &password)])).await;
+        assert_eq!(on.status, StatusCode::OK, "{}", on.html);
+        Some(key)
+    } else {
+        None
+    };
 
     let body = serde_json::json!({ "owner_user_id": ann });
     let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
@@ -2400,7 +2423,8 @@ async fn browser_signs_in_to_private_tunnels() {
     let second = add_json(&env, &[&app.port.to_string(), "--private", "--name", "two"]).await;
 
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/browser-sign-in.mjs");
-    let profile = std::env::temp_dir().join(format!("mp-chrome-{}", std::process::id()));
+    // One profile per test: Chrome won't start a second time on one that's in use.
+    let profile = std::env::temp_dir().join(format!("mp-chrome-{}-{}", std::process::id(), if with_code { "code" } else { "password" }));
     let opts = serde_json::json!({
         "chrome": chrome,
         "first": format!("{}/", first["public_url"].as_str().unwrap()),
@@ -2408,6 +2432,7 @@ async fn browser_signs_in_to_private_tunnels() {
         "management": url,
         "email": "ann@example.com",
         "password": password,
+        "totp": key,
         "resolve": format!("MAP *.{BASE} 127.0.0.1"),
         "profile": profile,
     });
@@ -4670,6 +4695,113 @@ async fn a_sign_in_link_can_replace_a_forgotten_password() {
     let cy = user_named(&env, "cy@example.com").await["id"].as_str().unwrap().to_string();
     env.api_json("PATCH", &format!("/api/v1/users/{cy}"), Some(&token), serde_json::json!({ "disabled": true })).await;
     assert_eq!(env.ui("/login/link", None, Some(&[("code", code.as_str())])).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// What's between `start` and `end` in a page.
+fn between<'a>(html: &'a str, start: &str, end: &str) -> &'a str {
+    let at = html.find(start).unwrap_or_else(|| panic!("no {start} in {html}")) + start.len();
+    &html[at..at + html[at..].find(end).expect("an end")]
+}
+
+/// Sign-in codes: set up from the Account page with the QR code's key, asked for after a password
+/// and with an emailed link, each code and recovery code good once, wrong ones limited per
+/// account, and turned off by their owner or an administrator's reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_in_codes_are_asked_for_after_the_password() {
+    let smtp = common::FakeSmtp::start().await;
+    let env = Env::with_config(Tls::DevCa, &smtp.config()).await;
+    let email = "ann@example.com";
+    let (password, session) = invited_account(&env, &smtp, email).await;
+    let now = magicpipes_now;
+
+    // Setting up: a QR code, the key to type, and a form that keeps the key when something's wrong.
+    let account = env.ui("/account", Some(&session), None).await;
+    assert!(account.html.contains("<h2>Sign-in codes</h2>") && account.html.contains(r#"href="/account/codes">Set up</a>"#), "{}", account.html);
+    let setup = env.ui("/account/codes", Some(&session), None).await;
+    assert!(setup.html.contains(r#"<svg class="qr""#) && setup.html.contains("otpauth://totp/MagicPipes%20%28localhost%29%3Aann%40example.com?secret="), "{}", setup.html);
+    let key = between(&setup.html, r#"<code class="key">"#, "</code>").replace(' ', "");
+    let sealed = between(&setup.html, r#"name="key" value=""#, "\"").to_string();
+    let turn_on = async |code: &str, password: &str| {
+        env.ui("/account/codes", Some(&session), Some(&[("csrf", &setup.csrf()), ("key", &sealed), ("code", code), ("password", password)])).await
+    };
+    let wrong = turn_on(&common::totp_code(&key, now() + 300), &password).await;
+    assert!(wrong.status == StatusCode::BAD_REQUEST && wrong.html.contains("That code isn&#39;t right; enter the one the app shows now.") && wrong.html.contains(&format!(r#"<code class="key">{}"#, &key[..4])), "{}", wrong.html);
+    let bad_password = turn_on(&common::totp_code(&key, now()), "not my password").await;
+    assert!(bad_password.status == StatusCode::BAD_REQUEST && bad_password.html.contains("The password is not correct."), "{}", bad_password.html);
+    let on = turn_on(&common::totp_code(&key, now()), &password).await;
+    assert_eq!(on.status, StatusCode::OK, "{}", on.html);
+    let recovery: Vec<String> = between(&on.html, r#"<pre class="term">"#, "</pre>").lines().map(str::to_string).collect();
+    assert_eq!(recovery.len(), 10, "{}", on.html);
+    let current = on.cookie.clone().expect("a new session");
+    assert_eq!(env.ui("/account", Some(&session), None).await.status, StatusCode::SEE_OTHER, "other sessions ended");
+    let account = env.ui("/account", Some(&current), None).await;
+    assert!(account.html.contains("10 recovery codes left") && account.html.contains(r#"href="/account/codes">Manage</a>"#), "{}", account.html);
+    assert_eq!(user_named(&env, email).await["has_totp"], true);
+
+    // The password alone signs nobody in: a code finishes it, once.
+    let password_then = async |code: &str| {
+        let first = env.ui("/login", None, Some(&[("email", email), ("password", &password), ("next", "/account")])).await;
+        assert_eq!(first.location.as_deref(), Some("/login/code?next=%2Faccount"), "{}", first.html);
+        let note = first.cookie.clone().expect("the note for the code step");
+        assert!(note.starts_with("__Host-mp_code="), "{note}");
+        assert!(env.ui("/login/code", Some(&note), None).await.html.contains(r#"autocomplete="one-time-code""#));
+        env.ui("/login/code", Some(&note), Some(&[("code", code), ("next", "/account")])).await
+    };
+    let refused = password_then(&common::totp_code(&key, now() + 300)).await;
+    assert!(refused.status == StatusCode::UNAUTHORIZED && refused.html.contains("That code isn&#39;t right") && refused.cookie.is_none(), "{}", refused.html);
+    let code = common::totp_code(&key, now() + 30);
+    let signed_in = password_then(&code).await;
+    assert!(signed_in.refresh.as_deref() == Some("0;url=/account") && signed_in.cookie.as_deref().is_some_and(|c| c.starts_with("__Host-mp_session=")), "{} {}", signed_in.status, signed_in.html);
+    assert_eq!(password_then(&code).await.status, StatusCode::UNAUTHORIZED, "a code works once");
+    assert_eq!(env.ui("/login/code", None, Some(&[("code", &code)])).await.status, StatusCode::UNAUTHORIZED, "nothing to finish without the note");
+
+    // A recovery code, however it's typed, works once.
+    let first = env.ui("/login", None, Some(&[("email", email), ("password", &password)])).await;
+    let note = first.cookie.expect("note");
+    let used = env.ui("/login/code", Some(&note), Some(&[("code", &recovery[0].to_uppercase().replace('-', " "))])).await;
+    assert_eq!(used.location.as_deref(), Some("/?done=recovery-code-used"), "{}", used.html);
+    let again = env.ui("/login/code", Some(&note), Some(&[("code", &recovery[0])])).await;
+    assert!(again.status == StatusCode::UNAUTHORIZED && again.html.contains("isn&#39;t one of your recovery codes") && again.html.contains("<details class=\"more\" open"), "{}", again.html);
+
+    // An emailed link takes a code too, and is still good while it hasn't had the right one.
+    env.ui("/login/email", None, Some(&[("email", email)])).await;
+    let link = smtp.wait_for(email, 2).await.code();
+    let asked = env.ui("/login/link", None, Some(&[("code", link.as_str())])).await;
+    assert!(asked.status == StatusCode::BAD_REQUEST && asked.html.contains("takes a code from your authenticator app") && asked.html.contains(r#"name="second""#) && asked.cookie.is_none(), "{}", asked.html);
+    let with_code = env.ui("/login/link", None, Some(&[("code", link.as_str()), ("second", &recovery[1])])).await;
+    assert_eq!(with_code.location.as_deref(), Some("/"), "{}", with_code.html);
+
+    // New recovery codes replace the old; wrong codes stop being checked for a while.
+    let manage = env.ui("/account/codes", Some(&current), None).await;
+    assert!(manage.html.contains("8 recovery codes left"), "{}", manage.html);
+    let fresh = env.ui("/account/codes/recovery", Some(&current), Some(&[("csrf", &manage.csrf()), ("password", &password)])).await;
+    assert_eq!(between(&fresh.html, r#"<pre class="term">"#, "</pre>").lines().count(), 10, "{}", fresh.html);
+    let first = env.ui("/login", None, Some(&[("email", email), ("password", &password)])).await;
+    let note = first.cookie.expect("note");
+    assert_eq!(env.ui("/login/code", Some(&note), Some(&[("code", &recovery[2])])).await.status, StatusCode::UNAUTHORIZED, "replaced");
+    for _ in 0..4 {
+        assert_eq!(env.ui("/login/code", Some(&note), Some(&[("code", &common::totp_code(&key, now() + 300))])).await.status, StatusCode::UNAUTHORIZED);
+    }
+    let held = env.ui("/login/code", Some(&note), Some(&[("code", &common::totp_code(&key, now()))])).await;
+    assert!(held.status == StatusCode::TOO_MANY_REQUESTS && held.html.contains("Too many wrong codes for this account"), "{}", held.html);
+
+    // Turning them off, and an administrator's reset, which takes an account back.
+    let off = env.ui("/account/codes/off", Some(&current), Some(&[("csrf", &manage.csrf()), ("password", &password)])).await;
+    assert_eq!(off.location.as_deref(), Some("/account?done=codes-off"), "{}", off.html);
+    assert_eq!(env.ui("/login", None, Some(&[("email", email), ("password", &password)])).await.location.as_deref(), Some("/"));
+    let setup = env.ui("/account/codes", Some(&current), None).await;
+    let key = between(&setup.html, r#"<code class="key">"#, "</code>").replace(' ', "");
+    let sealed = between(&setup.html, r#"name="key" value=""#, "\"").to_string();
+    let form = [("csrf", setup.csrf()), ("key", sealed), ("code", common::totp_code(&key, now())), ("password", password.clone())];
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    assert_eq!(env.ui("/account/codes", Some(&current), Some(&pairs)).await.status, StatusCode::OK);
+    let id = user_named(&env, email).await["id"].as_str().unwrap().to_string();
+    let (status, _) = env.api_json("POST", &format!("/api/v1/users/{id}/password"), Some(&env.admin_token()), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(user_named(&env, email).await["has_totp"], false);
+    let (_, audit) = env.api("GET", "/api/v1/audit?limit=50", Some(&env.admin_token())).await;
+    let actions: Vec<&str> = audit["entries"].as_array().unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
+    assert!(actions.contains(&"user.totp_on") && actions.contains(&"user.totp_off") && actions.contains(&"user.recovery_codes"), "{audit}");
 }
 
 /// A public page that sends mail needs limits of its own: per address and per client.

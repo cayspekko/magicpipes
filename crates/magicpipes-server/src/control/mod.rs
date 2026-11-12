@@ -42,6 +42,7 @@ mod settings;
 mod ssh;
 mod sso;
 mod tags;
+mod totp;
 mod users;
 mod views;
 
@@ -73,6 +74,7 @@ pub use registry::TunnelSignIn;
 pub use settings::{CertificateView, GENERATED_CONFIG, NewProvider, NewSmtp, ProviderChanges, ProviderView, SmtpView};
 pub use ssh::looks_private as looks_like_private_key;
 pub use tags::{EnrollmentOptions, TagView};
+pub use totp::{CodeError, SignedIn, TotpSetup};
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
 pub use views::TunnelView;
 
@@ -86,6 +88,8 @@ pub struct ControlPlane {
     /// Bounds concurrent password hashing (CPU and memory).
     hashing: Semaphore,
     accounts: users::AccountLimiter,
+    /// Wrong sign-in codes per account.
+    codes: users::AccountLimiter,
     devices: device::DeviceLogins,
     /// The configuration file's providers, read once.
     file_providers: Vec<Arc<crate::oidc::Provider>>,
@@ -262,6 +266,7 @@ impl ControlPlane {
             started_at: unix_now(),
             hashing: Semaphore::new(users::HASH_CONCURRENCY),
             accounts: users::AccountLimiter::default(),
+            codes: users::AccountLimiter::for_codes(),
             devices: device::DeviceLogins::default(),
             file_providers,
             file_mailer,
