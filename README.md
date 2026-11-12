@@ -1536,6 +1536,11 @@ scripts/bench/compare.sh base new
 
 ### CI and releases
 
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and every
+pull request: clippy and the test suite on Linux and macOS, clippy on Windows, `cargo deny
+check`, and a build of both images from the `Dockerfile` (the server, and `--target agent`),
+each of which then runs its binary's `--version`. Images are built, never pushed.
+
 [`.github/workflows/release.yml`](.github/workflows/release.yml) runs only when a GitHub
 release is published:
 

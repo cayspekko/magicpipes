@@ -1,6 +1,7 @@
 # Runs on every push to main and every pull request: clippy and tests on Linux and macOS, a
-# Windows compile check, and the cargo-deny policy (deny.toml: advisories, licenses, bans,
-# sources). The release workflow repeats the tests and adds builds and smoke tests.
+# Windows compile check, the cargo-deny policy (deny.toml: advisories, licenses, bans,
+# sources) and both images from the Dockerfile. The release workflow repeats the tests and
+# adds builds and smoke tests.
 
 name: CI
 
@@ -59,3 +60,40 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Builds the server image (the default target) and the agent image (--target agent) and runs
+  # each binary once. Nothing is pushed. The Dockerfile's cargo registry and target cache mounts
+  # live inside BuildKit, so the cache dance copies them in from the Actions cache before the
+  # build and back out after it; they sit in runner.temp to stay out of the build context.
+  docker:
+    name: Docker images
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v4
+        id: buildx
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: ${{ runner.temp }}/docker-cargo
+          key: docker-cargo-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          restore-keys: docker-cargo-
+      - uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          scratch-dir: ${{ runner.temp }}/docker-cargo-scratch
+          cache-map: |
+            {
+              "${{ runner.temp }}/docker-cargo/registry": "/usr/local/cargo/registry",
+              "${{ runner.temp }}/docker-cargo/target": "/src/target"
+            }
+          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+      - name: Build the server image
+        run: docker buildx build --load -t magicpipes .
+      - name: Build the agent image
+        run: docker buildx build --load --target agent -t magicpipes-agent .
+      - name: Run each image's binary
+        run: |
+          docker run --rm magicpipes --version
+          docker run --rm --entrypoint /usr/local/bin/magicpipes magicpipes-agent --version
