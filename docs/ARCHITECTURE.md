@@ -988,7 +988,18 @@ a connection to the public port that must arrive back at the agent (a warning, n
   listener (`agent/health.rs`: 16 connections, 5 s for headers, 10 s each, no keep-alive) for
   `/livez` and `/readyz`, which reads the session state and each declared tunnel's registration.
   None of it touches the data path. A `--detached` agent ignores all of these, as it does the
-  first-start enrollment from `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`. `MAGICPIPES_CONFIG` moves
+  first-start enrollment from `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`.
+* **Ingress objects** (`MAGICPIPES_INGRESS_CLASS`; `agent/ingress.rs`, `agent/kube.rs`). The gateway
+  agent is its own ingress controller: no `kube-rs`, but a client of a few calls on the agent's
+  hyper/rustls stack, trusting only the cluster CA and reading the service account's token again for
+  each request. It lists Ingress objects, then watches from that version (bookmarks on; a 410 or a
+  broken watch lists again), parsing only the fields used, at most 1 MiB an event and 16 MiB a list,
+  2000 objects and 200 tunnels. Each rule becomes `add` arguments (the Service's cluster IP and
+  port, looked up in the Ingress's namespace only) checked by the same clap definition, and is
+  declared in `agent/declared.rs`, which keeps a live set: a changed declaration ends its tries and
+  starts new ones, a removed one removes its tunnel. Readiness waits for the first list. Statuses are
+  patched (JSON merge patch) every 10 s when a host's tunnel has come or gone. The agent still dials
+  only what the local configuration names, here the cluster's own objects; the server names nothing. `MAGICPIPES_CONFIG` moves
   `config.json`, which the agent only reads, to a read-only Secret.
 
 ## Lifecycle policies

@@ -8,6 +8,7 @@
 //! * `ops` — operations exposed over IPC, including the readiness-gated `add`.
 //! * `declared` — tunnels declared in the environment for `agent run` in a container.
 //! * `health` — `/livez` and `/readyz` for a container's probes.
+//! * `ingress`, `kube` — Ingress objects of a Kubernetes cluster served as tunnels.
 //!
 //! Single instance: the agent holds an exclusive `flock` on `agent.lock` for its lifetime.
 //! A second agent (e.g. from two concurrent `magicpipes add` invocations) fails to take the lock
@@ -19,6 +20,8 @@
 mod declared;
 mod forward;
 mod health;
+mod ingress;
+mod kube;
 mod local_tls;
 mod ops;
 mod probe;
@@ -54,15 +57,19 @@ pub enum Start {
 pub fn run(detached: bool) -> anyhow::Result<Start> {
     // Only `agent run` itself reads what a container declares: an agent a command starts in the
     // background could have them in its environment by chance, and would remove other tunnels.
-    let (declared, health) = if detached {
-        (None, None)
+    let (declared, health, ingress) = if detached {
+        (None, None, None)
     } else {
         let declared = crate::declared::from_env().map_err(anyhow::Error::msg)?;
         let health = match std::env::var(health::HEALTH_ENV) {
             Ok(text) if !text.trim().is_empty() => Some(health::address(&text).map_err(anyhow::Error::msg)?),
             _ => None,
         };
-        (declared, health)
+        let ingress = match ingress::Settings::from_env().map_err(anyhow::Error::msg)? {
+            Some(settings) => Some((settings, kube::Kube::in_cluster()?)),
+            None => None,
+        };
+        (declared, health, ingress)
     };
     state::ensure_home()?;
     let lock = File::options().create(true).truncate(false).write(true).open(state::lock_path())?;
@@ -88,7 +95,7 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
             },
             None => bail!("not logged in; run `magicpipes login --server <url> --token <token>` first"),
         };
-        serve(cfg, detached, declared, health).await
+        serve(cfg, detached, declared, health, ingress).await
     });
     platform::cleanup_ipc();
     let _ = std::fs::remove_file(state::pid_path());
@@ -106,7 +113,13 @@ fn awaited() -> bool {
     }
 }
 
-async fn serve(cfg: AgentConfig, detached: bool, declared: Option<Vec<crate::declared::Declared>>, health: Option<std::net::SocketAddr>) -> anyhow::Result<()> {
+async fn serve(
+    cfg: AgentConfig,
+    detached: bool,
+    declared: Option<Vec<crate::declared::Declared>>,
+    health: Option<std::net::SocketAddr>,
+    ingress: Option<(ingress::Settings, kube::Kube)>,
+) -> anyhow::Result<()> {
     // We hold the lock, so any existing socket is stale.
     let mut listener = IpcListener::bind()?;
     // Before anything starts, so a port in use stops the agent with an error.
@@ -119,12 +132,20 @@ async fn serve(cfg: AgentConfig, detached: bool, declared: Option<Vec<crate::dec
     let shutdown = CancellationToken::new();
     let tunnels = tunnels::Tunnels::load()?;
     let tls = crate::https::tls_config(cfg.ca_cert_pem.as_deref())?;
+    let base_domain = cfg.base_domain.clone();
     let session = session::Session::new(cfg, tunnels.clone())?;
     let agent = Agent::new(session.clone(), tunnels.clone(), tls, shutdown.clone());
     tracing::info!(pid = std::process::id(), tunnels = tunnels.len(), declared = declared.as_ref().map(Vec::len), detached, "agent started");
 
     let session_task = tokio::spawn(session.clone().run(shutdown.clone()));
-    let declarations = declared.map(|d| declared::spawn(agent.clone(), d, shutdown.clone()));
+    let declarations = (declared.is_some() || ingress.is_some()).then(|| declared::Declarations::new(agent.clone(), shutdown.clone(), ingress.is_none()));
+    if let Some(d) = &declarations {
+        declared::start(d, declared.unwrap_or_default(), ingress.is_some());
+    }
+    if let (Some((settings, kube)), Some(d)) = (ingress, &declarations) {
+        tracing::info!(class = %settings.class, namespace = settings.namespace.as_deref().unwrap_or("every namespace"), "serving Ingress objects");
+        ingress::spawn(settings, kube, agent.clone(), d.clone(), base_domain, shutdown.clone());
+    }
     if let Some(listener) = health {
         health::spawn(listener, agent.clone(), declarations, shutdown.clone());
     }

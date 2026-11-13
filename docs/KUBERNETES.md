@@ -8,8 +8,9 @@ outside it.
 There are two ways to use it:
 
 * **A gateway.** One agent in its own Deployment publishes Services by their names in the cluster
-  (`80 --host shop.default.svc.cluster.local`). That's one machine for the whole cluster, and with
-  [replicas](#replicas), it can run as several pods.
+  (`80 --host shop.default.svc.cluster.local`), or serves the cluster's [Ingress objects](#ingress)
+  of its class. That's one machine for the whole cluster, and with [replicas](#replicas), it can run
+  as several pods.
 * **A sidecar.** An agent in an app's pod publishes that app at `127.0.0.1`. With replicas, every
   pod of the app is a copy of one machine, and they share its tunnels.
 
@@ -37,6 +38,8 @@ certificate authorities it was built with, so it needs no CA bundle. `docker bui
 | `MAGICPIPES_CONFIG` | Read the machine's identity (`config.json`) from this file instead of `/data/config.json`: a Secret |
 | `MAGICPIPES_LOG` | Log filter, such as `info` or `debug`. The log goes to standard error |
 | `MAGICPIPES_CONNECTIONS` | Connections to the server, 1 to 8 (default 4) |
+| `MAGICPIPES_INGRESS_CLASS` | Serve the cluster's Ingress objects of this class as tunnels ([Ingress](#ingress)) |
+| `MAGICPIPES_INGRESS_NAMESPACE` | Only those in this namespace (default: every namespace) |
 
 `agent run` reads the first four only in the foreground. An agent that `magicpipes add` starts in the
 background ignores them, so a declaration left in a shell's environment can't remove anything.
@@ -74,9 +77,9 @@ next start.
 With `MAGICPIPES_HEALTH_LISTEN` set, the agent answers plain HTTP:
 
 * `/livez`: 200 while the agent runs.
-* `/readyz`: 200 once it's connected to the server and every declared tunnel is registered.
-  Without declarations, it's every tunnel the agent has. Until then it answers 503, with what it's
-  waiting for:
+* `/readyz`: 200 once it's connected to the server and every declared tunnel is registered, those
+  from Ingress objects included once it has listed them. Without declarations, it's every tunnel the
+  agent has. Until then it answers 503, with what it's waiting for:
 
   ```json
   {"ready":false,"connection":"connected","waiting":[{"tunnel":"shop-admin","error":"local_unreachable"}]}
@@ -205,6 +208,96 @@ readiness probe on the sidecar makes the whole pod ready only once the tunnel wo
 when MagicPipes is the only way to the app, and wrong when a cluster Service also sends it traffic:
 then leave the probe off, or pick a health port the app doesn't use.
 
+## Ingress
+
+With `MAGICPIPES_INGRESS_CLASS=magicpipes`, the gateway agent serves the cluster's Ingress objects
+of that class as tunnels. There's no separate controller: the agent watches the Kubernetes API with
+its pod's service account, and adds, changes and removes tunnels as the objects do. Each Ingress
+rule is one tunnel, since a tunnel sends a whole hostname to one backend:
+
+* **The host** is `<name>.<base domain>`, which names the tunnel, or a custom hostname an
+  administrator gave this machine. A rule without a host takes its name from the
+  `magicpipes.io/name` annotation.
+* **One path, `/`** (or none), whose backend is a Service in the Ingress's namespace, by port number
+  or name. The agent reaches it at its cluster IP, or a headless one at `<service>.<namespace>.svc`,
+  and checks the Service again every minute.
+* **Annotations:** `magicpipes.io/visibility` (`public` or `private`; without it, the machine's
+  default), `magicpipes.io/tags` (a comma-separated list, which makes it private),
+  `magicpipes.io/check-path`, and `magicpipes.io/checks: off`.
+* **What can't be served** is logged, once each time the Ingress changes: several paths for one host,
+  wildcard hosts, a host with more than one label before the base domain, a missing Service or port.
+  It doesn't hold up the agent's readiness, since it never could be served. `spec.tls` is ignored:
+  MagicPipes gets the certificates.
+* **Status.** Once a rule's tunnel works, the Ingress's `status.loadBalancer.ingress` lists its
+  public hostname, which `kubectl get ingress` shows as its address.
+
+Tunnels declared in `MAGICPIPES_TUNNELS` work alongside, and win if both name the same tunnel. Once
+the agent has listed the Ingress objects, it removes the tunnels it served that nothing declares.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: magicpipes
+spec:
+  controller: magicpipes.io/agent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: magicpipes-gateway
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: magicpipes-gateway
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: magicpipes-gateway
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: magicpipes-gateway}
+subjects:
+  - {kind: ServiceAccount, name: magicpipes-gateway, namespace: default}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  annotations:
+    magicpipes.io/visibility: public
+spec:
+  ingressClassName: magicpipes
+  rules:
+    - host: shop.t.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: shop, port: {name: http}}
+```
+
+In the [gateway](#a-gateway) Deployment, add `serviceAccountName: magicpipes-gateway` to the pod and
+`{name: MAGICPIPES_INGRESS_CLASS, value: magicpipes}` to its environment; the ConfigMap of declared
+tunnels becomes optional. To watch one namespace, set `MAGICPIPES_INGRESS_NAMESPACE` and use a Role
+and RoleBinding there instead.
+
+Anyone who can create an Ingress of the class in a watched namespace can publish that namespace's
+Services through this machine, as with any ingress controller: limit who can, with the namespace or
+RBAC. Whether a tunnel may be public is still the machine's to decide: one enrolled without public
+tunnels refuses a public one, and its rule is logged as not served.
+
 ## Replicas
 
 A machine's copies can serve side by side: the pods of a gateway Deployment, or the sidecars of an
@@ -245,5 +338,4 @@ The token is used once, at the first start. After that the volume holds the iden
 
 * **Different machines can't share a tunnel.** Copies of one machine can (replicas), so give every
   pod that serves a tunnel the same identity.
-* **No controller reads Ingress objects yet** (phase 10d of the
-  [roadmap](ROADMAP.md#kubernetes-magicpipes-as-a-clusters-ingress)). Tunnels are the declared lines.
+* **Ingress only**, not the Gateway API (HTTPRoute), and one backend for each host.

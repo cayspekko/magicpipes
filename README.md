@@ -1239,6 +1239,9 @@ docker run -d -v magicpipes-agent:/data -e MAGICPIPES_SERVER=https://mp.example.
   in `/data`. In Kubernetes, keep `config.json` as a Secret instead and point `MAGICPIPES_CONFIG` at
   it.
 
+* **`MAGICPIPES_INGRESS_CLASS=magicpipes`** serves the cluster's Ingress objects of that class as
+  tunnels, one per host, as they come and go, and writes each one's public hostname to its status.
+
 These are read only by `agent run` in the foreground. [docs/KUBERNETES.md](docs/KUBERNETES.md) has a
 gateway Deployment, a sidecar, and replicas: several copies of one machine serving side by side,
 once **Replicas** is on for it (its page in the UI, or `PATCH /api/v1/agents/{id}`).
@@ -1270,6 +1273,8 @@ others go on serving while it reconnects. `magicpipes status` shows how many are
 | `MAGICPIPES_CONFIG` | Read `config.json`, the machine's identity, from this file instead (a Kubernetes Secret) |
 | `MAGICPIPES_TUNNELS`, `MAGICPIPES_TUNNELS_FILE` | Tunnels `agent run` serves, one per line as `add` arguments ([containers](#in-a-container-or-kubernetes)) |
 | `MAGICPIPES_HEALTH_LISTEN` | `agent run` answers `/livez` and `/readyz` here: a port, or `address:port` |
+| `MAGICPIPES_INGRESS_CLASS`, `MAGICPIPES_INGRESS_NAMESPACE` | `agent run` serves the cluster's Ingress objects of this class (in this namespace) as tunnels ([Kubernetes](docs/KUBERNETES.md#ingress)) |
+| `MAGICPIPES_KUBE_DIR` | Where the Kubernetes service account's `token` and `ca.crt` are (default `/var/run/secrets/kubernetes.io/serviceaccount`) |
 | `MAGICPIPES_API_TOKEN` | API token for `connect`, instead of signing in in a browser |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |
 | `MAGICPIPES_CONNECTIONS` | Connections the agent holds to the server, 1 to 8 (default 4, or `connections` in `config.json`) |

@@ -459,6 +459,15 @@ udp_idle_timeout_secs = 5
     }
 
     /// GET on a public tunnel hostname; returns status, `x-magicpipes-error` and body.
+    /// A public request's status, or `None` while the server has no certificate for the name.
+    pub async fn public_status(&self, hostname: &str) -> Option<StatusCode> {
+        let tls = self.try_connect(hostname, self.https_port).await.ok()?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.ok()?;
+        tokio::spawn(conn);
+        let req = Request::builder().uri("/").header(header::HOST, format!("{hostname}:{}", self.https_port)).body(Full::new(Bytes::new())).ok()?;
+        Some(sender.send_request(req).await.ok()?.status())
+    }
+
     pub async fn get_public(&self, hostname: &str, path: &str) -> (StatusCode, Option<String>, String) {
         let req = Request::get(path)
             .header(header::HOST, format!("{hostname}:{}", self.https_port))
@@ -1583,5 +1592,154 @@ impl SshClient {
         let run = self.command("ssh").args(args).output();
         let out = tokio::time::timeout(Duration::from_secs(30), run).await.unwrap_or_else(|_| panic!("ssh {args:?} took too long")).unwrap();
         (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned(), out.status.success())
+    }
+}
+
+/// A Kubernetes API server for the agent's Ingress watcher: Ingress objects to list and watch,
+/// Services to read, and the status patches it receives. HTTPS from a CA of its own, which `dir`
+/// holds with a service account's token, as a pod's `MAGICPIPES_KUBE_DIR` would.
+pub struct FakeKube {
+    pub port: u16,
+    pub dir: PathBuf,
+    state: Arc<std::sync::Mutex<KubeState>>,
+    events: tokio::sync::broadcast::Sender<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct KubeState {
+    version: u64,
+    ingresses: std::collections::BTreeMap<String, Value>,
+    services: std::collections::BTreeMap<String, Value>,
+    patches: Vec<(String, Value)>,
+    watches: usize,
+}
+
+const KUBE_TOKEN: &str = "test-service-account-token";
+
+impl Drop for FakeKube {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FakeKube {
+    pub async fn start(dir: &Path) -> FakeKube {
+        use http_body_util::combinators::BoxBody;
+        use hyper::service::service_fn;
+        std::fs::create_dir_all(dir).unwrap();
+        let (ca, chain, key) = own_certificate(&["127.0.0.1"], None);
+        std::fs::write(dir.join("ca.crt"), ca).unwrap();
+        std::fs::write(dir.join("token"), format!("{KUBE_TOKEN}\n")).unwrap();
+        let certs: Vec<CertificateDer> = CertificateDer::pem_slice_iter(chain.as_bytes()).map(Result::unwrap).collect();
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state: Arc<std::sync::Mutex<KubeState>> = Arc::default();
+        let (events, _) = tokio::sync::broadcast::channel::<String>(64);
+        let (st, ev) = (state.clone(), events.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let (acceptor, st, ev) = (acceptor.clone(), st.clone(), ev.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let (st, ev) = (st.clone(), ev.clone());
+                        async move {
+                            type B = BoxBody<Bytes, std::convert::Infallible>;
+                            let json = |status: StatusCode, v: Value| -> Response<B> {
+                                Response::builder().status(status).header("content-type", "application/json").body(Full::new(Bytes::from(v.to_string())).boxed()).unwrap()
+                            };
+                            if req.headers().get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {KUBE_TOKEN}")) {
+                                return Ok::<_, std::convert::Infallible>(json(StatusCode::UNAUTHORIZED, serde_json::json!({ "message": "Unauthorized" })));
+                            }
+                            let path = req.uri().path().to_string();
+                            let query = req.uri().query().unwrap_or("").to_string();
+                            let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+                            match (req.method().as_str(), parts.as_slice()) {
+                                ("GET", ["apis", "networking.k8s.io", "v1", "ingresses"]) if query.contains("watch=1") => {
+                                    let rx = ev.subscribe();
+                                    st.lock().unwrap().watches += 1;
+                                    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                                        loop {
+                                            match rx.recv().await {
+                                                Ok(line) => return Some((Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from(line))), rx)),
+                                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                                Err(_) => return None,
+                                            }
+                                        }
+                                    });
+                                    let body: B = BodyExt::boxed(http_body_util::StreamBody::new(stream));
+                                    Ok(Response::builder().header("content-type", "application/json").body(body).unwrap())
+                                }
+                                ("GET", ["apis", "networking.k8s.io", "v1", "ingresses"]) => {
+                                    let s = st.lock().unwrap();
+                                    let items: Vec<Value> = s.ingresses.values().cloned().collect();
+                                    Ok(json(StatusCode::OK, serde_json::json!({ "kind": "IngressList", "metadata": { "resourceVersion": s.version.to_string() }, "items": items })))
+                                }
+                                ("GET", ["api", "v1", "namespaces", ns, "services", name]) => match st.lock().unwrap().services.get(&format!("{ns}/{name}")) {
+                                    Some(svc) => Ok(json(StatusCode::OK, svc.clone())),
+                                    None => Ok(json(StatusCode::NOT_FOUND, serde_json::json!({ "message": format!("services \"{name}\" not found") }))),
+                                },
+                                ("PATCH", ["apis", "networking.k8s.io", "v1", "namespaces", ns, "ingresses", name, "status"]) => {
+                                    let ok = req.headers().get("content-type").and_then(|v| v.to_str().ok()) == Some("application/merge-patch+json");
+                                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                                    if !ok {
+                                        return Ok(json(StatusCode::UNSUPPORTED_MEDIA_TYPE, serde_json::json!({ "message": "not a merge patch" })));
+                                    }
+                                    st.lock().unwrap().patches.push((format!("{ns}/{name}"), serde_json::from_slice(&body).unwrap()));
+                                    Ok(json(StatusCode::OK, serde_json::json!({})))
+                                }
+                                _ => Ok(json(StatusCode::NOT_FOUND, serde_json::json!({ "message": "the server could not find the requested resource" }))),
+                            }
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), svc).await;
+                });
+            }
+        });
+        FakeKube { port, dir: dir.to_path_buf(), state, events, task }
+    }
+
+    pub fn put_service(&self, namespace: &str, name: &str, service: Value) {
+        self.state.lock().unwrap().services.insert(format!("{namespace}/{name}"), service);
+    }
+
+    /// Adds or changes an Ingress, and tells the watches.
+    pub fn put_ingress(&self, mut ingress: Value) {
+        let mut s = self.state.lock().unwrap();
+        s.version += 1;
+        ingress["metadata"]["resourceVersion"] = Value::String(s.version.to_string());
+        let key = format!("{}/{}", ingress["metadata"]["namespace"].as_str().unwrap(), ingress["metadata"]["name"].as_str().unwrap());
+        let kind = if s.ingresses.contains_key(&key) { "MODIFIED" } else { "ADDED" };
+        s.ingresses.insert(key, ingress.clone());
+        let _ = self.events.send(format!("{}\n", serde_json::json!({ "type": kind, "object": ingress })));
+    }
+
+    pub fn delete_ingress(&self, namespace: &str, name: &str) {
+        let mut s = self.state.lock().unwrap();
+        s.version += 1;
+        if let Some(mut ingress) = s.ingresses.remove(&format!("{namespace}/{name}")) {
+            ingress["metadata"]["resourceVersion"] = Value::String(s.version.to_string());
+            let _ = self.events.send(format!("{}\n", serde_json::json!({ "type": "DELETED", "object": ingress })));
+        }
+    }
+
+    /// Status patches so far, as `(namespace/name, patch)`.
+    pub fn patches(&self) -> Vec<(String, Value)> {
+        self.state.lock().unwrap().patches.clone()
+    }
+
+    /// Watches opened so far.
+    pub fn watches(&self) -> usize {
+        self.state.lock().unwrap().watches
     }
 }

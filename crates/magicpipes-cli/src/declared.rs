@@ -86,21 +86,26 @@ pub fn parse(text: &str, source: &str) -> Result<Vec<Declared>, String> {
         }
         let at = |msg: &str| format!("{source}, line {}: {msg}", n + 1);
         let words = words(line).map_err(|m| at(&m))?;
-        let args = ["magicpipes", "add"].into_iter().map(String::from).chain(words);
-        let cli = Cli::try_parse_from(args).map_err(|e| at(&clap_message(&e)))?;
-        if let Some((_, msg)) = add_args_problem(&cli.command) {
-            return Err(at(msg));
-        }
-        let (mut req, _) = add_request(cli.command).ok_or_else(|| at("not a tunnel"))?;
-        let label = match (&req.name, &req.hostname) {
-            (Some(name), _) => name.clone(),
-            (None, Some(hostname)) => hostname.trim().trim_end_matches('.').to_ascii_lowercase(),
-            (None, None) => return Err(at("give it a --name or --hostname, so it keeps its address when the agent starts again")),
-        };
-        resolve_paths(&mut req).map_err(|e| at(&e.message))?;
-        out.push(Declared { label, req });
+        out.push(declare(words).map_err(|m| at(&m))?);
     }
     Ok(out)
+}
+
+/// The tunnel `magicpipes add` with these arguments would add, checked as it would check them.
+pub fn declare(words: Vec<String>) -> Result<Declared, String> {
+    let args = ["magicpipes", "add"].into_iter().map(String::from).chain(words);
+    let cli = Cli::try_parse_from(args).map_err(|e| clap_message(&e))?;
+    if let Some((_, msg)) = add_args_problem(&cli.command) {
+        return Err(msg.to_string());
+    }
+    let (mut req, _) = add_request(cli.command).ok_or("not a tunnel")?;
+    let label = match (&req.name, &req.hostname) {
+        (Some(name), _) => name.clone(),
+        (None, Some(hostname)) => hostname.trim().trim_end_matches('.').to_ascii_lowercase(),
+        (None, None) => return Err("give it a --name or --hostname, so it keeps its address when the agent starts again".into()),
+    };
+    resolve_paths(&mut req).map_err(|e| e.message)?;
+    Ok(Declared { label, req })
 }
 
 /// clap's error without its usage lines: `unexpected argument '--fast' found`.

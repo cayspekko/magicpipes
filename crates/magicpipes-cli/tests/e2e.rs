@@ -6107,3 +6107,75 @@ async fn copies_of_one_machine_serve_a_tunnel_side_by_side() {
         assert_eq!((status, body.as_str()), (StatusCode::OK, "from-b"));
     }
 }
+
+/// `MAGICPIPES_INGRESS_CLASS`: the gateway agent serves the cluster's Ingress objects of its class
+/// as tunnels, keeps them in step as they're added and deleted, says where in their status, and
+/// leaves alone what it can't serve or isn't its class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ingress_objects_become_tunnels() {
+    let env = Env::new(Tls::DevCa).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let kube = common::FakeKube::start(&env.root.join("kube")).await;
+    kube.put_service("web", "front", serde_json::json!({ "spec": { "clusterIP": "127.0.0.1", "ports": [{ "name": "http", "port": app.port }] } }));
+    let ingress = |name: &str, class: &str, host: &str, paths: Value| {
+        serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+            "metadata": { "name": name, "namespace": "web", "annotations": { "magicpipes.io/visibility": "public" } },
+            "spec": { "ingressClassName": class, "rules": [{ "host": host, "http": { "paths": paths } }] }
+        })
+    };
+    let to_front = serde_json::json!([{ "path": "/", "pathType": "Prefix", "backend": { "service": { "name": "front", "port": { "name": "http" } } } }]);
+    kube.put_ingress(ingress("shop", "magicpipes", &format!("shop.{BASE}"), to_front.clone()));
+    kube.put_ingress(ingress("other", "nginx", &format!("other.{BASE}"), to_front.clone()));
+    let two = serde_json::json!([
+        { "path": "/", "backend": { "service": { "name": "front", "port": { "number": app.port } } } },
+        { "path": "/api", "backend": { "service": { "name": "front", "port": { "number": app.port } } } }
+    ]);
+    kube.put_ingress(ingress("split", "magicpipes", &format!("split.{BASE}"), two));
+
+    let health = common::free_port();
+    let mut agent = tokio::process::Command::new(common::bin("magicpipes"));
+    agent
+        .args(["agent", "run"])
+        .env("MAGICPIPES_HOME", env.root.join("gateway"))
+        .env("MAGICPIPES_SOCKET", env.root.join("gw.sock"))
+        .env("MAGICPIPES_PROBE_ADDR", "127.0.0.1")
+        .env("MAGICPIPES_LOG", "info,magicpipes=debug")
+        .env("MAGICPIPES_HEALTH_LISTEN", format!("127.0.0.1:{health}"))
+        .env("MAGICPIPES_SERVER", env.server_url())
+        .env("MAGICPIPES_TOKEN", env.enrollment_token())
+        .env("MAGICPIPES_CA_CERT", &env.ca_path)
+        .env("MAGICPIPES_INGRESS_CLASS", "magicpipes")
+        .env("KUBERNETES_SERVICE_HOST", "127.0.0.1")
+        .env("KUBERNETES_SERVICE_PORT", kube.port.to_string())
+        .env("MAGICPIPES_KUBE_DIR", &kube.dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(env.root.join("gateway.log")).unwrap())
+        .kill_on_drop(true);
+    let agent = agent.spawn().unwrap();
+    let log = || std::fs::read_to_string(env.root.join("gateway.log")).unwrap_or_default();
+    let host = |name: &str| format!("{name}.{BASE}");
+
+    // Not ready until the Ingress objects are listed and served. Then its class's Ingress is served,
+    // at its Service's port by name, and its status says where.
+    env.eventually("ready", Duration::from_secs(30), || async { health_get(health, "/readyz").await.is_some_and(|(s, _)| s == 200) }).await;
+    assert_eq!(env.get_public(&host("shop"), "/").await.0, StatusCode::OK);
+    env.eventually("the status", Duration::from_secs(20), || async {
+        kube.patches().iter().any(|(k, p)| k == "web/shop" && p["status"]["loadBalancer"]["ingress"][0]["hostname"] == host("shop"))
+    })
+    .await;
+    // Not another class's, and not one a tunnel can't express.
+    assert_eq!(env.public_status(&host("other")).await, None, "no certificate, so no tunnel");
+    assert_eq!(env.public_status(&host("split")).await, None);
+    assert!(log().contains("give the host one path"), "{}", log());
+
+    // Added and deleted while it runs.
+    env.eventually("a watch", Duration::from_secs(20), || async { kube.watches() > 0 }).await;
+    kube.put_ingress(ingress("docs", "magicpipes", &format!("docs.{BASE}"), to_front.clone()));
+    env.eventually("the new Ingress", Duration::from_secs(30), || async { env.public_status(&host("docs")).await == Some(StatusCode::OK) }).await;
+    kube.delete_ingress("web", "shop");
+    env.eventually("the deleted one to go", Duration::from_secs(20), || async { env.public_status(&host("shop")).await != Some(StatusCode::OK) }).await;
+    assert_eq!(env.get_public(&host("docs"), "/").await.0, StatusCode::OK);
+    unsafe { libc::kill(agent.id().unwrap() as i32, libc::SIGTERM) };
+}

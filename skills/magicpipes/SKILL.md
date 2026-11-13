@@ -139,7 +139,9 @@ declared one until its app answers. `MAGICPIPES_HEALTH_LISTEN=9090` serves `/rea
 every declared tunnel works; 503 with `waiting` entries, each a `tunnel` and an error code, until
 then). The first start enrolls with `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`. Several pods
 can serve the same tunnels as copies of one machine (one identity) once replicas are on for it:
-`PATCH /api/v1/agents/<id>` with `{"replicas": true}`. See
+`PATCH /api/v1/agents/<id>` with `{"replicas": true}`. With `MAGICPIPES_INGRESS_CLASS=magicpipes`, the
+agent serves the cluster's Ingress objects of that class instead of (or as well as) declared lines:
+one tunnel per host, one path `/`, options in `magicpipes.io/*` annotations. See
 `docs/KUBERNETES.md`.
 
 To check whether tunnels are reachable from the internet, not just from the server, run

@@ -552,12 +552,15 @@ impl Agent {
         let mut waiting: Vec<Value> = Vec::new();
         match declared {
             Some(d) => {
+                if !d.settled() {
+                    waiting.push(json!({ "ingress": "not listed yet" }));
+                }
                 let pending = d.waiting();
                 for label in d.labels() {
                     let registered = snapshots.iter().any(|s| {
                         (s.tunnel.name == label || (s.tunnel.custom_hostname && s.tunnel.hostname == label)) && s.registration == Registration::Registered
                     });
-                    match pending.iter().find(|(l, _)| l == label) {
+                    match pending.iter().find(|(l, _)| *l == label) {
                         Some((_, why)) => waiting.push(json!({ "tunnel": label, "error": why })),
                         None if !registered => waiting.push(json!({ "tunnel": label })),
                         None => {}
