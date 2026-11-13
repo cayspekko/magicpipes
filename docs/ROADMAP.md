@@ -487,8 +487,11 @@ own identity, or to be reached pod by pod.
    one-connection ceiling and spreads TLS across cores. A data-path change: benchmarked, and the
    mux's one-queue design (`SEND_QUEUE`, batching) revisited per connection.
 3. **Several agents per tunnel:** replicas, rolling updates and a highly available gateway; the
-   server picks among the live sessions serving a tunnel. `authorize` decides which agents may join
-   one (a service agent, or agents sharing a tag), and hostnames stop belonging to a single agent.
+   server picks among the live sessions serving a tunnel. *Done 2026-11-12, as copies of one
+   machine* ([replicas](KUBERNETES.md#replicas)): pods share one identity, and with replicas on for
+   it, each run serves the tunnels it registered. Different machines joining one tunnel (agents
+   sharing a tag, with a rule in `authorize`) isn't built: copies cover the cases above without
+   changing who owns a hostname.
 4. **An Ingress / Gateway API controller** (`ingressClassName: magicpipes`), a separate binary that
    configures the gateway from cluster objects, as cloudflared and ngrok's operator do.
 5. **Plain transport over loopback only,** for an agent in the server's own pod, and only if a
@@ -527,7 +530,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 9 | The server as a TLS certificate authority: certificates issued from a CA configured on the server, as an alternative to Let's Encrypt (internal names, closed networks, no public DNS) | yes | planned |
 | 10 | Kubernetes: container image, tunnels declared in a file or environment, a readiness endpoint ([plan](#kubernetes-magicpipes-as-a-clusters-ingress)) | none | done ([KUBERNETES.md](KUBERNETES.md)) |
 | 10b | Several connections per agent (past one connection and 224 streams) | yes | done (4 by default, `agents.max_connections` on the server) |
-| 10c | Several agents per tunnel (replicas, rolling updates, a highly available gateway) | yes | planned |
+| 10c | Several agents per tunnel (replicas, rolling updates, a highly available gateway) | yes | done, as copies of one machine ([replicas](KUBERNETES.md#replicas)) |
 | 10d | An Ingress / Gateway API controller (`ingressClassName: magicpipes`) | none (a separate binary) | planned |
 | 11 | Monitoring, measure: counters for errors by cause, latency and bytes, ping round trips, `/metrics` ([plan](#monitoring-health-history-alerts-and-synthetic-checks)) | yes | done |
 | 11b | Monitoring, show: a sampler with bounded history, a Health page, history on machine and tunnel pages | yes | done |

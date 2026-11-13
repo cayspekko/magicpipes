@@ -179,6 +179,10 @@ pub struct LocalTunnel {
     /// The owner's personal tag (absent on a service agent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_tag: Option<String>,
+    /// Other runs of this machine may serve it too (replicas), so a request through it may reach
+    /// one of them instead of this agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replicas: bool,
 }
 
 impl LocalTunnel {

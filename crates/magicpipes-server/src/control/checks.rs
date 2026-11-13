@@ -119,7 +119,7 @@ impl ControlPlane {
                     kind: t.row.kind,
                     hostname: t.row.hostname.clone(),
                     path: t.row.check_path.clone(),
-                    handle: st.sessions.get(&t.row.agent_id).and_then(|l| l.handle()),
+                    handle: st.sessions.get(&t.row.agent_id).and_then(|l| l.handle_for(&t.row.id)),
                 })
                 .collect()
         };

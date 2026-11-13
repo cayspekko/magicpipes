@@ -331,6 +331,7 @@ fn machine_row(m: &MachineHealth, now: i64) -> String {
     let total = m.recent.total();
     let owner = a.owner_email.as_deref().map_or_else(|| "service agent".to_string(), esc);
     let state = match (a.connected, a.connected_since, a.last_seen) {
+        (true, _, _) if a.runs > 1 => format!(r#"<span class="sub">{} replicas</span>"#, a.runs),
         (true, Some(at), _) => format!(r#"<span class="sub">for {}</span>"#, ago(now - at)),
         (false, _, Some(at)) => format!(r#"<span class="sub">last seen {} ago</span>"#, ago(now - at)),
         _ => String::new(),

@@ -194,11 +194,15 @@ impl ControlPlane {
 
 /// An agent's connections now, if any is open.
 fn link_now(link: &Link) -> Option<LinkNow> {
-    let open: Vec<_> = link.lanes.iter().filter(|s| !s.handle.is_closed()).collect();
+    let open: Vec<_> = link.lanes().filter(|s| !s.handle.is_closed()).collect();
     if open.is_empty() {
         return None;
     }
     let trips: Vec<u64> = open.iter().map(|s| s.round_trip.load(Relaxed)).filter(|t| *t > 0).collect();
     let round_trip = if trips.is_empty() { 0 } else { trips.iter().sum::<u64>() / trips.len() as u64 };
-    Some(LinkNow { connections: u8::try_from(open.len()).unwrap_or(u8::MAX), round_trip: u32::try_from(round_trip).unwrap_or(u32::MAX) })
+    Some(LinkNow {
+        connections: u8::try_from(open.len()).unwrap_or(u8::MAX),
+        round_trip: u32::try_from(round_trip).unwrap_or(u32::MAX),
+        expected: u8::try_from(link.expected()).unwrap_or(u8::MAX),
+    })
 }

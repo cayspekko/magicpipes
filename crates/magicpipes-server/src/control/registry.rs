@@ -38,14 +38,19 @@ impl ControlPlane {
     /// agent's own), or anyone's personal tag, to share with that person. The registration then
     /// adds the owner's personal tag, so the owner can open it. That is this function's policy,
     /// not a rule of the model: `authorize` sees only the tunnel's tags.
-    fn requested_access(&self, st: &State, agent_id: &str, req: &RegisterTunnel, existing: Option<&TunnelRow>) -> Result<Access, ErrorBody> {
+    fn requested_access(&self, st: &State, agent_id: &str, conn: Option<u64>, req: &RegisterTunnel, existing: Option<&TunnelRow>) -> Result<Access, ErrorBody> {
         // An agent missing from the directory (it couldn't be reloaded) gets the narrowest
         // settings, never the widest.
         let (allow_public, default_private) = st.dir.agent(agent_id).map_or((false, true), |a| (a.allow_public, a.default_private));
         // `members_can_publish` applies to machines enrolled before it was turned off, too.
         let members_may_not = st.dir.member_owned(agent_id) && !self.cfg.users.members_can_publish;
         let invalid = |m: String| err(ErrorCode::InvalidRequest, m);
-        let protocol = st.sessions.get(agent_id).map_or(proto::PROTOCOL_VERSION, |l| l.first().protocol);
+        // The registering connection's (runs of an agent may be different versions), else its first.
+        let protocol = st
+            .sessions
+            .get(agent_id)
+            .and_then(|l| l.lanes().find(|s| Some(s.conn_id) == conn).or_else(|| l.lanes().next()))
+            .map_or(proto::PROTOCOL_VERSION, |s| s.protocol);
         let (visibility, requested) = match (req.visibility, existing) {
             (None, Some(row)) => return Ok((row.visibility, row.tags.clone())),
             // An agent from before private tunnels would wait for its readiness probe, which
@@ -113,7 +118,9 @@ impl ControlPlane {
         Ok((visibility, list))
     }
 
-    pub fn register(&self, agent_id: &str, req: &RegisterTunnel) -> Result<TunnelInfo, ErrorBody> {
+    /// Registers a tunnel for an agent, or changes one of its own, from its connection `conn`: from
+    /// then on that connection's run serves it.
+    pub fn register(&self, agent_id: &str, conn: Option<u64>, req: &RegisterTunnel) -> Result<TunnelInfo, ErrorBody> {
         let who = Principal::Agent(agent_id.to_string());
         let check_path = req.check_path.as_deref().map(check_path).transpose()?;
         let target: String = req.target.chars().filter(|c| !c.is_control()).take(200).collect();
@@ -186,7 +193,7 @@ impl ControlPlane {
                     format!("tunnel '{}' is served at {}; remove it first to move it to {h}", row.name, row.hostname),
                 ));
             }
-            (row.visibility, row.tags) = self.requested_access(&st, agent_id, req, Some(&row))?;
+            (row.visibility, row.tags) = self.requested_access(&st, agent_id, conn, req, Some(&row))?;
             if row.kind != req.kind {
                 return Err(err(
                     ErrorCode::KindMismatch,
@@ -215,17 +222,23 @@ impl ControlPlane {
             }
             let t = st.tunnels.get_mut(&id).expect("checked above");
             let settings = |r: &TunnelRow| (r.target.clone(), r.allow.clone(), r.public_port, r.visibility, r.tags.clone(), r.checks, r.check_path.clone());
-            if settings(&t.row) != settings(&row) {
+            let changed = settings(&t.row) != settings(&row);
+            if changed {
                 self.store.update_tunnel(&row).map_err(internal)?;
                 t.row = row.clone();
                 t.version += 1;
+            }
+            // A replica that registers it again after connecting takes its share from now on.
+            let joined = st.serving(agent_id, conn, &id);
+            if changed || joined {
                 self.publish(&st);
             }
             if row.kind.is_http() {
                 self.certs.ensure(&row.hostname);
             }
             let access = row.tags.iter().filter(|t| st.dir.grants_access(t)).cloned().collect();
-            return Ok(self.info(&row, false, owner_tag, access));
+            let replicas = st.dir.agent(agent_id).is_some_and(|a| a.replicas);
+            return Ok(self.info(&row, false, owner_tag, access, replicas));
         }
 
         let owned = st.tunnels.values().filter(|t| t.row.agent_id == agent_id).count();
@@ -264,7 +277,7 @@ impl ControlPlane {
                 return Err(err(ErrorCode::LimitReached, format!("an agent may add at most {max} new hostnames per day; reuse a name or try later")));
             }
         }
-        let (visibility, tags) = self.requested_access(&st, agent_id, req, None)?;
+        let (visibility, tags) = self.requested_access(&st, agent_id, conn, req, None)?;
         let public_port = match (req.kind.has_port(), visibility, req.remote_port) {
             (false, ..) => None,
             (true, Visibility::Private, _) => private_port(&allow, req.remote_port)?,
@@ -296,10 +309,12 @@ impl ControlPlane {
             st.cert_orders.entry(agent_id.to_string()).or_default().push(Instant::now());
         }
         st.tunnels.insert(row.id.clone(), TunnelRecord { row: row.clone(), stats: Arc::default(), version: 0 });
+        st.serving(agent_id, conn, &row.id);
         self.publish(&st);
         let access = row.tags.iter().filter(|t| st.dir.grants_access(t)).cloned().collect();
+        let replicas = st.dir.agent(agent_id).is_some_and(|a| a.replicas);
         drop(st);
-        let info = self.info(&row, true, owner_tag, access);
+        let info = self.info(&row, true, owner_tag, access, replicas);
         tracing::info!(tunnel = %row.id, url = %info.public_url, agent = %agent_id, "tunnel registered");
         if row.kind.is_http() {
             self.certs.ensure(&row.hostname);
@@ -352,7 +367,7 @@ impl ControlPlane {
         }
     }
 
-    fn info(&self, row: &TunnelRow, created: bool, owner_tag: Option<String>, access: Vec<String>) -> TunnelInfo {
+    fn info(&self, row: &TunnelRow, created: bool, owner_tag: Option<String>, access: Vec<String>, replicas: bool) -> TunnelInfo {
         TunnelInfo {
             id: row.id.clone(),
             name: row.name.clone(),
@@ -365,12 +380,14 @@ impl ControlPlane {
             tags: row.tags.clone(),
             access,
             owner_tag,
+            replicas,
         }
     }
 
     /// Readiness check for a port tunnel owned by `agent_id`: opens a data stream to the agent,
-    /// as a client connection would, and reports whether the agent reached the local service.
-    pub async fn check(&self, agent_id: &str, id: &str) -> Result<(), ErrorBody> {
+    /// as a client connection would, and reports whether the agent reached the local service. With
+    /// `conn`, the run that asked is the one checked, whatever other runs serve the tunnel.
+    pub async fn check(&self, agent_id: &str, conn: Option<u64>, id: &str) -> Result<(), ErrorBody> {
         let who = Principal::Agent(agent_id.to_string());
         let (header, session) = {
             let st = self.state.lock().unwrap();
@@ -380,7 +397,7 @@ impl ControlPlane {
                 Kind::Udp => ServerOpen::Datagram { tunnel_id, peer: None },
                 _ => ServerOpen::Data { tunnel_id, peer: None },
             };
-            let session = st.sessions.get(agent_id).and_then(|l| l.handle());
+            let session = st.sessions.get(agent_id).and_then(|l| conn.and_then(|c| l.handle_of_run(c)).or_else(|| l.handle_for(id)));
             (header, session.ok_or_else(|| err(ErrorCode::AgentUnavailable, "agent is not connected"))?)
         };
         let unavailable = |_| err(ErrorCode::AgentUnavailable, "could not open a stream to the agent");
@@ -423,6 +440,12 @@ impl ControlPlane {
         self.store.delete_tunnel(id).map_err(internal)?;
         st.tunnels.remove(id);
         self.publish(&st);
+        // The agent's other runs stop serving it too.
+        let others: Vec<_> = st.sessions.get(agent_id).filter(|l| l.runs.len() > 1).map(|l| l.handles()).unwrap_or_default();
+        drop(st);
+        for handle in others {
+            tell_removed(handle, id.to_string());
+        }
         tracing::info!(tunnel = %id, agent = %agent_id, "tunnel removed by agent");
         Ok(())
     }
@@ -436,11 +459,11 @@ impl ControlPlane {
         self.store.delete_tunnel(id).map_err(internal)?;
         st.tunnels.remove(id);
         self.publish(&st);
-        let session = st.sessions.get(&agent_id).and_then(|l| l.handle());
+        let runs = st.sessions.get(&agent_id).map(|l| l.handles()).unwrap_or_default();
         drop(st);
         tracing::info!(tunnel = %id, "tunnel deleted by administrator");
         self.audit(who, "tunnel.delete", id, "");
-        if let Some(handle) = session {
+        for handle in runs {
             tell_removed(handle, id.to_string());
         }
         Ok(true)

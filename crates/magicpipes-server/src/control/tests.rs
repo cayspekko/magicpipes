@@ -96,7 +96,7 @@ fn http(name: &str) -> RegisterTunnel {
 async fn only_administrators_read_the_metrics() {
     let f = fixture();
     let a = f.agent("a \"quoted\" machine");
-    let t = f.cp.register(&a, &http("app")).unwrap();
+    let t = f.cp.register(&a, None, &http("app")).unwrap();
     let member = Principal::User { id: "us_x".into(), role: crate::authz::Role::Member, tags: vec![] };
     assert!(f.cp.metrics(&member).is_none() && f.cp.metrics(&Principal::Anonymous).is_none());
     let text = f.cp.metrics(&Principal::AdminToken).unwrap();
@@ -122,7 +122,7 @@ async fn history_is_for_those_who_manage_it() {
     use crate::control::history::Period;
     let f = fixture();
     let a = f.agent("a");
-    let t = f.cp.register(&a, &http("app")).unwrap();
+    let t = f.cp.register(&a, None, &http("app")).unwrap();
     f.cp.sample();
     let admin = Principal::AdminToken;
     let member = Principal::User { id: "us_x".into(), role: crate::authz::Role::Member, tags: vec![] };
@@ -143,14 +143,14 @@ async fn history_is_for_those_who_manage_it() {
 async fn checks_are_on_unless_turned_off_and_their_path_is_plain() {
     let f = fixture();
     let a = f.agent("a");
-    let t = f.cp.register(&a, &http("app")).unwrap();
+    let t = f.cp.register(&a, None, &http("app")).unwrap();
     let seen = |f: &Fixture| f.cp.tunnel(&Principal::AdminToken, &t.id).map(|v| (v.checks, v.check_path));
     assert_eq!(seen(&f), Some((true, Some("/".into()))));
-    f.cp.register(&a, &RegisterTunnel { checks: Some(false), check_path: Some("/health".into()), ..http("app") }).unwrap();
-    f.cp.register(&a, &RegisterTunnel { id: Some(t.id.clone()), ..http("app") }).unwrap();
+    f.cp.register(&a, None, &RegisterTunnel { checks: Some(false), check_path: Some("/health".into()), ..http("app") }).unwrap();
+    f.cp.register(&a, None, &RegisterTunnel { id: Some(t.id.clone()), ..http("app") }).unwrap();
     assert_eq!(seen(&f), Some((false, Some("/health".into()))), "a reconnect keeps them");
     for bad in ["health".to_string(), "/a b".into(), "/a\r\nX-Evil: 1".into(), format!("/{}", "a".repeat(200))] {
-        let e = f.cp.register(&a, &RegisterTunnel { check_path: Some(bad.clone()), ..http("app") }).unwrap_err();
+        let e = f.cp.register(&a, None, &RegisterTunnel { check_path: Some(bad.clone()), ..http("app") }).unwrap_err();
         assert!(e.is(ErrorCode::InvalidRequest), "{bad:?}");
     }
     let dir = f.stop();
@@ -163,13 +163,13 @@ async fn checks_are_on_unless_turned_off_and_their_path_is_plain() {
 async fn a_tunnels_version_follows_its_own_settings() {
     let f = fixture();
     let a = f.agent("a");
-    let t = f.cp.register(&a, &http("app")).unwrap();
+    let t = f.cp.register(&a, None, &http("app")).unwrap();
     let version = || f.data.lookup(&t.hostname).unwrap().version;
     let before = version();
-    f.cp.register(&a, &http("app")).unwrap();
-    f.cp.register(&a, &http("other")).unwrap();
+    f.cp.register(&a, None, &http("app")).unwrap();
+    f.cp.register(&a, None, &http("other")).unwrap();
     assert_eq!(version(), before, "the same settings, and another tunnel's");
-    f.cp.register(&a, &RegisterTunnel { target: "http://127.0.0.1:3001".into(), ..http("app") }).unwrap();
+    f.cp.register(&a, None, &RegisterTunnel { target: "http://127.0.0.1:3001".into(), ..http("app") }).unwrap();
     assert_ne!(version(), before, "a new target");
 }
 
@@ -177,15 +177,15 @@ async fn a_tunnels_version_follows_its_own_settings() {
 async fn agents_cannot_touch_each_others_tunnels() {
     let f = fixture();
     let (a, b) = (f.agent("a"), f.agent("b"));
-    let t = f.cp.register(&a, &http("app")).unwrap();
+    let t = f.cp.register(&a, None, &http("app")).unwrap();
     assert!(t.created);
 
     // Re-registering is idempotent for the owner and refused for anyone else.
-    assert!(!f.cp.register(&a, &http("app")).unwrap().created);
-    assert!(f.cp.register(&b, &http("app")).unwrap_err().is(ErrorCode::NameTaken));
+    assert!(!f.cp.register(&a, None, &http("app")).unwrap().created);
+    assert!(f.cp.register(&b, None, &http("app")).unwrap_err().is(ErrorCode::NameTaken));
     let by_id = RegisterTunnel { id: Some(t.id.clone()), ..http("app") };
-    assert!(f.cp.register(&b, &by_id).unwrap_err().is(ErrorCode::NotFound));
-    assert!(f.cp.check(&b, &t.id).await.unwrap_err().is(ErrorCode::NotFound));
+    assert!(f.cp.register(&b, None, &by_id).unwrap_err().is(ErrorCode::NotFound));
+    assert!(f.cp.check(&b, None, &t.id).await.unwrap_err().is(ErrorCode::NotFound));
     let cert = f.cp.cert_status(&b, &t.hostname, Duration::ZERO).await;
     assert!(cert.unwrap_err().is(ErrorCode::NotFound));
 
@@ -200,8 +200,8 @@ async fn agents_cannot_touch_each_others_tunnels() {
 async fn management_follows_authorize() {
     let f = fixture();
     let (a, b) = (f.agent("a"), f.agent("b"));
-    let ta = f.cp.register(&a, &http("one")).unwrap();
-    f.cp.register(&b, &http("two")).unwrap();
+    let ta = f.cp.register(&a, None, &http("one")).unwrap();
+    f.cp.register(&b, None, &http("two")).unwrap();
     let (pa, pb) = (Principal::Agent(a.clone()), Principal::Agent(b.clone()));
 
     // Each agent sees only its own tunnels and itself; an administrator sees everything.
@@ -230,7 +230,7 @@ async fn management_follows_authorize() {
 async fn routes_carry_their_access_policy() {
     let f = fixture();
     let a = f.agent("a");
-    let t = f.cp.register(&a, &http("pub")).unwrap();
+    let t = f.cp.register(&a, None, &http("pub")).unwrap();
     let route = f.data.lookup(&t.hostname).unwrap();
     assert_eq!(route.access.authz.agent_id, a);
     assert!(route.access.authz.public);
@@ -241,11 +241,11 @@ async fn routes_carry_their_access_policy() {
 async fn per_agent_tunnel_quota() {
     let f = fixture();
     let (a, b) = (f.agent("a"), f.agent("b"));
-    f.cp.register(&a, &http("q1")).unwrap();
-    f.cp.register(&a, &http("q2")).unwrap();
-    assert!(f.cp.register(&a, &http("q3")).unwrap_err().is(ErrorCode::LimitReached));
+    f.cp.register(&a, None, &http("q1")).unwrap();
+    f.cp.register(&a, None, &http("q2")).unwrap();
+    assert!(f.cp.register(&a, None, &http("q3")).unwrap_err().is(ErrorCode::LimitReached));
     // One agent's quota doesn't affect another.
-    f.cp.register(&b, &http("q4")).unwrap();
+    f.cp.register(&b, None, &http("q4")).unwrap();
 }
 
 #[tokio::test]
@@ -302,12 +302,12 @@ async fn personal_tags_and_access() {
 
     // A tunnel carries its owner's personal tag plus the tags asked for, from the owner's own.
     let private = |name: &str, tags: &[&str]| RegisterTunnel { visibility: Some(Visibility::Private), tags: s(tags), ..http(name) };
-    let app = f.cp.register(&laptop, &private("app", &["dev"])).unwrap();
+    let app = f.cp.register(&laptop, None, &private("app", &["dev"])).unwrap();
     assert_eq!((app.tags.clone(), app.owner_tag.clone()), (s(&["dev", &pa]), Some(pa.clone())));
-    assert!(f.cp.register(&laptop, &private("x", &["ops"])).unwrap_err().is(ErrorCode::TagUnknown));
+    assert!(f.cp.register(&laptop, None, &private("x", &["ops"])).unwrap_err().is(ErrorCode::TagUnknown));
     f.cp.create_tag(&admin, "ops", "", true).unwrap();
-    assert!(f.cp.register(&laptop, &private("x", &["ops"])).unwrap_err().is(ErrorCode::Forbidden), "ann doesn't hold ops");
-    let lbl = f.cp.register(&laptop, &private("lbl", &["prod"])).unwrap();
+    assert!(f.cp.register(&laptop, None, &private("x", &["ops"])).unwrap_err().is(ErrorCode::Forbidden), "ann doesn't hold ops");
+    let lbl = f.cp.register(&laptop, None, &private("lbl", &["prod"])).unwrap();
     let access = |host: &str| f.data.lookup(host).unwrap().access.authz.access.clone();
     assert_eq!(access(&lbl.hostname), std::slice::from_ref(&pa), "a tag that doesn't grant access is only a label");
     assert_eq!(lbl.access, std::slice::from_ref(&pa));
@@ -319,7 +319,7 @@ async fn personal_tags_and_access() {
     // Someone's personal tag on a tunnel shares it with that one person.
     let mut shared = s(&["prod", &pa, &pb]);
     shared.sort();
-    assert_eq!(f.cp.register(&laptop, &private("lbl", &["prod", &pb])).unwrap().tags, shared);
+    assert_eq!(f.cp.register(&laptop, None, &private("lbl", &["prod", &pb])).unwrap().tags, shared);
     assert!(may(&bob.id, &lbl.hostname));
     // Access is the tag's setting, applied at once.
     f.cp.set_tag_access(&admin, "prod", true).unwrap();
@@ -328,25 +328,25 @@ async fn personal_tags_and_access() {
     assert_eq!(access(&app.hostname), std::slice::from_ref(&pa));
     assert!(!may(&bob.id, &app.hostname));
     // Re-registering without a visibility keeps the tags.
-    assert_eq!(f.cp.register(&laptop, &http("app")).unwrap().tags, s(&["dev", &pa]));
+    assert_eq!(f.cp.register(&laptop, None, &http("app")).unwrap().tags, s(&["dev", &pa]));
     // Removing a tag from the owner doesn't unshare what she published (the tunnel keeps it),
     // but every registration that names tags is checked against what she holds now.
     f.cp.set_tag_access(&admin, "dev", true).unwrap();
     f.cp.set_user_tags(&admin, &ann.id, &s(&["prod"])).unwrap();
     assert_eq!(access(&app.hostname), s(&["dev", &pa]));
     assert!(may(&bob.id, &app.hostname));
-    assert!(f.cp.register(&laptop, &private("app", &["dev"])).unwrap_err().is(ErrorCode::Forbidden), "no longer hers to give");
-    assert_eq!(f.cp.register(&laptop, &private("app", &[])).unwrap().tags, std::slice::from_ref(&pa), "naming tags replaces them");
+    assert!(f.cp.register(&laptop, None, &private("app", &["dev"])).unwrap_err().is(ErrorCode::Forbidden), "no longer hers to give");
+    assert_eq!(f.cp.register(&laptop, None, &private("app", &[])).unwrap().tags, std::slice::from_ref(&pa), "naming tags replaces them");
     f.cp.set_user_tags(&admin, &ann.id, &s(&["dev", "prod"])).unwrap();
 
     // A service agent has tags of its own, set by administrators; untagged, nobody gets in.
     let service = f.agent("ci");
     assert!(f.cp.set_agent_tags(&who(&ann.id), &service, &s(&["dev"])).unwrap_err().is(ErrorCode::NotFound), "not ann's agent");
-    assert!(f.cp.register(&service, &private("svc", &["dev"])).unwrap_err().is(ErrorCode::Forbidden));
+    assert!(f.cp.register(&service, None, &private("svc", &["dev"])).unwrap_err().is(ErrorCode::Forbidden));
     f.cp.set_agent_tags(&admin, &service, &s(&["dev"])).unwrap();
-    let svc = f.cp.register(&service, &private("svc", &["dev"])).unwrap();
+    let svc = f.cp.register(&service, None, &private("svc", &["dev"])).unwrap();
     assert_eq!(svc.tags, s(&["dev"]));
-    let bare = f.cp.register(&service, &private("bare", &[])).unwrap();
+    let bare = f.cp.register(&service, None, &private("bare", &[])).unwrap();
     assert!(access(&bare.hostname).is_empty(), "no tag, no access: not even for an administrator");
 
     // Deleting a tag removes it everywhere.
@@ -390,11 +390,11 @@ async fn tag_changes_keep_other_edits() {
     let ci = f.agent("ci");
     f.cp.change_agent_tags(&admin, &ci, &s(&["team:dev", "team:ops"]), &[]).unwrap();
     let private = |name: &str, tags: &[&str]| RegisterTunnel { visibility: Some(Visibility::Private), tags: s(tags), ..http(name) };
-    let t = f.cp.register(&ci, &private("dev", &["team:dev"])).unwrap();
-    f.cp.register(&ci, &private("both", &["team:dev", "team:ops"])).unwrap();
+    let t = f.cp.register(&ci, None, &private("dev", &["team:dev"])).unwrap();
+    f.cp.register(&ci, None, &private("both", &["team:dev", "team:ops"])).unwrap();
     let web = f.agent("web");
     f.cp.change_agent_tags(&admin, &web, &s(&["team:ops"]), &[]).unwrap();
-    f.cp.register(&web, &RegisterTunnel { visibility: Some(Visibility::Public), ..http("public") }).unwrap();
+    f.cp.register(&web, None, &RegisterTunnel { visibility: Some(Visibility::Public), ..http("public") }).unwrap();
     let reach = f.cp.private_reach(&admin);
     assert_eq!((reach.by_tag.get("team:dev"), reach.by_tag.get("team:ops")), (Some(&2), Some(&1)), "public tunnels don't count");
     assert_eq!(reach.by_agent[&ci].get("team:dev"), Some(&2));
@@ -429,38 +429,38 @@ async fn registration_respects_the_enrollment() {
 
     // An agent that sends no visibility gets its enrollment's default: private, for its owner.
     let pa = ann.personal_tag.clone().unwrap();
-    let t = f.cp.register(&laptop, &http("old")).unwrap();
+    let t = f.cp.register(&laptop, None, &http("old")).unwrap();
     assert_eq!((t.visibility, t.tags.clone()), (Some(Visibility::Private), vec![pa.clone()]));
     let route = f.data.lookup(&t.hostname).unwrap();
     assert!(!route.access.authz.public);
     assert_eq!(route.access.authz.access, std::slice::from_ref(&pa), "no tags asked for: the owner only, by their tag");
     // ...and re-registering without one keeps the tunnel as it is.
-    f.cp.register(&laptop, &with("old", Some(Visibility::Private), &["team:dev"])).unwrap();
-    assert_eq!(f.cp.register(&laptop, &http("old")).unwrap().tags, ["team:dev".to_string(), pa.clone()]);
+    f.cp.register(&laptop, None, &with("old", Some(Visibility::Private), &["team:dev"])).unwrap();
+    assert_eq!(f.cp.register(&laptop, None, &http("old")).unwrap().tags, ["team:dev".to_string(), pa.clone()]);
 
-    assert!(f.cp.register(&laptop, &with("pub", Some(Visibility::Public), &[])).unwrap_err().is(ErrorCode::PublicNotAllowed));
-    assert!(f.cp.register(&laptop, &with("ops", Some(Visibility::Private), &["team:ops"])).unwrap_err().is(ErrorCode::Forbidden));
-    assert!(f.cp.register(&laptop, &with("qa", Some(Visibility::Private), &["team:qa"])).unwrap_err().is(ErrorCode::TagUnknown));
+    assert!(f.cp.register(&laptop, None, &with("pub", Some(Visibility::Public), &[])).unwrap_err().is(ErrorCode::PublicNotAllowed));
+    assert!(f.cp.register(&laptop, None, &with("ops", Some(Visibility::Private), &["team:ops"])).unwrap_err().is(ErrorCode::Forbidden));
+    assert!(f.cp.register(&laptop, None, &with("qa", Some(Visibility::Private), &["team:qa"])).unwrap_err().is(ErrorCode::TagUnknown));
     // A port tunnel follows the default too. Private, it needs no port, nor a port range: people
     // reach it with `magicpipes connect`.
-    let t = f.cp.register(&laptop, &RegisterTunnel { kind: Kind::Tcp, ..with("db", None, &[]) }).unwrap();
+    let t = f.cp.register(&laptop, None, &RegisterTunnel { kind: Kind::Tcp, ..with("db", None, &[]) }).unwrap();
     assert_eq!((t.visibility, t.public_port, t.public_url.as_str()), (Some(Visibility::Private), None, "magicpipes connect db"));
     let public = RegisterTunnel { visibility: Some(Visibility::Public), tags: vec!["team:dev".into()], ..http("site") };
-    assert!(f.cp.register(&ci, &public).unwrap_err().is(ErrorCode::InvalidRequest), "tags apply only to private tunnels");
+    assert!(f.cp.register(&ci, None, &public).unwrap_err().is(ErrorCode::InvalidRequest), "tags apply only to private tunnels");
 
     // The service agent from before users keeps making public tunnels; new ones default to private.
-    let t = f.cp.register(&ci, &http("site")).unwrap();
+    let t = f.cp.register(&ci, None, &http("site")).unwrap();
     assert_eq!(t.visibility, Some(Visibility::Public));
     assert!(f.data.lookup(&t.hostname).unwrap().access.authz.public);
     let later = f.agent("later");
-    assert_eq!(f.cp.register(&later, &http("site2")).unwrap().visibility, Some(Visibility::Private));
+    assert_eq!(f.cp.register(&later, None, &http("site2")).unwrap().visibility, Some(Visibility::Private));
 
     // An agent from before private tunnels can't check one; it is told to upgrade, and gets
     // neither a private tunnel it would time out on nor a public one.
     let old = f.agent("old");
     let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
     assert!(matches!(f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 2, None), super::Attached::Yes(_)));
-    assert!(f.cp.register(&old, &http("legacy")).unwrap_err().is(ErrorCode::AgentOutdated));
+    assert!(f.cp.register(&old, None, &http("legacy")).unwrap_err().is(ErrorCode::AgentOutdated));
 }
 
 #[tokio::test]
@@ -477,7 +477,7 @@ async fn deleting_a_tag_closes_tunnels_shared_with_it() {
     let token = f.cp.create_enrollment(&admin, opts).unwrap();
     let agent = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "box".into() }).unwrap().agent_id;
     let req = RegisterTunnel { visibility: Some(Visibility::Private), tags: vec!["team:secret".into()], ..http("db") };
-    let t = f.cp.register(&agent, &req).unwrap();
+    let t = f.cp.register(&agent, None, &req).unwrap();
     let access = || f.data.lookup(&t.hostname).unwrap().access.authz.access.clone();
     assert_eq!(access(), ["team:secret"]);
     assert!(f.cp.delete_tag(&admin, "team:secret").unwrap());
@@ -518,18 +518,18 @@ async fn custom_hostnames_are_assigned_by_administrators() {
     // Only the machines it is assigned to serve it; the name comes from its first label.
     let on = |host: &str| RegisterTunnel { hostname: Some(host.into()), visibility: Some(Visibility::Public), ..http("x") };
     let named = |host: &str| RegisterTunnel { name: None, ..on(host) };
-    assert!(f.cp.register(&bobs, &named(shop)).unwrap_err().is(ErrorCode::NotFound), "not bob's");
-    assert!(f.cp.register(&ci, &named(shop)).unwrap_err().is(ErrorCode::NotFound));
-    assert!(f.cp.register(&anns, &named("other.app.t.example.test")).unwrap_err().is(ErrorCode::NotFound), "not registered");
-    let t = f.cp.register(&anns, &named(shop)).unwrap();
+    assert!(f.cp.register(&bobs, None, &named(shop)).unwrap_err().is(ErrorCode::NotFound), "not bob's");
+    assert!(f.cp.register(&ci, None, &named(shop)).unwrap_err().is(ErrorCode::NotFound));
+    assert!(f.cp.register(&anns, None, &named("other.app.t.example.test")).unwrap_err().is(ErrorCode::NotFound), "not registered");
+    let t = f.cp.register(&anns, None, &named(shop)).unwrap();
     assert_eq!((t.hostname.as_str(), t.name.as_str(), t.created), (shop, "shop", true));
     assert_eq!(t.public_url, format!("https://{shop}"));
     assert!(f.data.lookup(shop).is_some() && f.data.lookup("shop.t.example.test").is_none(), "routed at the custom hostname only");
-    assert!(!f.cp.register(&anns, &named(shop)).unwrap().created, "adding it again is idempotent");
+    assert!(!f.cp.register(&anns, None, &named(shop)).unwrap().created, "adding it again is idempotent");
     let moved = RegisterTunnel { id: Some(t.id.clone()), ..named("api.app.t.example.test") };
-    assert!(f.cp.register(&anns, &moved).unwrap_err().is(ErrorCode::NotFound), "and it can't move to a hostname that isn't hers");
-    assert!(f.cp.register(&ci, &RegisterTunnel { kind: Kind::Tcp, ..named("api.app.t.example.test") }).unwrap_err().is(ErrorCode::InvalidRequest));
-    let api = f.cp.register(&ci, &named("api.app.t.example.test")).unwrap();
+    assert!(f.cp.register(&anns, None, &moved).unwrap_err().is(ErrorCode::NotFound), "and it can't move to a hostname that isn't hers");
+    assert!(f.cp.register(&ci, None, &RegisterTunnel { kind: Kind::Tcp, ..named("api.app.t.example.test") }).unwrap_err().is(ErrorCode::InvalidRequest));
+    let api = f.cp.register(&ci, None, &named("api.app.t.example.test")).unwrap();
     assert_eq!(f.cp.hostnames(&admin).iter().find(|h| h.hostname == shop).unwrap().tunnel.as_deref(), Some("shop"));
 
     // Removing the registration deletes its tunnel.
@@ -546,7 +546,7 @@ async fn ports_outside_the_range_stay_closed() {
     let ports = format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\"");
     let f = fixture_in(fixture().stop(), &ports);
     let agent = f.agent("db");
-    f.cp.register(&agent, &public_port("db")).unwrap();
+    f.cp.register(&agent, None, &public_port("db")).unwrap();
     assert!(f.data.lookup_port(Kind::Tcp, port).is_some());
     // The operator turns raw ports off and restarts: the port is not opened again.
     let f = fixture_in(f.stop(), "");
@@ -576,40 +576,40 @@ async fn a_private_port_tunnel_has_no_port() {
     let f = fixture_in(fixture().stop(), &format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\""));
     // Before the server has users, a machine's tunnels are public by default.
     let agent = f.agent("svc");
-    let open = f.cp.register(&agent, &public_port("db")).unwrap();
+    let open = f.cp.register(&agent, None, &public_port("db")).unwrap();
     assert_eq!(open.public_port, Some(port));
     // Made private, it gives its port back, and the port closes.
     let private = |name: &str| RegisterTunnel { visibility: Some(Visibility::Private), ..public_port(name) };
-    let closed = f.cp.register(&agent, &private("db")).unwrap();
+    let closed = f.cp.register(&agent, None, &private("db")).unwrap();
     assert_eq!((closed.id.as_str(), closed.public_port, closed.public_url.as_str()), (open.id.as_str(), None, "magicpipes connect db"));
     assert!(f.data.lookup_port(Kind::Tcp, port).is_none());
     // The range's one port is free for another tunnel; made public again, this one gets it back.
     let_go(port).await;
-    assert_eq!(f.cp.register(&agent, &public_port("db")).unwrap().public_port, Some(port));
-    f.cp.register(&agent, &private("db")).unwrap();
+    assert_eq!(f.cp.register(&agent, None, &public_port("db")).unwrap().public_port, Some(port));
+    f.cp.register(&agent, None, &private("db")).unwrap();
     let_go(port).await;
 
     // Nothing that applies to a public port goes with a private one.
     let with_port = RegisterTunnel { remote_port: Some(port), ..private("db2") };
-    assert!(f.cp.register(&agent, &with_port).unwrap_err().is(ErrorCode::InvalidRequest));
+    assert!(f.cp.register(&agent, None, &with_port).unwrap_err().is(ErrorCode::InvalidRequest));
     let with_list = RegisterTunnel { allow: vec!["10.0.0.0/8".into()], ..private("db3") };
-    assert!(f.cp.register(&agent, &with_list).unwrap_err().is(ErrorCode::InvalidRequest));
+    assert!(f.cp.register(&agent, None, &with_list).unwrap_err().is(ErrorCode::InvalidRequest));
     // A current agent without --allow-cidr, --allow-any or --private: public by default, so it's
     // asked which. An allow-list alone means public.
     let nothing = RegisterTunnel { visibility: None, ..public_port("db4") };
-    assert!(f.cp.register(&agent, &nothing).unwrap_err().is(ErrorCode::InvalidRequest));
+    assert!(f.cp.register(&agent, None, &nothing).unwrap_err().is(ErrorCode::InvalidRequest));
     let listed = RegisterTunnel { allow: vec!["10.0.0.0/8".into()], ..nothing.clone() };
-    assert_eq!(f.cp.register(&agent, &listed).unwrap().visibility, Some(Visibility::Public));
+    assert_eq!(f.cp.register(&agent, None, &listed).unwrap().visibility, Some(Visibility::Public));
 
     // An agent from before private ports: no visibility means public, as it always did, and it
     // can't have a private one.
     let old = f.agent("old");
     let (handle, _) = magicpipes_core::mux::spawn(tokio::io::duplex(1024).0, magicpipes_core::mux::Mode::Server);
     assert!(matches!(f.cp.attach_session(&old, handle, "127.0.0.1:1".parse().unwrap(), 5, None), super::Attached::Yes(_)));
-    f.cp.unregister(&agent, &f.cp.register(&agent, &listed).unwrap().id).unwrap();
+    f.cp.unregister(&agent, &f.cp.register(&agent, None, &listed).unwrap().id).unwrap();
     let_go(port).await;
-    assert_eq!(f.cp.register(&old, &RegisterTunnel { visibility: None, ..public_port("legacy") }).unwrap().visibility, Some(Visibility::Public));
-    assert!(f.cp.register(&old, &private("legacy2")).unwrap_err().is(ErrorCode::AgentOutdated));
+    assert_eq!(f.cp.register(&old, None, &RegisterTunnel { visibility: None, ..public_port("legacy") }).unwrap().visibility, Some(Visibility::Public));
+    assert!(f.cp.register(&old, None, &private("legacy2")).unwrap_err().is(ErrorCode::AgentOutdated));
 }
 
 #[tokio::test]
@@ -625,12 +625,12 @@ async fn members_can_publish_applies_to_enrolled_machines() {
     let token = f.cp.create_enrollment(&admin, opts).unwrap();
     let laptop = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "laptop".into() }).unwrap().agent_id;
     let public = |name: &str| RegisterTunnel { visibility: Some(Visibility::Public), ..http(name) };
-    f.cp.register(&laptop, &public("before")).unwrap();
+    f.cp.register(&laptop, None, &public("before")).unwrap();
     // The administrator turns public tunnels off for members and restarts the server.
     let f = fixture_in(f.stop(), "[users]\nmembers_can_publish = false");
-    assert!(f.cp.register(&laptop, &public("after")).unwrap_err().is(ErrorCode::PublicNotAllowed));
+    assert!(f.cp.register(&laptop, None, &public("after")).unwrap_err().is(ErrorCode::PublicNotAllowed));
     let private = RegisterTunnel { visibility: Some(Visibility::Private), ..http("after") };
-    assert_eq!(f.cp.register(&laptop, &private).unwrap().visibility, Some(Visibility::Private));
+    assert_eq!(f.cp.register(&laptop, None, &private).unwrap().visibility, Some(Visibility::Private));
 }
 
 #[tokio::test]
@@ -642,10 +642,10 @@ async fn only_http_tunnels_ask_for_certificates() {
     let ports = format!("[ports]\nrange = \"{port}-{port}\"\nbind = \"127.0.0.1\"");
     let f = fixture_in(fixture().stop(), &ports);
     let agent = f.agent("a");
-    let web = f.cp.register(&agent, &http("web")).unwrap();
+    let web = f.cp.register(&agent, None, &http("web")).unwrap();
     assert!(f.cp.cert_status(&agent, &web.hostname, Duration::ZERO).await.is_ok());
     // Asking about a port tunnel's hostname would order a certificate past the daily limit.
-    let db = f.cp.register(&agent, &public_port("db")).unwrap();
+    let db = f.cp.register(&agent, None, &public_port("db")).unwrap();
     assert!(f.cp.cert_status(&agent, &db.hostname, Duration::ZERO).await.unwrap_err().is(ErrorCode::NotFound));
 }
 
@@ -664,11 +664,11 @@ async fn a_changed_role_takes_effect_at_once() {
     let token = f.cp.create_enrollment(&admin, opts).unwrap();
     let laptop = f.cp.enroll(&EnrollRequest { enrollment_token: token, agent_name: "laptop".into() }).unwrap().agent_id;
     let public = |name: &str| RegisterTunnel { visibility: Some(Visibility::Public), ..http(name) };
-    f.cp.register(&laptop, &public("before")).unwrap();
+    f.cp.register(&laptop, None, &public("before")).unwrap();
     f.cp.update_user(&admin, &ann.id, Some(Role::Member), None).unwrap();
-    assert!(f.cp.register(&laptop, &public("after")).unwrap_err().is(ErrorCode::PublicNotAllowed));
+    assert!(f.cp.register(&laptop, None, &public("after")).unwrap_err().is(ErrorCode::PublicNotAllowed));
     f.cp.update_user(&admin, &ann.id, Some(Role::Admin), None).unwrap();
-    assert!(f.cp.register(&laptop, &public("after")).is_ok());
+    assert!(f.cp.register(&laptop, None, &public("after")).is_ok());
 }
 
 #[tokio::test]
@@ -802,7 +802,7 @@ async fn an_agents_connections_stay_together_up_to_a_limit() {
     let f = fixture();
     let max = f.cp.cfg.agents.max_connections;
     let a = f.agent("multi");
-    let t = f.cp.register(&a, &http("multi")).unwrap();
+    let t = f.cp.register(&a, None, &http("multi")).unwrap();
     let mut peers = Vec::new();
     let mut connect = |instance: Option<&str>| {
         let (x, y) = tokio::io::duplex(1 << 16);
@@ -846,4 +846,88 @@ async fn an_agents_connections_stay_together_up_to_a_limit() {
     assert!(second_run.is_closed());
     assert_eq!(connections(), 1);
     assert!(online());
+}
+
+/// With replicas on, another run of an agent serves beside the others instead of replacing them.
+/// Each tunnel's streams go to the runs that registered it, there's a limit on runs, and turning
+/// replicas off leaves only the newest.
+#[tokio::test]
+async fn replicas_serve_side_by_side_each_what_it_registered() {
+    use magicpipes_core::mux::{self, Mode};
+    use super::{Attached, MAX_RUNS};
+    let f = fixture();
+    let a = f.agent("gateway");
+    let admin = Principal::AdminToken;
+    let mut peers = Vec::new();
+    let mut connect = |instance: &str| {
+        let (x, y) = tokio::io::duplex(1 << 16);
+        let (handle, _) = mux::spawn(x, Mode::Server);
+        peers.push(mux::spawn(y, Mode::Client));
+        let attached = f.cp.attach_session(&a, handle.clone(), "127.0.0.1:1".parse().unwrap(), 9, Some(instance.to_string()));
+        (handle, attached)
+    };
+    let attached = |(h, at): (mux::MuxHandle, Attached)| match at {
+        Attached::Yes(conn) => (h, conn),
+        other => panic!("{other:?}"),
+    };
+    let runs = || f.cp.agents(&admin).into_iter().find(|v| v.id == a).unwrap().runs;
+    let online = |host: &str| f.data.lookup(host).unwrap().agent.as_ref().is_some_and(|l| l.is_online());
+
+    // Off, as it always was: a new run replaces the one before.
+    let (first, _) = attached(connect("run-one-aaaaaaaaaaaa"));
+    let (second, conn2) = attached(connect("run-two-bbbbbbbbbbbb"));
+    assert!(first.is_closed() && runs() == 1);
+
+    // On: the next run serves beside it, and each gets what it registered.
+    assert!(!f.cp.set_agent_replicas(&Principal::Anonymous, &a, true).unwrap(), "only someone who manages it");
+    assert!(f.cp.set_agent_replicas(&admin, &a, true).unwrap());
+    let one = f.cp.register(&a, Some(conn2), &http("one")).unwrap();
+    let (third, conn3) = attached(connect("run-three-cccccccccc"));
+    assert!(!second.is_closed() && runs() == 2);
+    let two = f.cp.register(&a, Some(conn3), &http("two")).unwrap();
+    second.close();
+    assert!(!online(&one.hostname), "only the second run serves the first tunnel");
+    assert!(online(&two.hostname));
+    // Once the third registers it too, it takes its share.
+    f.cp.register(&a, Some(conn3), &RegisterTunnel { id: Some(one.id.clone()), ..http("one") }).unwrap();
+    assert!(online(&one.hostname));
+    f.cp.detach_session(&a, conn2);
+    assert_eq!(runs(), 1);
+
+    // So many runs at most.
+    let mut more = Vec::new();
+    for i in 1..MAX_RUNS {
+        more.push(attached(connect(&format!("run-more-{i:012}"))));
+    }
+    assert_eq!(runs(), MAX_RUNS);
+    assert!(!f.cp.has_room(&a, Some("run-too-many-dddddd")));
+    assert_eq!(connect("run-too-many-dddddd").1, Attached::Full);
+
+    // Off again: the newest stays, and the next run replaces it.
+    assert!(f.cp.set_agent_replicas(&admin, &a, false).unwrap());
+    assert_eq!(runs(), 1);
+    assert!(third.is_closed() && more[..more.len() - 1].iter().all(|(h, _)| h.is_closed()));
+    assert!(!more[more.len() - 1].0.is_closed());
+    let (_last, _) = attached(connect("run-last-eeeeeeeeeeee"));
+    assert!(more[more.len() - 1].0.is_closed() && runs() == 1);
+}
+
+/// An agent with one run registers its tunnels again after every reconnect. That changes nothing,
+/// so it publishes nothing: after a server restart every agent does it, and publishing each time
+/// would rebuild the whole table once per tunnel.
+#[tokio::test]
+async fn registering_again_with_one_run_publishes_nothing() {
+    use magicpipes_core::mux::{self, Mode};
+    let f = fixture();
+    let a = f.agent("laptop");
+    let (x, y) = tokio::io::duplex(1 << 16);
+    let (handle, _) = mux::spawn(x, Mode::Server);
+    let _peer = mux::spawn(y, Mode::Client);
+    let super::Attached::Yes(conn) = f.cp.attach_session(&a, handle, "127.0.0.1:1".parse().unwrap(), 11, Some("run-one-aaaaaaaaaaaa".into())) else {
+        panic!("attached")
+    };
+    let t = f.cp.register(&a, Some(conn), &http("app")).unwrap();
+    let before = f.data.lookup(&t.hostname).unwrap();
+    f.cp.register(&a, Some(conn), &RegisterTunnel { id: Some(t.id.clone()), ..http("app") }).unwrap();
+    assert!(Arc::ptr_eq(&before, &f.data.lookup(&t.hostname).unwrap()), "the same table");
 }

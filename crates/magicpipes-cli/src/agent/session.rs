@@ -399,6 +399,7 @@ impl Session {
                         tags: info.tags,
                         access: info.access,
                         owner_tag: info.owner_tag,
+                        replicas: info.replicas,
                         ..t
                     };
                     self.tunnels.upsert(updated, Registration::Registered);

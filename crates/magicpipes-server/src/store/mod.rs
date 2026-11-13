@@ -72,6 +72,9 @@ pub struct AgentRow {
     pub allow_public: bool,
     /// Are its tunnels private unless asked otherwise?
     pub default_private: bool,
+    /// Several runs of it may serve at once (replicas), each the tunnels it registered. Otherwise
+    /// a run that connects replaces the one before.
+    pub replicas: bool,
 }
 
 /// The schema, applied in order and tracked in `user_version`. Append only: a released
@@ -482,6 +485,11 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user_id, code_hash)
     ) WITHOUT ROWID;
     "#,
+    // 17: replicas: several runs of one machine serving side by side, which whoever manages the
+    // machine turns on. Off, a run that connects replaces the one before, as it always has.
+    r#"
+    ALTER TABLE agents ADD COLUMN replicas INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -692,7 +700,7 @@ impl Store {
     pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, name, created_at, last_seen_at, owner_user_id, allow_public, default_private FROM agents ORDER BY created_at",
+                "SELECT id, name, created_at, last_seen_at, owner_user_id, allow_public, default_private, replicas FROM agents ORDER BY created_at",
             )?;
             st.query_map([], |r| {
                 Ok(AgentRow {
@@ -703,10 +711,17 @@ impl Store {
                     owner_user_id: r.get(4)?,
                     allow_public: r.get::<_, i64>(5)? != 0,
                     default_private: r.get::<_, i64>(6)? != 0,
+                    replicas: r.get::<_, i64>(7)? != 0,
                 })
             })?
             .collect()
         })
+    }
+
+    /// `false` if there's no such agent.
+    pub fn set_agent_replicas(&self, agent_id: &str, on: bool) -> anyhow::Result<bool> {
+        let n = self.with(|c| c.execute("UPDATE agents SET replicas = ?2 WHERE id = ?1", params![agent_id, on]))?;
+        Ok(n == 1)
     }
 
     // ---- tunnels --------------------------------------------------------------------------
@@ -1151,6 +1166,29 @@ mod tests {
         assert!(!store.clear_totp(&ann).unwrap());
         assert!(!store.set_recovery_codes(&ann, &digests).unwrap(), "off");
         assert!(!store.use_recovery_code(&ann, &secret::sha256_hex("d")).unwrap(), "went with them");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replicas_are_off_for_machines_from_before_and_can_be_turned_on() {
+        let dir = std::env::temp_dir().join(format!("mp-store-{}", secret::random_string(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let mut c = Connection::open(&path).unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(16) {
+            let tx = c.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+            tx.commit().unwrap();
+        }
+        c.execute("INSERT INTO agents (id, name, token_hash, created_at) VALUES ('ag_1', 'gateway', 'x', 100)", []).unwrap();
+        drop(c);
+        let store = Store::open(&path).unwrap();
+        let replicas = || store.agents().unwrap().into_iter().find(|a| a.id == "ag_1").unwrap().replicas;
+        assert!(!replicas(), "as it was: a new run replaces the last");
+        assert!(store.set_agent_replicas("ag_1", true).unwrap());
+        assert!(replicas());
+        assert!(!store.set_agent_replicas("ag_none", true).unwrap());
         std::fs::remove_dir_all(dir).ok();
     }
 

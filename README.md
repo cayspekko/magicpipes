@@ -1240,7 +1240,8 @@ docker run -d -v magicpipes-agent:/data -e MAGICPIPES_SERVER=https://mp.example.
   it.
 
 These are read only by `agent run` in the foreground. [docs/KUBERNETES.md](docs/KUBERNETES.md) has a
-gateway Deployment, a sidecar, and the limits for now: one replica per machine.
+gateway Deployment, a sidecar, and replicas: several copies of one machine serving side by side,
+once **Replicas** is on for it (its page in the UI, or `PATCH /api/v1/agents/{id}`).
 
 ### Connections to the server
 
@@ -1295,7 +1296,7 @@ answer `403 forbidden` to members.
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
 | GET | `/api/v1/me` | `{"kind": "admin_token"}` or `{"kind": "user", "user": {...}}` |
 | GET | `/api/v1/shared` | Tunnels you can reach but don't manage (`name`, `public_url`, `kind`, `visibility`, `owner_email`) |
-| PATCH | `/api/v1/agents/{id}` | `{"tags"?}`; a service agent's tags (administrators) |
+| PATCH | `/api/v1/agents/{id}` | `{"tags"?, "replicas"?}`; a service agent's tags (administrators); `replicas`: several runs of the machine may serve at once, each the tunnels it registered (whoever manages it). Turning it off keeps the newest run |
 | GET | `/api/v1/tags` | `{"tags": [{"name", "description", "access", "created_at"}]}` (administrators; personal tags not listed) |
 | POST | `/api/v1/tags` | 201; body `{"name", "description"?, "access"?}` (`access` defaults to true; `user:` names are reserved) |
 | PATCH | `/api/v1/tags/{name}` | `{"access": bool}`: whether it grants access |
@@ -1345,7 +1346,8 @@ Invitation object: `id`, `email`, `display_name`, `role`, `tags`, `invited_by` (
 
 Agent object: `id`, `name`, `connected`, `remote_addr`, `connected_at`, `protocol` (the connected
 agent's protocol version), `owner_user_id`, `owner_email`, `tags` (what it publishes with: its owner's, or a service agent's own),
-`allow_public`, `default_private`, `last_seen_at`, `tunnels`, `created_at`.
+`allow_public`, `default_private`, `replicas` (several runs may serve at once), `runs` (runs connected
+now: more than one only with replicas), `connections` (across them), `last_seen_at`, `tunnels`, `created_at`.
 
 Tunnel object: `id`, `name`, `hostname`, `public_url`, `target`, `agent_id`, `visibility`,
 `tags` (the owner's personal tag included), `access` (private: the tags that let people in), `status`

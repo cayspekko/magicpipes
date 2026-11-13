@@ -65,7 +65,11 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 /// * 10: after [`StreamStatus::LocalUnreachable`], an [`Unreachable`] frame saying why. An older
 ///   server closes the stream after the status byte and never reads it; the agent sends it only to
 ///   a server at [`REASONS_PROTOCOL`] or newer anyway.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// * 11: replicas. [`TunnelInfo`] says when other runs of the machine may serve the tunnel too
+///   (`replicas`), so a readiness probe through it may reach one of them; the agent then takes the
+///   server's acknowledgement as enough. An older server never says so, and an older agent
+///   ignores it and waits for a probe that may never reach it, so replicas need agents at 11.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The first protocol version whose servers read why the app couldn't be reached.
 pub const REASONS_PROTOCOL: u32 = 10;
@@ -330,6 +334,10 @@ pub struct TunnelInfo {
     /// The owner's personal tag; absent for a service agent's tunnel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_tag: Option<String>,
+    /// Other runs of the machine may serve it too (replicas, protocol 11): a request through it
+    /// may reach any of them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replicas: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -546,6 +554,11 @@ mod tests {
         assert_eq!((t.kind, t.public_port), (Kind::Http, None));
         // Before protocol 3: no visibility either way, so a new agent can tell it wasn't honored.
         assert!(t.visibility.is_none() && t.tags.is_empty());
+        // Before protocol 11: no replicas, so a probe must reach the agent that sent it.
+        assert!(!t.replicas);
+        let with: TunnelInfo = serde_json::from_str(r#"{"id":"tn","name":"a","hostname":"a.t","public_url":"https://a.t","created":true,"replicas":true}"#).unwrap();
+        assert!(with.replicas);
+        assert!(!serde_json::to_string(&t).unwrap().contains("replicas"), "said only when true");
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { visibility: None, .. })));
         let r = Request::Register(RegisterTunnel {

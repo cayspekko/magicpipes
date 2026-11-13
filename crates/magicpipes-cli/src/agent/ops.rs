@@ -374,6 +374,7 @@ impl Agent {
             access: info.access,
             custom_hostname: hostname.is_some() || existing.as_ref().is_some_and(|t| t.custom_hostname),
             owner_tag: info.owner_tag,
+            replicas: info.replicas,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);
         Ok((tunnel, info.created))

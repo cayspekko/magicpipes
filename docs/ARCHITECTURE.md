@@ -298,6 +298,33 @@ Known costs, left as they are for now:
 * No HTTP/2 toward browsers, so they open several connections.
 * A 64 KiB yamux frame size gave about 18% more on a Mac, and hasn't been measured on Linux.
 
+### Replicas: copies of one machine side by side (phase 10c)
+
+With `agents.replicas` on (the machine page, or `PATCH /api/v1/agents/{id}`; whoever manages the
+machine; audited), a connection with a new instance doesn't replace the others: it starts a run
+beside them, up to `MAX_RUNS` (16, 409 beyond). The server's `Link` is a list of runs, each its own
+connections (`Run::lanes`, kept together as above) and the tunnels it registered since it connected
+(`Run::serves`, recorded from the `Register` RPC's own connection and pruned to live tunnels).
+
+* **Routing.** `publish` gives each tunnel an `AgentLink` of the connections of the runs serving it,
+  or of all of them if none says so yet; with one run, one link per agent as before, so the data
+  plane is unchanged: `AgentLink::pick` spreads streams over whatever connections it's given.
+* **Publishing.** A run registering a tunnel it didn't serve publishes only beside other runs. With
+  one run every registration after a reconnect would otherwise rebuild the table
+  (`registering_again_with_one_run_publishes_nothing`).
+* **Checks** go through the run that asked (`Rpc::Check` on its connection), and a removal is told
+  to every run. History counts a run starting beside the others as no reconnect, and expects each
+  run's most connections, so a scale-down isn't "fewer connections".
+* **Probes (protocol 11).** `TunnelInfo::replicas` tells an agent that another run may answer its
+  readiness probe; it then takes the server's acknowledgement (tunnel id and nonce) without having
+  seen the stream itself, and a public port's connection without the stream.
+* **Settings.** Runs share the tunnel's row: an `add` sets it, the last one wins. A registration after
+  a reconnect sends no visibility, tags or checks, so it can't change them.
+* **Why copies, not different machines** (decided 2026-11-12): copies cover replicas, rolling
+  updates and a gateway that survives a pod, without changing who owns a hostname or adding a rule
+  to `authorize`. It's opt-in per machine, so a stolen token can't quietly take a share of a
+  laptop's traffic instead of visibly replacing its agent.
+
 ## Metrics (`/metrics`, `control/metrics.rs`)
 
 What tunnels carry is counted where it happens, on the traffic threads, in each tunnel's
@@ -978,7 +1005,8 @@ a connection to the public port that must arrive back at the agent (a warning, n
   lock, so a connection that authenticated just before the revoke cannot attach after it.
 * **Agent disconnect**: routes stay registered and answer `502 agent_offline`. The server drops
   sessions without a ping for `session_timeout_secs` (default 45 s; agents ping every 15 s).
-* **Agent reconnect**: the newest session of an agent replaces the old one. The agent
+* **Agent reconnect**: the newest session of an agent replaces the old one, unless replicas are on
+  for it (above). The agent
   re-registers every local tunnel by id (idempotent). A tunnel deleted on the server meanwhile
   returns `not_found` and is dropped locally.
 * **Server restart**: tunnels persist in SQLite and cached certificates in `data_dir/certs`.

@@ -210,6 +210,18 @@ impl Counters {
     }
 }
 
+/// How a connection joined an agent's others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Joined {
+    /// A run of its own, in place of any before: the agent started, or came back.
+    Replacing,
+    /// A run beside the agent's others (replicas).
+    Beside,
+    /// One more connection of a run that held `before` and at most `peak`: below that, one made
+    /// again.
+    Lane { before: usize, peak: usize },
+}
+
 /// An agent's connections at a sample.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Link {
@@ -217,6 +229,8 @@ pub struct Link {
     pub connections: u8,
     /// The average of its connections' last round trips, in microseconds; 0 if none is known.
     pub round_trip: u32,
+    /// The connections it should have: the most each of its runs has held.
+    pub expected: u8,
 }
 
 /// A machine in one interval.
@@ -297,10 +311,10 @@ struct AgentTrack {
     open: (i64, Presence),
     /// Reconnects since the last sample.
     reconnects: u32,
-    /// The run of the agent its connections came from, once one has, and the most connections
-    /// that run held: below that, a new one replaces one that was lost.
-    run: Option<Option<String>>,
-    peak: usize,
+    /// It has connected since the server started.
+    seen: bool,
+    /// The connections it should have, at the last sample it was connected in.
+    expected: usize,
     /// The last sample it was connected in; and since when it has held fewer connections than
     /// its run did.
     last_online: Option<i64>,
@@ -312,7 +326,7 @@ struct AgentTrack {
 pub struct MachineNow {
     /// The last sample it was connected in, since the server started.
     pub last_online: Option<i64>,
-    /// Since when it has had fewer connections than its run had, and how many that was.
+    /// Since when it has had fewer connections than its runs had, and how many that was.
     pub short_since: Option<i64>,
     pub peak: usize,
     /// Its round trips in the last 5 minutes' samples, in microseconds.
@@ -418,7 +432,8 @@ impl History {
             match link {
                 Some(l) => {
                     track.last_online = Some(now);
-                    let short = usize::from(l.connections) < track.peak;
+                    track.expected = usize::from(l.expected);
+                    let short = l.connections < l.expected;
                     track.short_since = if short { track.short_since.or(Some(now)) } else { None };
                 }
                 None => track.short_since = None,
@@ -460,7 +475,7 @@ impl History {
         MachineNow {
             last_online: track.last_online,
             short_since: track.short_since,
-            peak: track.peak,
+            peak: track.expected,
             round_trips: track.fine.entries.iter().filter(|(slot, p)| *slot > five && p.round_trip > 0).map(|(_, p)| p.round_trip).collect(),
             reconnects,
         }
@@ -480,25 +495,16 @@ impl History {
         self.started
     }
 
-    /// An agent's connection from its run `instance` was attached, after `before` others from that
-    /// run (`None`: it starts a run). Counts a reconnect unless it's the agent's first since the
-    /// server started, or one more of a run's first connections.
-    pub fn attached(&mut self, agent_id: &str, instance: Option<&str>, before: Option<usize>) {
+    /// An agent's connection was attached, `joined` as it did. Counts a reconnect unless it's the
+    /// agent's first since the server started, a run's next first connections, or a replica's.
+    pub fn attached(&mut self, agent_id: &str, joined: Joined) {
         let track = self.agents.entry(agent_id.to_string()).or_default();
-        let same_run = before.is_some() && track.run.as_ref().is_some_and(|r| r.as_deref() == instance);
-        let again = match before {
-            Some(n) if same_run => {
-                let again = n < track.peak;
-                track.peak = track.peak.max(n + 1);
-                again
-            }
-            _ => {
-                let again = track.run.is_some();
-                track.run = Some(instance.map(str::to_string));
-                track.peak = 1;
-                again
-            }
+        let again = match joined {
+            Joined::Replacing => track.seen,
+            Joined::Beside => false,
+            Joined::Lane { before, peak } => before < peak,
         };
+        track.seen = true;
         if again {
             track.reconnects = track.reconnects.saturating_add(1);
         }
@@ -667,7 +673,7 @@ mod tests {
     fn closed_slots_go_to_the_database_and_come_back() {
         let mut h = History::new(0);
         let t = |n| vec![("t".to_string(), counters(n, 0, n))];
-        let a = vec![("a".to_string(), Some(Link { connections: 2, round_trip: 1_000 }))];
+        let a = vec![("a".to_string(), Some(Link { connections: 2, round_trip: 1_000, expected: 2 }))];
         let first = h.record(0, &t(3), &a);
         assert!(first.tunnels.is_empty() && first.agents.is_empty(), "nothing has closed yet");
         let closed = h.record(COARSE_SECS, &t(5), &a);
@@ -712,23 +718,26 @@ mod tests {
     fn reconnects_are_connections_made_again() {
         let mut h = History::new(0);
         // A run's first four connections, after the server started: none is a reconnect.
-        h.attached("a", Some("run1"), None);
+        h.attached("a", Joined::Replacing);
         for n in 1..4 {
-            h.attached("a", Some("run1"), Some(n));
+            h.attached("a", Joined::Lane { before: n, peak: n });
         }
         assert_eq!(h.agents["a"].reconnects, 0);
         // One lost and made again; then the agent restarts.
-        h.attached("a", Some("run1"), Some(3));
-        h.attached("a", Some("run2"), None);
+        h.attached("a", Joined::Lane { before: 3, peak: 4 });
+        h.attached("a", Joined::Replacing);
+        assert_eq!(h.agents["a"].reconnects, 2);
+        // A replica starting beside the others isn't one.
+        h.attached("a", Joined::Beside);
         assert_eq!(h.agents["a"].reconnects, 2);
         // An old agent without runs: every connection after its first replaces one.
-        h.attached("old", None, None);
-        h.attached("old", None, None);
+        h.attached("old", Joined::Replacing);
+        h.attached("old", Joined::Replacing);
         assert_eq!(h.agents["old"].reconnects, 1);
 
-        let link = Some(Link { connections: 4, round_trip: 2_000 });
+        let link = Some(Link { connections: 4, round_trip: 2_000, expected: 4 });
         h.record(0, &[], &[("a".into(), link), ("old".into(), None)]);
-        h.record(10, &[], &[("a".into(), Some(Link { connections: 4, round_trip: 4_000 })), ("old".into(), None)]);
+        h.record(10, &[], &[("a".into(), Some(Link { connections: 4, round_trip: 4_000, expected: 4 })), ("old".into(), None)]);
         let a = h.agent("a", Period::Minutes15, 10).total();
         assert_eq!((a.online, a.samples, a.connections, a.round_trip, a.reconnects), (2, 2, 4, 3_000, 2));
         let old = h.agent("old", Period::Hours24, 10).total();

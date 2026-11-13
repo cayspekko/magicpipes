@@ -145,7 +145,7 @@ impl ControlPlane {
                 return Ok(false);
             }
             st.tunnels.retain(|_, t| t.row.hostname != hostname);
-            removed.into_iter().filter_map(|(id, agent)| st.sessions.get(&agent).and_then(|l| l.handle()).map(|h| (id, h))).collect::<Vec<_>>()
+            removed.into_iter().flat_map(|(id, agent)| st.sessions.get(&agent).map(|l| l.handles()).unwrap_or_default().into_iter().map(move |h| (id.clone(), h))).collect::<Vec<_>>()
         };
         for (id, handle) in removed {
             super::registry::tell_removed(handle, id);

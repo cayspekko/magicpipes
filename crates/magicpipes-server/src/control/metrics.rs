@@ -57,7 +57,7 @@ impl ControlPlane {
                 .dir
                 .agents()
                 .map(|a| {
-                    let lanes = st.sessions.get(&a.id).map(|l| l.lanes.as_slice()).unwrap_or_default();
+                    let lanes: Vec<_> = st.sessions.get(&a.id).map(|l| l.lanes().collect()).unwrap_or_default();
                     Agent {
                         id: a.id.clone(),
                         name: a.name.clone(),

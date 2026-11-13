@@ -46,7 +46,7 @@ mod totp;
 mod users;
 mod views;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
@@ -76,7 +76,7 @@ pub use ssh::looks_private as looks_like_private_key;
 pub use tags::{EnrollmentOptions, TagView};
 pub use totp::{CodeError, SignedIn, TotpSetup};
 pub use users::{Login, LoginError, MIN_PASSWORD_CHARS, UserView};
-pub use views::TunnelView;
+pub use views::{AgentView, TunnelView};
 
 pub struct ControlPlane {
     cfg: Arc<Config>,
@@ -137,6 +137,19 @@ struct TunnelRecord {
 }
 
 impl State {
+    /// The run that connection `conn` of an agent belongs to serves `tunnel_id` from now on. What
+    /// it served that's gone is forgotten here, which bounds the set. `true` if that changes where
+    /// the tunnel's streams go, which is only beside other runs: an agent with one run gets all of
+    /// its tunnels' streams anyway, so re-registering after a reconnect publishes nothing.
+    fn serving(&mut self, agent_id: &str, conn: Option<u64>, tunnel_id: &str) -> bool {
+        let State { sessions, tunnels, .. } = self;
+        let Some(link) = sessions.get_mut(agent_id) else { return false };
+        let beside_others = link.runs.len() > 1;
+        let Some(run) = link.runs.iter_mut().find(|r| r.lanes.iter().any(|s| Some(s.conn_id) == conn)) else { return false };
+        run.serves.retain(|id| tunnels.contains_key(id));
+        run.serves.insert(tunnel_id.to_string()) && beside_others
+    }
+
     /// What `authorize` needs about a tunnel: its tags that grant access, and its owner.
     fn tunnel_authz(&self, t: &TunnelRecord) -> TunnelAuthz {
         let access = t.row.tags.iter().filter(|tag| self.dir.grants_access(tag)).cloned().collect();
@@ -172,39 +185,85 @@ struct Session {
     round_trip: Arc<AtomicU64>,
 }
 
-/// An agent's connections: those of one run of it, at most [`proto::MAX_CONNECTIONS`], in the
-/// order they came. Never empty: the last one to go takes the entry with it.
+/// Runs of one agent that may serve at once, with replicas on (`agents.replicas`).
+pub const MAX_RUNS: usize = 16;
+
+/// An agent's connections: those of one run of it, or with replicas on, of each run serving at
+/// once (at most [`MAX_RUNS`]), oldest first. Never empty: the last connection to go takes the
+/// entry with it, and a run goes with its last one.
 struct Link {
+    runs: Vec<Run>,
+}
+
+/// One run of an agent: its connections, at most `agents.max_connections`, in the order they came.
+struct Run {
     /// What its connections sent as `x-magicpipes-instance`; `None` from an agent before protocol
     /// 9, whose one connection the next always replaces.
     instance: Option<String>,
     lanes: Vec<Session>,
+    /// The most connections it has held: below that, it lost some.
+    peak: usize,
+    /// The tunnels it registered since it connected. Beside other runs, it gets only these: a run
+    /// that hasn't registered a tunnel yet doesn't serve it.
+    serves: HashSet<String>,
 }
 
 impl Link {
-    /// An open connection, for the control plane's own streams (checks, removals).
-    fn handle(&self) -> Option<MuxHandle> {
-        self.lanes.iter().find(|s| !s.handle.is_closed()).map(|s| s.handle.clone())
+    fn lanes(&self) -> impl Iterator<Item = &Session> + Clone {
+        self.runs.iter().flat_map(|r| r.lanes.iter())
     }
 
-    /// The connections the data plane opens streams on.
+    /// The runs a tunnel's streams go to: those that registered it, or every one when none has
+    /// yet (one run, or a registration on its way).
+    fn serving<'a>(&'a self, tunnel_id: &str) -> Vec<&'a Run> {
+        let serving: Vec<&Run> = self.runs.iter().filter(|r| r.serves.contains(tunnel_id)).collect();
+        if serving.is_empty() { self.runs.iter().collect() } else { serving }
+    }
+
+    /// An open connection of a run serving `tunnel_id`, for a check of its app.
+    fn handle_for(&self, tunnel_id: &str) -> Option<MuxHandle> {
+        self.serving(tunnel_id).into_iter().flat_map(|r| r.lanes.iter()).find(|s| !s.handle.is_closed()).map(|s| s.handle.clone())
+    }
+
+    /// An open connection of the run that connection `conn` belongs to.
+    fn handle_of_run(&self, conn: u64) -> Option<MuxHandle> {
+        let run = self.runs.iter().find(|r| r.lanes.iter().any(|s| s.conn_id == conn))?;
+        run.lanes.iter().find(|s| !s.handle.is_closed()).map(|s| s.handle.clone())
+    }
+
+    /// An open connection of each run, to tell every run about a change.
+    fn handles(&self) -> Vec<MuxHandle> {
+        self.runs.iter().filter_map(|r| r.lanes.iter().find(|s| !s.handle.is_closed())).map(|s| s.handle.clone()).collect()
+    }
+
+    /// Every connection, for an agent with one run.
     fn data(&self) -> AgentLink {
-        AgentLink::new(self.lanes.iter().map(|s| s.handle.clone()).collect())
+        AgentLink::new(self.lanes().map(|s| s.handle.clone()).collect())
+    }
+
+    /// The connections the data plane opens a tunnel's streams on: those of the runs serving it.
+    fn data_for(&self, tunnel_id: &str) -> AgentLink {
+        AgentLink::new(self.serving(tunnel_id).into_iter().flat_map(|r| r.lanes.iter()).map(|s| s.handle.clone()).collect())
     }
 
     fn close(&self) {
-        for s in &self.lanes {
+        for s in self.lanes() {
             s.handle.close();
         }
     }
 
     /// The connection up longest, for what's shown about the agent.
     fn first(&self) -> &Session {
-        &self.lanes[0]
+        &self.runs[0].lanes[0]
     }
 
     fn is_closed(&self) -> bool {
-        self.lanes.iter().all(|s| s.handle.is_closed())
+        self.lanes().all(|s| s.handle.is_closed())
+    }
+
+    /// The connections it should have: each run's most.
+    fn expected(&self) -> usize {
+        self.runs.iter().map(|r| r.peak).sum()
     }
 }
 
@@ -356,14 +415,16 @@ impl ControlPlane {
         for k in st.dir.ssh_keys() {
             table.ssh_keys.insert(k.fingerprint.clone(), GatewayKey { id: k.id.clone(), user_id: k.user_id.clone() });
         }
-        // One link per agent, shared by its routes.
-        let links: HashMap<&str, AgentLink> = st.sessions.iter().map(|(agent, link)| (agent.as_str(), link.data())).collect();
+        // One link per agent with one run, shared by its routes; beside other runs, each tunnel goes
+        // to those that serve it.
+        let links: HashMap<&str, AgentLink> =
+            st.sessions.iter().filter(|(_, link)| link.runs.len() == 1).map(|(agent, link)| (agent.as_str(), link.data())).collect();
         for t in st.tunnels.values() {
             // A disabled owner's agents serve nothing.
             if !st.dir.agent_active(&t.row.agent_id) {
                 continue;
             }
-            let agent = links.get(t.row.agent_id.as_str()).cloned();
+            let agent = links.get(t.row.agent_id.as_str()).cloned().or_else(|| st.sessions.get(&t.row.agent_id).map(|l| l.data_for(&t.row.id)));
             // Stored lists were validated on registration. If one no longer parses, fail closed:
             // an empty list would mean "anyone".
             let allow = match cidr::parse_list(&t.row.allow) {

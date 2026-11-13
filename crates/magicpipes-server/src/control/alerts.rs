@@ -441,7 +441,7 @@ impl ControlPlane {
                 .agents()
                 .map(|a| {
                     let link = st.sessions.get(&a.id).filter(|l| !l.is_closed()).map(|l| {
-                        let open = l.lanes.iter().filter(|s| !s.handle.is_closed());
+                        let open = l.lanes().filter(|s| !s.handle.is_closed());
                         (open.clone().count(), open.map(|s| s.protocol).min().unwrap_or(PROTOCOL_VERSION))
                     });
                     MachineFacts {

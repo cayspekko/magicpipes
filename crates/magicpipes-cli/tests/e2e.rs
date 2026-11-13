@@ -6015,3 +6015,95 @@ async fn an_agent_in_a_container_serves_what_its_environment_declares() {
     assert!(!env.root.join("other-pod").join("config.json").exists());
     stop(elsewhere).await;
 }
+
+/// An app that answers every request with `name`, after `delay`: to tell which of several copies
+/// of a machine served a request.
+async fn named_app(name: &'static str, delay: Duration) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                let reply = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{name}", name.len());
+                let _ = s.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    port
+}
+
+/// Replicas: two copies of one machine (one identity, as pods sharing a Kubernetes Secret) serve
+/// one tunnel side by side once replicas are on, each from its own app, and when one stops, the
+/// other carries on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copies_of_one_machine_serve_a_tunnel_side_by_side() {
+    let env = Env::new(Tls::DevCa).await;
+    let admin = env.admin_token();
+    let (app_a, app_b) = (named_app("from-a", Duration::from_millis(300)).await, named_app("from-b", Duration::from_millis(300)).await);
+    let (health_a, health_b) = (common::free_port(), common::free_port());
+    let run = |home: &str, health: u16, vars: Vec<(&str, String)>| {
+        let dir = env.root.join(home);
+        let mut cmd = tokio::process::Command::new(common::bin("magicpipes"));
+        cmd.args(["agent", "run"])
+            .env("MAGICPIPES_HOME", &dir)
+            .env("MAGICPIPES_SOCKET", env.root.join(format!("{home}.sock")))
+            .env("MAGICPIPES_PROBE_ADDR", "127.0.0.1")
+            .env("MAGICPIPES_LOG", "info,magicpipes=debug")
+            .env("MAGICPIPES_HEALTH_LISTEN", format!("127.0.0.1:{health}"))
+            .env_remove("MAGICPIPES_TOKEN")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(env.root.join(format!("{home}.log"))).unwrap())
+            .kill_on_drop(true);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("start the agent")
+    };
+    let ready = |port: u16| async move { health_get(port, "/readyz").await.is_some_and(|(s, _)| s == 200) };
+    let host = format!("shop.{BASE}");
+
+    let a = run("copy-a", health_a, vec![
+        ("MAGICPIPES_SERVER", env.server_url()),
+        ("MAGICPIPES_TOKEN", env.enrollment_token()),
+        ("MAGICPIPES_CA_CERT", env.ca_path.to_string_lossy().to_string()),
+        ("MAGICPIPES_TUNNELS", format!("{app_a} --name shop --public")),
+    ]);
+    env.eventually("the first copy", Duration::from_secs(30), || ready(health_a)).await;
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(env.root.join("copy-a/config.json")).unwrap()).unwrap();
+    let id = config["agent_id"].as_str().unwrap().to_string();
+    let machine = async || env.api("GET", "/api/v1/agents", Some(&admin)).await.1["agents"].as_array().unwrap().iter().find(|m| m["id"] == id).cloned().unwrap();
+    assert_eq!((machine().await["replicas"].as_bool(), machine().await["runs"].as_u64()), (Some(false), Some(1)));
+
+    let (status, v) = env.api_json("PATCH", &format!("/api/v1/agents/{id}"), Some(&admin), serde_json::json!({ "replicas": true })).await;
+    assert_eq!((status, v["replicas"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    let config = env.root.join("copy-a/config.json").to_string_lossy().to_string();
+    let _b = run("copy-b", health_b, vec![("MAGICPIPES_CONFIG", config), ("MAGICPIPES_TUNNELS", format!("{app_b} --name shop --public"))]);
+    env.eventually("the second copy", Duration::from_secs(30), || ready(health_b)).await;
+    assert!(ready(health_a).await, "the first copy goes on serving");
+    assert_eq!(machine().await["runs"].as_u64(), Some(2));
+
+    // Requests at once spread over both copies: each goes to the least busy connection.
+    let answers = futures_util::future::join_all((0..12).map(|_| env.get_public(&host, "/"))).await;
+    let served: Vec<&str> = answers.iter().map(|(s, _, body)| { assert_eq!(*s, StatusCode::OK, "{body}"); body.as_str() }).collect();
+    assert!(served.contains(&"from-a") && served.contains(&"from-b"), "{served:?}");
+
+    // One copy stops; the other carries on alone.
+    unsafe { libc::kill(a.id().unwrap() as i32, libc::SIGTERM) };
+    env.eventually("only the second copy", Duration::from_secs(20), || async { machine().await["runs"].as_u64() == Some(1) }).await;
+    for _ in 0..4 {
+        let (status, _, body) = env.get_public(&host, "/").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "from-b"));
+    }
+}

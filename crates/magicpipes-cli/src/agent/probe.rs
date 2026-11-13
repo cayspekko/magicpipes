@@ -5,7 +5,8 @@
 //! 2. the response has `x-magicpipes-probe-ack: <tunnel id> <nonce>` — which the server adds only
 //!    to responses it received from this tunnel's upstream (and strips from application
 //!    responses), and has no `x-magicpipes-error` header, and
-//! 3. this agent saw a data stream for the tunnel reach the local target meanwhile.
+//! 3. this agent saw a data stream for the tunnel reach the local target meanwhile, unless other
+//!    runs of the machine serve it too (replicas): the request may have reached one of them.
 //!
 //! Any application status (200, 401, 404, 405, ...) counts: transport readiness is the goal,
 //! not application health. If the application accepts the connection but sends no HTTP
@@ -95,7 +96,7 @@ async fn probe_once(t: &LocalTunnel, path: &str, tls: &Arc<ClientConfig>, tunnel
         )
         .into());
     }
-    if tunnels.streams_ok(&t.id) <= before {
+    if tunnels.streams_ok(&t.id) <= before && !t.replicas {
         return Err("probe response was not served through this agent".to_string().into());
     }
     Ok(status)
@@ -134,8 +135,9 @@ pub async fn tcp(t: &LocalTunnel, tunnels: &Tunnels, timeout: std::time::Duratio
             None => tokio::net::TcpStream::connect((host, port)).await,
         }
         .map_err(|e| format!("could not connect to {}: {e}", t.public_url))?;
-        // Held open until the server has opened the stream to this agent.
-        while tunnels.streams_ok(&t.id) <= before {
+        // Held open until the server has opened the stream to this agent; with replicas, it may
+        // have gone to another run of the machine, so the connection is all there is to see.
+        while tunnels.streams_ok(&t.id) <= before && !t.replicas {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(())

@@ -136,7 +136,7 @@ async fn answer(control: &ControlPlane, agent_id: &str, conn_id: u64, req: Rpc) 
             control.touch(agent_id, conn_id);
             RpcResponse::Pong
         }
-        Rpc::Register(r) => match control.register(agent_id, &r) {
+        Rpc::Register(r) => match control.register(agent_id, Some(conn_id), &r) {
             Ok(info) => RpcResponse::Tunnel(info),
             Err(e) => RpcResponse::Error(e),
         },
@@ -144,7 +144,7 @@ async fn answer(control: &ControlPlane, agent_id: &str, conn_id: u64, req: Rpc) 
             Ok(()) => RpcResponse::Ok,
             Err(e) => RpcResponse::Error(e),
         },
-        Rpc::Check { id } => match control.check(agent_id, &id).await {
+        Rpc::Check { id } => match control.check(agent_id, Some(conn_id), &id).await {
             Ok(()) => RpcResponse::Ok,
             Err(e) => RpcResponse::Error(e),
         },

@@ -487,6 +487,8 @@ pub async fn delete_tag(Caller(who): Caller, State(app): State<AppState>, Path(n
 pub struct AgentChange {
     /// Replaces a service agent's tags (administrators only).
     tags: Option<Vec<String>>,
+    /// Several runs of it serve at once (replicas), or one replaces another.
+    replicas: Option<bool>,
 }
 
 pub async fn update_agent(
@@ -497,6 +499,11 @@ pub async fn update_agent(
 ) -> Result<impl IntoResponse, ApiError> {
     if let Some(tags) = &req.tags {
         app.control.set_agent_tags(&who, &id, tags).map_err(ApiError)?;
+    }
+    if let Some(on) = req.replicas
+        && !app.control.set_agent_replicas(&who, &id, on).map_err(ApiError)?
+    {
+        return Err(api_err(ErrorCode::NotFound, "no such agent"));
     }
     let agent = app.control.agents(&who).into_iter().find(|a| a.id == id).ok_or_else(|| api_err(ErrorCode::NotFound, "no such agent"))?;
     Ok(Json(agent))

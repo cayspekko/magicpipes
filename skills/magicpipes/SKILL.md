@@ -137,7 +137,9 @@ written as `add` arguments, each with `--name` or `--hostname` (for example
 `8080 --name shop --public`). It removes tunnels that aren't declared any more, and keeps trying a
 declared one until its app answers. `MAGICPIPES_HEALTH_LISTEN=9090` serves `/readyz` (200 once
 every declared tunnel works; 503 with `waiting` entries, each a `tunnel` and an error code, until
-then). The first start enrolls with `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`. See
+then). The first start enrolls with `MAGICPIPES_SERVER` and `MAGICPIPES_TOKEN`. Several pods
+can serve the same tunnels as copies of one machine (one identity) once replicas are on for it:
+`PATCH /api/v1/agents/<id>` with `{"replicas": true}`. See
 `docs/KUBERNETES.md`.
 
 To check whether tunnels are reachable from the internet, not just from the server, run

@@ -49,6 +49,8 @@ macro_rules! done_messages {
 done_messages! {
     TunnelDeleted "tunnel-deleted" "Tunnel deleted. Its address stopped working.",
     MachineRevoked "machine-revoked" "Machine revoked, and its tunnels deleted.",
+    ReplicasOn "replicas-on" "Replicas are on: copies of this machine that connect now serve beside each other.",
+    ReplicasOff "replicas-off" "Replicas are off: a copy of this machine that connects replaces the one before.",
     TagsSaved "tags-saved" "Tags saved.",
     TokenDeleted "token-deleted" "API token deleted.",
     SshKeyAdded "ssh-key-added" "SSH key added.",
@@ -455,7 +457,10 @@ fn machines_page(app: &AppState, user: &UiUser, attempt: Option<EnrollAttempt>) 
         rows.push_str(&format!(
             r#"<tr><td><a class="name" href="/machines/{id}">{name}</a><code class="sub">{id}</code></td><td>{owner}</td><td>{tags}</td><td>{status}</td><td class="num">{tunnels}</td><td>{last_seen}</td><td class="num">{actions}</td></tr>"#,
             name = esc(&a.name),
-            status = badge(if a.connected { "connected" } else { "disconnected" }),
+            status = match a.runs {
+                n if n > 1 => format!(r#"{}<span class="sub">{n} replicas</span>"#, badge("connected")),
+                _ => badge(if a.connected { "connected" } else { "disconnected" }),
+            },
             tunnels = a.tunnels,
             id = esc(&a.id),
         ));
@@ -643,6 +648,18 @@ pub async fn agent_tags(State(app): State<AppState>, Path(id): Path<String>, Pos
         Ok(()) => done("/machines", Done::TagsSaved),
         Err(e) => refused(&e.message),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ReplicasForm {
+    #[serde(default)]
+    replicas: String,
+}
+
+pub async fn agent_replicas(State(app): State<AppState>, Path(id): Path<String>, Posted(user, f): Posted<ReplicasForm>) -> Response {
+    let on = f.replicas == "on";
+    let done = if on { Done::ReplicasOn } else { Done::ReplicasOff };
+    outcome(&user, app.control.set_agent_replicas(&user.who, &id, on), &format!("/machines/{id}"), "Machine", done, "There is no machine with that id. It may have been revoked.")
 }
 
 pub async fn revoke_agent(State(app): State<AppState>, Path(id): Path<String>, Posted(user, _): Posted<NoFields>) -> Response {

@@ -138,6 +138,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/assets/vnc/{version}/{*path}", get(desktop::vnc_asset))
         .route("/assets/terminal/{file}", get(terminal::asset))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
+        .route("/agents/{id}/replicas", post(ui::agent_replicas))
         .route("/agents/{id}/tags", get(ui::agent_tags_page).post(ui::agent_tags))
         .route("/tags", get(accounts::tags).post(accounts::create_tag))
         .route("/tags/delete", post(accounts::delete_tag))

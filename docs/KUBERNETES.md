@@ -8,9 +8,10 @@ outside it.
 There are two ways to use it:
 
 * **A gateway.** One agent in its own Deployment publishes Services by their names in the cluster
-  (`80 --host shop.default.svc.cluster.local`). That's one machine for the whole cluster.
-* **A sidecar.** An agent in an app's pod publishes that app at `127.0.0.1`. That's one machine for
-  each pod.
+  (`80 --host shop.default.svc.cluster.local`). That's one machine for the whole cluster, and with
+  [replicas](#replicas), it can run as several pods.
+* **A sidecar.** An agent in an app's pod publishes that app at `127.0.0.1`. With replicas, every
+  pod of the app is a copy of one machine, and they share its tunnels.
 
 ## The image
 
@@ -130,10 +131,9 @@ kind: Deployment
 metadata:
   name: magicpipes-gateway
 spec:
-  replicas: 1
-  # One machine serves from one place at a time (see "Limits").
-  strategy:
-    type: Recreate
+  # Two copies of one machine, which needs replicas on for it (below). Without that, use 1, and
+  # `strategy: {type: Recreate}`, since a new copy replaces the old one.
+  replicas: 2
   selector:
     matchLabels: {app: magicpipes-gateway}
   template:
@@ -205,6 +205,31 @@ readiness probe on the sidecar makes the whole pod ready only once the tunnel wo
 when MagicPipes is the only way to the app, and wrong when a cluster Service also sends it traffic:
 then leave the probe off, or pick a health port the app doesn't use.
 
+## Replicas
+
+A machine's copies can serve side by side: the pods of a gateway Deployment, or the sidecars of an
+app's pods, all with the same identity (one Secret). Turn **Replicas** on for the machine, on its
+page in the management UI or with `PATCH /api/v1/agents/{id}` and `{"replicas": true}`; whoever
+manages the machine can, and the audit log records it.
+
+* **Off** (the default), a copy that connects replaces the one before, as a laptop's agent does after
+  a network change.
+* **On**, up to 16 copies stay connected at once, and each gets requests for the tunnels it has
+  registered. A copy that's just started takes its share once its own declarations are in. The
+  server sends each new request or connection to the least busy connection, so a quiet tunnel may
+  stay with one copy until there's more than one request at a time.
+* **A copy that goes away**, in a rolling update or a scale-down, stops getting requests once its
+  connections close. One that vanishes without closing them, such as on a node that fails, is
+  dropped when its pings stop, within `session_timeout_secs` (45 s by default).
+* **Turning replicas off** keeps the newest copy, and disconnects the others.
+
+Copies share their tunnels' settings: the last copy to declare a tunnel sets them. During a rolling
+update that changes a tunnel's declaration, old and new copies take turns until the old ones are gone.
+A tunnel's visibility and tags never change this way: a copy registering a tunnel again after it
+reconnects keeps what the server has. The machine page shows how many copies are connected, and from
+where. Copies need magicpipes from this version on (protocol 11); an older copy waits for a readiness
+probe another copy may answer, and doesn't become ready.
+
 ## Docker
 
 ```bash
@@ -218,11 +243,7 @@ The token is used once, at the first start. After that the volume holds the iden
 
 ## Limits
 
-These are for the next phases of the [roadmap](ROADMAP.md#kubernetes-magicpipes-as-a-clusters-ingress):
-
-* **One machine serves from one place.** Two agents with the same identity take turns, each new
-  connection replacing the other's. So a gateway runs one replica, with `strategy: Recreate`, and a
-  sidecar's Secret is for one pod. Several agents serving one tunnel is phase 10c.
-* **A sidecar is a machine for each pod,** each with its own enrollment, so it suits an app with one
-  replica.
-* **No controller reads Ingress objects yet** (phase 10d). Tunnels are the declared lines.
+* **Different machines can't share a tunnel.** Copies of one machine can (replicas), so give every
+  pod that serves a tunnel the same identity.
+* **No controller reads Ingress objects yet** (phase 10d of the
+  [roadmap](ROADMAP.md#kubernetes-magicpipes-as-a-clusters-ingress)). Tunnels are the declared lines.

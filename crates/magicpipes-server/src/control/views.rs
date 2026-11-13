@@ -74,6 +74,13 @@ pub struct AgentView {
     pub protocol: Option<u32>,
     /// How many connections the agent holds now (0 while it's offline).
     pub connections: usize,
+    /// Several runs of it may serve at once (replicas); otherwise one replaces another.
+    pub replicas: bool,
+    /// Runs of it connected now: more than one only with replicas.
+    pub runs: usize,
+    /// Where each run connects from, oldest first.
+    #[serde(skip)]
+    pub remote_addrs: Vec<String>,
     /// The user the agent belongs to; absent for a service agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_user_id: Option<String>,
@@ -217,7 +224,10 @@ impl ControlPlane {
                 let s = link.map(|l| l.first());
                 AgentView {
                     connected: s.is_some(),
-                    connections: link.map_or(0, |l| l.lanes.len()),
+                    connections: link.map_or(0, |l| l.lanes().count()),
+                    replicas: a.replicas,
+                    runs: link.map_or(0, |l| l.runs.len()),
+                    remote_addrs: link.map(|l| l.runs.iter().filter_map(|r| r.lanes.first()).map(|s| s.remote.to_string()).collect()).unwrap_or_default(),
                     remote_addr: s.map(|s| s.remote.to_string()),
                     connected_at: s.map(|s| rfc3339(s.connected_at)),
                     protocol: s.map(|s| s.protocol),
