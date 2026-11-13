@@ -501,6 +501,93 @@ own identity, or to be reached pod by pod.
 5. **Plain transport over loopback only,** for an agent in the server's own pod, and only if a
    profile shows TLS matters.
 
+## Upgrades: the binary replaces itself, without downtime
+
+Asked for 2026-11-13. Today an upgrade stops the old process and starts the new one. For the server
+that takes every tunnel down until it's back and the agents have reconnected: 6 s in production on
+2026-11-13, most of it the process stopping and starting. For a machine, its tunnels go down while
+its agent restarts, and requests in flight are cut. Nothing tells a running binary that a newer
+release exists; the `outdated_agent` alert only compares protocol versions. This is about the
+binaries installed on a host (systemd, launchd, Windows, or started by hand), not container images,
+which upgrade by pulling a new image; a server in a container gets the check and the command to run,
+nothing more.
+
+* **Signed releases first.** Releases are GitHub archives with `SHA256SUMS` beside them, which prove
+  nothing to a binary installing itself: whoever can publish a release could ship code to every
+  server and machine. Each release gets a manifest (version, and per target the archive's URL and
+  SHA-256), signed with an Ed25519 key whose public half is built into the binaries and checked with
+  `ring`, which is already a dependency. A binary installs only a release signed by that key, for
+  its own target, and newer than itself. *Decided 2026-11-13:* the private key is a GitHub secret,
+  kept in a `release` environment so only the release workflow reads it, and that workflow signs
+  the manifest once every platform's build has passed. Whoever controls the repository can
+  therefore ship an upgrade; the owner accepted that. The release workflow also has to refuse a tag
+  that doesn't match the workspace version: 0.1.2 was tagged with no archives, and the binaries
+  still say 0.1.1.
+* **The check.** The server reads the latest manifest once a day on the control threads (one HTTPS
+  request to the release source, bounded in size and time, `[upgrades] check = false` to turn it
+  off, `[upgrades] source` for a mirror). Administrators see "0.2.0 is available" on the Settings
+  page; a release the manifest marks as a security fix opens an alert. Agents report their release
+  version as well as their protocol (protocol 12), so machine pages say what each runs. Agents
+  don't each call out: the server passes on the latest version as a hint, and the agent checks the
+  signature itself before acting on it.
+* **`magicpipesd --upgrade` and `magicpipes --upgrade`.** Download the release for this target,
+  check its signature and checksum, run the new binary's self-test against the live configuration,
+  replace the binary atomically (written beside it, then renamed; the old one kept for rolling
+  back), then hand over to it as below and report how that went. `--upgrade --check` says what's
+  available and whether this install can upgrade itself, and if not why: the binary isn't
+  writable, a package manager owns it (Homebrew, Nix, apt), or it runs in a container. `--json`
+  and new error codes as for every command. `--upgrade --rollback` goes back to the kept binary,
+  and for the server, the database backup taken before (what changed since is lost, so it asks
+  first).
+* **The server's handover**, on Linux and macOS:
+  1. Rehearse: migrate a copy of the database with the new binary, as deploys are rehearsed by hand
+     today, then back up the real one.
+  2. The old process stops background work (certificate renewals, sweeps, alerts) and changes (the
+     API and UI answer "upgrading, try again in a few seconds" for that short time), so the
+     database is the new process's alone.
+  3. It starts the new binary with its listening sockets inherited, so nothing is ever unbound. The
+     new process migrates the database, loads, and takes over the management listener.
+  4. The old process asks each agent to reconnect (protocol 12). Agents connect to the new process
+     and register their tunnels there, keeping their old connections for streams in flight. Until
+     they have, the old process keeps serving public traffic.
+  5. Once every machine has moved, or after 10 s, the old process stops accepting public
+     connections. A request the new one can't place yet, for a tunnel whose machine was connected
+     before, waits a few seconds for it instead of failing (bounded per tunnel).
+  6. The old process lets requests in flight finish, gives long connections (WebSockets, TCP
+     tunnels, SSH, terminals) up to `[upgrades] drain_secs`, then exits. Under systemd the new
+     process tells it its PID first (`sd_notify`'s `MAINPID`, with `Type=notify`).
+
+  If the new process fails its self-test or isn't ready in time, the old one stops it, puts the
+  previous binary back and carries on; if it had already migrated the database, the backup goes
+  back too, with nothing lost, since the old process stopped writing in step 2. What can't move
+  between processes is said up front: pending sign-ins, rate-limit counts and UDP flows start over,
+  and long connections end after the drain. Windows restarts plainly at first, with the short wait
+  in step 5 covering most of the gap.
+* **A machine's handover** is simpler, since the agent dials out: the new agent starts beside the
+  old, connects as a second run of the machine (the server's support for copies) marked as taking
+  over, and the server sends new streams to it while the old run finishes its own, even with
+  replicas off. Then the old agent hands over the lock and the CLI's socket, and exits. A background
+  agent started by the CLI does this itself; one under a service manager does it where the manager
+  allows a new main process (systemd), and restarts plainly where it doesn't (launchd), with the
+  server's short wait covering the gap. On Windows the running `.exe` is renamed aside before the
+  new one takes its name.
+* **The server, from the UI.** This is the point of the UI part: administrators upgrade the server
+  itself from the Settings page. A button names the effect ("Upgrades to 0.2.0 and migrates the
+  database. Connections stay up; long ones get 30 s to finish."), then a page follows the steps and
+  says how it ended, with the version now running. It needs the binary somewhere the server's own
+  user may write; otherwise the page shows the command to run instead. Administrators only
+  (`authorize`), with the CSRF token, and recorded in the audit log.
+* **Asking a machine to upgrade itself,** from its page in the UI or the API, opt-in. *Decided
+  2026-11-13.* The machine's own user turns it on with `magicpipes --upgrade --allow-remote` (and
+  off with `--deny-remote`); it's kept in the machine's `config.json`, which the server can't write,
+  and off by default. The agent reports it, so the button shows only where it's on. The server only
+  asks; the agent installs nothing but a signed release newer than its own, for its own target,
+  from its own release source, and hands over as above. So a hostile server can at most make an
+  opted-in machine install a genuine newer release early. Whoever manages the machine may ask
+  (`authorize`'s Manage rule), and it's in the audit log. This relaxes the rule that the server
+  never chooses what runs on an agent's machine, so ARCHITECTURE.md's security model changes with
+  it.
+
 ## Compatibility
 
 - New protocol fields default so old agents keep working (missing `kind` = `http`).
@@ -541,3 +628,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
 | 11d | Monitoring, probe: synthetic checks from the server, on by default; the agent says why it couldn't reach an app (protocol 10) | yes | done |
 | 11e | Monitoring, tell: alert email and webhooks; `magicpipes probe` from outside | yes | done |
+| 12 | Upgrades, check: signed release manifests, the daily check, `--upgrade --check`, machines' versions (protocol 12) ([plan](#upgrades-the-binary-replaces-itself-without-downtime)) | yes | planned (the key: a GitHub secret) |
+| 12b | Upgrades, server: `magicpipesd --upgrade` with the database rehearsed and backed up, a handover to the new process on inherited sockets, requests held while machines move, rollback | yes | planned |
+| 12c | Upgrades, machines: `magicpipes --upgrade`, a new run taking over from the old without cutting its streams | yes | planned |
+| 12d | Upgrades from the UI: the server itself, by administrators; and asking a machine to upgrade itself, where its own user turned that on (`--allow-remote`) | yes | planned (both approved) |
