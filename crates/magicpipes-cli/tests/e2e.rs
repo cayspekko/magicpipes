@@ -5980,7 +5980,8 @@ async fn an_agent_in_a_container_serves_what_its_environment_declares() {
         ("MAGICPIPES_TUNNELS", declared),
     ]);
     env.eventually("the agent to be live", Duration::from_secs(20), || async { health_get(health, "/livez").await.is_some_and(|(s, _)| s == 200) }).await;
-    env.eventually("the shop", Duration::from_secs(30), || async { env.get_public(&host("shop"), "/").await.0 == StatusCode::OK }).await;
+    // A status, or `None` while the server has no certificate for the name yet.
+    env.eventually("the shop", Duration::from_secs(30), || async { env.public_status(&host("shop")).await == Some(StatusCode::OK) }).await;
     env.eventually("the late app to be waited for", Duration::from_secs(20), || async {
         ready().await.is_some_and(|(s, body)| s == 503 && body.contains(r#"{"error":"local_unreachable","tunnel":"late"}"#))
     })
@@ -5997,7 +5998,7 @@ async fn an_agent_in_a_container_serves_what_its_environment_declares() {
     // Started again with one tunnel fewer: enrolled already, it removes the other.
     let second = run("pod", &[("MAGICPIPES_TUNNELS", format!("{} --name shop --public", app.port))]);
     env.eventually("the agent to be ready again", Duration::from_secs(30), || async { ready().await.is_some_and(|(s, _)| s == 200) }).await;
-    env.eventually("the late tunnel to go", Duration::from_secs(15), || async { env.get_public(&host("late"), "/").await.0 == StatusCode::NOT_FOUND }).await;
+    env.eventually("the late tunnel to go", Duration::from_secs(15), || async { env.public_status(&host("late")).await == Some(StatusCode::NOT_FOUND) }).await;
     assert_eq!(env.get_public(&host("shop"), "/").await.0, StatusCode::OK);
     stop(second).await;
 
