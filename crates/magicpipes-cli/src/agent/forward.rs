@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use magicpipes_core::mux::{COPY_BUFFER, MuxStream};
@@ -25,18 +25,40 @@ use crate::state::Target;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Accepts inbound streams until the session ends. Each stream runs on its own task, so one
-/// slow or failing local application never blocks other tunnels. `server_protocol`: the
-/// server's, which decides whether it's told why an app couldn't be reached.
-pub async fn serve(mut inbound: mpsc::Receiver<MuxStream>, tunnels: Arc<Tunnels>, server_protocol: u32) {
-    let reasons = server_protocol >= REASONS_PROTOCOL;
-    while let Some(stream) = inbound.recv().await {
-        let tunnels = tunnels.clone();
-        tokio::spawn(async move { handle(stream, tunnels, reasons).await });
+/// What a connection's server asks of the agent, rather than of a tunnel (protocol 12).
+#[derive(Clone)]
+pub struct Asks {
+    /// The server is handing over to a new version: this connection should connect again.
+    pub reconnect: Arc<tokio::sync::Notify>,
+    /// Upgrade to the latest release; `None` unless this agent's user allows it.
+    pub upgrade: Option<mpsc::Sender<()>>,
+    /// Streams under way, across the agent's connections: a take-over waits for them.
+    pub active: Arc<AtomicUsize>,
+}
+
+/// Counts a stream as under way while it lives.
+struct Active(Arc<AtomicUsize>);
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>, reasons: bool) {
+/// Accepts inbound streams until the session ends. Each stream runs on its own task, so one
+/// slow or failing local application never blocks other tunnels. `server_protocol`: the
+/// server's, which decides whether it's told why an app couldn't be reached.
+pub async fn serve(mut inbound: mpsc::Receiver<MuxStream>, tunnels: Arc<Tunnels>, server_protocol: u32, asks: Asks) {
+    let reasons = server_protocol >= REASONS_PROTOCOL;
+    while let Some(stream) = inbound.recv().await {
+        let (tunnels, asks) = (tunnels.clone(), asks.clone());
+        tokio::spawn(async move { handle(stream, tunnels, reasons, asks).await });
+    }
+}
+
+async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>, reasons: bool, asks: Asks) {
+    asks.active.fetch_add(1, Ordering::SeqCst);
+    let _active = Active(asks.active.clone());
     let open = match tokio::time::timeout(HEADER_TIMEOUT, proto::read_frame_bytes(&mut stream)).await {
         Ok(Ok(body)) => serde_json::from_slice::<ServerOpen>(&body),
         _ => return,
@@ -54,6 +76,18 @@ async fn handle(mut stream: MuxStream, tunnels: Arc<Tunnels>, reasons: bool) {
     match open {
         ServerOpen::Ping => {
             let _ = StreamStatus::Ok.write(&mut stream).await;
+            let _ = stream.shutdown().await;
+        }
+        ServerOpen::Reconnect => {
+            let _ = StreamStatus::Ok.write(&mut stream).await;
+            let _ = stream.shutdown().await;
+            asks.reconnect.notify_one();
+        }
+        ServerOpen::Upgrade => {
+            // Only where this machine's user allows it; the agent then checks the release itself.
+            let started = asks.upgrade.as_ref().is_some_and(|tx| tx.try_send(()).is_ok());
+            let status = if started { StreamStatus::Ok } else { StreamStatus::Unsupported };
+            let _ = status.write(&mut stream).await;
             let _ = stream.shutdown().await;
         }
         ServerOpen::TunnelRemoved { tunnel_id } => {
@@ -222,15 +256,36 @@ mod tests {
 
     use super::*;
 
+    fn asks() -> Asks {
+        Asks { reconnect: Arc::default(), upgrade: None, active: Arc::default() }
+    }
+
     /// The status byte the agent answers a server-opened stream with.
     async fn status_for(header: serde_json::Value) -> u8 {
+        status_with(header, asks()).await
+    }
+
+    async fn status_with(header: serde_json::Value, asks: Asks) -> u8 {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (server, _rpcs) = mux::spawn(a, Mode::Server);
         let (_agent, inbound) = mux::spawn(b, Mode::Client);
-        tokio::spawn(serve(inbound, Arc::new(Tunnels::default()), proto::PROTOCOL_VERSION));
+        tokio::spawn(serve(inbound, Arc::new(Tunnels::default()), proto::PROTOCOL_VERSION, asks));
         let mut s = server.open(Duration::from_secs(5)).await.unwrap();
         proto::write_frame(&mut s, &header).await.unwrap();
         s.read_u8().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_server_may_ask_to_reconnect_and_to_upgrade_only_where_allowed() {
+        let a = asks();
+        assert_eq!(status_with(json!({ "kind": "reconnect" }), a.clone()).await, StreamStatus::Ok.byte());
+        tokio::time::timeout(Duration::from_secs(5), a.reconnect.notified()).await.expect("the connection is told to move");
+        // Not allowed: no channel, so the agent declines.
+        assert_eq!(status_for(json!({ "kind": "upgrade" })).await, StreamStatus::Unsupported.byte());
+        let (tx, mut rx) = mpsc::channel(1);
+        let allowed = Asks { upgrade: Some(tx), ..asks() };
+        assert_eq!(status_with(json!({ "kind": "upgrade" }), allowed).await, StreamStatus::Ok.byte());
+        assert!(rx.try_recv().is_ok(), "the agent's upgrade task hears it");
     }
 
     /// What a server at `protocol` hears when the tunnel's app refuses the connection.
@@ -242,7 +297,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (server, _rpcs) = mux::spawn(a, Mode::Server);
         let (_agent, inbound) = mux::spawn(b, Mode::Client);
-        tokio::spawn(serve(inbound, tunnels, protocol));
+        tokio::spawn(serve(inbound, tunnels, protocol, asks()));
         let mut s = server.open(Duration::from_secs(5)).await.unwrap();
         proto::write_frame(&mut s, &json!({ "kind": "data", "tunnel_id": "tn_1" })).await.unwrap();
         let status = s.read_u8().await.unwrap();

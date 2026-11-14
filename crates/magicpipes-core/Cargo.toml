@@ -17,3 +17,18 @@ sha2.workspace = true
 getrandom.workspace = true
 time.workspace = true
 tracing.workspace = true
+# Releases: checking their signatures, and downloading them (`release`, `upgrade`).
+ring.workspace = true
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -18,8 +18,9 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// `allow_sensitive_root` and `allow_any`. 6: `unix` and `allow_sensitive_socket`. 7: the kind
 /// `ssh`. 8: private TCP and UDP tunnels, which an older agent refuses, or opens a public port for.
 /// 9: the kind `rdp`. 10: the kind `vnc`. 11: `local_https`, which an older agent would ignore and
-/// send plain HTTP to an app that only speaks HTTPS.
-pub const IPC_VERSION: u32 = 11;
+/// send plain HTTP to an app that only speaks HTTPS. 12: `hand_over`, a new agent taking over
+/// without a gap; an older agent answers `bad_request`.
+pub const IPC_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -30,6 +31,8 @@ pub enum IpcRequest {
     Status,
     /// Stop the agent. With `if_idle`, only if it serves no tunnels and runs no operations.
     Shutdown { if_idle: bool },
+    /// Hand over to the binary at the agent's path: a new agent takes over without a gap.
+    HandOver,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

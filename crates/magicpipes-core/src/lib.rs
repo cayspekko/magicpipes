@@ -2,23 +2,30 @@
 //!
 //! * [`cidr`] — client network allow-lists for port tunnels.
 //! * [`error`] — the error codes shared by the API, RPCs, the CLI and server-generated pages.
+//! * [`fds`] — handing sockets and files to a new process (Unix), for upgrades without downtime.
 //! * [`proto`] — the agent <-> server wire protocol (RPC frames and data-stream headers).
+//! * [`release`] — release manifests, their signatures, and versions.
 //! * [`mux`] — a small driver that runs a yamux session on a Tokio task.
 //! * [`names`] — tunnel name validation and random name generation.
 //! * [`secret`] — token generation, hashing and constant-time comparison.
 //! * [`tags`] — tag syntax.
 //! * [`theme`] — the shared stylesheet and logo used by every HTML page.
+//! * [`upgrade`] — downloading a release and putting it in place of this binary.
 //! * [`url`] — percent-encoding.
 
 pub mod cidr;
 pub mod error;
+#[cfg(unix)]
+pub mod fds;
 pub mod mux;
 pub mod names;
 pub mod proto;
+pub mod release;
 pub mod secret;
 pub mod tags;
 pub mod terminal;
 pub mod theme;
+pub mod upgrade;
 pub mod url;
 
 /// Seconds since the Unix epoch.

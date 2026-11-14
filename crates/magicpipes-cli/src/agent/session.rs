@@ -18,8 +18,8 @@ use hyper_util::rt::TokioIo;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::{self, Mode, MuxHandle, MuxStream};
 use magicpipes_core::proto::{
-    self, AGENT_CONNECT_PATH, CONNECTIONS_PROTOCOL, INSTANCE_HEADER, MAX_CONNECTIONS, PROTOCOL_HEADER, PROTOCOL_VERSION, RegisterTunnel,
-    Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL, Visibility,
+    self, AGENT_CONNECT_PATH, CONNECTIONS_PROTOCOL, INSTANCE_HEADER, MAX_CONNECTIONS, PROTOCOL_HEADER, PROTOCOL_VERSION, REMOTE_UPGRADE_HEADER,
+    REPLACES_HEADER, RegisterTunnel, Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL, VERSION_HEADER, Visibility,
 };
 use rustls::ClientConfig;
 use tokio::io::AsyncWriteExt;
@@ -34,6 +34,9 @@ use crate::state::{AgentConfig, LocalTunnel};
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A connection the server asked to replace stays until the server closes it, which it does once
+/// what's on it is done (at most its `upgrades.drain_secs`, up to an hour); this is the backstop.
+const RETIRE_WITHIN: Duration = Duration::from_secs(2 * 3600);
 /// A session that lasted this long resets the reconnect backoff; a shorter one (the server closing
 /// it at once, say, or another machine with the same credentials) keeps it growing.
 const STABLE_SESSION: Duration = Duration::from_secs(30);
@@ -81,6 +84,20 @@ pub struct Session {
     reached: watch::Sender<u32>,
     /// Re-registering the tunnels after the agent was offline; stopped if it goes offline again.
     restoring: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The run of this agent this one takes over from (an upgrade), sent on every connection.
+    replaces: Option<String>,
+    /// Where the server's request to upgrade goes, if this machine's user allows it.
+    upgrades: Mutex<Option<mpsc::Sender<()>>>,
+    /// Streams under way on any connection.
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// How a connection ended.
+enum Served {
+    /// Lost or closed.
+    Ended,
+    /// The server asked for a new one (protocol 12); this one stays for what's on it.
+    Moving,
 }
 
 #[derive(Debug)]
@@ -101,7 +118,8 @@ impl std::fmt::Display for RpcError {
 }
 
 impl Session {
-    pub fn new(cfg: AgentConfig, tunnels: Arc<Tunnels>) -> anyhow::Result<Arc<Self>> {
+    /// `replaces`: the instance of the run this one takes over from, at an upgrade.
+    pub fn new(cfg: AgentConfig, tunnels: Arc<Tunnels>, replaces: Option<String>) -> anyhow::Result<Arc<Self>> {
         let tls = https::tls_config(cfg.ca_cert_pem.as_deref())?;
         let (state, _) = watch::channel(ConnState::Connecting { attempt: 0, last_error: None });
         let wanted = connections_wanted(cfg.connections, std::env::var("MAGICPIPES_CONNECTIONS").ok().as_deref());
@@ -115,7 +133,30 @@ impl Session {
             lanes: Mutex::new(vec![None; wanted]),
             reached: watch::Sender::new(0),
             restoring: Mutex::new(None),
+            replaces,
+            upgrades: Mutex::new(None),
+            active: Arc::default(),
         }))
+    }
+
+    /// Which run of the agent this is, as its connections say.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// Lets the server's requests to upgrade reach `tx`; done only where the machine's user allows
+    /// it (`allow_remote_upgrade`).
+    pub fn take_upgrade_requests(&self, tx: mpsc::Sender<()>) {
+        *self.upgrades.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub fn config(&self) -> &AgentConfig {
+        &self.cfg
+    }
+
+    /// Streams under way on any of its connections.
+    pub fn active_streams(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many connections to the server are open now.
@@ -154,6 +195,7 @@ impl Session {
     /// has no room for more.
     async fn lane(self: Arc<Self>, lane: usize, shutdown: CancellationToken) {
         let mut attempt: u32 = 0;
+        let mut moved = false;
         loop {
             if lane > 0 && !self.server_keeps_connections(&shutdown).await {
                 return;
@@ -171,9 +213,15 @@ impl Session {
                         continue;
                     }
                     let started = std::time::Instant::now();
-                    self.serve(lane, handle, inbound, server_protocol, &shutdown).await;
+                    let served = self.serve(lane, handle, inbound, server_protocol, moved, &shutdown).await;
                     if shutdown.is_cancelled() {
                         return;
+                    }
+                    moved = matches!(served, Served::Moving);
+                    if moved {
+                        // To the server's new version, at once.
+                        attempt = 0;
+                        continue;
                     }
                     attempt = if started.elapsed() >= STABLE_SESSION { 0 } else { attempt.saturating_add(1) };
                     tracing::warn!(lane, attempt, "connection to the server lost; reconnecting");
@@ -223,11 +271,30 @@ impl Session {
     fn up(&self, lane: usize, handle: &MuxHandle, server_protocol: u32) -> bool {
         let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
         let first = lanes.iter().flatten().all(|h| h.is_closed());
-        lanes[lane] = Some(handle.clone());
+        let before = lanes[lane].replace(handle.clone());
         if first {
             self.state.send_replace(ConnState::Connected { handle: handle.clone(), since: magicpipes_core::unix_now(), server_protocol });
+        } else if let Some(before) = before {
+            // A connection that moved: RPCs go on its replacement from now on.
+            self.state.send_if_modified(|s| match s {
+                ConnState::Connected { handle: h, server_protocol: p, .. } if h.same_session(&before) => {
+                    *h = handle.clone();
+                    *p = server_protocol;
+                    true
+                }
+                _ => false,
+            });
         }
         first
+    }
+
+    /// A connection the server asked to replace has closed: if its lane hasn't connected again
+    /// meanwhile, that lane is down.
+    fn retired(&self, lane: usize, handle: &MuxHandle) {
+        let still = self.lanes.lock().unwrap_or_else(|e| e.into_inner())[lane].as_ref().is_some_and(|h| h.same_session(handle));
+        if still {
+            self.down(lane, handle);
+        }
     }
 
     /// A lane's connection is gone. While others are open, RPCs move to one of them; with none
@@ -258,16 +325,23 @@ impl Session {
     async fn connect(&self) -> Result<(MuxHandle, mpsc::Receiver<MuxStream>, u32), ConnectError> {
         let (host, port) = https::parse_server(&self.cfg.server)?;
         let stream = https::connect(&host, port, &self.tls, None).await?;
-        let req = Request::get(AGENT_CONNECT_PATH)
+        let mut req = Request::get(AGENT_CONNECT_PATH)
             .header(header::HOST, https::host_header(&host, port))
             .header(header::AUTHORIZATION, format!("Bearer {}", self.cfg.agent_token))
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, UPGRADE_PROTOCOL)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
             .header(INSTANCE_HEADER, &self.instance)
-            .header(header::USER_AGENT, concat!("magicpipes/", env!("CARGO_PKG_VERSION")))
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| ConnectError::Other(e.into()))?;
+            .header(VERSION_HEADER, env!("CARGO_PKG_VERSION"))
+            .header(header::USER_AGENT, concat!("magicpipes/", env!("CARGO_PKG_VERSION")));
+        // Only where it can upgrade itself without a gap.
+        if self.cfg.allow_remote_upgrade && cfg!(unix) {
+            req = req.header(REMOTE_UPGRADE_HEADER, "1");
+        }
+        if let Some(old) = &self.replaces {
+            req = req.header(REPLACES_HEADER, old);
+        }
+        let req = req.body(Full::new(Bytes::new())).map_err(|e| ConnectError::Other(e.into()))?;
         let resp = tokio::time::timeout(Duration::from_secs(15), https::send(stream, req))
             .await
             .map_err(|_| ConnectError::Other(anyhow!("server did not answer the connect request")))??;
@@ -285,15 +359,20 @@ impl Session {
         Ok((handle, inbound, server_protocol))
     }
 
+    /// Serves one connection until it ends, or the server asks for a new one: `moved` says this
+    /// is that new one.
     async fn serve(
         self: &Arc<Self>,
         lane: usize,
         handle: MuxHandle,
         inbound: mpsc::Receiver<MuxStream>,
         server_protocol: u32,
+        moved: bool,
         shutdown: &CancellationToken,
-    ) {
-        if self.up(lane, &handle, server_protocol) {
+    ) -> Served {
+        // The server's new version knows nothing of the tunnels' runs yet: the first lane
+        // registers them again there.
+        if self.up(lane, &handle, server_protocol) || (moved && lane == 0) {
             tracing::info!(server = %self.cfg.server, server_protocol, "connected to server");
             // Back from offline: the server may have lost track of the tunnels meanwhile.
             let me = self.clone();
@@ -304,17 +383,28 @@ impl Session {
         } else {
             tracing::debug!(lane, "another connection to the server");
         }
-        let fwd = tokio::spawn(forward::serve(inbound, self.tunnels.clone(), server_protocol));
+        let reconnect = Arc::new(tokio::sync::Notify::new());
+        let asks = forward::Asks {
+            reconnect: reconnect.clone(),
+            upgrade: self.upgrades.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            active: self.active.clone(),
+        };
+        let fwd = tokio::spawn(forward::serve(inbound, self.tunnels.clone(), server_protocol, asks));
 
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
         // A ping that times out means the connection is gone. One that fails outright is
         // tolerated once: a busy session can briefly refuse a new stream.
         let mut failed = 0;
+        let mut moving = false;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = handle.closed() => break,
+                _ = reconnect.notified() => {
+                    moving = true;
+                    break;
+                }
                 _ = ping.tick() => {
                     match tokio::time::timeout(PING_TIMEOUT, rpc_on(&handle, &Rpc::Ping)).await {
                         Ok(Ok(RpcResponse::Pong)) => failed = 0,
@@ -333,9 +423,24 @@ impl Session {
                 }
             }
         }
+        if moving && !shutdown.is_cancelled() {
+            tracing::info!(lane, "the server is handing over to a new version; connecting to it");
+            // This connection stays for what's on it, until the server closes it.
+            let me = self.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = handle.closed() => {}
+                    _ = tokio::time::sleep(RETIRE_WITHIN) => handle.close(),
+                }
+                fwd.abort();
+                me.retired(lane, &handle);
+            });
+            return Served::Moving;
+        }
         handle.close();
         fwd.abort();
         self.down(lane, &handle);
+        Served::Ended
     }
 
     /// Re-registers every local tunnel on a new session (idempotent on the server). Each one is

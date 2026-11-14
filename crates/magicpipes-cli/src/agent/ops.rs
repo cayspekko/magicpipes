@@ -43,6 +43,11 @@ pub struct Agent {
     tls: Arc<ClientConfig>,
     inflight: AtomicUsize,
     started_at: i64,
+    /// What a background agent can hand to a new one taking over (`takeover`).
+    #[cfg(unix)]
+    pub handing: std::sync::OnceLock<super::takeover::Handing>,
+    /// Started by a command, in the background, rather than with `agent run`.
+    pub detached: std::sync::atomic::AtomicBool,
 }
 
 struct Events<'a>(&'a mpsc::Sender<IpcEvent>);
@@ -69,6 +74,9 @@ impl Agent {
             tls,
             inflight: AtomicUsize::new(0),
             started_at: magicpipes_core::unix_now(),
+            #[cfg(unix)]
+            handing: std::sync::OnceLock::new(),
+            detached: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -573,6 +581,14 @@ impl Agent {
         (ready, json!({ "ready": ready, "connection": conn, "waiting": waiting }))
     }
 
+    /// For a take-over: connected, and every tunnel either registered on this session or turned
+    /// down by the server (as the agent before it may have had it too). What it still waits for.
+    pub fn settled(&self) -> Result<(), Value> {
+        let (conn, _) = self.connection();
+        let pending: Vec<Value> = self.tunnels.snapshots().iter().filter(|s| s.registration == Registration::Pending).map(|s| json!(s.tunnel.name)).collect();
+        if conn == "connected" && pending.is_empty() { Ok(()) } else { Err(json!({ "connection": conn, "pending": pending })) }
+    }
+
     pub fn list(&self) -> Value {
         let (conn, _) = self.connection();
         let tunnels: Vec<Value> = self
@@ -617,6 +633,9 @@ impl Agent {
                 "running": true,
                 "pid": std::process::id(),
                 "version": magicpipes_core::VERSION,
+                "exe": magicpipes_core::upgrade::exe(),
+                "detached": self.detached.load(Ordering::Relaxed),
+                "allow_remote_upgrade": self.session.config().allow_remote_upgrade,
                 "ipc_version": crate::ipc::IPC_VERSION,
                 "started_at": magicpipes_core::rfc3339(self.started_at),
             },

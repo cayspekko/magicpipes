@@ -65,8 +65,11 @@ change and say why.
   Keep the `old_peers_still_parse` tests passing and extend them.
 - **Persistent formats are append-only.** SQLite schema changes go in a new entry at the end of
   `MIGRATIONS` in `store.rs` (never edit a shipped entry); add a test that migrates an old
-  database. `~/.magicpipes/tunnels.json` and `config.json` must keep loading files written by
-  older versions.
+  database. A migration must keep the previous release working on the migrated database (add
+  tables and columns with defaults; rename or drop only a release later): during an upgrade
+  without downtime both run on it for a moment (ARCHITECTURE.md "Upgrades without downtime").
+  `~/.magicpipes/tunnels.json` and `config.json` must keep loading files written by older
+  versions.
 - **OS-specific code lives in `magicpipes-cli/src/platform.rs`** (sockets, pipes, process
   spawning, file permissions). Everything else stays portable across macOS, Linux and Windows.
 - **Stable machine interfaces.** `--json` output fields, error codes (snake_case strings such as

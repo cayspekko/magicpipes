@@ -66,6 +66,7 @@ present a URL. Act on the code:
 | 3 | `forbidden` | The user doesn't hold that tag (or it is someone's personal tag). Retry without `--tag`, or ask the user. |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready. For `tls_timeout`, retry after ~30 s. For `tls_failed`, report the message to the user (server DNS/port 80 problem). |
 | 8 | `probe_failed` | The URL did not reach the app. Report the message; if the app needs a specific path to answer, retry with `--probe-path /health`. |
+| 9 | `release_unreachable`, `release_invalid`, `upgrade_not_possible`, `upgrade_failed` | Only from `--upgrade`: report the message. `release_invalid` means nothing was installed; `upgrade_not_possible` says why this install can't replace itself (a package manager, a container, a directory it can't write); `upgrade_failed` means the old version carries on. Don't work around any of them. |
 
 `magicpipes status --json` says how many connections the agent holds to the server
 (`connections`, 4 normally). If the user's service sees `agent_busy` under heavy load, a gateway
@@ -150,6 +151,13 @@ URL>` off an enrolled machine). It checks HTTP tunnels and public TCP ports the 
 from this computer, prints `{"results":[{"tunnel_id","name","url","ok","said"}],"reported"}`, and
 reports to the server. Exit 8 (`probe_failed`, with an `error` in the JSON) means a check failed:
 `said` gives why (DNS, refused, TLS, timeout). Run from the server's own network it proves little.
+
+To upgrade magicpipes itself, only when the user asks: `magicpipes --upgrade --check --json` says
+whether a newer release is available (`newer`, `latest`, `can_upgrade`, `why_not`), and
+`magicpipes --upgrade --json` installs it (the release's signature is checked first) and has a new
+agent take over without dropping a connection (`upgraded`, `from`, `to`, `pid`). Don't run
+`--allow-remote`, which lets the server ask this machine to upgrade itself, unless the user asks
+for exactly that.
 
 ## Notes
 

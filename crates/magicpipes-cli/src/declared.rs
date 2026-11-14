@@ -95,10 +95,11 @@ pub fn parse(text: &str, source: &str) -> Result<Vec<Declared>, String> {
 pub fn declare(words: Vec<String>) -> Result<Declared, String> {
     let args = ["magicpipes", "add"].into_iter().map(String::from).chain(words);
     let cli = Cli::try_parse_from(args).map_err(|e| clap_message(&e))?;
-    if let Some((_, msg)) = add_args_problem(&cli.command) {
+    let command = cli.command.ok_or("not a tunnel")?;
+    if let Some((_, msg)) = add_args_problem(&command) {
         return Err(msg.to_string());
     }
-    let (mut req, _) = add_request(cli.command).ok_or("not a tunnel")?;
+    let (mut req, _) = add_request(command).ok_or("not a tunnel")?;
     let label = match (&req.name, &req.hostname) {
         (Some(name), _) => name.clone(),
         (None, Some(hostname)) => hostname.trim().trim_end_matches('.').to_ascii_lowercase(),

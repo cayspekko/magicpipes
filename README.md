@@ -579,7 +579,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# notify: the server says when it's ready, and names its new process at an upgrade.
+Type=notify
+NotifyAccess=all
 ExecStart=/usr/local/bin/magicpipesd --config /etc/magicpipes/magicpipesd.toml
+# `systemctl reload` restarts it without downtime (see "Upgrades without downtime").
+ExecReload=/bin/kill -USR2 $MAINPID
 Restart=on-failure
 User=magicpipes
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -590,7 +595,48 @@ WantedBy=multi-user.target
 ```
 
 The server shuts down gracefully on `SIGTERM`: it stops accepting connections, closes agent
-sessions (agents reconnect when it is back) and gives in-flight requests up to 15 s.
+sessions (agents reconnect when it is back) and gives in-flight requests up to 15 s. A unit with
+`Type=simple` still works; it just can't be upgraded without downtime.
+
+### Upgrades without downtime
+
+Once a day the server looks for a new release (one request to the project's latest GitHub release,
+`[upgrades] check = false` to stop it), and administrators see it on the **Settings** page. A
+release only counts if it's signed by a key built into the binaries; a release that fixes a
+security problem opens an alert until the server has it.
+
+```bash
+magicpipesd --config /etc/magicpipes/magicpipesd.toml --upgrade --check   # what's available
+sudo magicpipesd --config /etc/magicpipes/magicpipesd.toml --upgrade      # move to it
+```
+
+`--upgrade` downloads this platform's binary, checks its signature and checksum, runs it, and puts
+it in place of the running server's binary, keeping the old one beside it (`magicpipesd.old`). Then
+the running server hands over to it, which nobody using a tunnel notices:
+
+1. It backs up the database into `<data_dir>/backups` (the newest 5 are kept), and has the new
+   version read the configuration and migrate a copy of it. Anything it refuses stops the upgrade
+   here, and the old version carries on.
+2. It starts the new version with its listening sockets, so none ever closes, and waits until it's
+   ready (certificates loaded, database migrated).
+3. It stops accepting connections, and asks each machine to connect again, which reaches the new
+   version. Meanwhile the new version holds requests for those machines' tunnels for a moment
+   (`[upgrades] hold_secs`, 15) instead of failing them.
+4. It finishes the requests and connections it has, up to `[upgrades] drain_secs` (30), and exits.
+
+An administrator can do the same with the button on the **Settings** page, which shows each step as
+it goes, if the server's own user may write to its binary's directory; otherwise the page shows
+the command. `--upgrade --restart` hands over to the binary in place without downloading anything
+(after you installed one yourself, or to restart without downtime; `systemctl reload` does the
+same), and `--upgrade --rollback` puts back the binary the last upgrade replaced. `--json` prints
+the outcome as JSON. Machines older than protocol 12 move too: their connection is closed once
+it's idle, and they reconnect.
+
+What can't move between processes starts over: sign-ins and `magicpipes login` approvals in
+progress, rate-limit counts, the last day of history kept in memory (the 5-minute history in the
+database stays), and UDP flows. Long connections (WebSockets, TCP tunnels, terminals) end after
+`drain_secs`. It works on Linux and macOS; it needs `Type=notify` under systemd, and isn't for
+launchd or Windows (restart the service) or containers (pull the new image).
 
 ---
 
@@ -1182,6 +1228,7 @@ On failure:
 | 6 | `name_conflict`, `name_taken`, `email_taken`, `tag_unknown`, `public_not_allowed`, `invalid_name`, `limit_reached`, `not_found`, `port_unavailable`, `kind_mismatch`, `ports_disabled`, `ssh_disabled`, `ssh_key_taken`, `server_outdated`, `unsupported`, `invalid_cidr`, `mail_not_configured` | Naming/registry, the server cannot give out that port, or the server needs a newer version |
 | 7 | `tls_failed`, `tls_timeout` | Certificate not ready |
 | 8 | `probe_failed` | Public URL did not reach the application |
+| 9 | `release_unreachable`, `release_invalid`, `upgrade_not_possible`, `upgrade_failed` | `--upgrade`: no release to be read, one whose signature or checksum doesn't match (nothing installed), an install that can't replace itself (a package manager or a container owns it, its directory isn't writable, or the build trusts no release key), or a new version that didn't take over (the old one carries on, its binary back) |
 
 `name_conflict`: one of your own tunnels already uses the name for another target. `name_taken`:
 another machine's agent owns it. `busy`: the local agent is in the middle of a conflicting operation.
@@ -1246,6 +1293,28 @@ These are read only by `agent run` in the foreground. [docs/KUBERNETES.md](docs/
 gateway Deployment, a sidecar, and replicas: several copies of one machine serving side by side,
 once **Replicas** is on for it (its page in the UI, or `PATCH /api/v1/agents/{id}`).
 
+### Upgrading magicpipes
+
+```bash
+magicpipes --upgrade --check     # what's available
+magicpipes --upgrade             # move to it without dropping a connection
+```
+
+`--upgrade` downloads this platform's binary from the latest release, checks its signature and
+checksum, runs it, and puts it in place of this machine's `magicpipes`, keeping the old one beside
+it (`magicpipes.old`). A new agent then starts from it and takes over from the running one, which
+finishes what it's serving first: visitors notice nothing. `--upgrade --restart` does the take-over
+alone (after installing a binary yourself), and `--upgrade --rollback` puts back the binary the last
+upgrade replaced. An agent started with `agent run` (a service, a container) isn't taken over: put
+the new binary in place, then restart it, or pull the new image. The take-over needs Linux or macOS;
+on Windows, `magicpipes agent stop` and start it again.
+
+**Upgrades the server asks for.** `magicpipes --upgrade --allow-remote` lets whoever manages the
+machine on the server ask it to upgrade, from its page in the UI or the API: the agent then reads
+the latest release from its own source (`MAGICPIPES_RELEASE_SOURCE`, else the project's), checks the
+signature itself, and installs nothing else, so the server can only ask. Off unless you turn it on;
+`--deny-remote` turns it off again.
+
 ### Connections to the server
 
 The agent holds 4 connections to the server, and the server spreads its tunnels' traffic across
@@ -1278,6 +1347,7 @@ others go on serving while it reconnects. `magicpipes status` shows how many are
 | `MAGICPIPES_API_TOKEN` | API token for `connect`, instead of signing in in a browser |
 | `MAGICPIPES_LOG` | Agent log filter, e.g. `debug` |
 | `MAGICPIPES_CONNECTIONS` | Connections the agent holds to the server, 1 to 8 (default 4, or `connections` in `config.json`) |
+| `MAGICPIPES_RELEASE_SOURCE` | Where `--upgrade` reads releases from (`release.json` and its signature) instead of the project's latest GitHub release |
 | `MAGICPIPES_PROBE_ADDR` | Testing: connect readiness probes to this IP instead of resolving DNS |
 
 ---
@@ -1295,7 +1365,10 @@ answer `403 forbidden` to members.
 | GET | `/api/v1/tunnels` | `{"tunnels": [...]}` |
 | GET | `/api/v1/tunnels/{id or name}` | One tunnel |
 | DELETE | `/api/v1/tunnels/{id or name}` | 204; the owning agent is notified and stops serving it; 404 if absent |
-| GET | `/api/v1/agents` | Enrolled agents and connection state (`connections`: how many are open) |
+| GET | `/api/v1/agents` | Enrolled agents and connection state (`connections`: how many are open; `version`: the connected agent's release; `remote_upgrade`: its user lets the server ask it to upgrade) |
+| POST | `/api/v1/agents/{id}/upgrade` | 202; asks the machine to upgrade itself, which it does only if its user allowed it (`magicpipes --upgrade --allow-remote`, else 409 `upgrade_not_possible`); whoever manages it may ask |
+| GET | `/api/v1/server/upgrade` | Administrators: `running`, `latest`, `newer`, `security`, `notes`, `checked_at`, `why_not` (why the server can't upgrade itself, if it can't) and `last` (how the last upgrade went); `?check=true` asks the release source first |
+| POST | `/api/v1/server/upgrade` | Administrators: 202 `{"id"}`; starts upgrading to the latest release, as the Settings page does; follow it with GET |
 | DELETE | `/api/v1/agents/{id}` | 204; revokes the credential, closes the session, deletes its tunnels; 404 if absent |
 | POST | `/api/v1/enrollments` | 201 `{"enrollment_token", "expires_in_secs"}`; optional body `{"owner_user_id"?, "tags"?, "allow_public"?, "default_private"?}`; `tags` only for a service agent (no owner). Members may enroll only their own machines |
 | POST | `/api/v1/enroll` | Exchange an enrollment token for agent credentials (used by `login`) |
@@ -1556,17 +1629,28 @@ release is published:
    runners for Linux ARM64);
 3. `scripts/smoke-test.sh` against each build on that OS: real server with a dev CA, login,
    `add`, a public HTTPS request through the tunnel, `agent stop`;
-4. if every platform passed, the four archives and `SHA256SUMS` are attached to the release.
+4. if every platform passed, the four archives, the bare binaries, `SHA256SUMS` and the manifest
+   `--upgrade` reads are attached to the release: `release.json`, listing each binary's address
+   and SHA-256, and `release.json.sig`, its Ed25519 signature.
 
-To publish, create a GitHub release with a tag such as `v0.2.0` on a commit from `main`. The
-workflow refuses tags that aren't on `main`, and warns if the tag doesn't match the `version`
-in `Cargo.toml` (bump that first so `--version` is right). The toolchain is pinned to Rust 1.99.
+To publish, create a GitHub release with a tag such as `0.2.0` on a commit from `main`. The
+workflow refuses tags that aren't on `main` or don't match the `version` in `Cargo.toml` (bump that
+first: binaries compare it with the release's to decide whether to upgrade). Release notes that
+contain `[security]` mark it as a security fix. The toolchain is pinned to Rust 1.99.
+
+The manifest is signed in the `publish` job, which runs in a GitHub environment named `release`
+holding the secret `MAGICPIPES_RELEASE_KEY`. To set it up once, run `scripts/release-key.sh`, which
+makes the key with OpenSSL, add the public key it prints to `RELEASE_KEYS` in
+`crates/magicpipes-core/src/release.rs`, and store the private key as that secret. Binaries
+install only releases signed by a key they were built with, so the workflow also refuses a key
+that isn't in that list. Whoever controls the repository can therefore ship an upgrade.
 To check builds without releasing, run `cargo test --workspace` and `scripts/smoke-test.sh`
 locally.
 
 The end-to-end tests in `crates/magicpipes-cli/tests/e2e.rs` start real `magicpipesd` and
 `magicpipes` processes and cover HTTP, streaming, WebSockets, the UI, the API, agent and server
-restarts, removal, concurrent startup, authentication failures and certificate failures. An
+restarts, upgrades without downtime (from a signed release they serve themselves), removal,
+concurrent startup, authentication failures and certificate failures. An
 ACME test against [Pebble](https://github.com/letsencrypt/pebble), with real HTTP-01
 validation, is ignored by default because it needs Docker; the doc comment on
 `acme_with_pebble` has the setup commands.

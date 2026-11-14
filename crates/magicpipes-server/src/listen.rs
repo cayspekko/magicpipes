@@ -103,6 +103,31 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
     }
 }
 
+/// A connection's service, noting when its first request starts ([`Notify::notify_one`] keeps the
+/// note for a waiter that comes later). After that, a request costs one relaxed load.
+struct FirstRequest<S> {
+    inner: S,
+    started: Arc<tokio::sync::Notify>,
+    seen: std::sync::atomic::AtomicBool,
+}
+
+impl<S, R> Service<R> for FirstRequest<S>
+where
+    S: Service<R>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn call(&self, req: R) -> Self::Future {
+        if !self.seen.load(Ordering::Relaxed) {
+            self.seen.store(true, Ordering::Relaxed);
+            self.started.notify_one();
+        }
+        self.inner.call(req)
+    }
+}
+
 /// Open connections per client key.
 #[derive(Default)]
 pub(crate) struct PerClient(Mutex<HashMap<IpAddr, usize>>);
@@ -253,6 +278,8 @@ where
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.timer(TokioTimer::new()).header_read_timeout(header_timeout).keep_alive(true);
     let activity = Activity::new();
+    let first = Arc::new(tokio::sync::Notify::new());
+    let svc = FirstRequest { inner: svc, started: first.clone(), seen: std::sync::atomic::AtomicBool::new(false) };
     let conn = builder.serve_connection(TokioIo::new(activity.track(io)), svc).with_upgrades();
     tokio::pin!(conn);
     let stalled = async {
@@ -269,9 +296,23 @@ where
         }
         // Dropping the connection closes it, and ends the request it was in the middle of.
         _ = stalled => tracing::debug!("closing a stalled connection"),
+        // The request under way finishes, then the connection closes. How long that may take is
+        // the caller's: 15 seconds at shutdown, `upgrades.drain_secs` at a handover. A connection
+        // accepted a moment before gets its first request answered: closing it before that would
+        // fail a client that did nothing wrong, while another process takes the new ones.
         _ = shutdown.cancelled() => {
+            tokio::select! {
+                res = conn.as_mut() => {
+                    if let Err(e) = res {
+                        tracing::debug!(error = %e, "connection error");
+                    }
+                    return;
+                }
+                _ = first.notified() => {}
+                _ = tokio::time::sleep(header_timeout) => {}
+            }
             conn.as_mut().graceful_shutdown();
-            let _ = tokio::time::timeout(Duration::from_secs(10), conn).await;
+            let _ = conn.await;
         }
     }
 }

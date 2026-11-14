@@ -76,6 +76,12 @@ acme_directory = "letsencrypt"
 # synthetics = true                    # check each tunnel's app through its machine (`add --no-check` skips one)
 # check_interval_secs = 60             # how often (10 to 3600)
 
+[upgrades]
+# check = true                         # look for a new release once a day and tell administrators (one request to source)
+# source = "https://github.com/cayspekko/magicpipes/releases/latest/download/"  # where release.json and its signature are
+# drain_secs = 30                      # at an upgrade, how long the old process lets long connections run (1 to 3600)
+# hold_secs = 15                       # at an upgrade, how long a request waits for its machine to reconnect (1 to 60)
+
 [users]
 # Accounts are created by administrators in the UI (Users) or the API; see the README.
 # session_max_age_secs = 43200         # how long a sign-in lasts

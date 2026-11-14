@@ -1,2 +1,4 @@
 target/
 .DS_Store
+# The release signing key scripts/release-key.sh makes: a secret, never committed.
+magicpipes-release-key.pem

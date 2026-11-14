@@ -280,6 +280,21 @@ mod unix_ipc {
     pub fn cleanup_ipc() {
         let _ = std::fs::remove_file(state::socket_path());
     }
+
+    impl IpcListener {
+        /// The listener an older agent handed over when this one took over from it.
+        pub fn from_handed(fd: std::os::fd::OwnedFd) -> anyhow::Result<Self> {
+            let std = std::os::unix::net::UnixListener::from(fd);
+            std.set_nonblocking(true)?;
+            // SAFETY: getuid has no preconditions.
+            Ok(Self { inner: UnixListener::from_std(std)?, uid: unsafe { libc::getuid() } })
+        }
+
+        /// Another descriptor for its socket, to hand to a new agent taking over.
+        pub fn handed(&self) -> io::Result<std::os::fd::OwnedFd> {
+            std::os::fd::AsFd::as_fd(&self.inner).try_clone_to_owned()
+        }
+    }
 }
 
 #[cfg(windows)]

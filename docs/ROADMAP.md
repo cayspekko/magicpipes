@@ -512,6 +512,9 @@ binaries installed on a host (systemd, launchd, Windows, or started by hand), no
 which upgrade by pulling a new image; a server in a container gets the check and the command to run,
 nothing more.
 
+*Built 2026-11-13* (README "Upgrades without downtime" and "Upgrading magicpipes", ARCHITECTURE.md
+"Upgrades without downtime"). Where it differs from the plan below, the notes in italics say how.
+
 * **Signed releases first.** Releases are GitHub archives with `SHA256SUMS` beside them, which prove
   nothing to a binary installing itself: whoever can publish a release could ship code to every
   server and machine. Each release gets a manifest (version, and per target the archive's URL and
@@ -522,14 +525,20 @@ nothing more.
   the manifest once every platform's build has passed. Whoever controls the repository can
   therefore ship an upgrade; the owner accepted that. The release workflow also has to refuse a tag
   that doesn't match the workspace version: 0.1.2 was tagged with no archives, and the binaries
-  still say 0.1.1.
+  still say 0.1.1. *Built: the manifest lists the bare binaries, which releases now carry beside
+  the archives, so installing needs no unpacking; `scripts/release-key.sh` makes the key, and the
+  workflow refuses one whose public half isn't built in. Until the key is made, `RELEASE_KEYS` is
+  empty and no build can upgrade itself.*
 * **The check.** The server reads the latest manifest once a day on the control threads (one HTTPS
   request to the release source, bounded in size and time, `[upgrades] check = false` to turn it
   off, `[upgrades] source` for a mirror). Administrators see "0.2.0 is available" on the Settings
   page; a release the manifest marks as a security fix opens an alert. Agents report their release
   version as well as their protocol (protocol 12), so machine pages say what each runs. Agents
   don't each call out: the server passes on the latest version as a hint, and the agent checks the
-  signature itself before acting on it.
+  signature itself before acting on it. *Built without the hint: machine pages compare an agent's
+  version with the server's latest release, and `magicpipes --upgrade --check` asks the source
+  itself, which only happens when someone runs it. `GET /api/v1/server/upgrade?check=true` checks
+  at once.*
 * **`magicpipesd --upgrade` and `magicpipes --upgrade`.** Download the release for this target,
   check its signature and checksum, run the new binary's self-test against the live configuration,
   replace the binary atomically (written beside it, then renamed; the old one kept for rolling
@@ -538,7 +547,9 @@ nothing more.
   writable, a package manager owns it (Homebrew, Nix, apt), or it runs in a container. `--json`
   and new error codes as for every command. `--upgrade --rollback` goes back to the kept binary,
   and for the server, the database backup taken before (what changed since is lost, so it asks
-  first).
+  first). *Built: rolling back puts the kept binary back and hands over to it; if the newer version
+  had migrated the database, the older one refuses it, the handover fails safely, and the message
+  names the backup to restore by hand. `--upgrade --restart` hands over without downloading.*
 * **The server's handover**, on Linux and macOS:
   1. Rehearse: migrate a copy of the database with the new binary, as deploys are rehearsed by hand
      today, then back up the real one.
@@ -562,7 +573,12 @@ nothing more.
   back too, with nothing lost, since the old process stopped writing in step 2. What can't move
   between processes is said up front: pending sign-ins, rate-limit counts and UDP flows start over,
   and long connections end after the drain. Windows restarts plainly at first, with the short wait
-  in step 5 covering most of the gap.
+  in step 5 covering most of the gap. *Built in a simpler order: there's no read-only moment. The
+  new process says ready once its certificates are loaded; the old one then stops accepting at
+  once (connections wait in the shared sockets' queues for the new one), and only then asks agents
+  to reconnect, while the new one holds their tunnels' requests (`hold_secs`). The old process's
+  background work runs until then and the new one's starts after, and migrations must keep the
+  previous release working (a rule in CLAUDE.md), so neither stops writing.*
 * **A machine's handover** is simpler, since the agent dials out: the new agent starts beside the
   old, connects as a second run of the machine (the server's support for copies) marked as taking
   over, and the server sends new streams to it while the old run finishes its own, even with
@@ -570,7 +586,10 @@ nothing more.
   agent started by the CLI does this itself; one under a service manager does it where the manager
   allows a new main process (systemd), and restarts plainly where it doesn't (launchd), with the
   server's short wait covering the gap. On Windows the running `.exe` is renamed aside before the
-  new one takes its name.
+  new one takes its name. *Built for the background agent the CLI starts, which hands the new one
+  its lock and socket as inherited descriptors. An agent run in the foreground (a service, a
+  container) isn't taken over, and Windows has no take-over: `--upgrade` puts the binary in place
+  and says to restart it.*
 * **The server, from the UI.** This is the point of the UI part: administrators upgrade the server
   itself from the Settings page. A button names the effect ("Upgrades to 0.2.0 and migrates the
   database. Connections stay up; long ones get 30 s to finish."), then a page follows the steps and
@@ -586,7 +605,8 @@ nothing more.
   opted-in machine install a genuine newer release early. Whoever manages the machine may ask
   (`authorize`'s Manage rule), and it's in the audit log. This relaxes the rule that the server
   never chooses what runs on an agent's machine, so ARCHITECTURE.md's security model changes with
-  it.
+  it. *Built so that it stays within the rule: the message (`ServerOpen::Upgrade`) carries nothing
+  for the agent to act on, and the agent chooses the release and its source.*
 
 ## Compatibility
 
@@ -628,7 +648,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
 | 11d | Monitoring, probe: synthetic checks from the server, on by default; the agent says why it couldn't reach an app (protocol 10) | yes | done |
 | 11e | Monitoring, tell: alert email and webhooks; `magicpipes probe` from outside | yes | done |
-| 12 | Upgrades, check: signed release manifests, the daily check, `--upgrade --check`, machines' versions (protocol 12) ([plan](#upgrades-the-binary-replaces-itself-without-downtime)) | yes | planned (the key: a GitHub secret) |
-| 12b | Upgrades, server: `magicpipesd --upgrade` with the database rehearsed and backed up, a handover to the new process on inherited sockets, requests held while machines move, rollback | yes | planned |
-| 12c | Upgrades, machines: `magicpipes --upgrade`, a new run taking over from the old without cutting its streams | yes | planned |
-| 12d | Upgrades from the UI: the server itself, by administrators; and asking a machine to upgrade itself, where its own user turned that on (`--allow-remote`) | yes | planned (both approved) |
+| 12 | Upgrades, check: signed release manifests, the daily check, `--upgrade --check`, machines' versions (protocol 12) ([plan](#upgrades-the-binary-replaces-itself-without-downtime)) | yes | done (the signing key still to be made: `scripts/release-key.sh`) |
+| 12b | Upgrades, server: `magicpipesd --upgrade` with the database rehearsed and backed up, a handover to the new process on inherited sockets, requests held while machines move, rollback | yes | done (Linux and macOS) |
+| 12c | Upgrades, machines: `magicpipes --upgrade`, a new run taking over from the old without cutting its streams | yes | done (background agents on Linux and macOS) |
+| 12d | Upgrades from the UI: the server itself, by administrators; and asking a machine to upgrade itself, where its own user turned that on (`--allow-remote`) | yes | done |

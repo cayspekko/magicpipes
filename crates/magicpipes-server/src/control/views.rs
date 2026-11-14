@@ -72,6 +72,11 @@ pub struct AgentView {
     /// The connected agent's protocol version (1 for agents that predate the handshake).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<u32>,
+    /// The connected agent's release, from protocol 12.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Its user lets the server ask it to upgrade itself (protocol 12).
+    pub remote_upgrade: bool,
     /// How many connections the agent holds now (0 while it's offline).
     pub connections: usize,
     /// Several runs of it may serve at once (replicas); otherwise one replaces another.
@@ -222,7 +227,11 @@ impl ControlPlane {
             .map(|a| {
                 let link = st.sessions.get(&a.id);
                 let s = link.map(|l| l.first());
+                // The newest run says what the machine runs now.
+                let newest = link.and_then(|l| l.runs.last()).and_then(|r| r.lanes.first());
                 AgentView {
+                    version: newest.and_then(|s| s.version.clone()),
+                    remote_upgrade: newest.is_some_and(|s| s.remote_upgrade),
                     connected: s.is_some(),
                     connections: link.map_or(0, |l| l.lanes().count()),
                     replicas: a.replicas,

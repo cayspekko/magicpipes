@@ -554,6 +554,21 @@ impl Store {
         Ok(f(&conn)?)
     }
 
+    /// A consistent copy of the whole database at `to`, which must not exist yet: a backup before
+    /// an upgrade, or the copy a new version tries its migrations on. Readable by its owner only.
+    pub fn copy_to(&self, to: &Path) -> anyhow::Result<()> {
+        let path = to.to_str().context("the path isn't UTF-8")?;
+        self.with(|c| c.execute("VACUUM INTO ?1", [path]).map(|_| ()))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(to, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        Ok(())
+    }
+
+    /// How many migrations the database has had.
+    pub fn schema_version(&self) -> anyhow::Result<i64> {
+        self.with(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+    }
+
     // ---- administrators -------------------------------------------------------------------
 
     pub fn admin_token_count(&self) -> anyhow::Result<i64> {

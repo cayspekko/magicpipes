@@ -118,6 +118,10 @@ pub struct Env {
     pub ca_path: PathBuf,
     server: Option<std::process::Child>,
     tls: Tls,
+    /// The server binary [`Env::start_server`] runs, when not the one built for the tests.
+    pub server_bin: Option<PathBuf>,
+    /// More environment for the server process.
+    pub server_env: Vec<(String, String)>,
 }
 
 impl Env {
@@ -175,6 +179,8 @@ impl Env {
                 ca_path = ca;
             }
         }
+        // A test server never looks for a release on the internet, unless a test says where.
+        let upgrades = if extra.contains("[upgrades]") { "" } else { "[upgrades]\ncheck = false\n" };
         let cfg = format!(
             r#"base_domain = "{BASE}"
 data_dir = "{data}"
@@ -197,13 +203,13 @@ bind = "127.0.0.1"
 public_host = "localhost"
 udp_idle_timeout_secs = 5
 {extra}
-"#,
+{upgrades}"#,
             data = root.join("server").display(),
             first = ports.0,
             last = ports.1,
         );
         std::fs::write(root.join("server.toml"), cfg).unwrap();
-        let mut env = Env { root, https_port, http_port, mgmt_port, ports, ca_path, server: None, tls };
+        let mut env = Env { root, https_port, http_port, mgmt_port, ports, ca_path, server: None, tls, server_bin: None, server_env: Vec::new() };
         env.start_server().await;
         env
     }
@@ -215,9 +221,10 @@ udp_idle_timeout_secs = 5
     pub async fn start_server(&mut self) {
         assert!(self.server.is_none());
         let log = std::fs::OpenOptions::new().create(true).append(true).open(self.root.join("server.log")).unwrap();
-        let child = std::process::Command::new(bin("magicpipesd"))
+        let child = std::process::Command::new(self.server_bin.clone().unwrap_or_else(|| bin("magicpipesd")))
             .arg("--config")
             .arg(self.root.join("server.toml"))
+            .envs(self.server_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .env("MAGICPIPESD_LOG", "info,magicpipesd=debug")
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -254,6 +261,48 @@ udp_idle_timeout_secs = 5
         }
     }
 
+    /// Whether the server process [`Env::start_server`] started has exited (and is reaped).
+    pub fn first_server_exited(&mut self) -> bool {
+        self.server.as_mut().is_none_or(|c| c.try_wait().ok().flatten().is_some())
+    }
+
+    /// The serving process, as the server's pid file names it: after a handover, not the one
+    /// [`Env::start_server`] started.
+    pub fn server_pid(&self) -> Option<i32> {
+        let text = std::fs::read_to_string(self.root.join("server/magicpipesd.pid")).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?["pid"].as_i64().map(|p| p as i32)
+    }
+
+    /// A copy of a binary built for the tests, in this environment's directory, to upgrade in
+    /// place without touching the build.
+    pub fn copy_of(&self, name: &str) -> PathBuf {
+        let dir = self.root.join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let to = dir.join(name);
+        std::fs::copy(bin(name), &to).unwrap();
+        to
+    }
+
+    /// Runs the `magicpipes` at `exe` (a [`Env::copy_of`]) with `vars`, as [`Env::cli`] does.
+    pub async fn cli_from(&self, exe: &Path, vars: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut cmd = self.cli_command_for(exe, args);
+        cmd.envs(vars.iter().copied());
+        self.run(cmd, args).await
+    }
+
+    /// Runs `magicpipesd` with this environment's configuration and `args`.
+    pub async fn server_cli(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
+        let mut cmd = tokio::process::Command::new(self.server_bin.clone().unwrap_or_else(|| bin("magicpipesd")));
+        cmd.arg("--config").arg(self.root.join("server.toml")).args(args).stdin(Stdio::null()).kill_on_drop(true);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        match tokio::time::timeout(STEP_TIMEOUT, cmd.output()).await {
+            Ok(out) => out.expect("run magicpipesd"),
+            Err(_) => panic!("magicpipesd {args:?} didn't finish within {STEP_TIMEOUT:?}\nserver log:\n{}", self.server_log()),
+        }
+    }
+
     pub fn server_log(&self) -> String {
         std::fs::read_to_string(self.root.join("server.log")).unwrap_or_default()
     }
@@ -267,7 +316,11 @@ udp_idle_timeout_secs = 5
     }
 
     fn cli_command(&self, args: &[&str]) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(bin("magicpipes"));
+        self.cli_command_for(&bin("magicpipes"), args)
+    }
+
+    fn cli_command_for(&self, exe: &Path, args: &[&str]) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args)
             .env("MAGICPIPES_HOME", self.home())
             .env("MAGICPIPES_SOCKET", self.root.join("a.sock"))
@@ -468,6 +521,21 @@ udp_idle_timeout_secs = 5
         Some(sender.send_request(req).await.ok()?.status())
     }
 
+    /// As [`Env::public_status`], saying what went wrong.
+    pub async fn public_status_or_why(&self, hostname: &str) -> Result<StatusCode, String> {
+        let tls = self.try_connect(hostname, self.https_port).await.map_err(|e| format!("connect: {e}"))?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.map_err(|e| format!("handshake: {e}"))?;
+        tokio::spawn(conn);
+        let req = Request::builder().uri("/").header(header::HOST, format!("{hostname}:{}", self.https_port)).body(Full::new(Bytes::new())).unwrap();
+        let resp = sender.send_request(req).await.map_err(|e| format!("request: {e}"))?;
+        let status = resp.status();
+        if status != StatusCode::OK {
+            let err = resp.headers().get("x-magicpipes-error").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            return Err(format!("{status} {err}"));
+        }
+        Ok(status)
+    }
+
     pub async fn get_public(&self, hostname: &str, path: &str) -> (StatusCode, Option<String>, String) {
         let req = Request::get(path)
             .header(header::HOST, format!("{hostname}:{}", self.https_port))
@@ -587,6 +655,10 @@ impl Drop for Env {
     fn drop(&mut self) {
         if let Some(pid) = self.agent_pid() {
             unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        // A server that took over in a handover isn't the process started here.
+        if let Some(pid) = self.server_pid().filter(|p| Some(*p as u32) != self.server.as_ref().map(|c| c.id())) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         if let Some(mut c) = self.server.take() {
             let _ = c.kill();
@@ -1741,5 +1813,79 @@ impl FakeKube {
     /// Watches opened so far.
     pub fn watches(&self) -> usize {
         self.state.lock().unwrap().watches
+    }
+}
+
+/// A release source for tests: a manifest for `version` listing this platform's `binaries`, served
+/// with its signature, signed by a key made for it. Its public half, in base64, goes in
+/// `MAGICPIPES_TEST_RELEASE_KEY`, which debug builds trust.
+pub struct FakeRelease {
+    pub url: String,
+    pub key: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FakeRelease {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FakeRelease {
+    /// `binaries`: each binary's name and the file it serves. `tampered`: the manifest served
+    /// isn't the one signed.
+    pub async fn start(version: &str, binaries: &[(&str, PathBuf)], tampered: bool) -> FakeRelease {
+        use base64::Engine;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        use sha2::Digest;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let target = magicpipes_core::release::TARGET.expect("a platform with releases");
+        let mut files = Vec::new();
+        let mut served: Vec<(String, Bytes)> = Vec::new();
+        for (name, path) in binaries {
+            let bytes = Bytes::from(std::fs::read(path).unwrap());
+            let sha256: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+            files.push(serde_json::json!({ "target": target, "binary": name, "url": format!("{url}bin/{name}"), "sha256": sha256, "size": bytes.len() }));
+            served.push((format!("/bin/{name}"), bytes));
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({ "version": version, "notes": "https://example.com/notes", "files": files })).unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let signature = b64.encode(pair.sign(&manifest).as_ref());
+        let key = b64.encode(pair.public_key().as_ref());
+        let mut shown = manifest.clone();
+        if tampered {
+            shown = String::from_utf8(shown).unwrap().replace(version, "98.0.0").into_bytes();
+        }
+        served.push(("/release.json".into(), Bytes::from(shown)));
+        served.push(("/release.json.sig".into(), Bytes::from(signature)));
+        let served = Arc::new(served);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let found = served.iter().find(|(p, _)| p == req.uri().path()).map(|(_, b)| b.clone());
+                        async move {
+                            let mut resp = Response::new(Full::new(found.clone().unwrap_or_default()));
+                            if found.is_none() {
+                                *resp.status_mut() = StatusCode::NOT_FOUND;
+                            }
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tcp), svc).await;
+                });
+            }
+        });
+        FakeRelease { url, key, task }
+    }
+
+    /// The environment a process needs to read and trust this release.
+    pub fn vars(&self) -> [(&str, &str); 2] {
+        [("MAGICPIPES_RELEASE_SOURCE", self.url.as_str()), ("MAGICPIPES_TEST_RELEASE_KEY", self.key.as_str())]
     }
 }

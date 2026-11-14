@@ -28,9 +28,12 @@ mod probe;
 mod serve;
 mod session;
 mod shell;
+#[cfg(unix)]
+mod takeover;
 mod tunnels;
 mod udp;
 mod unix;
+mod upgrades;
 
 use std::fs::File;
 use std::sync::Arc;
@@ -45,6 +48,11 @@ use crate::ipc::{self, ErrorInfo, IpcEvent, IpcRequest};
 use crate::platform::{self, IpcListener};
 use crate::state::{self, AgentConfig};
 use ops::Agent;
+
+/// Where `--upgrade` reads releases from (`MAGICPIPES_RELEASE_SOURCE`, else the project's).
+pub fn upgrade_source() -> String {
+    upgrades::source()
+}
 
 /// Outcome of trying to become the agent.
 pub enum Start {
@@ -72,18 +80,31 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
         (declared, health, ingress)
     };
     state::ensure_home()?;
-    let lock = File::options().create(true).truncate(false).write(true).open(state::lock_path())?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(Start::AlreadyRunning),
-        Err(std::fs::TryLockError::Error(e)) => return Err(e).context("locking agent.lock"),
-    }
-    // A command started us and waits, but we may have got here too late: when several start an
-    // agent at once, the losers exit because the winner holds the lock, and a slow one can reach
-    // it only after the winner has been stopped and every command has stopped waiting.
-    if detached && !awaited() {
-        return Ok(Start::Unwanted);
-    }
+    // A background agent may be taking over from another, which handed it the lock it holds.
+    #[cfg(unix)]
+    let joining = if detached { takeover::joining() } else { None };
+    #[cfg(not(unix))]
+    let joining: Option<std::convert::Infallible> = None;
+    let lock = match &joining {
+        #[cfg(unix)]
+        Some(j) => j.lock.try_clone()?,
+        _ => {
+            let lock = File::options().create(true).truncate(false).write(true).open(state::lock_path())?;
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(Start::AlreadyRunning),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).context("locking agent.lock"),
+            }
+            // A command started us and waits, but we may have got here too late: when several
+            // start an agent at once, the losers exit because the winner holds the lock, and a
+            // slow one can reach it only after the winner has been stopped and every command has
+            // stopped waiting.
+            if detached && !awaited() {
+                return Ok(Start::Unwanted);
+            }
+            lock
+        }
+    };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let res = rt.block_on(async {
         let cfg = match AgentConfig::load()? {
@@ -95,10 +116,13 @@ pub fn run(detached: bool) -> anyhow::Result<Start> {
             },
             None => bail!("not logged in; run `magicpipes login --server <url> --token <token>` first"),
         };
-        serve(cfg, detached, declared, health, ingress).await
+        serve(cfg, detached, declared, health, ingress, &lock, joining).await
     });
-    platform::cleanup_ipc();
-    let _ = std::fs::remove_file(state::pid_path());
+    // Handed over: the socket and the pid file are the new agent's.
+    if !matches!(res, Ok(true)) {
+        platform::cleanup_ipc();
+        let _ = std::fs::remove_file(state::pid_path());
+    }
     drop(lock);
     res.map(|_| Start::Ran)
 }
@@ -113,29 +137,54 @@ fn awaited() -> bool {
     }
 }
 
+/// Serves until stopped; `true` if it handed over to a new agent.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     cfg: AgentConfig,
     detached: bool,
     declared: Option<Vec<crate::declared::Declared>>,
     health: Option<std::net::SocketAddr>,
     ingress: Option<(ingress::Settings, kube::Kube)>,
-) -> anyhow::Result<()> {
-    // We hold the lock, so any existing socket is stale.
-    let mut listener = IpcListener::bind()?;
+    lock: &File,
+    #[cfg(unix)] joining: Option<takeover::Joining>,
+    #[cfg(not(unix))] joining: Option<std::convert::Infallible>,
+) -> anyhow::Result<bool> {
+    let _ = lock;
+    // We hold the lock, so any existing socket is stale; or the agent we take over from handed
+    // us its listener.
+    #[cfg(unix)]
+    let (mut listener, replaces) = match &joining {
+        Some(j) => (IpcListener::from_handed(j.ipc.try_clone()?)?, j.replaces.clone()),
+        None => (IpcListener::bind()?, None),
+    };
+    #[cfg(not(unix))]
+    let (mut listener, replaces): (IpcListener, Option<String>) = (IpcListener::bind()?, None);
     // Before anything starts, so a port in use stops the agent with an error.
     let health = match health {
         Some(addr) => Some(tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listening on {addr} ({})", health::HEALTH_ENV))?),
         None => None,
     };
-    state::write_private(&state::pid_path(), std::process::id().to_string().as_bytes())?;
+    if joining.is_none() {
+        state::write_private(&state::pid_path(), std::process::id().to_string().as_bytes())?;
+    }
 
     let shutdown = CancellationToken::new();
     let tunnels = tunnels::Tunnels::load()?;
     let tls = crate::https::tls_config(cfg.ca_cert_pem.as_deref())?;
     let base_domain = cfg.base_domain.clone();
-    let session = session::Session::new(cfg, tunnels.clone())?;
+    let remote_upgrades = cfg.allow_remote_upgrade;
+    let session = session::Session::new(cfg, tunnels.clone(), replaces)?;
     let agent = Agent::new(session.clone(), tunnels.clone(), tls, shutdown.clone());
+    agent.detached.store(detached, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(unix)]
+    if detached {
+        let handing = takeover::Handing::new(std::os::fd::AsFd::as_fd(lock).try_clone_to_owned()?, listener.handed()?);
+        let _ = agent.handing.set(handing);
+    }
     tracing::info!(pid = std::process::id(), tunnels = tunnels.len(), declared = declared.as_ref().map(Vec::len), detached, "agent started");
+    if remote_upgrades {
+        upgrades::listen(&agent);
+    }
 
     let session_task = tokio::spawn(session.clone().run(shutdown.clone()));
     let declarations = (declared.is_some() || ingress.is_some()).then(|| declared::Declarations::new(agent.clone(), shutdown.clone(), ingress.is_none()));
@@ -149,13 +198,34 @@ async fn serve(
     if let Some(listener) = health {
         health::spawn(listener, agent.clone(), declarations, shutdown.clone());
     }
+    #[cfg(unix)]
+    if let Some(j) = joining {
+        if let Err(e) = j.ready(&agent).await {
+            shutdown.cancel();
+            tunnels.end_all();
+            return Err(e);
+        }
+        state::write_private(&state::pid_path(), std::process::id().to_string().as_bytes())?;
+        tracing::info!("took over from the agent before");
+    }
+    #[cfg(not(unix))]
+    drop(joining);
+    #[cfg(unix)]
+    let handed_over = agent.handing.get().map(|h| h.stop_commands.clone()).unwrap_or_default();
+    #[cfg(not(unix))]
+    let handed_over = CancellationToken::new();
     let terminate = platform::terminate();
     tokio::pin!(terminate);
+    let mut handed = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = platform::interrupt() => break,
             _ = &mut terminate => break,
+            _ = handed_over.cancelled() => {
+                handed = true;
+                break;
+            }
             conn = listener.accept() => {
                 let stream = match conn {
                     Ok(s) => s,
@@ -170,7 +240,16 @@ async fn serve(
             }
         }
     }
-    tracing::info!("agent stopping");
+    if handed {
+        // The new agent gets every new stream; these finish first.
+        let deadline = tokio::time::Instant::now() + takeover_drain();
+        while session.active_streams() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tracing::info!(left = session.active_streams(), "handed over to the new agent; stopping");
+    } else {
+        tracing::info!("agent stopping");
+    }
     shutdown.cancel();
     // Web terminal programs get SIGHUP now and SIGKILL after shell::KILL_GRACE; those timers
     // run on this runtime, so it must outlive them.
@@ -179,7 +258,14 @@ async fn serve(
     if tunnels.list().iter().any(|t| matches!(t.target, state::Target::Shell { .. })) {
         tokio::time::sleep(shell::KILL_GRACE + std::time::Duration::from_millis(200)).await;
     }
-    Ok(())
+    Ok(handed)
+}
+
+fn takeover_drain() -> std::time::Duration {
+    #[cfg(unix)]
+    return takeover::DRAIN;
+    #[cfg(not(unix))]
+    std::time::Duration::ZERO
 }
 
 async fn handle_ipc<S: AsyncRead + AsyncWrite>(agent: Arc<Agent>, stream: S) {
@@ -207,6 +293,10 @@ async fn handle_ipc<S: AsyncRead + AsyncWrite>(agent: Arc<Agent>, stream: S) {
             IpcRequest::List => Ok(agent.list()),
             IpcRequest::Status => Ok(agent.status()),
             IpcRequest::Shutdown { if_idle } => agent.shutdown(if_idle),
+            #[cfg(unix)]
+            IpcRequest::HandOver => agent.hand_over().await,
+            #[cfg(not(unix))]
+            IpcRequest::HandOver => Err(ErrorInfo::new(ErrorCode::Unsupported, "a take-over without a gap needs Linux or macOS")),
         };
         let _ = tx.send(match res {
             Ok(data) => IpcEvent::Ok { data },

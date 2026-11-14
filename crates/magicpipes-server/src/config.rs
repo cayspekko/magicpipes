@@ -31,6 +31,8 @@ pub struct Config {
     pub users: UsersConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub upgrades: UpgradesConfig,
     /// Addresses (CIDR) of reverse proxies or load balancers in front of magicpipesd, such as
     /// HAProxy. Only these may name the client: X-Forwarded-For on the HTTPS listeners (used for
     /// login rate limits and passed on to tunnels) and PROXY headers on port tunnels.
@@ -622,6 +624,35 @@ impl Default for MonitoringConfig {
     }
 }
 
+/// New releases, and moving to one without downtime (`[upgrades]`, README "Upgrades").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpgradesConfig {
+    /// Look for a new release once a day (one request to `source`), and tell administrators.
+    pub check: bool,
+    /// Where releases are read from: an address holding `release.json` and `release.json.sig`.
+    /// Unset: the project's latest GitHub release.
+    pub source: Option<String>,
+    /// During a handover to a new version, how long the old process lets long connections
+    /// (WebSockets, TCP tunnels, terminals) run before closing them, 1 to 3600.
+    pub drain_secs: u64,
+    /// How long the new process holds a request for a tunnel whose machine was connected to the
+    /// old one, while the machine reconnects, 1 to 60.
+    pub hold_secs: u64,
+}
+
+impl Default for UpgradesConfig {
+    fn default() -> Self {
+        Self { check: true, source: None, drain_secs: 30, hold_secs: 15 }
+    }
+}
+
+impl UpgradesConfig {
+    pub fn source_url(&self) -> String {
+        magicpipes_core::upgrade::source_url(self.source.as_deref())
+    }
+}
+
 /// User accounts (docs/USERS.md). Administrators create them in the UI or API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -832,6 +863,17 @@ impl Config {
         }
         if !(1..=30).contains(&self.monitoring.history_days) {
             bail!("monitoring.history_days must be between 1 and 30");
+        }
+        if !(1..=3600).contains(&self.upgrades.drain_secs) {
+            bail!("upgrades.drain_secs must be between 1 and 3600");
+        }
+        if !(1..=60).contains(&self.upgrades.hold_secs) {
+            bail!("upgrades.hold_secs must be between 1 and 60");
+        }
+        if let Some(src) = &self.upgrades.source
+            && !(src.starts_with("https://") || src.starts_with("http://"))
+        {
+            bail!("upgrades.source must be an http:// or https:// address");
         }
         if !(10..=3600).contains(&self.monitoring.check_interval_secs) {
             bail!("monitoring.check_interval_secs must be between 10 and 3600");

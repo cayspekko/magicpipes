@@ -19,6 +19,7 @@
 //! * `settings` — sign-in settings and certificates made on the Settings page, and the generated
 //!   configuration;
 //! * `tags` — the tag registry, tag assignments and enrollment tokens;
+//! * `upgrades` — the daily check for a new release;
 //! * `users` — accounts, logins, UI sessions, API tokens and the audit log;
 //! * `views` — what the API and the UI show.
 
@@ -37,12 +38,13 @@ pub mod outside;
 mod registry;
 pub mod rules;
 mod sessions;
-pub use sessions::Attached;
+pub use sessions::{Attached, Hello};
 mod settings;
 mod ssh;
 mod sso;
 mod tags;
 mod totp;
+pub mod upgrades;
 mod users;
 mod views;
 
@@ -114,6 +116,10 @@ pub struct ControlPlane {
     outside: Mutex<outside::Outside>,
     /// Alert email waiting to go, and webhooks ([`notify`]).
     notify: notify::Notifier,
+    /// The last check for a new release ([`upgrades`]).
+    releases: upgrades::Releases,
+    /// Where a request to hand over to a new version goes (`crate::handover`); set by `main`.
+    handover: std::sync::OnceLock<tokio::sync::mpsc::Sender<crate::handover::Ask>>,
 }
 
 #[derive(Default)]
@@ -179,6 +185,10 @@ struct Session {
     remote: SocketAddr,
     /// The agent's protocol version (`proto::PROTOCOL_VERSION`).
     protocol: u32,
+    /// Its release, from protocol 12.
+    version: Option<String>,
+    /// Its user lets the server ask it to upgrade itself (protocol 12).
+    remote_upgrade: bool,
     last_ping: Instant,
     /// The last round trip the server timed on it, in microseconds; 0 until one has been, or after
     /// one failed. See [`ControlPlane::ping_agents`].
@@ -206,6 +216,9 @@ struct Run {
     /// The tunnels it registered since it connected. Beside other runs, it gets only these: a run
     /// that hasn't registered a tunnel yet doesn't serve it.
     serves: HashSet<String>,
+    /// A newer run took over from it (protocol 12): it gets no new streams while another can
+    /// take them, and goes when its agent closes its connections.
+    leaving: bool,
 }
 
 impl Link {
@@ -214,10 +227,13 @@ impl Link {
     }
 
     /// The runs a tunnel's streams go to: those that registered it, or every one when none has
-    /// yet (one run, or a registration on its way).
+    /// yet (one run, or a registration on its way). A run that's leaving gets them only when no
+    /// other is there.
     fn serving<'a>(&'a self, tunnel_id: &str) -> Vec<&'a Run> {
-        let serving: Vec<&Run> = self.runs.iter().filter(|r| r.serves.contains(tunnel_id)).collect();
-        if serving.is_empty() { self.runs.iter().collect() } else { serving }
+        let staying: Vec<&Run> = self.runs.iter().filter(|r| !r.leaving).collect();
+        let runs = if staying.is_empty() { self.runs.iter().collect() } else { staying };
+        let serving: Vec<&Run> = runs.iter().copied().filter(|r| r.serves.contains(tunnel_id)).collect();
+        if serving.is_empty() { runs } else { serving }
     }
 
     /// An open connection of a run serving `tunnel_id`, for a check of its app.
@@ -339,6 +355,8 @@ impl ControlPlane {
             checks: Mutex::new(checks::Checks::default()),
             outside: Mutex::new(outside::Outside::default()),
             notify: notify::Notifier::default(),
+            releases: upgrades::Releases::default(),
+            handover: std::sync::OnceLock::new(),
         });
         cp.publish(&cp.state.lock().unwrap());
         cp.load_history();
@@ -364,23 +382,13 @@ impl ControlPlane {
     /// requests for sign-in links, and hourly pruning of the audit log, expired UI sessions and
     /// emailed links, and disabling accounts single sign-on has gone quiet about.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) {
-        let hosts: Vec<String> = self
-            .state
-            .lock()
-            .unwrap()
-            .tunnels
-            .values()
-            .filter(|t| t.row.kind.is_http())
-            .map(|t| t.row.hostname.clone())
-            .collect();
-        for h in hosts {
-            self.certs.ensure(&h);
-        }
+        self.ensure_certificates();
         self.start_mail_queue(shutdown.clone());
         self.start_webhooks(shutdown.clone());
         self.start_sso_rechecks(shutdown.clone());
         self.start_checks(shutdown.clone());
         self.start_gateway_reports(shutdown.clone());
+        self.start_release_checks(shutdown.clone());
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -404,6 +412,35 @@ impl ControlPlane {
         });
     }
 
+    /// Has a certificate on its way for every HTTP tunnel's hostname, and returns them: loaded
+    /// from the cache, or ordered.
+    pub fn ensure_certificates(&self) -> Vec<String> {
+        let hosts: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .tunnels
+            .values()
+            .filter(|t| t.row.kind.is_http())
+            .map(|t| t.row.hostname.clone())
+            .collect();
+        for h in &hosts {
+            self.certs.ensure(h);
+        }
+        hosts
+    }
+
+    /// Taking over from an older version: waits (up to `timeout`) until the certificate of each
+    /// of `hosts` ([`ControlPlane::ensure_certificates`]) is ready or has failed, so no visitor
+    /// meets a hostname this process has no certificate for yet.
+    pub async fn certificates_settled(&self, hosts: Vec<String>, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        for h in hosts {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.certs.wait(&h, left).await;
+        }
+    }
+
     /// Builds the data-plane view from the registry. Must be called with the state lock held so
     /// concurrent mutations publish in order.
     fn publish(&self, st: &State) {
@@ -415,8 +452,8 @@ impl ControlPlane {
         for k in st.dir.ssh_keys() {
             table.ssh_keys.insert(k.fingerprint.clone(), GatewayKey { id: k.id.clone(), user_id: k.user_id.clone() });
         }
-        // One link per agent with one run, shared by its routes; beside other runs, each tunnel goes
-        // to those that serve it.
+        // One link per agent with one run, shared by its routes; beside other runs (or one taking
+        // over from another), each tunnel goes to those that serve it.
         let links: HashMap<&str, AgentLink> =
             st.sessions.iter().filter(|(_, link)| link.runs.len() == 1).map(|(agent, link)| (agent.as_str(), link.data())).collect();
         for t in st.tunnels.values() {

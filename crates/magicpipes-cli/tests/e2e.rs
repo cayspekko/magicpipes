@@ -6179,3 +6179,293 @@ async fn ingress_objects_become_tunnels() {
     assert_eq!(env.get_public(&host("docs"), "/").await.0, StatusCode::OK);
     unsafe { libc::kill(agent.id().unwrap() as i32, libc::SIGTERM) };
 }
+
+/// `magicpipesd --upgrade --restart` hands the server over to a new process while requests keep
+/// coming: none fails, a response under way when it starts finishes, a port tunnel keeps its port,
+/// and the agent moves to the new process without going offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_hands_over_to_a_new_process_without_dropping_a_request() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let mut env = Env::with_config(Tls::DevCa, "[upgrades]\ncheck = false\n").await;
+    env.login().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = common::http_app(release.clone()).await;
+    let web = add_json(&env, &[&app.port.to_string(), "--public", "--name", "web"]).await;
+    let host = hostname(web["public_url"].as_str().unwrap());
+    let echo = common::tcp_echo_app().await;
+    let tcp = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any", "--name", "echo"]).await;
+    let port = tcp["public_port"].as_u64().unwrap() as u16;
+    assert_eq!(tcp_roundtrip(port, b"ping").await, b"ping");
+    let before = env.server_pid().expect("the server writes its pid");
+
+    // A response under way when the handover starts: its first part now, the rest later.
+    let req = Request::get("/stream").header(header::HOST, format!("{host}:{}", env.https_port)).body(Full::new(Bytes::new())).unwrap();
+    let mut streaming = env.send(&host, env.https_port, req).await.into_body();
+    let first = streaming.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&first[..], b"first");
+
+    let stop = AtomicBool::new(false);
+    let web_load = async {
+        let (mut ok, mut failed) = (0, Vec::new());
+        while !stop.load(Relaxed) {
+            match env.public_status_or_why(&host).await {
+                Ok(_) => ok += 1,
+                Err(why) => failed.push(why),
+            }
+            // A new connection each time, which this machine's ports must keep up with.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (ok, failed)
+    };
+    let tcp_load = async {
+        let (mut ok, mut failed) = (0, 0);
+        while !stop.load(Relaxed) {
+            if tcp_roundtrip(port, b"ping").await == b"ping" {
+                ok += 1;
+            } else {
+                failed += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (ok, failed)
+    };
+    let status = || std::fs::read_to_string(env.root.join("server/upgrade-status.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    // The old process finishes what it has once it has handed over: the response ends there.
+    let finish_stream = async {
+        env.eventually("the handover to reach its last step", Duration::from_secs(60), || async { status().is_some_and(|s| s["step"].as_u64() >= Some(6)) }).await;
+        release.notify_waiters();
+        let mut rest = Vec::new();
+        while let Some(Ok(frame)) = streaming.frame().await {
+            if let Ok(data) = frame.into_data() {
+                rest.extend_from_slice(&data);
+            }
+        }
+        rest
+    };
+    let hand_over = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let out = env.server_cli(&["--upgrade", "--restart", "--json"], &[]).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop.store(true, Relaxed);
+        out
+    };
+    let ((web_ok, web_failed), (tcp_ok, tcp_failed), rest, out) = tokio::join!(web_load, tcp_load, finish_stream, hand_over);
+
+    assert!(out.status.success(), "{}\n{}\nserver log:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr), env.server_log());
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(said["upgraded"], true, "{said}");
+    let after = said["pid"].as_i64().unwrap() as i32;
+    assert_ne!(after, before, "{said}");
+    assert_eq!(env.server_pid(), Some(after), "the new process wrote its pid");
+    assert!(said["backup"].as_str().is_some_and(|b| std::path::Path::new(b).exists()), "{said}");
+    assert!(web_failed.is_empty() && web_ok > 0, "{web_ok} requests answered, these not: {web_failed:?}\nserver log:\n{}", env.server_log());
+    assert!(tcp_failed == 0 && tcp_ok > 0, "{tcp_ok} round trips, {tcp_failed} failed");
+    assert_eq!(rest, b"second", "the response under way finished");
+
+    // The old process is gone; the agent moved without going offline, and the new process serves.
+    let waited = std::time::Instant::now();
+    while !env.first_server_exited() {
+        assert!(waited.elapsed() < Duration::from_secs(10), "the old process didn't exit\n{}", env.server_log());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(env.agent_log().contains("connecting to it"), "{}", env.agent_log());
+    assert!(!env.agent_log().contains("connection to the server lost"), "{}", env.agent_log());
+    assert!(env.server_log().contains("took over from the older version"), "{}", env.server_log());
+    assert_eq!(env.public_status(&host).await, Some(StatusCode::OK));
+    assert_eq!(tcp_roundtrip(port, b"after").await, b"after");
+}
+
+/// `magicpipes --upgrade --restart` has a new agent take over from the running one while
+/// requests keep coming: none fails, a response under way on the old agent finishes there, and
+/// commands reach the new agent from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_agent_takes_over_without_dropping_a_request() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let env = Env::new(Tls::DevCa).await;
+    env.login().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = common::http_app(release.clone()).await;
+    let web = add_json(&env, &[&app.port.to_string(), "--public", "--name", "web"]).await;
+    let host = hostname(web["public_url"].as_str().unwrap());
+    let echo = common::tcp_echo_app().await;
+    let tcp = add_json(&env, &[&echo.port.to_string(), "--tcp", "--allow-any", "--name", "echo"]).await;
+    let port = tcp["public_port"].as_u64().unwrap() as u16;
+    let before = env.agent_pid().expect("the agent writes its pid");
+
+    let req = Request::get("/stream").header(header::HOST, format!("{host}:{}", env.https_port)).body(Full::new(Bytes::new())).unwrap();
+    let mut streaming = env.send(&host, env.https_port, req).await.into_body();
+    assert_eq!(&streaming.frame().await.unwrap().unwrap().into_data().unwrap()[..], b"first");
+
+    let stop = AtomicBool::new(false);
+    let web_load = async {
+        let (mut ok, mut failed) = (0, Vec::new());
+        while !stop.load(Relaxed) {
+            match env.public_status_or_why(&host).await {
+                Ok(_) => ok += 1,
+                Err(why) => failed.push(why),
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (ok, failed)
+    };
+    let tcp_load = async {
+        let (mut ok, mut failed) = (0, 0);
+        while !stop.load(Relaxed) {
+            if tcp_roundtrip(port, b"ping").await == b"ping" {
+                ok += 1;
+            } else {
+                failed += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (ok, failed)
+    };
+    let take_over = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let out = env.cli(&["--upgrade", "--restart", "--json"]).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The old agent finishes the response it has, then goes.
+        release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, Relaxed);
+        out
+    };
+    let finish_stream = async {
+        let mut rest = Vec::new();
+        while let Some(Ok(frame)) = streaming.frame().await {
+            if let Ok(data) = frame.into_data() {
+                rest.extend_from_slice(&data);
+            }
+        }
+        rest
+    };
+    let ((web_ok, web_failed), (tcp_ok, tcp_failed), out, rest) = tokio::join!(web_load, tcp_load, take_over, finish_stream);
+
+    assert!(out.status.success(), "{}\n{}\nagent log:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr), env.agent_log());
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let after = said["pid"].as_i64().unwrap() as i32;
+    assert_ne!(after, before, "{said}");
+    assert!(web_failed.is_empty() && web_ok > 0, "{web_ok} requests answered, these not: {web_failed:?}\nagent log:\n{}", env.agent_log());
+    assert!(tcp_failed == 0 && tcp_ok > 0, "{tcp_ok} round trips, {tcp_failed} failed");
+    assert_eq!(rest, b"second", "the response under way finished on the old agent");
+
+    env.eventually("the old agent to exit", Duration::from_secs(40), || async { (unsafe { libc::kill(before, 0) }) != 0 }).await;
+    assert_eq!(env.agent_pid(), Some(after), "the new agent wrote its pid");
+    assert!(env.agent_log().contains("took over from the agent before"), "{}", env.agent_log());
+    assert!(env.server_log().contains("a new run of the agent takes over"), "{}", env.server_log());
+    // Commands reach the new agent, which serves both tunnels.
+    let list = env.cli_json(&["list", "--json"]).await;
+    assert_eq!(list["tunnels"].as_array().map(Vec::len), Some(2), "{list}");
+    assert_eq!(env.cli_json(&["agent", "status", "--json"]).await["agent"]["pid"], after);
+    assert_eq!(env.public_status(&host).await, Some(StatusCode::OK));
+    assert_eq!(tcp_roundtrip(port, b"after").await, b"after");
+}
+
+/// `magicpipes --upgrade` reads a signed release, puts its binary in place of this one and has a
+/// new agent take over; a release whose signature doesn't match installs nothing. Allowed to, the
+/// agent upgrades itself when the server asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magicpipes_upgrades_from_a_signed_release_and_when_the_server_asks() {
+    let env = Env::new(Tls::DevCa).await;
+    let exe = env.copy_of("magicpipes");
+    let release = common::FakeRelease::start("99.0.0", &[("magicpipes", common::bin("magicpipes"))], false).await;
+    let vars = release.vars();
+    let token = env.enrollment_token();
+    let login = env.cli_from(&exe, &vars, &["login", "--server", &env.server_url(), "--token", &token, "--ca-cert", &env.ca_path.to_string_lossy(), "--name", "test-agent"]).await;
+    assert!(login.status.success(), "{login:?}");
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let added = env.cli_from(&exe, &vars, &["add", &app.port.to_string(), "--public", "--name", "web", "--json"]).await;
+    let web: Value = serde_json::from_slice(&added.stdout).unwrap_or_else(|_| panic!("{added:?}"));
+    let host = hostname(web["public_url"].as_str().unwrap());
+    let json = |out: &std::process::Output| serde_json::from_slice::<Value>(&out.stdout).unwrap_or_else(|_| panic!("{out:?}"));
+
+    let checked = json(&env.cli_from(&exe, &vars, &["--upgrade", "--check", "--json"]).await);
+    assert_eq!((checked["latest"].as_str(), checked["newer"].as_bool(), checked["can_upgrade"].as_bool()), (Some("99.0.0"), Some(true), Some(true)), "{checked}");
+
+    // A manifest that isn't the one signed: nothing is installed, and the agent carries on.
+    let forged = common::FakeRelease::start("99.0.0", &[("magicpipes", common::bin("magicpipes"))], true).await;
+    let before = std::fs::read(&exe).unwrap();
+    let out = env.cli_from(&exe, &forged.vars(), &["--upgrade", "--json"]).await;
+    assert_eq!(out.status.code(), Some(9), "{out:?}");
+    assert_eq!(json(&out)["error"]["code"], "release_invalid");
+    assert_eq!(std::fs::read(&exe).unwrap(), before);
+    assert!(!magicpipes_core::upgrade::kept_path(&exe).exists());
+
+    let agent = env.agent_pid().unwrap();
+    let out = env.cli_from(&exe, &vars, &["--upgrade", "--json"]).await;
+    let said = json(&out);
+    assert!(out.status.success() && said["upgraded"] == true && said["to"] == "99.0.0", "{said}\n{}", env.agent_log());
+    assert_ne!(said["pid"].as_i64(), Some(i64::from(agent)), "a new agent took over");
+    assert!(magicpipes_core::upgrade::kept_path(&exe).exists(), "the binary it replaced is kept");
+    assert_eq!(env.public_status(&host).await, Some(StatusCode::OK));
+
+    // Rolling back puts the kept binary in place, and hands over to it.
+    let out = env.cli_from(&exe, &vars, &["--upgrade", "--rollback", "--json"]).await;
+    assert!(out.status.success(), "{out:?}");
+
+    // Off until its user turns it on: then the server may ask, and the agent upgrades itself.
+    let (_, agents) = env.api("GET", "/api/v1/agents", Some(&env.admin_token())).await;
+    let id = agents["agents"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(agents["agents"][0]["version"], magicpipes_core::VERSION, "{agents}");
+    let (status, refused) = env.api("POST", &format!("/api/v1/agents/{id}/upgrade"), Some(&env.admin_token())).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("upgrade_not_possible")), "{refused}");
+    let out = env.cli_from(&exe, &vars, &["--upgrade", "--allow-remote", "--json"]).await;
+    assert_eq!(json(&out)["allow_remote"], true, "{out:?}");
+    env.eventually("the agent to say it may be asked", Duration::from_secs(20), || async {
+        env.api("GET", "/api/v1/agents", Some(&env.admin_token())).await.1["agents"][0]["remote_upgrade"] == true
+    })
+    .await;
+    let asked_of = env.agent_pid().unwrap();
+    let (status, _) = env.api("POST", &format!("/api/v1/agents/{id}/upgrade"), Some(&env.admin_token())).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    env.eventually("the agent to upgrade itself and hand over", Duration::from_secs(60), || async { env.agent_pid().is_some_and(|p| p != asked_of) }).await;
+    assert!(env.agent_log().contains("the server asked this agent to upgrade itself"), "{}", env.agent_log());
+    let (_, audit) = env.api("GET", "/api/v1/audit", Some(&env.admin_token())).await;
+    assert!(audit.to_string().contains("agent.upgrade"), "{audit}");
+    assert_eq!(env.public_status(&host).await, Some(StatusCode::OK));
+}
+
+/// The server looks for a release, says on the Settings page that one is available, and an
+/// administrator upgrades it from there: it downloads the release in place of its binary and
+/// hands over to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_upgrades_itself_from_the_settings_page() {
+    let release = common::FakeRelease::start("99.0.0", &[("magicpipesd", common::bin("magicpipesd"))], false).await;
+    let mut env = Env::with_config(Tls::DevCa, &format!("[upgrades]\nsource = \"{}\"\n", release.url)).await;
+    env.stop_server().await;
+    let exe = env.copy_of("magicpipesd");
+    env.server_bin = Some(exe.clone());
+    env.server_env.push(("MAGICPIPES_TEST_RELEASE_KEY".into(), release.key.clone()));
+    env.start_server().await;
+    let token = env.admin_token();
+
+    let out = env.server_cli(&["--upgrade", "--check", "--json"], &[("MAGICPIPES_TEST_RELEASE_KEY", &release.key)]).await;
+    let checked: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{out:?}"));
+    assert_eq!((checked["latest"].as_str(), checked["newer"].as_bool()), (Some("99.0.0"), Some(true)), "{checked}");
+
+    let (status, view) = env.api("GET", "/api/v1/server/upgrade?check=true", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!((view["latest"].as_str(), view["newer"].as_bool(), view["why_not"].as_str()), (Some("99.0.0"), Some(true), None), "{view}");
+
+    let admin = admin_session(&env).await;
+    let settings = env.ui("/settings", Some(&admin), None).await;
+    assert!(settings.html.contains("magicpipesd 99.0.0 is available") && settings.html.contains(r#"action="/settings/upgrade""#), "{}", settings.html);
+    let before = env.server_pid().unwrap();
+    let started = env.ui("/settings/upgrade", Some(&admin), Some(&[("csrf", &settings.csrf())])).await;
+    assert_eq!(started.location.as_deref(), Some("/settings/upgrade"), "{}", started.html);
+
+    env.eventually("the upgrade to finish", Duration::from_secs(60), || async {
+        env.api("GET", "/api/v1/server/upgrade", Some(&token)).await.1["last"]["state"] != "running"
+    })
+    .await;
+    let (_, view) = env.api("GET", "/api/v1/server/upgrade", Some(&token)).await;
+    assert_eq!(view["last"]["state"], "done", "{view}\n{}", env.server_log());
+    // What the new binary says it is: the fake release serves this build.
+    assert_eq!(view["last"]["to"], magicpipes_core::VERSION);
+    assert_ne!(env.server_pid(), Some(before), "a new process serves");
+    assert!(magicpipes_core::upgrade::kept_path(&exe).exists(), "the binary it replaced is kept");
+    let page = env.ui("/settings/upgrade", Some(&admin), None).await;
+    assert!(page.html.contains("took over from") && !page.html.contains(">under way</span>") && page.html.matches(">done</span>").count() == 7, "{}", page.html);
+    let (_, audit) = env.api("GET", "/api/v1/audit", Some(&token)).await;
+    assert!(audit.to_string().contains("server.upgrade"), "{audit}");
+}

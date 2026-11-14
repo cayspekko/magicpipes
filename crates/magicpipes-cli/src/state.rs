@@ -126,6 +126,10 @@ pub struct AgentConfig {
     /// the default, 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<u8>,
+    /// The server may ask this agent to upgrade itself to the latest signed release
+    /// (`magicpipes --upgrade --allow-remote`). Off unless its user turned it on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_remote_upgrade: bool,
 }
 
 impl AgentConfig {

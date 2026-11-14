@@ -31,6 +31,15 @@ pub(super) fn esc(s: &str) -> String {
 }
 
 /// An error message, if there is one.
+/// A message from the control plane as a sentence on a page: "the password is not correct" reads
+/// "The password is not correct."
+pub(super) fn sentence(message: &str) -> String {
+    let mut chars = message.chars();
+    let Some(first) = chars.next() else { return String::new() };
+    let end = if message.ends_with(['.', '?', '!']) { "" } else { "." };
+    format!("{}{}{end}", first.to_uppercase(), chars.as_str())
+}
+
 pub(super) fn alert(msg: Option<&str>) -> String {
     msg.map(|m| format!(r#"<div class="alert with-ic" role="alert">{WARNING}<span>{}</span></div>"#, esc(m))).unwrap_or_default()
 }
@@ -58,8 +67,8 @@ pub(super) fn count(n: usize, one: &str, many: &str) -> String {
 /// The color of a state.
 pub(super) fn tone(state: &str) -> &'static str {
     match state {
-        "connected" | "ready" => "ok",
-        "pending" => "warn",
+        "connected" | "ready" | "done" => "ok",
+        "pending" | "under way" => "warn",
         "disconnected" | "error" | "failed" => "bad",
         _ => "",
     }

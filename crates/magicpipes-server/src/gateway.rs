@@ -13,11 +13,12 @@ use hyper_util::rt::TokioIo;
 use magicpipes_core::error::ErrorCode;
 use magicpipes_core::mux::{self, Mode, MuxStream};
 use magicpipes_core::proto::{
-    self, ErrorBody, INSTANCE_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION, Request as Rpc, Response as RpcResponse, UPGRADE_PROTOCOL,
+    self, ErrorBody, INSTANCE_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION, REMOTE_UPGRADE_HEADER, REPLACES_HEADER, Request as Rpc, Response as RpcResponse,
+    UPGRADE_PROTOCOL, VERSION_HEADER,
 };
 use tokio::io::AsyncWriteExt;
 
-use crate::control::{Attached, ControlPlane};
+use crate::control::{Attached, ControlPlane, Hello};
 use crate::mgmt::{AppState, PeerAddr, bearer_token};
 
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,12 +40,28 @@ pub async fn connect(State(app): State<AppState>, mut req: Request) -> Response 
         Some(Ok(id)) if proto::valid_instance(&id) => Some(id),
         Some(_) => return (StatusCode::BAD_REQUEST, "invalid x-magicpipes-instance").into_response(),
     };
+    // Protocol 12: a run taking over from another of the same agent.
+    let replaces = match req.headers().get(REPLACES_HEADER).map(|v| v.to_str().map(str::to_string)) {
+        None => None,
+        Some(Ok(id)) if proto::valid_instance(&id) => Some(id),
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid x-magicpipes-replaces").into_response(),
+    };
+    // Shown, never acted on: a version that doesn't read as one is left out.
+    let version = req
+        .headers()
+        .get(VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(magicpipes_core::release::Version::parse)
+        .map(|v| v.to_string())
+        .filter(|v| v.len() <= 64);
+    let remote_upgrade = req.headers().get(REMOTE_UPGRADE_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+    let hello = Hello { protocol, instance, version, remote_upgrade, replaces };
     let Some(agent_id) = bearer_token(req.headers()).and_then(|t| app.control.authenticate_agent(t)) else {
         tracing::warn!(%peer, "rejected agent connection: invalid credentials");
         tokio::time::sleep(Duration::from_millis(250)).await;
         return (StatusCode::UNAUTHORIZED, "invalid agent credentials").into_response();
     };
-    if !app.control.has_room(&agent_id, instance.as_deref()) {
+    if !app.control.has_room(&agent_id, hello.instance.as_deref()) {
         tracing::debug!(agent = %agent_id, %peer, "refused a connection: the agent has as many as agents.max_connections allows");
         return (StatusCode::CONFLICT, "this agent has as many connections as the server allows").into_response();
     }
@@ -54,7 +71,7 @@ pub async fn connect(State(app): State<AppState>, mut req: Request) -> Response 
     let control = app.control.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
-            Ok(upgraded) => run_session(control, agent_id, peer, protocol, instance, TokioIo::new(upgraded)).await,
+            Ok(upgraded) => run_session(control, agent_id, peer, hello, TokioIo::new(upgraded)).await,
             Err(e) => tracing::warn!(%peer, error = %e, "agent upgrade failed"),
         }
     });
@@ -66,17 +83,10 @@ pub async fn connect(State(app): State<AppState>, mut req: Request) -> Response 
     resp
 }
 
-async fn run_session(
-    control: Arc<ControlPlane>,
-    agent_id: String,
-    peer: SocketAddr,
-    protocol: u32,
-    instance: Option<String>,
-    io: TokioIo<hyper::upgrade::Upgraded>,
-) {
+async fn run_session(control: Arc<ControlPlane>, agent_id: String, peer: SocketAddr, hello: Hello, io: TokioIo<hyper::upgrade::Upgraded>) {
     // All of this agent's traffic goes through the session; only its RPCs stay on this thread.
     let (handle, mut inbound) = control.on_traffic_threads(|| mux::spawn(io, Mode::Server));
-    let conn_id = match control.attach_session(&agent_id, handle.clone(), peer, protocol, instance) {
+    let conn_id = match control.attach(&agent_id, handle.clone(), peer, hello) {
         Attached::Yes(conn_id) => conn_id,
         Attached::Revoked => {
             tracing::warn!(agent = %agent_id, %peer, "closing session of revoked agent");

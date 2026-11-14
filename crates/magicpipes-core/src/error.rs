@@ -138,6 +138,18 @@ codes! {
     /// The mail server can't be reached, or refused the message.
     MailFailed = "mail_failed", http 502, exit 5;
 
+    // ---- upgrades ----------------------------------------------------------------------------
+    /// The release source couldn't be reached, or didn't answer with a release.
+    ReleaseUnreachable = "release_unreachable", http 502, exit 9;
+    /// A release whose signature or checksum doesn't match: nothing was installed.
+    ReleaseInvalid = "release_invalid", http 502, exit 9;
+    /// This install can't replace itself: a package manager or a container owns the binary, its
+    /// directory isn't writable, there's no release for this platform, or this build trusts no
+    /// release key.
+    UpgradeNotPossible = "upgrade_not_possible", http 409, exit 9;
+    /// The new version didn't take over; the old one carries on, and its binary is back.
+    UpgradeFailed = "upgrade_failed", http 500, exit 9;
+
     // ---- public traffic (server-generated pages) ---------------------------------------------
     TunnelNotFound = "tunnel_not_found", http 404, exit 1;
     AgentOffline = "agent_offline", http 502, exit 1;
@@ -192,6 +204,7 @@ mod tests {
                   "ports_disabled", "ssh_disabled", "ssh_key_taken", "server_outdated", "invalid_cidr", "unsupported", "mail_not_configured"]),
             (7, &["tls_failed", "tls_timeout"]),
             (8, &["probe_failed"]),
+            (9, &["release_unreachable", "release_invalid", "upgrade_not_possible", "upgrade_failed"]),
         ];
         for c in ErrorCode::ALL {
             let want = table.iter().find(|(_, codes)| codes.contains(&c.as_str())).map_or(1, |(e, _)| *e);

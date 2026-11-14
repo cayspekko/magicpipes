@@ -69,7 +69,28 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   (`replicas`), so a readiness probe through it may reach one of them; the agent then takes the
 ///   server's acknowledgement as enough. An older server never says so, and an older agent
 ///   ignores it and waits for a probe that may never reach it, so replicas need agents at 11.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// * 12: upgrades. The agent says its release ([`VERSION_HEADER`]) and whether it may be asked to
+///   upgrade itself ([`REMOTE_UPGRADE_HEADER`]); a run taking over from another of the same agent
+///   names it ([`REPLACES_HEADER`]), and the server lets that one finish what it's doing instead of
+///   cutting it off. [`ServerOpen::Reconnect`] asks the agent to connect again, to the server's
+///   new version, keeping this connection until what's on it is done; [`ServerOpen::Upgrade`]
+///   asks an agent that allows it to upgrade itself. An older agent answers both
+///   [`StreamStatus::Unsupported`], and the server then waits until its connection is idle and
+///   closes it, which it reconnects after.
+pub const PROTOCOL_VERSION: u32 = 12;
+
+/// The first protocol version that knows about upgrades (see [`PROTOCOL_VERSION`]).
+pub const UPGRADES_PROTOCOL: u32 = 12;
+
+/// Header on an agent's connection requests (protocol 12): its release, such as `0.2.0`.
+pub const VERSION_HEADER: &str = "x-magicpipes-version";
+/// Header on an agent's connection requests (protocol 12), `1` when its user lets the server ask
+/// it to upgrade itself (`magicpipes --upgrade --allow-remote`).
+pub const REMOTE_UPGRADE_HEADER: &str = "x-magicpipes-remote-upgrade";
+/// Header on the connection requests of a new run of an agent taking over from an older one
+/// (protocol 12): the older run's [`INSTANCE_HEADER`]. Its connections get no new streams, and
+/// close when the older run is done.
+pub const REPLACES_HEADER: &str = "x-magicpipes-replaces";
 
 /// The first protocol version whose servers read why the app couldn't be reached.
 pub const REASONS_PROTOCOL: u32 = 10;
@@ -387,6 +408,14 @@ pub enum ServerOpen {
     /// Answered with a status byte at once, so the server can time a round trip on this
     /// connection. An agent before this answers [`StreamStatus::Unsupported`], which times it too.
     Ping,
+    /// Protocol 12: connect again, to the new version of the server, and keep this connection only
+    /// for what's already on it, which the server then closes. Answered with a status byte.
+    Reconnect,
+    /// Protocol 12: upgrade to the latest release, if this agent's user allows it
+    /// ([`REMOTE_UPGRADE_HEADER`]): [`StreamStatus::Ok`] once it has started, else
+    /// [`StreamStatus::Unsupported`]. The agent reads the release from its own source and checks
+    /// its signature itself; the server only asks.
+    Upgrade,
 }
 
 /// Body of `POST /api/v1/enroll`.
@@ -599,6 +628,10 @@ mod tests {
         // A ping the server times: plain, so that an agent which doesn't know it answers at once.
         assert_eq!(serde_json::to_string(&ServerOpen::Ping).unwrap(), r#"{"kind":"ping"}"#);
         assert_eq!(serde_json::from_str::<ServerOpen>(r#"{"kind":"ping"}"#).unwrap(), ServerOpen::Ping);
+        // Protocol 12. An agent before it can't read these, and answers Unsupported.
+        assert_eq!(serde_json::to_string(&ServerOpen::Reconnect).unwrap(), r#"{"kind":"reconnect"}"#);
+        assert_eq!(serde_json::to_string(&ServerOpen::Upgrade).unwrap(), r#"{"kind":"upgrade"}"#);
+        assert_eq!(serde_json::from_str::<ServerOpen>(r#"{"kind":"upgrade"}"#).unwrap(), ServerOpen::Upgrade);
         // Protocol 10: why the app couldn't be reached, and a reason from a newer agent is "other".
         let u: Unreachable = serde_json::from_str(r#"{"reason":"refused","detail":"connection refused by 127.0.0.1:8080"}"#).unwrap();
         assert_eq!(u.reason, UnreachableReason::Refused);

@@ -9,6 +9,7 @@ mod ipc;
 mod platform;
 mod probe;
 mod state;
+mod upgrading;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -40,11 +41,38 @@ use crate::state::AgentConfig;
   magicpipes connect db --local 5432                 Reach a private TCP or UDP tunnel from here
   magicpipes probe                                   Check your tunnels' addresses from here
   magicpipes list                                    See what's running
-  magicpipes remove <name>                           Stop one"
+  magicpipes remove <name>                           Stop one
+  magicpipes --upgrade                               Move to the latest release without a gap",
+    arg_required_else_help = true
 )]
 struct Cli {
+    /// Upgrade magicpipes to the latest release: download it, check its signature, put it in
+    /// place of this machine's binary, and have the running agent hand over to it without
+    /// dropping a connection.
+    #[arg(long)]
+    upgrade: bool,
+    /// With --upgrade: only say whether a newer release is available.
+    #[arg(long, requires = "upgrade", conflicts_with_all = ["restart", "rollback", "allow_remote", "deny_remote"])]
+    check: bool,
+    /// With --upgrade: hand the running agent over to the binary in place now, downloading
+    /// nothing (after installing one another way, or to restart without a gap).
+    #[arg(long, requires = "upgrade", conflicts_with_all = ["rollback", "allow_remote", "deny_remote"])]
+    restart: bool,
+    /// With --upgrade: put back the binary the last upgrade replaced, and hand over to it.
+    #[arg(long, requires = "upgrade", conflicts_with_all = ["allow_remote", "deny_remote"])]
+    rollback: bool,
+    /// With --upgrade: let the server ask this machine's agent to upgrade itself, to a release
+    /// the agent checks (off unless turned on here).
+    #[arg(long, requires = "upgrade", conflicts_with = "deny_remote")]
+    allow_remote: bool,
+    /// With --upgrade: stop the server from asking this machine's agent to upgrade itself.
+    #[arg(long, requires = "upgrade")]
+    deny_remote: bool,
+    /// With --upgrade: print the result as JSON on stdout.
+    #[arg(long = "json", id = "upgrade_json", requires = "upgrade")]
+    json: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Args, Clone, Copy)]
@@ -350,13 +378,55 @@ enum AgentCommand {
 
 /// Exit codes (documented in the README).
 fn main() -> ExitCode {
+    // While this process has one thread, and before an upgrade could replace its binary.
+    magicpipes_core::upgrade::remember_exe();
+    #[cfg(unix)]
+    magicpipes_core::fds::adopt_from_env();
     let cli = Cli::parse();
-    check_add_args(&cli.command);
-    if let Command::Agent { command: AgentCommand::Run { detached } } = cli.command {
+    if cli.upgrade {
+        if cli.command.is_some() {
+            use clap::CommandFactory;
+            Cli::command().error(clap::error::ErrorKind::ArgumentConflict, "--upgrade is a command of its own: `magicpipes --upgrade`").exit();
+        }
+        let what = match (cli.check, cli.restart, cli.rollback, cli.allow_remote, cli.deny_remote) {
+            (true, ..) => upgrading::What::Check,
+            (_, true, ..) => upgrading::What::Restart,
+            (_, _, true, ..) => upgrading::What::Rollback,
+            (_, _, _, true, _) => upgrading::What::Remote(true),
+            (.., true) => upgrading::What::Remote(false),
+            _ => upgrading::What::Upgrade,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+        return match rt.block_on(upgrading::run(what, cli.json)) {
+            Ok(out) => {
+                if cli.json {
+                    print_json(&out);
+                } else if let Some(text) = out["text"].as_str() {
+                    println!("{text}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                if cli.json {
+                    println!("{}", json!({ "error": e }));
+                } else {
+                    eprintln!("Error: {}", e.message);
+                }
+                ExitCode::from(magicpipes_core::error::exit_code(&e.code))
+            }
+        };
+    }
+    let Some(command) = cli.command else {
+        use clap::CommandFactory;
+        let _ = Cli::command().print_help();
+        return ExitCode::from(2);
+    };
+    check_add_args(&command);
+    if let Command::Agent { command: AgentCommand::Run { detached } } = command {
         return run_agent(detached);
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
-    rt.block_on(dispatch(cli.command))
+    rt.block_on(dispatch(command))
 }
 
 /// Argument rules clap cannot express: a bool flag such as `--shell` always counts as present
@@ -689,6 +759,7 @@ async fn enroll(server: &str, token: &str, ca_pem: Option<String>, tls: &Arc<rus
     }
     let enrolled: magicpipes_core::proto::EnrollResponse =
         serde_json::from_value(resp).map_err(|e| ErrorInfo::new(ErrorCode::Protocol, e.to_string()))?;
+    let before = AgentConfig::load().ok().flatten();
     let cfg = AgentConfig {
         server: server.to_string(),
         agent_id: enrolled.agent_id.clone(),
@@ -696,7 +767,9 @@ async fn enroll(server: &str, token: &str, ca_pem: Option<String>, tls: &Arc<rus
         base_domain: enrolled.base_domain.clone(),
         ca_cert_pem: ca_pem,
         // Logging in again keeps how many connections were asked for.
-        connections: AgentConfig::load().ok().flatten().and_then(|c| c.connections),
+        connections: before.as_ref().and_then(|c| c.connections),
+        // And whether the server may ask for an upgrade, but only the same server.
+        allow_remote_upgrade: before.as_ref().is_some_and(|c| c.allow_remote_upgrade && c.server == server),
     };
     cfg.save().map_err(|e| ErrorInfo::new(ErrorCode::ConfigError, format!("{e:#}")))?;
     Ok(enrolled)
@@ -1160,11 +1233,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upgrade_is_a_flag_beside_the_commands() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["magicpipes"].iter().chain(args).copied());
+        let up = parse(&["--upgrade", "--check", "--json"]).unwrap();
+        assert!(up.upgrade && up.check && up.json && up.command.is_none());
+        let add = parse(&["add", "8080", "--json"]).unwrap();
+        assert!(!add.upgrade && !add.json && matches!(add.command, Some(Command::Add { out: Output { json: true, .. }, .. })), "a command's own --json");
+        for bad in [&["--check"][..], &["--json"], &["--upgrade", "--check", "--restart"], &["--upgrade", "--allow-remote", "--deny-remote"], &["--upgrade", "--rollback", "--allow-remote"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn tags_can_be_repeated_or_comma_separated() {
         let tags = |args: &[&str]| {
             let line = ["magicpipes", "add", "8080"].iter().chain(args).copied();
             Cli::try_parse_from(line).map(|cli| match cli.command {
-                Command::Add { tags, .. } => tags,
+                Some(Command::Add { tags, .. }) => tags,
                 _ => panic!("not add"),
             })
         };

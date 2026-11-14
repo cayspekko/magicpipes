@@ -64,46 +64,82 @@ fn flows_per_client(max_flows: usize) -> usize {
     (max_flows / 8).max(1)
 }
 
+/// An open port: cancelling `stop` closes it.
+pub(super) struct Listening {
+    pub stop: CancellationToken,
+    /// Another descriptor for its socket, to hand to a new version of the server.
+    #[cfg(unix)]
+    pub fd: Option<std::os::fd::OwnedFd>,
+}
+
+/// What a port's socket is called when it's handed to a new version of the server.
+pub fn fd_name(kind: Kind, port: u16) -> String {
+    format!("{kind}:{port}")
+}
+
 /// Binds `port` and serves it until `stop` is cancelled. Binding is synchronous so the caller
-/// learns at once if the port is taken.
-pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: CancellationToken) -> io::Result<()> {
+/// learns at once if the port is taken. A socket the older version handed over is taken instead.
+pub(super) fn listen(dp: Arc<DataPlane>, kind: Kind, port: u16, stop: CancellationToken) -> io::Result<Listening> {
     let addr = SocketAddr::new(dp.settings.ports.bind, port);
+    #[cfg(unix)]
+    let handed = magicpipes_core::fds::take(&fd_name(kind, port));
+    #[cfg(not(unix))]
+    let handed: Option<std::convert::Infallible> = None;
+    let dup: Option<socket2::Socket>;
     match kind {
         Kind::Tcp => {
-            // std sets SO_REUSEADDR on Unix, so a restarted server can rebind at once.
-            let std = std::net::TcpListener::bind(addr)?;
+            let std = match handed {
+                #[cfg(unix)]
+                Some(fd) => std::net::TcpListener::from(fd),
+                // std sets SO_REUSEADDR on Unix, so a restarted server can rebind at once.
+                _ => std::net::TcpListener::bind(addr)?,
+            };
             std.set_nonblocking(true)?;
+            dup = SockRef::from(&std).try_clone().ok();
             let listener = TcpListener::from_std(std)?;
-            tokio::spawn(serve_tcp(dp, port, listener, stop));
+            tokio::spawn(serve_tcp(dp, port, listener, stop.clone()));
         }
         Kind::Udp => {
-            let std = std::net::UdpSocket::bind(addr)?;
+            let std = match handed {
+                #[cfg(unix)]
+                Some(fd) => std::net::UdpSocket::from(fd),
+                _ => std::net::UdpSocket::bind(addr)?,
+            };
             std.set_nonblocking(true)?;
+            dup = SockRef::from(&std).try_clone().ok();
             let socket = Arc::new(UdpSocket::from_std(std)?);
-            tokio::spawn(serve_udp(dp, port, socket, stop));
+            tokio::spawn(serve_udp(dp, port, socket, stop.clone()));
         }
         Kind::Http | Kind::Ssh | Kind::Rdp | Kind::Vnc => return Err(io::Error::other("this kind of tunnel has no port of its own")),
     }
-    Ok(())
+    #[cfg(unix)]
+    let listening = Listening { stop, fd: dup.map(std::os::fd::OwnedFd::from) };
+    #[cfg(not(unix))]
+    let listening = {
+        drop(dup);
+        Listening { stop }
+    };
+    Ok(listening)
 }
 
 /// The route for a new connection or flow, if the client may use it and the agent is online.
-fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr) -> Option<(Arc<Route>, AgentLink)> {
+/// `wait`: a TCP connection may wait a moment for a machine moving to this server after a
+/// handover; a datagram can't, since one socket carries every flow.
+async fn admit(dp: &DataPlane, kind: Kind, port: u16, peer: SocketAddr, wait: bool) -> Option<(Arc<Route>, AgentLink)> {
     let route = dp.lookup_port(kind, port)?;
     if !route.access.admits(&Principal::Anonymous, peer.ip()) {
         tracing::debug!(%kind, port, %peer, "client not admitted by the tunnel's access policy");
         return None;
     }
-    match route.agent.as_ref().filter(|a| a.is_online()) {
-        Some(a) => {
-            let agent = a.clone();
-            Some((route, agent))
-        }
-        None => {
-            route.stats.record(Outcome::AgentOffline);
-            None
-        }
+    if let Some(a) = route.agent.as_ref().filter(|a| a.is_online()) {
+        let agent = a.clone();
+        return Some((route, agent));
     }
+    if wait && let Some(found) = dp.wait_for_agent(&route, |dp| dp.lookup_port(kind, port)).await {
+        return Some(found);
+    }
+    route.stats.record(Outcome::AgentOffline);
+    None
 }
 
 /// Returns once `peer` may no longer use the tunnel on `port`: it was removed, or its allow-list
@@ -194,7 +230,7 @@ async fn tcp_connection(dp: &DataPlane, port: u16, mut tcp: TcpStream, mut peer:
             Err(e) => return tracing::debug!(port, %peer, error = %e, "bad PROXY header"),
         }
     }
-    let Some((route, session)) = admit(dp, Kind::Tcp, port, peer) else { return };
+    let Some((route, session)) = admit(dp, Kind::Tcp, port, peer, true).await else { return };
     let header = ServerOpen::Data { tunnel_id: route.tunnel_id.clone(), peer: Some(peer.to_string()) };
     let Some(stream) = open(dp, &route, &session, peer.ip(), header).await else { return };
     tokio::select! {
@@ -239,7 +275,7 @@ async fn serve_udp(dp: Arc<DataPlane>, port: u16, socket: Arc<UdpSocket>, stop: 
             tracing::debug!(port, %peer, "too many UDP flows from this client; dropping datagram");
             continue;
         }
-        let Some((route, session)) = admit(&dp, Kind::Udp, port, peer) else { continue };
+        let Some((route, session)) = admit(&dp, Kind::Udp, port, peer, false).await else { continue };
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         let _ = tx.try_send(datagram);
         flows.insert(peer, tx);

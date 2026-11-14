@@ -37,10 +37,11 @@ pub enum Rule {
     KeyRefused,
     CheckFailing,
     OutsideFailing,
+    SecurityRelease,
 }
 
 impl Rule {
-    const ALL: [Rule; 13] = [
+    const ALL: [Rule; 14] = [
         Rule::MachineOffline,
         Rule::FewerConnections,
         Rule::SlowRoundTrips,
@@ -54,6 +55,7 @@ impl Rule {
         Rule::KeyRefused,
         Rule::CheckFailing,
         Rule::OutsideFailing,
+        Rule::SecurityRelease,
     ];
 
     /// Its name in the database.
@@ -72,6 +74,7 @@ impl Rule {
             Rule::KeyRefused => "key_refused",
             Rule::CheckFailing => "check_failing",
             Rule::OutsideFailing => "outside_failing",
+            Rule::SecurityRelease => "security_release",
         }
     }
 
@@ -95,6 +98,7 @@ impl Rule {
             Rule::KeyRefused => "Key changed",
             Rule::CheckFailing => "Check failing",
             Rule::OutsideFailing => "Unreachable from outside",
+            Rule::SecurityRelease => "Security fix released",
         }
     }
 }
@@ -332,6 +336,8 @@ pub struct Facts {
     /// Public ports held, and how many the range has.
     pub ports: Option<(usize, usize)>,
     pub max_new_certificates_per_day: usize,
+    /// A newer release that fixes a security problem, by version, while this server runs older.
+    pub security_release: Option<String>,
 }
 
 /// Every rule, on one sample.
@@ -420,6 +426,10 @@ pub fn judge(f: &Facts) -> Vec<Finding> {
     {
         find(Rule::PortsUsedUp, "server".into(), "Public ports", Severity::Warn, format!("{used} of the {total} in the [ports] range are in use."));
     }
+    if let Some(version) = &f.security_release {
+        let detail = format!("Release {version} fixes a security problem; this server runs {}. Upgrade it on the Settings page.", magicpipes_core::VERSION);
+        find(Rule::SecurityRelease, "server".into(), "This server", Severity::Bad, detail);
+    }
     out
 }
 
@@ -506,7 +516,15 @@ impl ControlPlane {
             for m in &mut machines {
                 m.offline_alert = alerts.is_open(Rule::MachineOffline, &format!("machine:{}", m.id));
             }
-            Facts { now, started, machines, tunnels, ports, max_new_certificates_per_day: self.cfg.agents.max_new_certificates_per_day }
+            Facts {
+                now,
+                started,
+                machines,
+                tunnels,
+                ports,
+                max_new_certificates_per_day: self.cfg.agents.max_new_certificates_per_day,
+                security_release: self.security_release(),
+            }
         };
         let findings = judge(&facts);
         let exists = |subject: &str| match subject.split_once(':') {
@@ -662,7 +680,7 @@ mod tests {
     }
 
     fn facts() -> Facts {
-        Facts { now: 10_000, started: 0, machines: vec![], tunnels: vec![], ports: None, max_new_certificates_per_day: 20 }
+        Facts { now: 10_000, started: 0, machines: vec![], tunnels: vec![], ports: None, max_new_certificates_per_day: 20, security_release: None }
     }
 
     fn machine(id: &str, tunnels: usize, link: Option<(usize, u32)>) -> MachineFacts {
@@ -782,6 +800,9 @@ mod tests {
         f.tunnels.clear();
         f.ports = Some((45, 50));
         assert!(rules(&f).is_empty(), "90% isn't over 90%");
+        f.security_release = Some("9.9.9".into());
+        assert_eq!(rules(&f), vec![(Rule::SecurityRelease, "server".into(), Severity::Bad)]);
+        assert!(judge(&f)[0].detail.starts_with("Release 9.9.9 fixes a security problem"));
     }
 
     #[test]

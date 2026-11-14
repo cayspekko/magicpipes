@@ -44,6 +44,9 @@ pub async fn machine(user: UiUser, State(app): State<AppState>, Path(id): Path<S
         let from: Vec<String> = a.remote_addrs.iter().map(|addr| format!("<code>{}</code>", esc(addr))).collect();
         dl.push_str(&field("Connects from", &from.join(", ")));
     }
+    if let Some(v) = &a.version {
+        dl.push_str(&field("Version", &format!("magicpipes {}", esc(v))));
+    }
     if let Some(p) = a.protocol {
         dl.push_str(&field("Agent protocol", &p.to_string()));
     }
@@ -78,7 +81,7 @@ pub async fn machine(user: UiUser, State(app): State<AppState>, Path(id): Path<S
 {list}
 <div class="section"><h2>Details</h2></div>
 <div class="card"><dl>{dl}</dl></div>
-{replicas}
+{upgrade}{replicas}
 <div class="card panel danger spaced"><div><h3>Revoke machine</h3><p>Its tunnels are deleted, and it can't connect again until it's enrolled again.</p></div>
 <form method="post" action="/agents/{id}/revoke" data-confirm="{question}">{csrf}<button class="btn danger">Revoke machine</button></form></div>"#,
         back = back("/machines", "Machines"),
@@ -86,6 +89,7 @@ pub async fn machine(user: UiUser, State(app): State<AppState>, Path(id): Path<S
         what = if a.owner_user_id.is_some() { "A personal machine, publishing with its owner's tags." } else { "A service agent: a machine nobody owns, with tags of its own." },
         connections = if a.runs > 1 { format!("{}<small>from {} replicas</small>", a.connections, a.runs) } else { a.connections.to_string() },
         replicas = replicas_panel(&a, &user),
+        upgrade = super::upgrades::machine_panel(&a, app.control.latest_release().as_ref().map(|m| m.version.as_str()), &user),
         round_trip = round_trip.unwrap_or_else(|| "—".to_string()),
         since = esc(&since),
         history = presence_section(&href, &series, history_days),

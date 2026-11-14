@@ -33,6 +33,7 @@ mod settings;
 mod ssh;
 mod terminal;
 mod ui;
+mod upgrades;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -139,6 +140,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/assets/terminal/{file}", get(terminal::asset))
         .route("/agents/{id}/revoke", post(ui::revoke_agent))
         .route("/agents/{id}/replicas", post(ui::agent_replicas))
+        .route("/agents/{id}/upgrade", post(upgrades::upgrade_agent))
         .route("/agents/{id}/tags", get(ui::agent_tags_page).post(ui::agent_tags))
         .route("/tags", get(accounts::tags).post(accounts::create_tag))
         .route("/tags/delete", post(accounts::delete_tag))
@@ -169,6 +171,7 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/audit", get(accounts::audit))
         .route("/settings", get(settings::settings))
         .route("/settings/export", get(settings::export))
+        .route("/settings/upgrade", get(upgrades::progress).post(upgrades::upgrade))
         .route("/settings/sign-in", post(settings::save_rules))
         .route("/settings/providers/new", get(settings::new_provider).post(settings::create_provider))
         .route("/settings/providers/{id}", get(settings::edit_provider).post(settings::update_provider))
@@ -197,6 +200,8 @@ pub fn router(control: Arc<ControlPlane>) -> Router {
         .route("/api/v1/probes", post(api::report_probes))
         .route("/api/v1/agents", get(api::list_agents))
         .route("/api/v1/agents/{id}", axum::routing::delete(api::revoke_agent).patch(api::update_agent))
+        .route("/api/v1/agents/{id}/upgrade", post(upgrades::api_upgrade_agent))
+        .route("/api/v1/server/upgrade", get(upgrades::api_status).post(upgrades::api_upgrade))
         .route("/api/v1/tags", get(api::list_tags).post(api::create_tag))
         .route("/api/v1/tags/{name}", axum::routing::delete(api::delete_tag).patch(api::update_tag))
         .route("/api/v1/tag-rules", get(api::list_tag_rules).post(api::create_tag_rule))

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::accounts::shown_once;
 use super::email::{FROM_ELSEWHERE, TOO_MANY, WENT_WRONG, client_of, over_limit_after_a_bad_code};
 use super::extract::{Posted, UiUser};
-use super::html::{count, esc, form_alert, invalid, title_of, when};
+use super::html::{count, esc, form_alert, invalid, sentence, title_of, when};
 use super::ui::{Done, cross_site, done, done_url, logged_in_to, login_page, page};
 use super::{AppState, ClientIp};
 use crate::control::{CodeError, TotpSetup, UserView};
@@ -142,15 +142,6 @@ pub(super) fn panel(user: &UiUser, app: &AppState, me: &UserView) -> String {
         None => ("Off. Turn them on to need a code from an authenticator app after your password.".to_string(), "Set up"),
     };
     format!(r#"<div class="card panel spaced"><div><h2>Sign-in codes</h2><p>{said}</p></div><a class="btn" href="/account/codes">{button}</a></div>"#)
-}
-
-/// A message from the control plane as a sentence on a page: "the password is not correct" reads
-/// "The password is not correct."
-fn sentence(message: &str) -> String {
-    let mut chars = message.chars();
-    let Some(first) = chars.next() else { return String::new() };
-    let end = if message.ends_with(['.', '?', '!']) { "" } else { "." };
-    format!("{}{}{end}", first.to_uppercase(), chars.as_str())
 }
 
 fn recovery_left(n: i64) -> String {

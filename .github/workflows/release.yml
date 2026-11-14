@@ -1,6 +1,8 @@
 # Runs only when a GitHub release is published: tests, builds magicpipes + magicpipesd for four
-# platforms, smoke-tests each build on its own OS, and attaches the archives and SHA256SUMS to
-# the release. Nothing is published unless every platform passes.
+# platforms, smoke-tests each build on its own OS, and attaches the archives, the bare binaries,
+# SHA256SUMS and the signed manifest `--upgrade` reads (release.json and release.json.sig) to the
+# release. Nothing is published unless every platform passes. A release whose notes contain
+# "[security]" is marked as a security fix, which servers raise an alert about until they have it.
 
 name: Build and release
 
@@ -70,9 +72,12 @@ jobs:
             echo "::error::Release tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main."
             exit 1
           fi
+          # Binaries report the workspace version, and compare it with the release's to decide
+          # whether to upgrade, so the two must be the same.
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
-            echo "::warning::Tag ${GITHUB_REF_NAME} does not match the Cargo version ${version}; binaries report ${version}."
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the workspace version ${version} in Cargo.toml."
+            exit 1
           fi
 
       - uses: dtolnay/rust-toolchain@1.99
@@ -134,19 +139,21 @@ jobs:
           cp "$novnc/docs/LICENSE.BSD-2-Clause" "dist/$name/LICENSE-novnc-BSD-2-Clause"
           cp "$novnc/docs/LICENSE.BSD-3-Clause" "dist/$name/LICENSE-novnc-BSD-3-Clause"
           cp "$novnc/vendor/pako/LICENSE" "dist/$name/LICENSE-pako"
+          # The bare binaries, for `--upgrade` (scripts/release-manifest.py lists them).
+          mkdir -p dist/upload
+          cp "target/$TARGET/release/magicpipes$ext" "dist/upload/magicpipes-${GITHUB_REF_NAME}-${TARGET}$ext"
+          cp "target/$TARGET/release/magicpipesd$ext" "dist/upload/magicpipesd-${GITHUB_REF_NAME}-${TARGET}$ext"
           cd dist
           if [[ "$TARGET" == *windows* ]]; then
-            7z a -tzip -bso0 "$name.zip" "$name"
-            echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
+            7z a -tzip -bso0 "upload/$name.zip" "$name"
           else
-            tar -czf "$name.tar.gz" "$name"
-            echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+            tar -czf "upload/$name.tar.gz" "$name"
           fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: ${{ steps.package.outputs.archive }}
+          path: dist/upload/*
           if-no-files-found: error
 
   publish:
@@ -154,9 +161,14 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # The signing key is a secret of this environment, so only this job can read it.
+    environment: release
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -164,6 +176,34 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum -- * | tee SHA256SUMS
+      - name: Sign the manifest
+        env:
+          RELEASE_KEY: ${{ secrets.MAGICPIPES_RELEASE_KEY }}
+          NOTES: ${{ github.event.release.body }}
+        run: |
+          if [[ -z "$RELEASE_KEY" ]]; then
+            echo "::error::The release environment has no MAGICPIPES_RELEASE_KEY secret (scripts/release-key.sh makes one)."
+            exit 1
+          fi
+          security=""
+          [[ "$NOTES" == *"[security]"* ]] && security="--security"
+          python3 src/scripts/release-manifest.py "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}" dist $security > dist/release.json
+          key="$RUNNER_TEMP/release-key.pem"
+          (umask 077; printf '%s\n' "$RELEASE_KEY" > "$key")
+          # Binaries trust only the keys built into them: signing with another would publish a
+          # release nothing installs.
+          pub=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | base64 -w0)
+          if ! grep -qF "\"$pub\"" src/crates/magicpipes-core/src/release.rs; then
+            rm -f "$key"
+            echo "::error::The signing key's public half ($pub) isn't in RELEASE_KEYS in crates/magicpipes-core/src/release.rs."
+            exit 1
+          fi
+          openssl pkeyutl -sign -inkey "$key" -rawin -in dist/release.json -out "$RUNNER_TEMP/release.sig"
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/release-pub.pem"
+          rm -f "$key"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/release-pub.pem" -rawin -in dist/release.json -sigfile "$RUNNER_TEMP/release.sig"
+          base64 -w0 "$RUNNER_TEMP/release.sig" > dist/release.json.sig
+          cat dist/release.json
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}

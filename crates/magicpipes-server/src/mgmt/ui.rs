@@ -51,6 +51,7 @@ done_messages! {
     MachineRevoked "machine-revoked" "Machine revoked, and its tunnels deleted.",
     ReplicasOn "replicas-on" "Replicas are on: copies of this machine that connect now serve beside each other.",
     ReplicasOff "replicas-off" "Replicas are off: a copy of this machine that connects replaces the one before.",
+    UpgradeAsked "upgrade-asked" "Asked. The machine checks the release itself, and a new agent takes over; its version here changes once it has.",
     TagsSaved "tags-saved" "Tags saved.",
     TokenDeleted "token-deleted" "API token deleted.",
     SshKeyAdded "ssh-key-added" "SSH key added.",

@@ -88,3 +88,8 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # history_days = 7
 # synthetics = true
 # check_interval_secs = 60
+
+# Once a day the server looks for a new release and tells administrators on the Settings page. In a
+# container it can't replace itself: pull the new image and recreate the container instead.
+# [upgrades]
+# check = true

@@ -16,7 +16,7 @@ use crate::control::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, EnrollmentOpti
 use crate::data::connect::{MAX_PER_PERSON, Refused};
 
 /// An API error; its HTTP status follows from the code.
-pub struct ApiError(ErrorBody);
+pub struct ApiError(pub(super) ErrorBody);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -42,12 +42,22 @@ fn forbidden() -> ApiError {
     api_err(ErrorCode::Forbidden, "only administrators can do this")
 }
 
+impl ApiError {
+    pub(super) fn forbidden() -> Self {
+        forbidden()
+    }
+
+    pub(super) fn not_found(what: &str) -> Self {
+        api_err(ErrorCode::NotFound, what)
+    }
+}
+
 fn no_user() -> ApiError {
     api_err(ErrorCode::NotFound, "no such user")
 }
 
 /// Extractor: who the bearer token stands for, an admin token or a user's API token.
-pub struct Caller(Principal);
+pub struct Caller(pub(super) Principal);
 
 impl FromRequestParts<AppState> for Caller {
     type Rejection = ApiError;

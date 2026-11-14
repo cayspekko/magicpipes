@@ -906,10 +906,10 @@ tunnel, never an address.
 Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgraded connection.
 
 * **Handshake**: the agent's upgrade request and the server's `101` carry
-  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 10: 2 added the handshake and
+  `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 12: 2 added the handshake and
   answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
   and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels, 9 several connections per agent, 10 why an app
-  couldn't be reached). A peer without the header is
+  couldn't be reached, 11 replicas, 12 upgrades: see "Upgrades without downtime"). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,
@@ -932,7 +932,10 @@ Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgrad
   inside `StatusPrefixed`, where it stays one byte. An older agent closes the stream after the
   byte, so reading the frame ends at once.
   `Datagram { tunnel_id }` is the same for one UDP client, followed by `u16`-length framed
-  datagrams. `TunnelRemoved` tells the agent an administrator deleted a tunnel.
+  datagrams. `TunnelRemoved` tells the agent an administrator deleted a tunnel. `Reconnect` and
+  `Upgrade` (version 12) ask the agent to connect again, to the server's new version, and to
+  upgrade itself; both are answered with a status byte, and neither carries anything for the agent
+  to act on but the request itself.
 * The status byte is read lazily by the server (`StatusPrefixed`): the HTTP request is written
   immediately, so a successful request costs no extra round trip, but local connection failures
   are still attributed exactly (`local_unreachable` vs `upstream_error` vs `agent_offline`).
@@ -977,6 +980,16 @@ a connection to the public port that must arrive back at the agent (a warning, n
   (`if_idle` variant used to clean up an agent a failed `add` started).
 * Registration is serialized inside the agent, so concurrent `add`s of one port yield one
   tunnel.
+* **Take-over** (`agent/takeover.rs`, Unix): a background agent can hand everything to a new one,
+  which is how `magicpipes --upgrade` changes binaries without a gap. It starts the binary at its
+  path with `agent.lock`'s descriptor, its IPC listener and a socket pair inherited
+  (`magicpipes_core::fds`): `flock` belongs to the open file, so the new agent holds the same lock
+  and no third agent can start in between, and no command ever finds the socket gone. The new agent
+  connects as a new run naming the old one (`X-MagicPipes-Replaces`), registers its tunnels, says
+  ready; the old one stops accepting commands, says go, waits for its streams (counted in
+  `forward`) for up to 30 s, and exits without removing the socket or the pid file, which are the
+  new agent's. An agent run in the foreground isn't taken over: its service manager or container
+  owns its process.
 * Agent state (`tunnels.json`) is written atomically (temp file plus rename, mode 0600).
 * **In a container** (`agent run` in the foreground; [KUBERNETES.md](KUBERNETES.md)): tunnels can be
   declared in `MAGICPIPES_TUNNELS` or `MAGICPIPES_TUNNELS_FILE`, one per line as `add` arguments,
@@ -1031,6 +1044,70 @@ a connection to the public port that must arrive back at the agent (a warning, n
   `create` fields and are registered just before the change (`Submitted::create_missing`). The picker dialog (`mgmt/ui.js`) is an enhancement over a page
   of checkboxes at the same URL, so the UI still works without JavaScript; the tag registry
   reaches it as a JSON data block, which the CSP doesn't treat as a script.
+
+## Upgrades without downtime (phases 12 to 12d)
+
+Releases carry `release.json`, each binary's address, SHA-256 and size, and `release.json.sig`, its
+Ed25519 signature, made in the release workflow's `release` environment with a key whose public half
+is compiled into the binaries (`release::RELEASE_KEYS`). A binary installs only a release signed by
+one of those keys (checked with `ring`), with a binary for its own platform, of a newer version than
+its own; it downloads to `<binary>.new` beside itself, checking size and SHA-256 as it goes (at most
+256 MiB, 30 s between pieces, 10 minutes in all, redirects never from `https` to `http`), runs its
+`--version`, links the running binary to `<binary>.old`, and renames the new one over it, so the
+path is never without a binary (`upgrade.rs`). On Windows the running binary is renamed aside first,
+which Windows allows. Debug builds also trust `MAGICPIPES_TEST_RELEASE_KEY`, for the tests.
+
+**The server hands over** (`handover.rs`, Unix), asked by `magicpipesd --upgrade` (which writes a
+request file and sends `SIGUSR2`, the pid from `magicpipesd.pid`), the Settings page, or `systemctl
+reload`. The old process backs up the database (`VACUUM INTO`, newest 5 kept), has the new binary
+read the configuration and migrate a copy (`magicpipesd rehearse`), then starts it with every
+listening socket inherited, ports included, and a Unix socket of their own. The new process adopts
+the sockets instead of binding (a listener the configuration moved is bound anew), migrates the
+database, loads every HTTP tunnel's certificate, and says ready; only then does the old one stop
+accepting, so the kernel queues every new connection on sockets the new process accepts from, and
+none is refused. The old process then asks each agent at protocol 12 to reconnect (`Reconnect`):
+the agent dials new connections, which reach the new process, and leaves the old ones to the old
+process, which closes each once it carries no stream (`MuxHandle::data_streams`, its pool of idle
+connections emptied and closed first). Older agents' connections are closed once idle, and they
+reconnect as after any restart. The new process holds requests for those agents' tunnels
+(`DataPlane::wait_for_agent`: their routes have no agent yet) until they arrive, at most
+`hold_secs` and 4096 at once, so the moment between stopping and reconnecting costs a short wait
+rather than errors; TCP ports wait the same way, UDP doesn't, since one socket carries every flow.
+A connection the old process accepted a moment before it stopped gets its first request answered
+before it closes (`listen::FirstRequest`). The old process finishes what's under way, up to
+`drain_secs`, and exits once systemd knows the new one is the main process (`MAINPID`, which needs
+`Type=notify`: the old process says so, and the new one too where `NotifyAccess=all` lets it). Background work (certificate renewals, sweeps, checks,
+alerts) runs in one process at a time: the new one starts its own when the old one stops accepting.
+Tested end to end with requests, TCP round trips and a slow response going on through it
+(`the_server_hands_over_to_a_new_process_without_dropping_a_request`).
+
+Costs left in place: one relaxed load per request on every connection (`FirstRequest`), and two
+atomic additions per agent stream (counting what a take-over waits for). A route with no agent
+looks at the hold before failing, which takes a lock only on that already-failing path.
+
+* **Migrations keep the previous release working.** For a few seconds the old process may still
+  write to a database the new one has migrated, and a failed handover leaves the old one running
+  on it. A migration adds tables and columns (with defaults) and doesn't rename or drop what the
+  previous release reads; anything else waits for the release after. `rehearse` tries the new
+  migrations, not the old code against them, so this is a rule, not a check.
+* **What doesn't move**: rate-limit counts, sign-ins and device logins in progress, the last day of
+  history kept in memory, UDP flows, and long connections past `drain_secs`.
+* **Where it doesn't apply**: Windows, launchd and systemd with `Type=simple` (the new process
+  would be stopped with the old one), and containers (the image is the thing to upgrade). `blocker`
+  says which, and the Settings page and `--upgrade` say so instead of trying.
+
+**Agents** upgrade with `magicpipes --upgrade`, which installs the binary and has the running agent
+hand over (take-over, above). On the server a run naming another of the same agent
+(`X-MagicPipes-Replaces`) is attached beside it with the old one marked leaving: it gets no new
+streams while another run can take them, even with replicas off, and goes when its connections
+close.
+
+**Asking an agent to upgrade** (`ServerOpen::Upgrade`) is the server reaching into someone else's
+machine, which the rule "the server names a tunnel, never an address" exists to prevent. It stays
+inside that rule: the message carries nothing, and the agent answers it only if its own user turned
+it on (`magicpipes --upgrade --allow-remote`, kept in `config.json`, which the server can't write).
+The agent then reads the release from its own source and checks the signature itself, so the most a
+compromised server can do is have an opted-in machine install a genuine newer release early.
 
 ## Security model (Milestone 1)
 
@@ -1246,7 +1323,9 @@ a connection to the public port that must arrive back at the agent (a warning, n
   Windows runner (login, `add`, a public request, `agent stop`), not by the full end-to-end
   suite, which is Unix-only. Files in `%USERPROFILE%\.magicpipes` rely on the profile's
   default ACL rather than explicit permissions.
-* One server node, one agent per tunnel; no load balancing.
+* One server node, one agent per tunnel; no load balancing. Upgrades hand over without downtime
+  (above), but a crash or a plain restart is still an outage until it's back.
+* Upgrades without downtime need Linux or macOS: a Windows server or agent restarts.
 * The `Host` header is forwarded unchanged; dev servers with host allow-lists must allow the
   public hostname.
 

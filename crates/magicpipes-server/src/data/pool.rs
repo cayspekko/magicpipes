@@ -61,11 +61,13 @@ impl<B> Idle<B> {
 pub struct Pool<B> {
     /// Per tunnel id, most recently returned last.
     idle: Mutex<HashMap<String, Vec<Idle<B>>>>,
+    /// Keeps nothing more: this server is handing over to a new version.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl<B> Default for Pool<B> {
     fn default() -> Self {
-        Self { idle: Mutex::default() }
+        Self { idle: Mutex::default(), closed: std::sync::atomic::AtomicBool::new(false) }
     }
 }
 
@@ -88,8 +90,11 @@ impl<B> Pool<B> {
         found
     }
 
-    /// Keeps a connection for the next request, unless the pool is full.
+    /// Keeps a connection for the next request, unless the pool is full or closed.
     pub fn put(&self, tunnel: &str, session: MuxHandle, version: u64, sender: SendRequest<B>) {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let mut idle = self.idle.lock().unwrap();
         let total: usize = idle.values().map(Vec::len).sum();
         let list = idle.entry(tunnel.to_string()).or_default();
@@ -117,6 +122,13 @@ impl<B> Pool<B> {
             }
         }
         true
+    }
+
+    /// Closes every idle connection, and keeps none from now on: so agents' connections go idle
+    /// when this server hands over to a new version.
+    pub fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.idle.lock().unwrap().clear();
     }
 
     /// Drops connections idle for longer than [`IDLE_TIMEOUT`], or no longer usable.

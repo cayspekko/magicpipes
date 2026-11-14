@@ -273,7 +273,7 @@ pub struct DataPlane {
     routes: RwLock<Arc<RouteTable>>,
     settings: ProxySettings,
     /// Bound port listeners; cancelling a token closes that listener.
-    listeners: Mutex<HashMap<(Kind, u16), CancellationToken>>,
+    listeners: Mutex<HashMap<(Kind, u16), ports::Listening>>,
     /// Ports in the route table that could not be bound, with the reason.
     bind_errors: Mutex<HashMap<(Kind, u16), String>>,
     tcp_permits: Arc<Semaphore>,
@@ -301,7 +301,20 @@ pub struct DataPlane {
     desktops: terminal::Limits,
     /// `magicpipes connect` connections per person.
     connections: connect::Limits,
+    /// Just after taking over from an older version: the machines connected to it, which are on
+    /// their way here, and until when a request for one of their tunnels waits for it.
+    hold: Mutex<Option<Hold>>,
+    /// Requests waiting that way, at most.
+    holding: Arc<Semaphore>,
 }
+
+struct Hold {
+    agents: std::collections::HashSet<String>,
+    until: tokio::time::Instant,
+}
+
+/// Requests that may wait at once for their machine after a handover; more fail as offline.
+const MAX_HELD: usize = 4096;
 
 impl DataPlane {
     /// Call on the threads that are to carry traffic.
@@ -327,6 +340,8 @@ impl DataPlane {
             terminals: terminal::Limits::default(),
             desktops: terminal::Limits::default(),
             connections: connect::Limits::default(),
+            hold: Mutex::new(None),
+            holding: Arc::new(Semaphore::new(MAX_HELD)),
         });
         // Closes idle pooled connections that timed out, until shutdown. (Without a runtime, in
         // unit tests, nothing is pooled anyway.)
@@ -463,10 +478,10 @@ impl DataPlane {
         let keys: Vec<(Kind, u16)> = table.by_port.keys().copied().collect();
         *self.routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(table);
         self.generation.send_modify(|g| *g += 1);
-        self.listeners.lock().unwrap_or_else(|e| e.into_inner()).retain(|key, stop| {
+        self.listeners.lock().unwrap_or_else(|e| e.into_inner()).retain(|key, listening| {
             let keep = keys.contains(key);
             if !keep {
-                stop.cancel();
+                listening.stop.cancel();
                 tracing::info!(kind = %key.0, port = key.1, "port closed");
             }
             keep
@@ -505,10 +520,58 @@ impl DataPlane {
         }
         let me = self.me.upgrade().ok_or_else(|| std::io::Error::other("server is shutting down"))?;
         let stop = self.shutdown.child_token();
-        self.on_traffic_threads(|| ports::listen(me, kind, port, stop.clone()))?;
-        listeners.insert((kind, port), stop);
+        let listening = self.on_traffic_threads(|| ports::listen(me, kind, port, stop.clone()))?;
+        listeners.insert((kind, port), listening);
         tracing::info!(%kind, port, "port open");
         Ok(())
+    }
+
+    /// The open port listeners, to hand to a new version of the server (`handover`), named as
+    /// [`ports::fd_name`] names them.
+    #[cfg(unix)]
+    pub fn port_fds(&self) -> Vec<(String, std::os::fd::RawFd)> {
+        use std::os::fd::AsRawFd;
+        let listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        listeners.iter().filter_map(|((kind, port), l)| l.fd.as_ref().map(|fd| (ports::fd_name(*kind, *port), fd.as_raw_fd()))).collect()
+    }
+
+    /// This server is handing over to a new version: it keeps no idle connection to an agent, so
+    /// each agent connection goes idle once its requests are done, and can be closed.
+    pub fn stop_pooling(&self) {
+        self.pool.close();
+    }
+
+    /// After taking over from an older version: requests for the tunnels of `agents`, which were
+    /// connected to it, wait up to `for_how_long` for them to connect here instead of failing.
+    pub fn hold_for(&self, agents: std::collections::HashSet<String>, for_how_long: Duration) {
+        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(Hold { agents, until: tokio::time::Instant::now() + for_how_long });
+    }
+
+    /// For a route whose machine isn't connected: if it's one the handover is waiting for, waits
+    /// for it (as [`DataPlane::hold_for`] allows), and gives the route again, as `again` finds it,
+    /// with its machine. `None` if it doesn't come, or isn't one to wait for.
+    pub async fn wait_for_agent(&self, route: &Route, again: impl Fn(&DataPlane) -> Option<Arc<Route>>) -> Option<(Arc<Route>, AgentLink)> {
+        let until = {
+            let hold = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+            match &*hold {
+                Some(h) if tokio::time::Instant::now() < h.until && h.agents.contains(&route.access.authz.agent_id) => h.until,
+                _ => return None,
+            }
+        };
+        let _waiting = self.holding.try_acquire().ok()?;
+        // Subscribed before looking, so a publish in between isn't missed.
+        let mut published = self.generation.subscribe();
+        loop {
+            if let Some(r) = again(self)
+                && let Some(agent) = r.agent.clone().filter(AgentLink::is_online)
+            {
+                return Some((r, agent));
+            }
+            match tokio::time::timeout_at(until, published.changed()).await {
+                Ok(Ok(())) => continue,
+                _ => return None,
+            }
+        }
     }
 }
 

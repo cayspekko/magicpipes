@@ -89,15 +89,16 @@ async fn proxy(dp: &Arc<DataPlane>, conn: &ConnInfo, mut req: Request<Incoming>)
         false => Some(gate::check(dp, &req, &host, &route)?),
     };
 
-    let agent = match route.agent.as_ref().filter(|a| a.is_online()) {
-        Some(a) => a.clone(),
-        None => {
-            route.stats.record(Outcome::AgentOffline);
-            return Err(error_page(
-                ErrorCode::AgentOffline,
-                "The MagicPipes agent serving this tunnel is not connected.",
-            ));
-        }
+    let (route, agent) = match route.agent.clone().filter(|a| a.is_online()) {
+        Some(a) => (route, a),
+        // Just after a handover to a new version of the server, its machine may be on its way.
+        None => match dp.wait_for_agent(&route, |dp| dp.lookup(&host)).await {
+            Some(found) => found,
+            None => {
+                route.stats.record(Outcome::AgentOffline);
+                return Err(error_page(ErrorCode::AgentOffline, "The MagicPipes agent serving this tunnel is not connected."));
+            }
+        },
     };
 
     let client = client_key(client_ip);

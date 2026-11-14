@@ -1671,14 +1671,26 @@ dependencies = [
 name = "magicpipes-core"
 version = "0.1.1"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
+ "webpki-roots",
  "yamux",
 ]
 
@@ -1702,6 +1714,7 @@ dependencies = [
  "instant-acme",
  "ironrdp-rdcleanpath",
  "lettre",
+ "libc",
  "magicpipes-core",
  "mimalloc",
  "qrcodegen",

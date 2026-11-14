@@ -5,7 +5,8 @@
 # terminal, echoes through TCP and UDP port tunnels, public and (with `magicpipes connect`)
 # private, registers an SSH tunnel and remote desktops (RDP and VNC), reaches an app that only
 # speaks HTTPS and an application on a Unix socket (or, on Windows, is told that isn't
-# supported), and stops the agent.
+# supported), checks for an upgrade and has a new agent take over (where it can), and stops the
+# agent.
 #
 # Usage: scripts/smoke-test.sh <directory containing magicpipes[.exe] and magicpipesd[.exe]>
 #
@@ -83,6 +84,8 @@ bind = "127.0.0.1"
 public_host = "localhost"
 [ssh]
 listen = "127.0.0.1:39510"
+[upgrades]
+source = "http://127.0.0.1:9/"
 EOF
 
 export MAGICPIPES_HOME
@@ -161,6 +164,24 @@ cat status.out | tee -a transcript.log
 grep -q '"connections": 4' status.out
 
 step "public request"
+run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "smoke.t.test:$HTTPS:127.0.0.1" "https://smoke.t.test:$HTTPS/"
+grep -q "hello from smoke test" cmd.out
+
+step "upgrades"
+# Without a release source to reach (and in a build that trusts no release key) both checks say
+# why, with the upgrades' exit code; the network is never needed.
+rc=0
+MAGICPIPES_RELEASE_SOURCE="http://127.0.0.1:9/" run "$MP" --upgrade --check --json || rc=$?
+[[ $rc -eq 9 ]] || { echo "magicpipes --upgrade --check: expected exit 9, got $rc"; exit 1; }
+grep -Eq '"code":"(release_unreachable|upgrade_not_possible)"' cmd.out
+rc=0
+run "$MPD" --config "$(native "$WORK/server.toml")" --upgrade --check --json || rc=$?
+[[ $rc -eq 9 ]] || { echo "magicpipesd --upgrade --check: expected exit 9, got $rc"; exit 1; }
+grep -Eq '"code":"(release_unreachable|upgrade_not_possible)"' cmd.out
+# A new agent takes over from the running one (on Windows the CLI says it can't), and the
+# tunnel keeps answering.
+run "$MP" --upgrade --restart --json
+grep -q '"text"' cmd.out
 run "${CURL[@]}" -f --cacert server/dev-ca/ca.crt --resolve "smoke.t.test:$HTTPS:127.0.0.1" "https://smoke.t.test:$HTTPS/"
 grep -q "hello from smoke test" cmd.out
 
