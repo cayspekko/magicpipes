@@ -527,8 +527,8 @@ nothing more.
   that doesn't match the workspace version: 0.1.2 was tagged with no archives, and the binaries
   still say 0.1.1. *Built: the manifest lists the bare binaries, which releases now carry beside
   the archives, so installing needs no unpacking; `scripts/release-key.sh` makes the key, and the
-  workflow refuses one whose public half isn't built in. Until the key is made, `RELEASE_KEYS` is
-  empty and no build can upgrade itself.*
+  workflow refuses one whose public half isn't built in. The key was made on 2026-11-14 and its
+  public half is in `RELEASE_KEYS`.*
 * **The check.** The server reads the latest manifest once a day on the control threads (one HTTPS
   request to the release source, bounded in size and time, `[upgrades] check = false` to turn it
   off, `[upgrades] source` for a mirror). Administrators see "0.2.0 is available" on the Settings
@@ -648,7 +648,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 11c | Monitoring, judge: alert rules, alerts in the app, rollups in SQLite (7 days, up to 30) | yes | done |
 | 11d | Monitoring, probe: synthetic checks from the server, on by default; the agent says why it couldn't reach an app (protocol 10) | yes | done |
 | 11e | Monitoring, tell: alert email and webhooks; `magicpipes probe` from outside | yes | done |
-| 12 | Upgrades, check: signed release manifests, the daily check, `--upgrade --check`, machines' versions (protocol 12) ([plan](#upgrades-the-binary-replaces-itself-without-downtime)) | yes | done (the signing key still to be made: `scripts/release-key.sh`) |
+| 12 | Upgrades, check: signed release manifests, the daily check, `--upgrade --check`, machines' versions (protocol 12) ([plan](#upgrades-the-binary-replaces-itself-without-downtime)) | yes | done |
 | 12b | Upgrades, server: `magicpipesd --upgrade` with the database rehearsed and backed up, a handover to the new process on inherited sockets, requests held while machines move, rollback | yes | done (Linux and macOS) |
 | 12c | Upgrades, machines: `magicpipes --upgrade`, a new run taking over from the old without cutting its streams | yes | done (background agents on Linux and macOS) |
 | 12d | Upgrades from the UI: the server itself, by administrators; and asking a machine to upgrade itself, where its own user turned that on (`--allow-remote`) | yes | done |

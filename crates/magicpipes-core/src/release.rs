@@ -22,9 +22,9 @@ pub const MAX_MANIFEST: u64 = 256 * 1024;
 pub const MAX_BINARY: u64 = 256 * 1024 * 1024;
 
 /// The public halves of the keys releases are signed with: Ed25519, 32 bytes, base64.
-/// `scripts/release-key.sh` makes the key and prints the line to add here. Empty, this build
-/// trusts no release, and can't upgrade itself.
-pub const RELEASE_KEYS: &[&str] = &[];
+/// `scripts/release-key.sh` makes the key and prints the line to add here. Empty, a build would
+/// trust no release, and couldn't upgrade itself.
+pub const RELEASE_KEYS: &[&str] = &["WnZqbn3xBAKOPvD8/hNYFx+FzJPBkWcJwP5XuUoIka0="];
 
 /// In a debug build only (tests), one more key to trust, base64: never in a release build.
 pub const TEST_KEY_ENV: &str = "MAGICPIPES_TEST_RELEASE_KEY";
