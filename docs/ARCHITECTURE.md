@@ -1136,7 +1136,10 @@ reconnect as after any restart. The new process holds requests for those agents'
 `hold_secs` and 4096 at once, so the moment between stopping and reconnecting costs a short wait
 rather than errors; TCP ports wait the same way, UDP doesn't, since one socket carries every flow.
 A connection the old process accepted a moment before it stopped gets its first request answered
-before it closes (`listen::FirstRequest`). The old process finishes what's under way, up to
+before it closes (`listen::FirstRequest`). On a plain stop (`SIGTERM`, a container restart) nobody
+takes the new connections, so those close at once instead (`listen::Stop::nobody_takes_over`):
+browsers keep spare connections that never send a request, and waiting for them held a stopping
+server for its whole 15 s, which was then the outage of every restart behind Docker. The old process finishes what's under way, up to
 `drain_secs`, and exits once systemd knows the new one is the main process (`MAINPID`, which needs
 `Type=notify`: the old process says so, and the new one too where `NotifyAccess=all` lets it). Background work (certificate renewals, sweeps, checks,
 alerts) runs in one process at a time: the new one starts its own when the old one stops accepting.

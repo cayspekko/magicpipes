@@ -684,7 +684,8 @@ WantedBy=multi-user.target
 ```
 
 The server shuts down gracefully on `SIGTERM`: it stops accepting connections, closes agent
-sessions (agents reconnect when it is back) and gives in-flight requests up to 15 s. A unit with
+sessions (agents reconnect when it is back) and gives in-flight requests up to 15 s. Connections
+that haven't sent a request yet, such as those browsers open in advance, close at once. A unit with
 `Type=simple` still works; it just can't be upgraded without downtime.
 
 ### Upgrades without downtime

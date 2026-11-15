@@ -324,6 +324,8 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
         tracing::warn!(ca = %p.display(), "tls.mode = dev-ca: clients must trust this CA; do not use in production");
     }
     let shutdown = CancellationToken::new();
+    // What the listeners see of it, and whether another process takes their new connections.
+    let stop = listen::Stop { shutdown: shutdown.clone(), nobody_takes_over: CancellationToken::new() };
     // Certificate renewals, sweeps, checks and the like: stopped first at a handover.
     let background = shutdown.child_token();
     let signer = tunnel_auth::Signer::load_or_create(&cfg.data_dir)?;
@@ -417,17 +419,17 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
     };
     match mgmt {
         Some(mgmt) => {
-            tasks.spawn(data::ingress::serve_https(public_https, public_acceptor, data.clone(), public_opts, shutdown.clone(), tracker.clone()));
+            tasks.spawn(data::ingress::serve_https(public_https, public_acceptor, data.clone(), public_opts, stop.clone(), tracker.clone()));
             let mgmt_acceptor = TlsAcceptor::from(certs::server_config(mgmt_resolver));
-            tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), control_rt.clone(), shutdown.clone(), tracker.clone()));
+            tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), control_rt.clone(), stop.clone(), tracker.clone()));
         }
         None => {
             let site = mgmt::site(control.clone(), control_rt.clone());
-            tasks.spawn(data::ingress::serve_https_with(public_https, public_acceptor, data.clone(), public_opts, site, shutdown.clone(), tracker.clone()));
+            tasks.spawn(data::ingress::serve_https_with(public_https, public_acceptor, data.clone(), public_opts, site, stop.clone(), tracker.clone()));
         }
     }
     if let Some(l) = public_http {
-        tasks.spawn(data::ingress::serve_http(l, certs.challenges(), cfg.url_port(), shutdown.clone(), tracker.clone()));
+        tasks.spawn(data::ingress::serve_http(l, certs.challenges(), cfg.url_port(), stop.clone(), tracker.clone()));
     }
     if let Some((listener, key, settings)) = ssh {
         tasks.spawn(data::ssh::serve(listener, key, data.clone(), settings, shutdown.clone()));
@@ -508,6 +510,8 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
     let Some(mut handing) = handing else {
         tracing::info!("shutting down");
         handover::notify("STOPPING=1");
+        // Nobody takes the new connections, so nothing waits for a first request.
+        stop.nobody_takes_over.cancel();
         shutdown.cancel();
         control.close_sessions();
         while tasks.join_next().await.is_some() {}

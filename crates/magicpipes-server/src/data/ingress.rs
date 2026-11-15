@@ -11,23 +11,22 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::DataPlane;
 use crate::certs::Http01Challenges;
 use crate::forwarded::TrustedProxies;
-use crate::listen::{ConnInfo, ListenOpts, Site, serve, serve_with_site};
+use crate::listen::{ConnInfo, ListenOpts, Site, Stop, serve, serve_with_site};
 
 pub async fn serve_https(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     dp: Arc<DataPlane>,
     opts: ListenOpts,
-    shutdown: CancellationToken,
+    stop: Stop,
     tracker: TaskTracker,
 ) {
-    serve(listener, Some(acceptor), opts, shutdown, tracker, move |conn| {
+    serve(listener, Some(acceptor), opts, stop, tracker, move |conn| {
         let dp = dp.clone();
         let conn = Arc::new(conn);
         service_fn(move |req| super::proxy::handle(dp.clone(), conn.clone(), req))
@@ -43,7 +42,7 @@ pub async fn serve_https_with<G, T, C>(
     dp: Arc<DataPlane>,
     opts: ListenOpts,
     management: Site<G>,
-    shutdown: CancellationToken,
+    stop: Stop,
     tracker: TaskTracker,
 ) where
     G: Fn(ConnInfo) -> T + Send + Sync + 'static,
@@ -58,7 +57,7 @@ pub async fn serve_https_with<G, T, C>(
         let conn = Arc::new(conn);
         service_fn(move |req| super::proxy::handle(dp.clone(), conn.clone(), req))
     };
-    serve_with_site(listener, acceptor, opts, shutdown, tracker, tunnels, management).await
+    serve_with_site(listener, acceptor, opts, stop, tracker, tunnels, management).await
 }
 
 const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
@@ -67,7 +66,7 @@ pub async fn serve_http(
     listener: TcpListener,
     challenges: Arc<Http01Challenges>,
     https_port: u16,
-    shutdown: CancellationToken,
+    stop: Stop,
     tracker: TaskTracker,
 ) {
     let opts = ListenOpts {
@@ -79,7 +78,7 @@ pub async fn serve_http(
         proxy_protocol: false,
         idle_timeout: None,
     };
-    serve(listener, None, opts, shutdown, tracker, move |_conn| {
+    serve(listener, None, opts, stop, tracker, move |_conn| {
         let challenges = challenges.clone();
         service_fn(move |req| {
             let challenges = challenges.clone();

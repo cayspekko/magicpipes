@@ -52,13 +52,12 @@ use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper::body::Incoming;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tower::ServiceExt;
 
 use crate::control::ControlPlane;
 use crate::forwarded::{TrustedProxies, client_key};
-use crate::listen::{ConnInfo, ListenOpts, Site, serve};
+use crate::listen::{ConnInfo, ListenOpts, Site, Stop, serve};
 
 /// Remote address of the management connection, inserted into request extensions.
 #[derive(Clone, Copy, Debug)]
@@ -293,11 +292,11 @@ pub async fn serve_mgmt(
     acceptor: TlsAcceptor,
     control: Arc<ControlPlane>,
     control_rt: tokio::runtime::Handle,
-    shutdown: CancellationToken,
+    stop: Stop,
     tracker: TaskTracker,
 ) {
     let site = site(control, control_rt);
-    serve(listener, Some(acceptor), site.opts, shutdown, tracker, site.make_service).await
+    serve(listener, Some(acceptor), site.opts, stop, tracker, site.make_service).await
 }
 
 /// The management host as a listener serves it: on one of its own ([`serve_mgmt`]), or as the

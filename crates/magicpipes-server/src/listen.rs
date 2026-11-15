@@ -162,6 +162,18 @@ impl Drop for ClientSlot {
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How a listener stops. `shutdown` ends its accept loop; each connection then finishes the request
+/// under way, and one accepted a moment before gets its first request answered, since at a handover
+/// another process takes the new ones. On a plain stop nobody does, and `nobody_takes_over` closes
+/// the connections still waiting for a first request at once: waiting only lengthens the outage, and
+/// the spare connections browsers open in advance never send one (they held a stopping server for
+/// its whole 15 s, behind every restart of a Docker container).
+#[derive(Clone, Debug, Default)]
+pub struct Stop {
+    pub shutdown: CancellationToken,
+    pub nobody_takes_over: CancellationToken,
+}
+
 /// A connection's share of the listener's limits: its permit and its per-client slot, released
 /// when the last holder drops it. The connection task holds it for as long as the HTTP connection
 /// lasts, on every listener. Anything that outlives the HTTP connection and should go on counting
@@ -191,7 +203,7 @@ pub async fn serve<F, S, B>(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
     opts: ListenOpts,
-    shutdown: CancellationToken,
+    stop: Stop,
     tracker: TaskTracker,
     make_service: F,
 ) where
@@ -204,10 +216,10 @@ pub async fn serve<F, S, B>(
 {
     let counts = Counts::new(&opts);
     let make_service = Arc::new(make_service);
-    while let Some((tcp, peer, permit)) = accept(&listener, &counts, &opts, &shutdown).await {
+    while let Some((tcp, peer, permit)) = accept(&listener, &counts, &opts, &stop.shutdown).await {
         let make_service = make_service.clone();
         let tls = tls.clone();
-        let shutdown = shutdown.clone();
+        let stop = stop.clone();
         let opts = opts.clone();
         let counts = counts.clone();
         tracker.spawn(async move {
@@ -218,9 +230,9 @@ pub async fn serve<F, S, B>(
                     let Some(stream) = handshake(&acceptor, tcp, peer).await else { return };
                     let sni = stream.get_ref().1.server_name().map(str::to_ascii_lowercase);
                     let svc = make_service(ConnInfo { peer, sni, limits: limits.clone() });
-                    serve_conn(stream, svc, header_timeout, idle_timeout, shutdown).await
+                    serve_conn(stream, svc, header_timeout, idle_timeout, stop).await
                 }
-                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, idle_timeout, shutdown).await,
+                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, idle_timeout, stop).await,
             }
         });
     }
@@ -245,7 +257,7 @@ pub async fn serve_with_site<F, S, B, G, T, C>(
     listener: TcpListener,
     tls: TlsAcceptor,
     opts: ListenOpts,
-    shutdown: CancellationToken,
+    stop: Stop,
     tracker: TaskTracker,
     make_service: F,
     site: Site<G>,
@@ -268,11 +280,11 @@ pub async fn serve_with_site<F, S, B, G, T, C>(
     let site_counts = Counts::new(&site.opts);
     let make_service = Arc::new(make_service);
     let site = Arc::new(site);
-    while let Some((tcp, peer, permit)) = accept(&listener, &setting_up, &opts, &shutdown).await {
+    while let Some((tcp, peer, permit)) = accept(&listener, &setting_up, &opts, &stop.shutdown).await {
         let make_service = make_service.clone();
         let site = site.clone();
         let tls = tls.clone();
-        let shutdown = shutdown.clone();
+        let stop = stop.clone();
         let opts = opts.clone();
         let (setting_up, tunnels, site_counts) = (setting_up.clone(), tunnels.clone(), site_counts.clone());
         tracker.spawn(async move {
@@ -284,9 +296,9 @@ pub async fn serve_with_site<F, S, B, G, T, C>(
             drop(pending);
             let info = ConnInfo { peer, sni, limits: limits.clone() };
             if to_site {
-                serve_conn(stream, (site.make_service)(info), site.opts.header_read_timeout, site.opts.idle_timeout, shutdown).await
+                serve_conn(stream, (site.make_service)(info), site.opts.header_read_timeout, site.opts.idle_timeout, stop).await
             } else {
-                serve_conn(stream, make_service(info), opts.header_read_timeout, opts.idle_timeout, shutdown).await
+                serve_conn(stream, make_service(info), opts.header_read_timeout, opts.idle_timeout, stop).await
             }
         });
     }
@@ -386,7 +398,7 @@ async fn handshake(acceptor: &TlsAcceptor, tcp: TcpStream, peer: SocketAddr) -> 
     }
 }
 
-async fn serve_conn<I, S, B>(io: I, svc: S, header_timeout: Duration, idle_timeout: Option<Duration>, shutdown: CancellationToken)
+async fn serve_conn<I, S, B>(io: I, svc: S, header_timeout: Duration, idle_timeout: Option<Duration>, stop: Stop)
 where
     I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     S: Service<Request<Incoming>, Response = Response<B>, Error = Infallible> + Send + 'static,
@@ -417,10 +429,11 @@ where
         // Dropping the connection closes it, and ends the request it was in the middle of.
         _ = stalled => tracing::debug!("closing a stalled connection"),
         // The request under way finishes, then the connection closes. How long that may take is
-        // the caller's: 15 seconds at shutdown, `upgrades.drain_secs` at a handover. A connection
-        // accepted a moment before gets its first request answered: closing it before that would
-        // fail a client that did nothing wrong, while another process takes the new ones.
-        _ = shutdown.cancelled() => {
+        // the caller's: 15 seconds at shutdown, `upgrades.drain_secs` at a handover. At a handover,
+        // a connection accepted a moment before gets its first request answered: closing it before
+        // that would fail a client that did nothing wrong, while another process takes the new
+        // ones. On a plain stop nobody takes them, so it closes at once ([`Stop`]).
+        _ = stop.shutdown.cancelled() => {
             tokio::select! {
                 res = conn.as_mut() => {
                     if let Err(e) = res {
@@ -430,6 +443,7 @@ where
                 }
                 _ = first.notified() => {}
                 _ = tokio::time::sleep(header_timeout) => {}
+                _ = stop.nobody_takes_over.cancelled() => {}
             }
             conn.as_mut().graceful_shutdown();
             let _ = conn.await;
@@ -477,7 +491,7 @@ mod tests {
             })
         };
         let opts = ListenOpts { idle_timeout: Some(Duration::from_millis(400)), ..opts(4) };
-        tokio::spawn(serve(listener, None, opts, CancellationToken::new(), TaskTracker::new(), make));
+        tokio::spawn(serve(listener, None, opts, Stop::default(), TaskTracker::new(), make));
         let head = b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n";
 
         // An upload that keeps moving outlives the timeout.
@@ -494,13 +508,61 @@ mod tests {
         assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))), "{closed:?}");
     }
 
+    /// A connection that never sends a request (a browser's spare one) is kept at a handover, where
+    /// it may still be used, and closed at once on a plain stop, which it would otherwise hold.
+    #[tokio::test]
+    async fn a_plain_stop_closes_connections_that_sent_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let make = |_: ConnInfo| hyper::service::service_fn(|_: Request<Incoming>| async { Ok::<_, Infallible>(Response::new(Empty::<bytes::Bytes>::new())) });
+        let (stop, tracker) = (Stop::default(), TaskTracker::new());
+        tokio::spawn(serve(listener, None, opts(4), stop.clone(), tracker.clone(), make));
+        let mut spare = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        stop.shutdown.cancel();
+        let mut buf = [0u8; 16];
+        assert!(tokio::time::timeout(Duration::from_millis(300), spare.read(&mut buf)).await.is_err(), "kept while another process may take over");
+        stop.nobody_takes_over.cancel();
+        let closed = tokio::time::timeout(Duration::from_secs(2), spare.read(&mut buf)).await;
+        assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))), "{closed:?}");
+        tracker.close();
+        assert!(tokio::time::timeout(Duration::from_secs(2), tracker.wait()).await.is_ok(), "nothing left to wait for");
+    }
+
+    /// A plain stop still lets the request under way finish.
+    #[tokio::test]
+    async fn a_plain_stop_lets_the_request_under_way_finish() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let make = |_: ConnInfo| {
+            hyper::service::service_fn(|req: Request<Incoming>| async move {
+                let _ = http_body_util::BodyExt::collect(req.into_body()).await;
+                Ok::<_, Infallible>(Response::new(Empty::<bytes::Bytes>::new()))
+            })
+        };
+        let stop = Stop::default();
+        tokio::spawn(serve(listener, None, opts(4), stop.clone(), TaskTracker::new(), make));
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 4\r\n\r\nab").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        stop.nobody_takes_over.cancel();
+        stop.shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.write_all(b"cd").await.unwrap();
+        let mut buf = [0u8; 12];
+        let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await.unwrap().unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&buf[..n]));
+    }
+
     /// A service that keeps nothing of the connection's: the listener still counts it.
     #[tokio::test]
     async fn every_connection_counts_until_it_ends() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let make = |_: ConnInfo| hyper::service::service_fn(|_: Request<Incoming>| async { Ok::<_, Infallible>(Response::new(Empty::<bytes::Bytes>::new())) });
-        tokio::spawn(serve(listener, None, opts(1), CancellationToken::new(), TaskTracker::new(), make));
+        tokio::spawn(serve(listener, None, opts(1), Stop::default(), TaskTracker::new(), make));
         let request = |addr| async move {
             let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
             s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n").await.ok()?;
@@ -532,7 +594,7 @@ mod tests {
                 Ok::<_, Infallible>(resp.body(Empty::<bytes::Bytes>::new()).unwrap())
             })
         };
-        tokio::spawn(serve(listener, None, opts(1), CancellationToken::new(), TaskTracker::new(), make));
+        tokio::spawn(serve(listener, None, opts(1), Stop::default(), TaskTracker::new(), make));
         let first = upgrade(addr).await.expect("first connection upgrades");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(upgrade(addr).await.is_some(), "the upgraded connection gave its slot back");
@@ -575,7 +637,7 @@ mod tests {
         };
         let site = Site { host: "m.t.test".into(), opts: opts(1), make_service: answer("site") };
         let acceptor = TlsAcceptor::from(crate::certs::server_config(resolver));
-        tokio::spawn(serve_with_site(listener, acceptor, opts(1), CancellationToken::new(), TaskTracker::new(), answer("tunnels"), site));
+        tokio::spawn(serve_with_site(listener, acceptor, opts(1), Stop::default(), TaskTracker::new(), answer("tunnels"), site));
 
         // A connection that has had one answer and stays open, with that answer; `None` if refused.
         let open = |name: &'static str| {
@@ -626,7 +688,7 @@ mod tests {
                 }
             })
         };
-        tokio::spawn(serve(listener, None, opts(1), CancellationToken::new(), TaskTracker::new(), make));
+        tokio::spawn(serve(listener, None, opts(1), Stop::default(), TaskTracker::new(), make));
         let first = upgrade(addr).await.expect("first connection upgrades");
         assert!(upgrade(addr).await.is_none(), "the upgraded connection still uses the client's only slot");
         drop(first);
