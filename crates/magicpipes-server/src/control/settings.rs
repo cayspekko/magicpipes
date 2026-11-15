@@ -530,6 +530,12 @@ impl ControlPlane {
         self.certs.provided_covers(hostname)
     }
 
+    /// The certificate authorities this server issues from (`[[tls.authorities]]`): their
+    /// certificates are public, for anyone signed in to install.
+    pub fn authorities(&self) -> Vec<crate::certs::AuthorityView> {
+        self.certs.authorities()
+    }
+
     /// Adds a certificate from the Settings page, in use at once.
     pub fn add_certificate(&self, who: &Principal, chain: &str, key: &str) -> Result<ProvidedCert, ErrorBody> {
         self.settings_admin(who)?;

@@ -5,11 +5,14 @@
 //! SNI names, so an attacker cannot make the server request certificates. Issued certificates
 //! are cached on disk and installed into the [`CertResolver`], which the TLS acceptors consult
 //! for every handshake without touching the control plane. Certificates people bring themselves
-//! are in [`provided`].
+//! are in [`provided`]. A name under a `[[tls.authorities]]` domain gets its certificate from
+//! that [`authority`], whatever the mode.
 
 mod acme;
 mod devca;
 mod provided;
+
+mod authority;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -201,6 +204,22 @@ impl HostCert {
     }
 }
 
+/// Where the CAs the server makes for `[[tls.authorities]]` are kept, one directory per domain.
+pub const AUTHORITIES_DIR: &str = "authorities";
+
+/// A `[[tls.authorities]]` CA, for people to install on their devices.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuthorityView {
+    pub domain: String,
+    /// Made by this server (else brought by its administrator).
+    pub made_here: bool,
+    pub not_after: String,
+    /// SHA-256 of its certificate, `AB:CD:…`.
+    pub fingerprint: String,
+    /// Its certificate, and any above it (PEM).
+    pub pem: String,
+}
+
 /// A hostname no tunnel uses is no longer renewed, and is forgotten (resolver, cache) after this
 /// long, so a tunnel removed and added again soon keeps its certificate.
 const FORGET_UNWANTED_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -215,6 +234,8 @@ pub struct CertManager {
     challenges: Arc<Http01Challenges>,
     acme: acme::AcmeClient,
     devca: Option<devca::DevCa>,
+    /// `[[tls.authorities]]`, by domain.
+    authorities: Vec<authority::Authority>,
     /// Limits concurrent orders (CA rate limits, resource use).
     order_slots: Semaphore,
     /// Names covered by `tls.mode = "files"`.
@@ -247,6 +268,14 @@ impl CertManager {
             tracing::info!(names = ?loaded.names, "loaded certificate from files");
             static_names = loaded.names;
         }
+        let mut authorities = Vec::new();
+        for a in &cfg.authorities {
+            let ca = match (&a.cert_file, &a.key_file) {
+                (Some(c), Some(k)) => authority::Authority::load(c, k, &a.domain),
+                _ => authority::Authority::load_or_create(&data_dir.join(AUTHORITIES_DIR).join(&a.domain), &format!("MagicPipes CA for {}", a.domain), &[&a.domain]),
+            };
+            authorities.push(ca.with_context(|| format!("tls.authorities '{}'", a.domain))?);
+        }
         let provided_dir = data_dir.join(provided::DIR);
         let provided = Mutex::new(provided::load_all(&cfg.certificates, &provided_dir)?);
         let challenges = Arc::new(Http01Challenges::default());
@@ -259,6 +288,7 @@ impl CertManager {
             challenges,
             acme,
             devca,
+            authorities,
             order_slots: Semaphore::new(2),
             static_names,
             provided,
@@ -284,6 +314,50 @@ impl CertManager {
         self.devca.as_ref().map(|d| d.ca_path())
     }
 
+    /// The authority that issues `host`'s certificate, if one does.
+    fn authority(&self, host: &str) -> Option<&authority::Authority> {
+        let domain = self.cfg.authority_for(host)?;
+        self.authorities.iter().find(|a| a.domain == domain)
+    }
+
+    /// Whether this server issues `host`'s certificate itself, from one of its authorities.
+    pub fn issued_here(&self, host: &str) -> bool {
+        self.authority(host).is_some()
+    }
+
+    /// The domain of the authority whose certificate `host` gets, if it gets one of theirs and not
+    /// one people brought. `*.exhub.internal`: the names under it.
+    pub fn authority_of(&self, host: &str) -> Option<String> {
+        if self.provided_covers(host) {
+            return None;
+        }
+        self.authority(host).map(|a| a.domain.clone())
+    }
+
+    /// The certificate of the authority for `domain` (and any above it), PEM.
+    pub fn authority_pem(&self, domain: &str) -> Option<String> {
+        self.authorities.iter().find(|a| a.domain == domain).map(|a| a.chain_pem.clone())
+    }
+
+    /// The `[[tls.authorities]]`, for the pages that let people install them.
+    pub fn authorities(&self) -> Vec<AuthorityView> {
+        self.authorities
+            .iter()
+            .map(|a| AuthorityView {
+                domain: a.domain.clone(),
+                made_here: a.made_at.is_some(),
+                not_after: magicpipes_core::rfc3339(a.not_after),
+                fingerprint: a.fingerprint.clone(),
+                pem: a.chain_pem.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether `host` has a certificate only from `tls.mode = "files"`: one another tool keeps.
+    fn kept_in_files(&self, host: &str) -> bool {
+        self.cfg.mode == TlsMode::Files && !self.issued_here(host)
+    }
+
     fn cache_paths(&self, host: &str) -> (PathBuf, PathBuf) {
         (self.dir.join(format!("{host}.crt")), self.dir.join(format!("{host}.key")))
     }
@@ -296,6 +370,10 @@ impl CertManager {
                 continue;
             }
             let Some(host) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
+            // Issued here now; it gets one at once.
+            if self.issued_here(&host) {
+                continue;
+            }
             let (crt, key) = self.cache_paths(&host);
             match std::fs::read(&crt).and_then(|c| Ok((c, std::fs::read(&key)?))) {
                 Ok((c, k)) => match load_pem(&c, &k) {
@@ -330,7 +408,7 @@ impl CertManager {
         if let Some(status) = self.provided_status(host) {
             return status;
         }
-        if self.cfg.mode == TlsMode::Files {
+        if self.kept_in_files(host) {
             return self.files_status(host);
         }
         self.hosts.lock().unwrap().get(host).map(|h| h.status.borrow().clone()).unwrap_or(CertStatus::Pending)
@@ -342,7 +420,7 @@ impl CertManager {
         if let Some(t) = self.provided_not_after(host) {
             return Some(t);
         }
-        if self.cfg.mode == TlsMode::Files {
+        if self.kept_in_files(host) {
             return None;
         }
         self.hosts.lock().unwrap().get(host).map(|h| h.not_after).filter(|t| *t > 0)
@@ -359,7 +437,7 @@ impl CertManager {
     /// Makes sure a certificate for `host` exists or is being obtained. Never blocks. A name someone
     /// brought a certificate for is only noted, so it's ordered if that certificate goes away.
     pub fn ensure(self: &Arc<Self>, host: &str) {
-        if self.cfg.mode == TlsMode::Files {
+        if self.kept_in_files(host) {
             return;
         }
         let covered = self.provided_covers(host);
@@ -391,18 +469,22 @@ impl CertManager {
     async fn issue(self: Arc<Self>, host: String) {
         let _slot = self.order_slots.acquire().await;
         let timeout = Duration::from_secs(self.cfg.issuance_timeout_secs);
-        tracing::info!(%host, mode = ?self.cfg.mode, "obtaining certificate");
-        let result = match (&self.devca, self.cfg.mode) {
-            (Some(ca), _) => ca.issue(&host),
-            (None, TlsMode::Acme) => match tokio::time::timeout(timeout, self.acme.order(&host)).await {
+        let authority = self.authority(&host);
+        tracing::info!(%host, mode = ?self.cfg.mode, authority = authority.map(|a| a.domain.as_str()), "obtaining certificate");
+        let result = match (authority, &self.devca, self.cfg.mode) {
+            (Some(ca), ..) => ca.issue(&host),
+            (None, Some(ca), _) => ca.issue(&host),
+            (None, None, TlsMode::Acme) => match tokio::time::timeout(timeout, self.acme.order(&host)).await {
                 Ok(r) => r,
                 Err(_) => Err(anyhow!("timed out after {}s waiting for the ACME server", timeout.as_secs())),
             },
             _ => Err(anyhow!("no certificate source configured")),
         };
+        // Only what an ACME CA issued is kept: an authority here issues again at once.
+        let keep = authority.is_none() && self.devca.is_none();
         let loaded = result.and_then(|(chain, key)| {
             let l = load_pem(chain.as_bytes(), key.as_bytes())?;
-            if self.devca.is_none() {
+            if keep {
                 let (crt_path, key_path) = self.cache_paths(&host);
                 write_private(&key_path, key.as_bytes())?;
                 write_private(&crt_path, chain.as_bytes())?;
@@ -435,7 +517,7 @@ impl CertManager {
         if let Some(status) = self.provided_status(host) {
             return status;
         }
-        if self.cfg.mode == TlsMode::Files {
+        if self.kept_in_files(host) {
             return self.files_status(host);
         }
         self.ensure(host);

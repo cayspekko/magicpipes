@@ -38,7 +38,10 @@ let people in and `owner_tag` is the user's own.
 
 Use `--name <label>` for a stable, readable hostname (`https://<label>.<base domain>`), or
 `--hostname shop.example.com` for a hostname an administrator assigned to the user or this
-machine (`not_found` means it isn't assigned). `--no-verify` registers without the certificate
+machine (`not_found` means it isn't assigned). An assigned wildcard such as `*.exhub.internal`
+allows any name one label under it (`--hostname wiki.exhub.internal`). When the JSON has
+`"authority": "exhub.internal"`, the certificate is from the server's own CA for that domain:
+browsers warn until that CA is installed, which the human output says where to download. `--no-verify` registers without the certificate
 wait and public check (the JSON then has `"verified": false`); use it only when the user says
 DNS doesn't point at the server yet. Running
 the same `add` again is safe: it returns the existing tunnel (`"created": false`).

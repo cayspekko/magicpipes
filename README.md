@@ -129,6 +129,34 @@ certificate as failed, until you replace or remove it; removing it hands its nam
 source. The management hostname never uses one, so a bad certificate can't lock you out of the page
 that fixes it: use `management.cert_file` for that.
 
+**Certificate authorities of the server's own** issue the certificates of every name under a domain,
+whatever the mode: for internal names such as `*.exhub.internal`, which Let's Encrypt can't serve,
+or a closed network with no Let's Encrypt at all.
+
+```toml
+[[tls.authorities]]
+domain = "exhub.internal"          # the domain and every name under it, at least two labels
+# cert_file = "/etc/magicpipes/exhub-ca.crt"  # your own CA (PEM, its certificate first, then any above it),
+# key_file = "/etc/magicpipes/exhub-ca.key"   #   instead of one the server makes
+```
+
+* Without `cert_file` and `key_file`, the server makes a CA in `data_dir/authorities/<domain>/`
+  (its key 0600), valid for 10 years and limited to that domain by an X.509 name constraint: a device
+  that trusts it trusts it for nothing else.
+* With your own, it's checked at start: a CA certificate, the key that goes with it, not expired, and
+  name constraints (if any) that allow the domain. An intermediate limited to the domain is the
+  safest kind to give it.
+* Its certificates last 30 days, are issued again at every start and renewed at two thirds, and are
+  never ordered from anyone else. A certificate you brought for a name still comes first.
+* Devices trust them once the CA's certificate is installed: **Settings → Certificate authorities**
+  shows each one with its SHA-256 fingerprint, and anyone signed in downloads it from
+  `https://<management host>/ca/<domain>.crt` (linked from each tunnel it issued for), or
+  `GET /api/v1/authorities`. `magicpipes add` prints that address, and checks the new tunnel
+  through that CA.
+* An authority whose domain covers the base domain and the management hostname makes a server that
+  needs nothing from outside: `tls.mode = "acme"` then needs no `public.http_listen`, and names
+  outside the authorities' domains can't be registered.
+
 **TCP and UDP ports** are off until you give the server a port range:
 
 ```toml
@@ -705,19 +733,29 @@ own): without one, nobody can open it.
 ### Your own hostnames
 
 Tunnels are `<name>.<base domain>` unless an administrator registers a hostname of your own
-under **Hostnames** (or `POST /api/v1/hostnames`): an exact name such as `shop.example.com`
-(a bare domain works too), for one person's machines or one service agent. Its DNS must point
-at the server. The certificate is ordered as soon as it is registered.
+under **Hostnames** (or `POST /api/v1/hostnames`), for one person's machines or one service
+agent. Its DNS must point at the server.
+
+* An exact name such as `shop.example.com` (a bare domain works too). Its certificate is ordered as
+  soon as it is registered.
+* A wildcard such as `*.exhub.internal`: its machines may use any name one label under it
+  (`tunnel.exhub.internal`, not `a.b.exhub.internal`), one tunnel per name, and each name gets its
+  own certificate when a tunnel takes it: from Let's Encrypt (so each counts against
+  `max_new_certificates_per_day`), or under a [certificate authority](#configure-and-start) of the
+  server's own, from that. A name registered on its own wins over the wildcard, but can't be
+  registered for someone else while a tunnel under the wildcard has it. Wildcard certificates from
+  Let's Encrypt (DNS-01) aren't supported yet.
 
 ```bash
 magicpipes add 8000 --hostname shop.example.com             # only on a machine it was assigned to
 magicpipes add 8000 --hostname shop.example.com --no-verify # register now; skip the certificate wait and public check
+magicpipes add 3000 --hostname wiki.exhub.internal          # under *.exhub.internal, if that's assigned to you
 ```
 
 `--no-verify` is for moving a site over: register the tunnel while DNS (or a proxy in front)
 still points at the old server, switch it, then run the same command without `--no-verify` to
-check the public address. Removing the hostname's registration deletes its tunnel. Wildcards
-aren't supported.
+check the public address. Removing a registration deletes the tunnels it allowed: the one on an
+exact name, or those under a wildcard that have no registration of their own.
 
 * Opening a private tunnel in a browser without being signed in shows the sign-in page, then
   comes back to the same address. Signed in without a shared tag: an "access denied" page. API
@@ -1211,6 +1249,9 @@ them).
 }
 ```
 
+A tunnel whose certificate comes from one of the server's own certificate authorities also has
+`"authority": "exhub.internal"`, that CA's domain.
+
 On failure:
 
 ```json
@@ -1382,9 +1423,10 @@ answer `403 forbidden` to members.
 | POST | `/api/v1/tag-rules` | 201 `{"rule"}`; body `{"source", "claim"?, "value", "tag"}`: `source` is a source's `issuer`, or `*` with a domain as `value` for an address's domain. At most 500 |
 | DELETE | `/api/v1/tag-rules/{id}` | 204; whoever held its tag only through it loses it |
 | DELETE | `/api/v1/tags/{name}` | 204; removes it from every user, agent and tunnel |
-| GET | `/api/v1/hostnames` | `{"hostnames": [{"hostname", "owner_user_id"?, "owner_email"?, "agent_id"?, "agent_name"?, "tunnel"?, "tls", "created_at"}]}` (administrators: all; others: those assigned to them) |
-| POST | `/api/v1/hostnames` | 201; body `{"hostname", "owner_user_id"? \| "agent_id"?}` (exactly one; administrators) |
-| DELETE | `/api/v1/hostnames/{hostname}` | 204; deletes the tunnel on it |
+| GET | `/api/v1/hostnames` | `{"hostnames": [{"hostname", "owner_user_id"?, "owner_email"?, "agent_id"?, "agent_name"?, "tunnel"?, "tunnels"?, "tls", "authority"?, "created_at"}]}` (administrators: all; others: those assigned to them). A wildcard (`*.example.com`) lists the tunnels under it in `tunnels`, and `tls` is the worst of theirs; `authority` is the `[[tls.authorities]]` domain whose CA issues its certificates |
+| POST | `/api/v1/hostnames` | 201; body `{"hostname", "owner_user_id"? \| "agent_id"?}` (exactly one; administrators). `hostname` is an exact name or a wildcard `*.domain` |
+| DELETE | `/api/v1/hostnames/{hostname}` | 204; deletes the tunnels it allowed |
+| GET | `/api/v1/authorities` | `{"authorities": [{"domain", "made_here", "not_after", "fingerprint", "pem"}]}`: the server's own certificate authorities (`[[tls.authorities]]`), for devices to trust; any signed-in caller |
 | POST | `/api/v1/device` | Starts a browser-approved `magicpipes login` (used by the CLI) |
 | POST | `/api/v1/device/poll` | Its result: `pending`, `approved` (with `enrollment_token`, or for `connect` a `pass` and `expires_at`), `denied` or `expired` |
 | POST | `/api/v1/passes` | 201 `{"pass", "expires_at"}`: a connect pass for 15 minutes, for your API token's user (used by `connect`) |

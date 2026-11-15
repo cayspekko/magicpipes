@@ -536,6 +536,24 @@ pub struct TlsConfig {
     /// can't come before plain values.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<CertFiles>,
+    /// Certificate authorities this server issues certificates from, each for one domain, instead
+    /// of `mode`: internal names, closed networks.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub authorities: Vec<AuthorityConfig>,
+}
+
+/// A certificate authority for `domain` and every name under it. Without `cert_file` and
+/// `key_file`, the server makes one that can vouch for nothing else (an X.509 name constraint),
+/// in `<data_dir>/authorities/<domain>/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityConfig {
+    pub domain: String,
+    /// Your own CA's certificate (PEM, with any certificates above it) and private key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<PathBuf>,
 }
 
 /// A certificate kept in files, which another tool may renew.
@@ -558,11 +576,42 @@ impl Default for TlsConfig {
             issuance_timeout_secs: 120,
             failure_backoff_secs: 300,
             certificates: Vec::new(),
+            authorities: Vec::new(),
         }
     }
 }
 
 impl TlsConfig {
+    /// The domain of the authority that issues `host`'s certificate, if one does: the longest
+    /// domain that is `host` or a parent of it.
+    pub fn authority_for(&self, host: &str) -> Option<&str> {
+        self.authorities
+            .iter()
+            .map(|a| a.domain.as_str())
+            .filter(|d| host == *d || host.strip_suffix(d).is_some_and(|rest| rest.ends_with('.')))
+            .max_by_key(|d| d.len())
+    }
+
+    fn check_authorities(&mut self) -> anyhow::Result<()> {
+        for i in 0..self.authorities.len() {
+            let a = &mut self.authorities[i];
+            a.domain = a.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            let d = a.domain.clone();
+            let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            // Two labels at least: a CA for a whole top-level domain could vouch for other people's sites.
+            if d.len() > 253 || d.split('.').count() < 2 || !d.split('.').all(label_ok) {
+                bail!("tls.authorities: '{d}' is not a domain such as exhub.internal");
+            }
+            if a.cert_file.is_some() != a.key_file.is_some() {
+                bail!("tls.authorities '{d}': cert_file and key_file must be set together");
+            }
+            if self.authorities[..i].iter().any(|o| o.domain == d) {
+                bail!("tls.authorities: '{d}' is listed twice");
+            }
+        }
+        Ok(())
+    }
+
     pub fn acme_directory_url(&self) -> String {
         match self.acme_directory.as_str() {
             "letsencrypt" => instant_acme::LetsEncrypt::Production.url().to_string(),
@@ -884,7 +933,10 @@ impl Config {
         if self.tls.mode == TlsMode::Files && (self.tls.cert_file.is_none() || self.tls.key_file.is_none()) {
             bail!("tls.mode = \"files\" requires tls.cert_file and tls.key_file");
         }
-        if self.tls.mode == TlsMode::Acme && self.public.http_listen.is_none() {
+        self.tls.check_authorities()?;
+        // Unless authorities issue the server's own names' certificates (a closed network).
+        let own_from_authorities = self.tls.authority_for(&self.management.hostname).is_some() && self.tls.authority_for(&self.base_domain).is_some();
+        if self.tls.mode == TlsMode::Acme && self.public.http_listen.is_none() && !own_from_authorities {
             bail!("tls.mode = \"acme\" requires public.http_listen for HTTP-01 challenges");
         }
         if let Some(r) = &self.ports.range {
@@ -980,6 +1032,29 @@ pub const EXAMPLE: &str = include_str!("../../../magicpipesd.example.toml");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorities_are_for_a_domain_each_and_the_longest_wins() {
+        let load = |authorities: &str| {
+            let mut c: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n{authorities}"))?;
+            c.validate().map(|()| c)
+        };
+        let c = load("[[tls.authorities]]\ndomain = \"Exhub.Internal.\"\n[[tls.authorities]]\ndomain = \"lab.exhub.internal\"").unwrap();
+        assert_eq!(c.tls.authorities[0].domain, "exhub.internal");
+        for (host, want) in [("exhub.internal", Some("exhub.internal")), ("a.exhub.internal", Some("exhub.internal")), ("a.lab.exhub.internal", Some("lab.exhub.internal")), ("lab.exhub.internal", Some("lab.exhub.internal")), ("notexhub.internal", None), ("t.example.com", None)] {
+            assert_eq!(c.tls.authority_for(host), want, "{host}");
+        }
+        for bad in ["domain = \"internal\"", "domain = \"*.exhub.internal\"", "domain = \"ex hub.internal\"", "domain = \"exhub.internal\"\ncert_file = \"/ca.crt\""] {
+            assert!(load(&format!("[[tls.authorities]]\n{bad}")).is_err(), "{bad}");
+        }
+        assert!(load("[[tls.authorities]]\ndomain = \"exhub.internal\"\n[[tls.authorities]]\ndomain = \"EXHUB.internal\"").is_err(), "twice");
+        // Without Let's Encrypt, only when authorities issue the server's own names.
+        let mut c: Config = toml::from_str("base_domain = \"t.exhub.internal\"\n[management]\nhostname = \"mp.exhub.internal\"\n[[tls.authorities]]\ndomain = \"exhub.internal\"").unwrap();
+        c.public.http_listen = None;
+        assert!(c.validate().is_ok());
+        c.management.hostname = "mp.example.com".into();
+        assert!(c.validate().is_err(), "the management host would need Let's Encrypt");
+    }
 
     #[test]
     fn port_ranges() {

@@ -1,6 +1,7 @@
-//! Custom hostnames and who may serve them (migration 2).
+//! Custom hostnames and who may serve them (migration 2). A row may be a wildcard,
+//! `*.exhub.internal`, for every name one label under it that has no row of its own.
 //!
-//! Callers pass validated, lowercase hostnames (`control::hostnames::validate`).
+//! Callers pass validated, lowercase hostnames (`control::hostnames::validate_registration`).
 
 use magicpipes_core::unix_now;
 use rusqlite::params;
@@ -50,12 +51,15 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// Removes a hostname's registration and every tunnel on it, in one transaction. `false`
-    /// if it wasn't registered.
-    pub fn delete_hostname(&self, hostname: &str) -> anyhow::Result<bool> {
+    /// Removes a hostname's registration and the tunnels on it (`tunnels`, by id: for a wildcard,
+    /// those on names under it), in one transaction. `false` if it wasn't registered.
+    pub fn delete_hostname(&self, hostname: &str, tunnels: &[String]) -> anyhow::Result<bool> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM tunnels WHERE hostname = ?1", [hostname])?;
+        for id in tunnels {
+            tx.execute("DELETE FROM tunnels WHERE id = ?1", [id])?;
+        }
         let deleted = tx.execute("DELETE FROM hostnames WHERE org_id = ?1 AND hostname = ?2", params![DEFAULT_ORG, hostname])?;
         tx.commit()?;
         Ok(deleted == 1)
@@ -95,7 +99,7 @@ mod tests {
         // Revoking the agent takes its hostname with it.
         assert!(s.delete_agent(&agent).unwrap());
         assert_eq!(s.hostnames().unwrap().len(), 1);
-        assert!(s.delete_hostname("shop.example.com").unwrap() && !s.delete_hostname("shop.example.com").unwrap());
+        assert!(s.delete_hostname("shop.example.com", &[]).unwrap() && !s.delete_hostname("shop.example.com", &[]).unwrap());
         std::fs::remove_dir_all(dir).ok();
     }
 }

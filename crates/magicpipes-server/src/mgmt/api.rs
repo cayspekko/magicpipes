@@ -356,6 +356,11 @@ pub async fn ssh_ca(Caller(_): Caller, State(app): State<AppState>) -> Result<im
     Ok(Json(json!({ "public_key": key.trim() })))
 }
 
+/// The certificate authorities this server issues certificates from, with their certificates.
+pub async fn list_authorities(Caller(_): Caller, State(app): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(json!({ "authorities": app.control.authorities() })))
+}
+
 #[derive(Deserialize)]
 pub struct NewSshKey {
     #[serde(default)]

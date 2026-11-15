@@ -48,6 +48,10 @@ pub struct TunnelView {
     pub tls: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_error: Option<String>,
+    /// The `[[tls.authorities]]` domain whose CA issues its certificate, if one does: devices
+    /// must trust that CA.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
     pub created_at: String,
     pub requests: u64,
     pub upstream_errors: u64,
@@ -173,6 +177,7 @@ impl ControlPlane {
                 Some(CertStatus::Failed(m)) => Some(m),
                 _ => None,
             },
+            authority: if t.row.kind.is_http() { self.certs.authority_of(&t.row.hostname) } else { None },
             created_at: rfc3339(t.row.created_at),
             requests: t.stats.requests.load(std::sync::atomic::Ordering::Relaxed),
             upstream_errors: t.stats.upstream_errors.load(std::sync::atomic::Ordering::Relaxed),

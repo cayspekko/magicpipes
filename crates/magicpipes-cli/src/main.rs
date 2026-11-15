@@ -1006,6 +1006,10 @@ async fn add(mut req: AddRequest, out: Output) -> Result<(), ErrorInfo> {
         if kind.is_http() && data["verified"] == false {
             println!("Not verified (--no-verify). Once its DNS points at the server, run the same command without --no-verify to check it.");
         }
+        if let Some(domain) = data["authority"].as_str() {
+            let server = AgentConfig::load().ok().flatten().map(|c| c.server.trim_end_matches('/').to_string()).unwrap_or_default();
+            println!("Its certificate is from the server's own CA for {domain}, which devices trust once it's installed: {server}/ca/{domain}.crt");
+        }
         println!("Stop it with: magicpipes remove {}", data["name"].as_str().unwrap_or_default());
     }
     if let Some((cmd, writable, _)) = &shell

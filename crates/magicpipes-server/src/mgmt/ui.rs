@@ -78,7 +78,9 @@ done_messages! {
     AccessOff "access-off" "That tag no longer grants access.",
     HostnameRegistered "hostname-registered" "Hostname registered. Its certificate is being ordered.",
     HostnameCovered "hostname-covered" "Hostname registered. It uses the certificate you added.",
-    HostnameRemoved "hostname-removed" "Hostname removed, with the tunnel on it.",
+    HostnameFromAuthority "hostname-from-authority" "Hostname registered. Its certificate is from this server's CA.",
+    WildcardRegistered "wildcard-registered" "Wildcard registered. Each name under it gets a certificate when a tunnel takes it.",
+    HostnameRemoved "hostname-removed" "Registration removed, with the tunnels it allowed.",
     SignInSaved "sign-in-saved" "Saved. It applies from the next sign-in.",
     ProviderAdded "provider-added" "Provider added. Try it from a private window.",
     ProviderSaved "provider-saved" "Provider saved.",
@@ -527,7 +529,15 @@ fn detail_body(t: &TunnelView, agent: &str, csrf: &str, people: &HashMap<String,
     };
     dl.push_str(&field("Who can open it", &format!("{}{change}", access_cell(t, people, false))));
     if t.kind.is_http() {
-        dl.push_str(&field("TLS certificate", &badge(t.tls)));
+        let from_ca = t.authority.as_deref().map_or_else(String::new, |d| {
+            format!(
+                r#"<p class="note">From this server's CA for {d}, which devices trust once it's installed. <a href="{href}">{DOWNLOAD} Download its certificate</a></p>"#,
+                d = esc(d),
+                href = esc(&super::certificates::authority_href(d)),
+                DOWNLOAD = super::icons::DOWNLOAD,
+            )
+        });
+        dl.push_str(&field("TLS certificate", &format!("{}{from_ca}", badge(t.tls))));
     } else if t.kind.has_port() {
         // A private one has no public port, so nothing to allow anyone into.
         if t.public_port.is_some() {

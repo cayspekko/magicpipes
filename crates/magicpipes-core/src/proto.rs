@@ -77,7 +77,12 @@ pub const PROTOCOL_HEADER: &str = "x-magicpipes-protocol";
 ///   asks an agent that allows it to upgrade itself. An older agent answers both
 ///   [`StreamStatus::Unsupported`], and the server then waits until its connection is idle and
 ///   closes it, which it reconnects after.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// * 13: certificate authorities. [`TunnelInfo`] names the `[[tls.authorities]]` domain whose CA
+///   issues the tunnel's certificate (`authority`) and gives that CA's certificate
+///   (`authority_ca`), which the agent trusts for its readiness probe of that tunnel and for
+///   nothing else. An older agent ignores both, and its probe then fails unless it trusts that CA
+///   already; an older server never sends them.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The first protocol version that knows about upgrades (see [`PROTOCOL_VERSION`]).
 pub const UPGRADES_PROTOCOL: u32 = 12;
@@ -359,6 +364,13 @@ pub struct TunnelInfo {
     /// may reach any of them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replicas: bool,
+    /// The `[[tls.authorities]]` domain whose CA issues its certificate (protocol 13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// That CA's certificate, PEM (protocol 13): the agent trusts it for its readiness probe of
+    /// this tunnel, and for nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_ca: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -588,6 +600,14 @@ mod tests {
         let with: TunnelInfo = serde_json::from_str(r#"{"id":"tn","name":"a","hostname":"a.t","public_url":"https://a.t","created":true,"replicas":true}"#).unwrap();
         assert!(with.replicas);
         assert!(!serde_json::to_string(&t).unwrap().contains("replicas"), "said only when true");
+        // Before protocol 13: no certificate authority, and nothing about one is sent.
+        assert!(t.authority.is_none() && t.authority_ca.is_none());
+        assert!(!serde_json::to_string(&t).unwrap().contains("authority"));
+        let from_ca: TunnelInfo = serde_json::from_str(
+            r#"{"id":"tn","name":"a","hostname":"a.exhub.internal","public_url":"https://a.exhub.internal","created":true,"authority":"exhub.internal","authority_ca":"PEM"}"#,
+        )
+        .unwrap();
+        assert_eq!((from_ca.authority.as_deref(), from_ca.authority_ca.as_deref()), (Some("exhub.internal"), Some("PEM")));
         let r: Request = serde_json::from_str(r#"{"op":"register","id":null,"name":"a","target":"x"}"#).unwrap();
         assert!(matches!(r, Request::Register(RegisterTunnel { visibility: None, .. })));
         let r = Request::Register(RegisterTunnel {

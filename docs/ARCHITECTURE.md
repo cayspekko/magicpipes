@@ -525,6 +525,42 @@ generated copy names their files like any other `[[tls.certificates]]`. One that
 startup stays listed so it can be removed, and costs nothing else; one in the configuration file that
 can't be read stops startup.
 
+**Certificate authorities** (`certs/authority.rs`, `[[tls.authorities]]`) issue the certificates of
+every name under a domain, for internal names and closed networks:
+
+* **One per domain**, so a device that installs one trusts it for that domain only: one the server makes
+  carries an X.509 name constraint for it (and a path length of 0), and adding a domain adds a CA rather
+  than widening one that devices already trust. One people bring is checked at start (a CA, its key,
+  valid, constraints that allow the domain) and stops startup otherwise, like any configuration mistake.
+  The development CA of `tls.mode = "dev-ca"` is the same code, for the server's own names.
+* **Where a name's certificate comes from** is decided per name: a certificate people brought first,
+  then the authority with the longest domain that is the name or a parent of it, then `tls.mode`. So an
+  authority works in any mode, `files` included, and one for the base domain and the management host
+  makes a server that needs nothing from outside (it then needs no `http_listen`). The management host
+  may use an authority, unlike a certificate added on the page: an authority comes only from the
+  configuration file, so nothing on the page can break it.
+* **Issued, not ordered**: in memory, 30 days, again at every start and at two thirds, never past the
+  CA's own end, with the server-auth extended key usage Apple's platforms require. Nothing is cached in
+  `certs/`, and a cached ACME certificate for a name an authority now covers is passed over. There's no
+  rate limit to protect, so these names don't count against `max_new_certificates_per_day`.
+* **The agent's readiness probe** has to trust the CA too: from protocol 13 the server sends the CA's
+  certificate with the registration (`TunnelInfo.authority_ca`), and the agent trusts it for that probe
+  of that tunnel and nothing else. A server could vouch for a probe anyway, by answering it, so this
+  gives it nothing new.
+* **Its certificate is public, its domain less so**: anyone signed in downloads it (`/ca/<domain>.crt`,
+  linked from the tunnels it issued for, and `GET /api/v1/authorities`), but nobody signed out, since a
+  management host on the internet shouldn't list internal domains.
+
+**Wildcard registrations** (`*.exhub.internal`, `control/hostnames.rs`) are rows of the `hostnames`
+table like exact ones, so they needed no migration. They cover names one label under the domain: the
+same names a wildcard certificate covers, so one from DNS-01 later will fit them. A name's own
+registration wins over the wildcard (`State::registration_for`), but isn't granted to someone else while
+a tunnel under the wildcard has the name. Each name gets its own certificate when a tunnel takes it,
+from the same sources as any other, and stops being renewed when no tunnel has it. Removing a wildcard
+removes the tunnels under it in the same transaction. An older release reading the table during an
+upgrade sees `*.exhub.internal` as a hostname no tunnel can have, and orders a certificate for it that
+fails and backs off: harmless, and only while both run.
+
 **Bounds:** 32 saved providers, 500 entries per list, and the request limits of the management
 listener. Adding a provider asks it about itself first: at most two requests of 4 s and 256 KiB,
 sharing the limit of 16 exchanges with sign-ins. Only administrators can trigger this, and the only
@@ -768,7 +804,7 @@ the sshd its own user configured, and older agents, Windows agents and `--host` 
   before now, for a slow clock), principal the person's email, extension `permit-pty` only: no
   forwarding, no agent, no X11. The key lives in memory for the session. The machine maps principals
   to accounts (`AuthorizedPrincipalsFile`), so MagicPipes never knows Unix names, and a refusal comes
-  from sshd. The same authority will sign more than SSH certificates later (ROADMAP.md).
+  from sshd. TLS certificates have authorities of their own, one per domain (see "Certificate authorities").
 * **Why the server, not the agent.** The agent could hold the authority, and a stolen server database
   couldn't log in anywhere. But the server decides who is signed in either way, a server authority
   needs nothing from the agent, and it's the start of the server being a certificate authority in general.
@@ -909,7 +945,8 @@ Defined in `magicpipes-core/src/proto.rs`. It is a yamux session over the upgrad
   `X-MagicPipes-Protocol: <version>` (`PROTOCOL_VERSION`, now 12: 2 added the handshake and
   answers to unknown messages, 3 visibility and tags, 4 custom hostnames, 5 SSH tunnels, 6 private TCP
   and UDP tunnels, 7 RDP tunnels, 8 VNC tunnels, 9 several connections per agent, 10 why an app
-  couldn't be reached, 11 replicas, 12 upgrades: see "Upgrades without downtime"). A peer without the header is
+  couldn't be reached, 11 replicas, 12 upgrades: see "Upgrades without downtime", 13 the CA that issues a
+  tunnel's certificate: see "Certificate authorities"). A peer without the header is
   version 1. Each side knows the other's version before sending anything, so a new feature can
   be skipped or refused with `server_outdated` / `agent_outdated` instead of misbehaving. Bump
   the version when a peer must know about a new request, stream type or field before using it,

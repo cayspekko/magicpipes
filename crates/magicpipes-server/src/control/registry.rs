@@ -134,7 +134,7 @@ impl ControlPlane {
             Some(_) if !req.kind.is_http() => {
                 return Err(err(ErrorCode::InvalidRequest, "a custom hostname applies only to HTTP tunnels"));
             }
-            Some(h) => Some(h.trim().trim_end_matches('.').to_ascii_lowercase()),
+            Some(h) => Some(super::hostnames::tunnel_hostname(&self.cfg, h).map_err(|m| err(ErrorCode::InvalidRequest, m))?),
         };
         match req.kind {
             Kind::Http | Kind::Ssh | Kind::Rdp | Kind::Vnc if req.remote_port.is_some() || !allow.is_empty() => {
@@ -267,8 +267,9 @@ impl ControlPlane {
             return Err(err(ErrorCode::NameTaken, format!("'{hostname}' is served by another tunnel")));
         }
         // Every new hostname costs a certificate order, and the CA's limits are shared by all
-        // agents (Let's Encrypt: 50 certificates per domain per week).
-        let new_cert = req.kind.is_http() && self.cfg.tls.mode == TlsMode::Acme && self.certs.status(&hostname) != CertStatus::Ready;
+        // agents (Let's Encrypt: 50 certificates per domain per week). This server's own CAs
+        // have none.
+        let new_cert = req.kind.is_http() && self.cfg.tls.mode == TlsMode::Acme && !self.certs.issued_here(&hostname) && self.certs.status(&hostname) != CertStatus::Ready;
         if new_cert {
             let max = self.cfg.agents.max_new_certificates_per_day;
             let orders = st.cert_orders.entry(agent_id.to_string()).or_default();
@@ -368,7 +369,10 @@ impl ControlPlane {
     }
 
     fn info(&self, row: &TunnelRow, created: bool, owner_tag: Option<String>, access: Vec<String>, replicas: bool) -> TunnelInfo {
+        let authority = if row.kind.is_http() { self.certs.authority_of(&row.hostname) } else { None };
         TunnelInfo {
+            authority_ca: authority.as_deref().and_then(|d| self.certs.authority_pem(d)),
+            authority,
             id: row.id.clone(),
             name: row.name.clone(),
             hostname: row.hostname.clone(),

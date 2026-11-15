@@ -35,6 +35,24 @@ pub fn tls_config(extra_ca_pem: Option<&str>) -> anyhow::Result<Arc<ClientConfig
     Ok(Arc::new(cfg))
 }
 
+/// Trusting only the CA certificates in `pem` (at most a few, and nothing that isn't one): for
+/// checking a certificate the server says one of its own authorities issued.
+pub fn tls_config_trusting(pem: &str) -> anyhow::Result<Arc<ClientConfig>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(pem.as_bytes()).take(8) {
+        roots.add(cert.map_err(|e| anyhow!("invalid CA certificate: {e}"))?)?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!("no CA certificate in it");
+    }
+    let mut cfg = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
 /// `https://host[:port]` -> `(host, port)`.
 pub fn parse_server(url: &str) -> anyhow::Result<(String, u16)> {
     let uri: Uri = url.parse().with_context(|| format!("invalid URL {url}"))?;

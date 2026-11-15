@@ -14,7 +14,7 @@ use super::picker::{self, Holder, Submitted};
 use super::ui::{Done, done, done_url, failed, logged_in_to, not_there, outcome, page, server_url};
 use crate::authz::{Principal, Role};
 use crate::control::rules::TagRuleView;
-use crate::control::{InvitationView, MIN_PASSWORD_CHARS, Purpose, TagView, TunnelSignIn, UserView};
+use crate::control::{HostnameView, InvitationView, MIN_PASSWORD_CHARS, Purpose, TagView, TunnelSignIn, UserView};
 use crate::store::ANY_SOURCE;
 use crate::tunnel_auth::safe_path;
 
@@ -900,6 +900,30 @@ pub async fn tag_access(State(app): State<AppState>, Posted(user, f): Posted<Tag
 
 // ---- hostnames ---------------------------------------------------------------------------------
 
+/// A wildcard's tunnels, for scanning: a few, and how many more (never just one more).
+fn tunnels_cell(names: &[String]) -> String {
+    const SHOWN: usize = 3;
+    if names.is_empty() {
+        return r#"<span class="sub">none yet</span>"#.into();
+    }
+    let shown = if names.len() <= SHOWN + 1 { names.len() } else { SHOWN };
+    let mut cell: Vec<String> = names[..shown].iter().map(|n| format!("<code>{}</code>", esc(n))).collect();
+    if shown < names.len() {
+        cell.push(format!(r#"<span class="sub">and {} more</span>"#, names.len() - shown));
+    }
+    cell.join(" ")
+}
+
+/// What removing a registration does, in the words of the question asked first.
+fn hostname_removal(h: &HostnameView) -> String {
+    let effect = match (h.hostname.starts_with("*."), h.tunnel.as_deref(), h.tunnels.len()) {
+        (false, Some(t), _) => format!("Its tunnel, {t}, is deleted."),
+        (true, _, n) if n > 0 => format!("The {} under it {} deleted.", count(n, "tunnel", "tunnels"), if n == 1 { "is" } else { "are" }),
+        _ => "No tunnel uses it.".into(),
+    };
+    format!("Remove {}? {effect}", h.hostname)
+}
+
 /// `error`: about the list. `attempt`: the form that came back, and why.
 fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Option<(&HostnameForm, &str)>) -> Response {
     let assigned = attempt.map_or("", |(f, _)| f.assign.as_str());
@@ -911,10 +935,12 @@ fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: O
             (None, Some(agent)) => format!(r#"{} <span class="sub">service agent</span>"#, esc(agent)),
             (None, None) => "—".into(),
         };
-        let tunnel = h.tunnel.as_deref().map(|t| format!("<code>{}</code>", esc(t))).unwrap_or_else(|| r#"<span class="sub">none yet</span>"#.into());
+        let tunnel = if h.hostname.starts_with("*.") { tunnels_cell(&h.tunnels) } else { tunnels_cell(h.tunnel.as_slice()) };
+        let from_ca = if h.authority.is_some() { r#"<span class="sub">this server's CA</span>"# } else { "" };
         rows.push_str(&format!(
-            r#"<tr><td><span class="name">{host}</span></td><td>{served_by}</td><td>{tunnel}</td><td>{tls}</td><td>{created}</td><td class="num"><form method="post" action="/hostnames/delete" data-confirm="Remove {host}? The tunnel on it is deleted.">{csrf}<input type="hidden" name="hostname" value="{host}"><button class="btn danger small">Remove</button></form></td></tr>"#,
+            r#"<tr><td class="wrap"><span class="name">{host}</span></td><td>{served_by}</td><td class="wrap">{tunnel}</td><td>{tls}{from_ca}</td><td>{created}</td><td class="num"><form method="post" action="/hostnames/delete" data-confirm="{question}">{csrf}<input type="hidden" name="hostname" value="{host}"><button class="btn danger small" aria-label="Remove {host}">Remove</button></form></td></tr>"#,
             host = esc(&h.hostname),
+            question = esc(&hostname_removal(&h)),
             tls = badge(h.tls),
             created = when(&h.created_at),
             csrf = user.csrf_field(),
@@ -940,10 +966,10 @@ fn hostnames_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: O
 {err}<div class="spaced">{list}</div>
 <div class="section"><h2>Register a hostname</h2></div>
 <div class="card form">{form_error}<form method="post" action="/hostnames">{csrf}
-<label for="hn">Hostname</label><input id="hn" name="hostname" placeholder="shop.example.com" maxlength="253" value="{typed_host}"{host_invalid} required>
+<label for="hn">Hostname</label><input id="hn" name="hostname" placeholder="shop.example.com or *.example.com" maxlength="253" value="{typed_host}"{host_invalid} required>
 <label for="ha">Served by</label><select id="ha" name="assign"{assign_invalid} required><option value="">Choose…</option>{users}{agents}</select>
 <button class="btn primary">Register</button></form>
-<p class="note">One exact name, no wildcards, with its DNS pointing at this server. Its certificate is ordered as soon as you register it, so it can be ready before traffic moves over; if it can't be ordered, <a href="/settings#certificates">add your own</a>. Then serve a tunnel on it with <code>magicpipes add PORT --hostname NAME</code>. Removing it deletes that tunnel.</p></div>"#,
+<p class="note">An exact name, or a wildcard such as <code>*.example.com</code> for every name one label under it, with DNS pointing at this server. An exact name's certificate is ordered as soon as you register it; a wildcard's names each get one when a tunnel takes them. If one can't be ordered, <a href="/settings#certificates">add your own</a>. Then serve a tunnel with <code>magicpipes add PORT --hostname NAME</code>. Removing a registration deletes the tunnels it allowed.</p></div>"#,
         base = esc(&app.control.config().base_domain),
         list = table(&[Text("Hostname"), Text("Served by"), Text("Tunnel"), Text("TLS"), Text("Registered"), Actions], &rows, "No custom hostnames yet. Register one below, or use names under the base domain."),
         err = alert(error),
@@ -976,6 +1002,8 @@ pub async fn create_hostname(State(app): State<AppState>, Posted(user, f): Poste
     };
     match app.control.create_hostname(&user.who, &f.hostname, owner, agent) {
         Ok(h) if app.control.certificate_covers(&h.hostname) => done("/hostnames", Done::HostnameCovered),
+        Ok(h) if h.hostname.starts_with("*.") => done("/hostnames", Done::WildcardRegistered),
+        Ok(h) if h.authority.is_some() => done("/hostnames", Done::HostnameFromAuthority),
         Ok(_) => done("/hostnames", Done::HostnameRegistered),
         Err(e) => (StatusCode::BAD_REQUEST, hostnames_page(&user, &app, None, Some((&f, &e.message)))).into_response(),
     }

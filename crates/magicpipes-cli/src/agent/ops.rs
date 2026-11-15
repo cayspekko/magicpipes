@@ -120,7 +120,7 @@ impl Agent {
 
         // 3. Registration (find-or-create, serialized).
         ev.step(Step::Register, StepState::Running).await;
-        let (tunnel, created) = match self.register(&req, target).await {
+        let (tunnel, created, authority) = match self.register(&req, target).await {
             Ok(v) => v,
             Err(e) => {
                 ev.step(Step::Register, StepState::Failed).await;
@@ -135,7 +135,7 @@ impl Agent {
                 ev.step(Step::Probe, StepState::Skipped).await;
                 Ok(None)
             }
-            Kind::Http => self.verify(&tunnel, &req, &ev, deadline).await.map(|()| None),
+            Kind::Http => self.verify(&tunnel, &req, &ev, deadline, authority.as_ref()).await.map(|()| None),
             _ => self.verify_port(&tunnel, &ev, deadline).await,
         };
         let reachable = match result {
@@ -177,6 +177,9 @@ impl Agent {
             out["public_port"] = json!(port);
             out["allow"] = json!(tunnel.allow);
         }
+        if let Some((domain, _)) = &authority {
+            out["authority"] = json!(domain);
+        }
         match tunnel.kind {
             // A private one has no public port to reach.
             Kind::Tcp if tunnel.public_port.is_none() => {}
@@ -195,7 +198,9 @@ impl Agent {
         self.tunnels.remove(&tunnel.id);
     }
 
-    async fn register(&self, req: &AddRequest, mut target: Target) -> Result<(LocalTunnel, bool), ErrorInfo> {
+    /// Also returns the domain and certificate of the server's CA that issues its certificate,
+    /// if one does.
+    async fn register(&self, req: &AddRequest, mut target: Target) -> Result<(LocalTunnel, bool, Option<(String, String)>), ErrorInfo> {
         // Serializes the find-or-register step so concurrent `add`s of one port don't duplicate,
         // and keeps it apart from restoring tunnels after a reconnect.
         let _lock = self.session.register_lock.lock().await;
@@ -367,6 +372,7 @@ impl Agent {
             }
             return Err(ErrorInfo::new(ErrorCode::ServerOutdated, message));
         }
+        let authority = info.authority.clone().zip(info.authority_ca.clone());
         let tunnel = LocalTunnel {
             created_at: existing.as_ref().map(|t| t.created_at).unwrap_or_else(magicpipes_core::unix_now),
             id: info.id,
@@ -385,10 +391,11 @@ impl Agent {
             replicas: info.replicas,
         };
         self.tunnels.upsert(tunnel.clone(), Registration::Registered);
-        Ok((tunnel, info.created))
+        Ok((tunnel, info.created, authority))
     }
 
-    async fn verify(&self, t: &LocalTunnel, req: &AddRequest, ev: &Events<'_>, deadline: Instant) -> Result<(), ErrorInfo> {
+    /// `authority`: the server's CA that issues its certificate, which the probe trusts instead.
+    async fn verify(&self, t: &LocalTunnel, req: &AddRequest, ev: &Events<'_>, deadline: Instant, authority: Option<&(String, String)>) -> Result<(), ErrorInfo> {
         let remaining = || deadline.saturating_duration_since(Instant::now());
 
         // 4. Certificate.
@@ -435,8 +442,16 @@ impl Agent {
 
         // 5. End-to-end probe through the public HTTPS endpoint.
         ev.step(Step::Probe, StepState::Running).await;
+        let tls = match authority.map(|(_, pem)| crate::https::tls_config_trusting(pem)) {
+            Some(Ok(tls)) => tls,
+            Some(Err(e)) => {
+                ev.step(Step::Probe, StepState::Failed).await;
+                return Err(ErrorInfo::new(ErrorCode::Protocol, format!("the server sent its CA's certificate in a form this can't use: {e:#}")).at(Step::Probe));
+            }
+            None => self.tls.clone(),
+        };
         loop {
-            let last = match probe::probe(t, &req.probe_path, &self.tls, &self.tunnels).await {
+            let last = match probe::probe(t, &req.probe_path, &tls, &self.tunnels).await {
                 Ok(status) => {
                     tracing::debug!(tunnel = %t.name, status, "probe succeeded");
                     break;

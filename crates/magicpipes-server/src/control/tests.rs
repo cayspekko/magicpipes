@@ -540,6 +540,53 @@ async fn custom_hostnames_are_assigned_by_administrators() {
 }
 
 #[tokio::test]
+async fn a_wildcard_lets_its_owner_use_each_name_under_it() {
+    use magicpipes_core::proto::Visibility;
+
+    use crate::authz::Role;
+    use crate::certs::CertStatus;
+    use crate::control::EnrollmentOptions;
+    let dir = std::env::temp_dir().join(format!("mp-control-{}", secret::random_string(8)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = fixture_in(dir, "[[tls.authorities]]\ndomain = \"exhub.internal\"");
+    let admin = Principal::AdminToken;
+    let (ann, _) = f.cp.create_user(&admin, "ann@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let (bob, _) = f.cp.create_user(&admin, "bob@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    let laptop_of = |id: &str| EnrollmentOptions { owner_user_id: Some(id.to_string()), ..Default::default() };
+    let enroll = |opts| f.cp.enroll(&EnrollRequest { enrollment_token: f.cp.create_enrollment(&admin, opts).unwrap(), agent_name: "m".into() }).unwrap().agent_id;
+    let (anns, bobs) = (enroll(laptop_of(&ann.id)), enroll(laptop_of(&bob.id)));
+    let on = |host: &str| RegisterTunnel { name: None, hostname: Some(host.into()), visibility: Some(Visibility::Public), ..http("x") };
+
+    let view = f.cp.create_hostname(&admin, "*.Exhub.Internal", Some(&ann.id), None).unwrap();
+    assert_eq!((view.hostname.as_str(), view.authority.as_deref(), view.tls), ("*.exhub.internal", Some("exhub.internal"), "ready"));
+
+    // Any name one label under it, for her machines only, each with its own certificate from the
+    // authority (the server's mode is dev-ca, whose CA couldn't issue it).
+    let t = f.cp.register(&anns, None, &on("Tunnel.Exhub.Internal")).unwrap();
+    assert_eq!((t.hostname.as_str(), t.name.as_str()), ("tunnel.exhub.internal", "tunnel"));
+    assert!(f.data.lookup("tunnel.exhub.internal").is_some());
+    assert_eq!(f.cp.certs.wait("tunnel.exhub.internal", Duration::from_secs(10)).await, CertStatus::Ready);
+    assert!(f.cp.register(&bobs, None, &on("bob.exhub.internal")).unwrap_err().is(ErrorCode::NotFound), "not bob's");
+    assert!(f.cp.register(&anns, None, &on("a.b.exhub.internal")).unwrap_err().is(ErrorCode::NotFound), "one label down only");
+    assert!(f.cp.register(&anns, None, &on("*.exhub.internal")).unwrap_err().is(ErrorCode::InvalidRequest), "never the wildcard itself");
+    f.cp.register(&anns, None, &on("wiki.exhub.internal")).unwrap();
+    let listed = f.cp.hostnames(&admin);
+    assert_eq!((listed[0].tunnels.as_slice(), listed[0].tunnel.as_deref()), (["tunnel".to_string(), "wiki".to_string()].as_slice(), None));
+
+    // An exact registration under it wins, but can't take a name one of her tunnels has.
+    assert!(f.cp.create_hostname(&admin, "wiki.exhub.internal", Some(&bob.id), None).unwrap_err().is(ErrorCode::InvalidRequest));
+    f.cp.create_hostname(&admin, "shop.exhub.internal", Some(&bob.id), None).unwrap();
+    assert!(f.cp.register(&anns, None, &on("shop.exhub.internal")).unwrap_err().is(ErrorCode::NotFound));
+    let shop = f.cp.register(&bobs, None, &on("shop.exhub.internal")).unwrap();
+
+    // Removing the wildcard removes the tunnels under it, and not those registered on their own.
+    assert!(f.cp.delete_hostname(&admin, "*.exhub.internal").unwrap());
+    assert!(f.data.lookup("tunnel.exhub.internal").is_none() && f.data.lookup("wiki.exhub.internal").is_none());
+    assert!(f.data.lookup("shop.exhub.internal").is_some() && f.cp.tunnel(&admin, &shop.id).is_some());
+    assert_eq!(f.cp.hostnames(&admin).len(), 1);
+}
+
+#[tokio::test]
 async fn ports_outside_the_range_stay_closed() {
     use magicpipes_core::proto::Kind;
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

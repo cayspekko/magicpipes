@@ -70,6 +70,7 @@ use crate::data::{AccessPolicy, AgentLink, DataPlane, GatewayKey, Route, RouteSt
 use crate::store::{Store, TunnelRow};
 pub use device::{API_PASS_SECS, DEVICE_LOGIN_TTL, DevicePoll, Purpose};
 pub use email::{AcceptError, INVITATION_DAYS, InvitationView, LinkError, OpenInvitation, SIGN_IN_LINK_MINUTES};
+pub use hostnames::HostnameView;
 pub use oidc::SignInError;
 pub use notify::WebhookView;
 pub use registry::TunnelSignIn;
@@ -499,8 +500,9 @@ impl ControlPlane {
         self.data.publish(table);
         let mut wanted: std::collections::HashSet<&str> =
             st.tunnels.values().filter(|t| t.row.kind.is_http()).map(|t| t.row.hostname.as_str()).collect();
-        // Registered hostnames keep their certificates without a tunnel, ready for one.
-        wanted.extend(st.dir.hostnames().map(|h| h.hostname.as_str()));
+        // Registered hostnames keep their certificates without a tunnel, ready for one; a
+        // wildcard's names, only while a tunnel has them.
+        wanted.extend(st.dir.hostnames().map(|h| h.hostname.as_str()).filter(|h| !h.starts_with("*.")));
         wanted.insert(&self.cfg.management.hostname);
         self.certs.set_wanted(&wanted);
     }

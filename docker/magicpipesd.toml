@@ -24,6 +24,10 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # [[tls.certificates]]
 # cert_file = "/etc/magicpipes/shop.crt"
 # key_file  = "/etc/magicpipes/shop.key"
+# A certificate authority of the server's own for every name under a domain (internal names): the
+# server makes one in /data/authorities/<domain> unless you mount your own (cert_file, key_file).
+# [[tls.authorities]]
+# domain = "exhub.internal"
 
 # [users]
 # session_max_age_secs = 43200

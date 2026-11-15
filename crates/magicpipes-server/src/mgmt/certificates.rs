@@ -1,16 +1,18 @@
-//! Certificates on the Settings page: your own, for names the usual source can't or shouldn't serve.
-//! The decisions are in `certs::provided`.
+//! Certificates on the Settings page: your own, for names the usual source can't or shouldn't serve,
+//! and the certificate authorities this server issues from. The decisions are in `certs::provided`
+//! and `certs::authority`.
 
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
-use http::StatusCode;
+use http::{HeaderValue, StatusCode, header};
 use serde::Deserialize;
 
 use super::AppState;
 use super::extract::{AdminPosted, AdminUser, NoFields, UiUser};
 use super::html::{Actions, Number, Text, back, count, esc, form_alert, invalid, table, title_of, when};
-use super::ui::{Done, done, outcome, page};
-use crate::certs::ProvidedCert;
+use super::icons::DOWNLOAD;
+use super::ui::{Done, done, not_there, outcome, page};
+use crate::certs::{AuthorityView, ProvidedCert};
 use crate::config::TlsMode;
 use crate::control::CertificateView;
 
@@ -105,7 +107,54 @@ pub(super) fn section(user: &UiUser, app: &AppState) -> String {
 <div class="row"><a class="btn" href="/settings/certificates/new">Add a certificate</a></div>"#,
         list = table(&[Text("Names"), Text("Expires"), Text("Status"), Number("Tunnels"), Actions], &rows, &esc(&empty)),
         host = esc(&app.control.config().management.hostname),
+    ) + &authorities_section(app, source)
+}
+
+/// Where anyone signed in downloads an authority's certificate.
+pub(super) fn authority_href(domain: &str) -> String {
+    format!("/ca/{domain}.crt")
+}
+
+fn authority_row(a: &AuthorityView) -> String {
+    let origin = if a.made_here { "made by this server" } else { "yours, from the configuration file" };
+    format!(
+        r#"<tr><td class="wrap"><span class="name">{domain}</span><span class="sub">{origin}</span><code class="sub wrap" title="SHA-256 fingerprint">{fingerprint}</code></td><td>{expires}</td><td class="num"><a class="btn small" href="{href}" aria-label="Download the certificate of the CA for {domain}">{DOWNLOAD} Download</a></td></tr>"#,
+        domain = esc(&a.domain),
+        fingerprint = esc(&a.fingerprint),
+        expires = when(&a.not_after),
+        href = esc(&authority_href(&a.domain)),
     )
+}
+
+/// The `[[tls.authorities]]`, if there are any: they're set in the configuration file.
+fn authorities_section(app: &AppState, source: &str) -> String {
+    let list = app.control.authorities();
+    if list.is_empty() {
+        return String::new();
+    }
+    let rows: String = list.iter().map(authority_row).collect();
+    format!(
+        r#"<div class="section" id="authorities"><h2>Certificate authorities</h2></div>
+{table}
+<p class="note">Names under these domains get their certificates from this server instead of {source}. A device trusts them once the CA's certificate is installed on it; anyone signed in can download it.</p>"#,
+        table = table(&[Text("Domain"), Text("Expires"), Actions], &rows, ""),
+    )
+}
+
+/// An authority's certificate, for anyone signed in to install on their devices: `<domain>.crt`.
+pub async fn download_authority(user: UiUser, State(app): State<AppState>, Path(file): Path<String>) -> Response {
+    let domain = file.strip_suffix(".crt").unwrap_or(&file).to_ascii_lowercase();
+    match app.control.authorities().into_iter().find(|a| a.domain == domain) {
+        Some(a) => {
+            let name = format!("attachment; filename=\"{}-ca.crt\"", a.domain);
+            let headers = [
+                (header::CONTENT_TYPE, HeaderValue::from_static("application/x-x509-ca-cert")),
+                (header::CONTENT_DISPOSITION, HeaderValue::from_str(&name).unwrap_or(HeaderValue::from_static("attachment"))),
+            ];
+            (headers, a.pem).into_response()
+        }
+        None => not_there(&user, "/", "Tunnels", "This server has no certificate authority for that domain."),
+    }
 }
 
 /// The form. What was typed comes back, except a key, or anything with a key in it.

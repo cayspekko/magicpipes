@@ -1777,6 +1777,71 @@ async fn custom_hostnames() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// A wildcard under a `[[tls.authorities]]` domain: the machine it's assigned to serves any name
+/// under it, each with a certificate from the server's own CA instead of the mode's (dev-ca here),
+/// and `add` checks it through that CA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn names_under_a_wildcard_get_certificates_from_the_servers_ca() {
+    let env = Env::with_config(Tls::DevCa, "[[tls.authorities]]\ndomain = \"exhub.test\"\n").await;
+    env.login().await;
+    let admin = env.admin_token();
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let port = app.port.to_string();
+    let (_, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    let agent = v["agents"][0]["id"].as_str().unwrap().to_string();
+    let (s, v) = env.api_json("POST", "/api/v1/hostnames", Some(&admin), serde_json::json!({ "hostname": "*.exhub.test", "agent_id": agent })).await;
+    assert_eq!((s, v["hostname"].as_str(), v["authority"].as_str()), (StatusCode::CREATED, Some("*.exhub.test"), Some("exhub.test")), "{v}");
+
+    // `add` checks it through the CA the server names, and says where devices get that CA.
+    let t = add_json(&env, &[&port, "--hostname", "web.exhub.test"]).await;
+    assert_eq!((t["status"].as_str(), t["authority"].as_str(), t["name"].as_str()), (Some("ready"), Some("exhub.test"), Some("web")), "{t}");
+    let out = env.cli(&["add", &port, "--hostname", "web.exhub.test"]).await;
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && said.contains(&format!("{}/ca/exhub.test.crt", env.server_url())), "{said}");
+
+    // The certificate is that CA's: whoever installs it gets through, and the development CA
+    // vouches for nothing there.
+    let (_, v) = env.api("GET", "/api/v1/authorities", Some(&admin)).await;
+    let ca = v["authorities"][0]["pem"].as_str().unwrap().to_string();
+    assert_eq!((v["authorities"][0]["domain"].as_str(), v["authorities"][0]["made_here"].as_bool()), (Some("exhub.test"), Some(true)), "{v}");
+    assert!(env.connect_trusting(&ca, "web.exhub.test", env.https_port).await.is_ok());
+    assert!(env.try_connect("web.exhub.test", env.https_port).await.is_err(), "not from the development CA");
+    assert!(env.root.join("server/authorities/exhub.test/ca.key").exists());
+
+    // Anyone signed in downloads it; nobody else.
+    let body = serde_json::json!({ "email": "mo@example.com", "password": "correct horse battery", "role": "member" });
+    env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    let cookie = sign_in(&env, "mo@example.com", "correct horse battery").await;
+    let download = env.ui("/ca/exhub.test.crt", Some(&cookie), None).await;
+    assert_eq!((download.status, download.html.as_str()), (StatusCode::OK, ca.as_str()));
+    let anonymous = env.ui("/ca/exhub.test.crt", None, None).await;
+    assert!(anonymous.status.is_redirection() && anonymous.location.as_deref().is_some_and(|l| l.starts_with("/login")), "{:?}", anonymous.location);
+    assert_eq!(env.ui("/ca/other.test.crt", Some(&cookie), None).await.status, StatusCode::NOT_FOUND);
+
+    // Removing the wildcard removes the tunnel under it.
+    let (s, _) = env.api("DELETE", "/api/v1/hostnames/*.exhub.test", Some(&admin)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, v) = env.api("GET", "/api/v1/tunnels", Some(&admin)).await;
+    assert!(!v.to_string().contains("web.exhub.test"), "{v}");
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
+/// An authority for the base domain, as on a closed network: every tunnel's certificate is from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_for_the_base_domain_issues_every_tunnels_certificate() {
+    let env = Env::with_config(Tls::DevCa, &format!("[[tls.authorities]]\ndomain = \"{BASE}\"\n")).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let t = add_json(&env, &[&app.port.to_string()]).await;
+    assert_eq!((t["status"].as_str(), t["authority"].as_str()), (Some("ready"), Some(BASE)), "{t}");
+    let host = hostname(t["public_url"].as_str().unwrap());
+    let (_, v) = env.api("GET", "/api/v1/authorities", Some(&env.admin_token())).await;
+    let ca = v["authorities"][0]["pem"].as_str().unwrap().to_string();
+    assert!(env.connect_trusting(&ca, &host, env.https_port).await.is_ok());
+    assert!(env.try_connect(&host, env.https_port).await.is_err(), "not from the development CA");
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_agent_is_cut_off() {
     let env = Env::new(Tls::DevCa).await;
