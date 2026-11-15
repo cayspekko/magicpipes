@@ -72,6 +72,15 @@ acme_directory = "letsencrypt"
 # domain = "exhub.internal"
 # cert_file = "/etc/magicpipes/exhub-ca.crt"   # your own CA instead: its certificate, then any above it
 # key_file  = "/etc/magicpipes/exhub-ca.key"
+# Wildcard certificates from the ACME CA through DNS-01, answered by the server's own DNS responder:
+# each domain gets one certificate for itself and *.domain. At the DNS host, once per domain:
+# "_acme-challenge.<domain> NS <nameserver>", or with zone set, "<zone> NS <nameserver>" and
+# "_acme-challenge.<domain> CNAME <domain>.<zone>". Port 53 (UDP and TCP) must reach the server.
+# [tls.dns01]
+# domains = ["t.example.com"]
+# listen = "0.0.0.0:53"
+# zone = "acme.example.com"
+# nameserver = "example.com"                   # default: management.hostname
 
 [agents]
 # session_timeout_secs = 45

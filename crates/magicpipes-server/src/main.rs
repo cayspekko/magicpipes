@@ -246,10 +246,26 @@ async fn take_or_bind(names: &[&str], addr: std::net::SocketAddr, what: &str) ->
     bind(addr, what).await
 }
 
+/// The UDP socket an older version handed over as `name`, if it's for `addr`; else a new one.
+async fn take_or_bind_udp(name: &str, addr: std::net::SocketAddr, what: &str) -> anyhow::Result<tokio::net::UdpSocket> {
+    #[cfg(unix)]
+    if let Some(fd) = magicpipes_core::fds::take(name) {
+        let std = std::net::UdpSocket::from(fd);
+        if std.local_addr().ok() == Some(addr) || std.local_addr().is_ok_and(|a| addr.ip().is_unspecified() && a.port() == addr.port()) {
+            std.set_nonblocking(true)?;
+            return Ok(tokio::net::UdpSocket::from_std(std)?);
+        }
+        tracing::info!(listener = what, %addr, "the configuration moved this listener; binding the new address");
+    }
+    #[cfg(not(unix))]
+    let _ = name;
+    tokio::net::UdpSocket::bind(addr).await.with_context(|| format!("binding {what} on {addr} (UDP)"))
+}
+
 /// Another descriptor for a listener's socket, to hand to a new version.
 #[cfg(unix)]
-fn dup(name: &str, l: &TcpListener) -> Option<(String, std::os::fd::OwnedFd)> {
-    std::os::fd::AsFd::as_fd(l).try_clone_to_owned().ok().map(|fd| (name.to_string(), fd))
+fn dup(name: &str, l: &impl std::os::fd::AsFd) -> Option<(String, std::os::fd::OwnedFd)> {
+    l.as_fd().try_clone_to_owned().ok().map(|fd| (name.to_string(), fd))
 }
 
 /// Certificates for the management listener: its hostname only, never a tunnel's.
@@ -341,13 +357,24 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
         }
         None => None,
     };
-    // A listener the older version had that nothing here uses.
+    // The DNS-01 responder (`[tls.dns01]`): UDP and TCP on one address.
+    let dns = match (&cfg.tls.dns01, certs.dns_challenges()) {
+        (Some(d), Some(ch)) => {
+            let what = "DNS-01 responder";
+            Some((take_or_bind_udp("dns-udp", d.listen, what).await?, take_or_bind(&["dns-tcp"], d.listen, what).await?, ch))
+        }
+        _ => None,
+    };
+    // Listeners the older version had that nothing here uses.
     #[cfg(unix)]
-    drop(magicpipes_core::fds::take("mgmt"));
+    for name in ["mgmt", "dns-udp", "dns-tcp"] {
+        drop(magicpipes_core::fds::take(name));
+    }
     #[cfg(unix)]
     let handed: Vec<(String, std::os::fd::OwnedFd)> = [dup("https", &public_https), mgmt.as_ref().and_then(|l| dup("mgmt", l))]
         .into_iter()
         .chain([public_http.as_ref().and_then(|l| dup("http", l)), ssh.as_ref().and_then(|(l, ..)| dup("ssh", l))])
+        .chain([dns.as_ref().and_then(|(u, ..)| dup("dns-udp", u)), dns.as_ref().and_then(|(_, t, _)| dup("dns-tcp", t))])
         .flatten()
         .collect();
 
@@ -404,6 +431,11 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
     }
     if let Some((listener, key, settings)) = ssh {
         tasks.spawn(data::ssh::serve(listener, key, data.clone(), settings, shutdown.clone()));
+    }
+    if let Some((udp, tcp, challenges)) = dns {
+        tracing::info!(listen = %udp.local_addr()?, "DNS-01 responder started");
+        tasks.spawn(certs::dns::serve_udp(udp, challenges.clone(), shutdown.clone()));
+        tasks.spawn(certs::dns::serve_tcp(tcp, challenges, shutdown.clone()));
     }
 
     if let Some(mut j) = joining.take() {

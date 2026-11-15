@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::{CERT_ORDER_WINDOW, ControlPlane, State, TunnelRecord, err, internal};
 use crate::authz::{Action, Principal};
 use crate::certs::CertStatus;
-use crate::config::{PortRange, TlsMode};
+use crate::config::PortRange;
 use crate::store::TunnelRow;
 
 /// A tunnel's visibility and tags.
@@ -269,7 +269,7 @@ impl ControlPlane {
         // Every new hostname costs a certificate order, and the CA's limits are shared by all
         // agents (Let's Encrypt: 50 certificates per domain per week). This server's own CAs
         // have none.
-        let new_cert = req.kind.is_http() && self.cfg.tls.mode == TlsMode::Acme && !self.certs.issued_here(&hostname) && self.certs.status(&hostname) != CertStatus::Ready;
+        let new_cert = req.kind.is_http() && self.certs.orders_its_own(&hostname) && self.certs.status(&hostname) != CertStatus::Ready;
         if new_cert {
             let max = self.cfg.agents.max_new_certificates_per_day;
             let orders = st.cert_orders.entry(agent_id.to_string()).or_default();

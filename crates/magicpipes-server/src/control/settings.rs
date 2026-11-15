@@ -536,6 +536,11 @@ impl ControlPlane {
         self.certs.authorities()
     }
 
+    /// `[tls.dns01]`: the records it needs at the DNS host, and each domain's certificate.
+    pub fn dns01(&self) -> Option<crate::certs::Dns01View> {
+        self.certs.dns01()
+    }
+
     /// Adds a certificate from the Settings page, in use at once.
     pub fn add_certificate(&self, who: &Principal, chain: &str, key: &str) -> Result<ProvidedCert, ErrorBody> {
         self.settings_admin(who)?;

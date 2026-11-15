@@ -6,13 +6,15 @@
 //! are cached on disk and installed into the [`CertResolver`], which the TLS acceptors consult
 //! for every handshake without touching the control plane. Certificates people bring themselves
 //! are in [`provided`]. A name under a `[[tls.authorities]]` domain gets its certificate from
-//! that [`authority`], whatever the mode.
+//! that [`authority`], whatever the mode. Under a `[tls.dns01]` domain, a name shares that domain's
+//! one certificate for `D` and `*.D`, ordered through DNS-01 and answered by [`dns`].
 
 mod acme;
 pub(crate) mod devca;
 mod provided;
 
 mod authority;
+pub(crate) mod dns;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -72,7 +74,17 @@ impl CertResolver {
     }
 
     fn remove(&self, name: &str) {
-        self.exact.write().unwrap().remove(&name.to_ascii_lowercase());
+        let name = name.to_ascii_lowercase();
+        match name.strip_prefix("*.") {
+            // A domain's wildcard certificate covers the domain itself too.
+            Some(domain) => {
+                self.wildcard.write().unwrap().remove(domain);
+                self.exact.write().unwrap().remove(domain);
+            }
+            None => {
+                self.exact.write().unwrap().remove(&name);
+            }
+        }
     }
 
     /// What the public listener serves.
@@ -219,6 +231,27 @@ impl HostCert {
     }
 }
 
+/// `[tls.dns01]` as the Settings page shows it.
+#[derive(Debug, Clone)]
+pub struct Dns01View {
+    pub domains: Vec<Dns01Domain>,
+    pub zone: Option<String>,
+    pub nameserver: String,
+    pub listen: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Dns01Domain {
+    pub domain: String,
+    /// `_acme-challenge.<domain>`, which must lead to this server.
+    pub challenge_name: String,
+    /// With a zone: what `challenge_name` is a CNAME to.
+    pub cname: Option<String>,
+    /// Of its certificate for `domain` and `*.domain`; none until a name under it is used.
+    pub status: Option<CertStatus>,
+    pub not_after: Option<String>,
+}
+
 /// Where the CAs the server makes for `[[tls.authorities]]` are kept, one directory per domain.
 pub const AUTHORITIES_DIR: &str = "authorities";
 
@@ -251,6 +284,8 @@ pub struct CertManager {
     devca: Option<devca::DevCa>,
     /// `[[tls.authorities]]`, by domain.
     authorities: Vec<authority::Authority>,
+    /// The DNS-01 challenges the responder answers (`[tls.dns01]`).
+    dns: Option<Arc<dns::DnsChallenges>>,
     /// Limits concurrent orders (CA rate limits, resource use).
     order_slots: Semaphore,
     /// Names covered by `tls.mode = "files"`.
@@ -294,7 +329,8 @@ impl CertManager {
         let provided_dir = data_dir.join(provided::DIR);
         let provided = Mutex::new(provided::load_all(&cfg.certificates, &provided_dir)?);
         let challenges = Arc::new(Http01Challenges::default());
-        let acme = acme::AcmeClient::new(cfg, data_dir, challenges.clone());
+        let dns = cfg.dns01.as_ref().map(|d| Arc::new(dns::DnsChallenges::new(&d.domains, d.zone.as_deref(), d.nameserver.as_deref().unwrap_or_default())));
+        let acme = acme::AcmeClient::new(cfg, data_dir, challenges.clone(), dns.clone());
         let mgr = Arc::new(Self {
             cfg: cfg.clone(),
             dir,
@@ -304,6 +340,7 @@ impl CertManager {
             acme,
             devca,
             authorities,
+            dns,
             order_slots: Semaphore::new(2),
             static_names,
             provided,
@@ -368,13 +405,54 @@ impl CertManager {
             .collect()
     }
 
+    /// The DNS-01 responder's challenges, if `[tls.dns01]` is set.
+    pub fn dns_challenges(&self) -> Option<Arc<dns::DnsChallenges>> {
+        self.dns.clone()
+    }
+
+    /// Which certificate `host` gets from here: its own, or under a `[tls.dns01]` domain, that
+    /// domain's `*.D` (which covers `D` too). An authority comes first.
+    fn key(&self, host: &str) -> String {
+        match self.cfg.dns01_domain_for(host) {
+            Some(d) if self.authority(host).is_none() => format!("*.{d}"),
+            _ => host.to_string(),
+        }
+    }
+
+    /// Whether a new tunnel on `host` costs a certificate order of its own, from an ACME CA that
+    /// limits them: not when an authority here issues it, or a DNS-01 wildcard covers it.
+    pub fn orders_its_own(&self, host: &str) -> bool {
+        self.cfg.mode == TlsMode::Acme && !self.issued_here(host) && self.key(host) == host
+    }
+
+    /// `[tls.dns01]`, for the page that says which records to add and how each domain is doing.
+    pub fn dns01(&self) -> Option<Dns01View> {
+        let cfg = self.cfg.dns01.as_ref()?;
+        let records = self.dns.as_ref()?.records();
+        let domains = cfg
+            .domains
+            .iter()
+            .zip(records)
+            .map(|(d, (name, cname))| {
+                let key = format!("*.{d}");
+                let found = self.hosts.lock().unwrap().get(&key).map(|h| (h.status.borrow().clone(), h.not_after));
+                let not_after = found.as_ref().map_or(0, |f| f.1);
+                Dns01Domain { domain: d.clone(), challenge_name: name, cname, status: found.map(|f| f.0), not_after: (not_after > 0).then(|| magicpipes_core::rfc3339(not_after)) }
+            })
+            .collect();
+        Some(Dns01View { domains, zone: cfg.zone.clone(), nameserver: cfg.nameserver.clone().unwrap_or_default(), listen: cfg.listen.to_string() })
+    }
+
     /// Whether `host` has a certificate only from `tls.mode = "files"`: one another tool keeps.
     fn kept_in_files(&self, host: &str) -> bool {
         self.cfg.mode == TlsMode::Files && !self.issued_here(host)
     }
 
-    fn cache_paths(&self, host: &str) -> (PathBuf, PathBuf) {
-        (self.dir.join(format!("{host}.crt")), self.dir.join(format!("{host}.key")))
+    /// `*.example.com` is kept as `_.example.com`: no hostname has an underscore, and Windows
+    /// refuses a `*` in a file name.
+    fn cache_paths(&self, key: &str) -> (PathBuf, PathBuf) {
+        let stem = key.replace('*', "_");
+        (self.dir.join(format!("{stem}.crt")), self.dir.join(format!("{stem}.key")))
     }
 
     fn load_cache(&self) {
@@ -384,9 +462,13 @@ impl CertManager {
             if path.extension().and_then(|s| s.to_str()) != Some("crt") {
                 continue;
             }
-            let Some(host) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
-            // Issued here now; it gets one at once.
-            if self.issued_here(&host) {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let host = match stem.strip_prefix("_.") {
+                Some(domain) => format!("*.{domain}"),
+                None => stem.to_string(),
+            };
+            // Issued here now, which takes no time; or a DNS-01 wildcard covers it now.
+            if self.issued_here(&host) || self.key(&host) != host {
                 continue;
             }
             let (crt, key) = self.cache_paths(&host);
@@ -410,6 +492,10 @@ impl CertManager {
 
     fn install(&self, host: &str, cert: LoadedCert) {
         self.resolver.insert(host, cert.key.clone());
+        // `D` and `*.D` share one certificate.
+        if let Some(domain) = host.strip_prefix("*.") {
+            self.resolver.insert(domain, cert.key.clone());
+        }
         let mut hosts = self.hosts.lock().unwrap();
         let entry = hosts.entry(host.to_string()).or_insert_with(HostCert::new);
         entry.not_before = cert.not_before;
@@ -426,7 +512,7 @@ impl CertManager {
         if self.kept_in_files(host) {
             return self.files_status(host);
         }
-        self.hosts.lock().unwrap().get(host).map(|h| h.status.borrow().clone()).unwrap_or(CertStatus::Pending)
+        self.hosts.lock().unwrap().get(&self.key(host)).map(|h| h.status.borrow().clone()).unwrap_or(CertStatus::Pending)
     }
 
     /// Until when the certificate `host` gets is valid (Unix time), if it has one: the one
@@ -438,7 +524,7 @@ impl CertManager {
         if self.kept_in_files(host) {
             return None;
         }
-        self.hosts.lock().unwrap().get(host).map(|h| h.not_after).filter(|t| *t > 0)
+        self.hosts.lock().unwrap().get(&self.key(host)).map(|h| h.not_after).filter(|t| *t > 0)
     }
 
     fn files_status(&self, host: &str) -> CertStatus {
@@ -456,9 +542,10 @@ impl CertManager {
             return;
         }
         let covered = self.provided_covers(host);
+        let host = self.key(host);
         let backoff = Duration::from_secs(self.cfg.failure_backoff_secs);
         let mut hosts = self.hosts.lock().unwrap();
-        let entry = hosts.entry(host.to_string()).or_insert_with(HostCert::new);
+        let entry = hosts.entry(host.clone()).or_insert_with(HostCert::new);
         if covered {
             return;
         }
@@ -477,7 +564,6 @@ impl CertManager {
         }
         drop(hosts);
         let me = self.clone();
-        let host = host.to_string();
         tokio::spawn(async move { me.issue(host).await });
     }
 
@@ -489,10 +575,18 @@ impl CertManager {
         let result = match (authority, &self.devca, self.cfg.mode) {
             (Some(ca), ..) => ca.issue(&host),
             (None, Some(ca), _) => ca.issue(&host),
-            (None, None, TlsMode::Acme) => match tokio::time::timeout(timeout, self.acme.order(&host)).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow!("timed out after {}s waiting for the ACME server", timeout.as_secs())),
-            },
+            (None, None, TlsMode::Acme) => {
+                let order = async {
+                    match host.strip_prefix("*.") {
+                        Some(domain) => self.acme.order_wildcard(domain).await,
+                        None => self.acme.order(&host).await,
+                    }
+                };
+                match tokio::time::timeout(timeout, order).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow!("timed out after {}s waiting for the ACME server", timeout.as_secs())),
+                }
+            }
             _ => Err(anyhow!("no certificate source configured")),
         };
         // Only what an ACME CA issued is kept: an authority here issues again at once.
@@ -536,7 +630,7 @@ impl CertManager {
             return self.files_status(host);
         }
         self.ensure(host);
-        let mut rx = match self.hosts.lock().unwrap().get(host) {
+        let mut rx = match self.hosts.lock().unwrap().get(&self.key(host)) {
             Some(h) => h.status.subscribe(),
             None => return CertStatus::Pending,
         };
@@ -550,8 +644,9 @@ impl CertManager {
     /// The hostnames the control plane serves now (its tunnels and the management hostname);
     /// called on every publish. Others are no longer renewed, and are forgotten after a while.
     pub fn set_wanted(&self, wanted: &HashSet<&str>) {
+        let wanted: HashSet<String> = wanted.iter().map(|h| self.key(h)).collect();
         for (host, h) in self.hosts.lock().unwrap().iter_mut() {
-            if wanted.contains(host.as_str()) {
+            if wanted.contains(host) {
                 h.unwanted_since = None;
             } else if h.unwanted_since.is_none() {
                 h.unwanted_since = Some(Instant::now());
@@ -636,6 +731,43 @@ mod tests {
         assert!(!covers(&names, "a.b.t.example.com"));
         assert!(covers(&names, "example.com"));
         assert!(!covers(&names, "t.example.com"));
+    }
+
+    /// A certificate for `names`, as an ACME CA would have issued it, cached under `stem`.
+    fn cache(dir: &Path, stem: &str, names: &[&str]) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap().self_signed(&key).unwrap();
+        std::fs::create_dir_all(dir.join("certs")).unwrap();
+        std::fs::write(dir.join(format!("certs/{stem}.crt")), cert.pem()).unwrap();
+        std::fs::write(dir.join(format!("certs/{stem}.key")), key.serialize_pem()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn names_under_a_dns01_domain_share_its_wildcard_certificate() {
+        let dir = std::env::temp_dir().join(format!("mp-certs-{}", magicpipes_core::secret::random_string(8)));
+        cache(&dir, "_.t.test", &["t.test", "*.t.test"]);
+        cache(&dir, "old.t.test", &["old.t.test"]);
+        cache(&dir, "a.b.t.test", &["a.b.t.test"]);
+        let cfg: TlsConfig = toml::from_str("mode = \"acme\"\n[dns01]\ndomains = [\"t.test\"]\nnameserver = \"ns.t.test\"").unwrap();
+        let certs = CertManager::new(&cfg, &dir, &["t.test"]).unwrap();
+        for (host, key) in [("x.t.test", "*.t.test"), ("t.test", "*.t.test"), ("*.t.test", "*.t.test"), ("a.b.t.test", "a.b.t.test"), ("other.test", "other.test")] {
+            assert_eq!(certs.key(host), key, "{host}");
+        }
+        assert!(!certs.orders_its_own("new.t.test") && certs.orders_its_own("a.b.t.test") && certs.orders_its_own("other.test"));
+        // The cached wildcard serves the domain and every name one label under it; the per-name
+        // certificate it replaces isn't loaded, and a deeper name keeps its own.
+        let wildcard = certs.resolver.lookup("anything.t.test").expect("the wildcard");
+        assert!(Arc::ptr_eq(&wildcard, &certs.resolver.lookup("old.t.test").unwrap()));
+        assert!(Arc::ptr_eq(&wildcard, &certs.resolver.lookup("t.test").unwrap()));
+        assert!(!Arc::ptr_eq(&wildcard, &certs.resolver.lookup("a.b.t.test").unwrap()));
+        assert_eq!((certs.status("new.t.test"), certs.status("t.test")), (CertStatus::Ready, CertStatus::Ready));
+        assert!(certs.not_after("new.t.test").is_some());
+        assert!(certs.cache_paths("*.t.test").0.ends_with("certs/_.t.test.crt"));
+        // Forgotten when nothing under it is wanted.
+        certs.set_wanted(&HashSet::from(["a.b.t.test"]));
+        certs.maintain(Duration::ZERO);
+        assert!(certs.resolver.lookup("x.t.test").is_none() && certs.resolver.lookup("t.test").is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

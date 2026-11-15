@@ -553,13 +553,38 @@ every name under a domain, for internal names and closed networks:
 
 **Wildcard registrations** (`*.exhub.internal`, `control/hostnames.rs`) are rows of the `hostnames`
 table like exact ones, so they needed no migration. They cover names one label under the domain: the
-same names a wildcard certificate covers, so one from DNS-01 later will fit them. A name's own
+same names a wildcard certificate covers, so DNS-01's fits them. A name's own
 registration wins over the wildcard (`State::registration_for`), but isn't granted to someone else while
 a tunnel under the wildcard has the name. Each name gets its own certificate when a tunnel takes it,
 from the same sources as any other, and stops being renewed when no tunnel has it. Removing a wildcard
 removes the tunnels under it in the same transaction. An older release reading the table during an
 upgrade sees `*.exhub.internal` as a hostname no tunnel can have, and orders a certificate for it that
 fails and backs off: harmless, and only while both run.
+
+**DNS-01** (`[tls.dns01]`, `certs/dns.rs`, `AcmeClient::order_wildcard`) gets one certificate for a
+domain `D` and `*.D` from the ACME CA:
+
+* **Its own DNS responder, no API keys.** Each domain's `_acme-challenge` name is delegated to the
+  server once (NS), or CNAMEd into a zone delegated to it, and the server answers the TXT query itself.
+  Any DNS host works, nothing at the DNS host is ever changed by the server, and there is no token
+  that could rewrite a zone. The cost is port 53 on the internet, so the responder is narrow:
+  authoritative answers for those names only (`REFUSED` for anything else, no recursion), one question
+  per query, no compression pointers followed in what it reads, answers under 512 bytes (truncated
+  with TC past that, never seen in practice), a global rate limit, 32 TCP connections of 8 queries
+  with 10 s timeouts, and at most 4 values per domain, each served for at most 15 minutes. Values
+  live in memory only (`DnsChallenges`), published by an order and withdrawn by a guard however the
+  order ends, as HTTP-01 tokens are. Hand-written rather than a DNS crate: it parses one question and
+  writes four record types.
+* **One certificate per domain.** Any name that is `D` or one label under it maps to the key `*.D` in
+  the certificate manager (`CertManager::key`): one order, one status, one renewal, one cache file
+  (`_.D.crt`, since `*` isn't allowed in Windows file names and no hostname has `_`). It covers the
+  management hostname when that's `D` or under it, and every tunnel when `D` is the base domain. A
+  per-name certificate cached from before isn't loaded, so the wildcard takes over at once. Precedence
+  for a name: a certificate people brought, an authority, DNS-01, then the mode's HTTP-01. New tunnels
+  under `D` cost no order, so they don't count against `max_new_certificates_per_day`.
+* **At an upgrade**, the UDP and TCP sockets are handed over like the other listeners (`dns-udp`,
+  `dns-tcp`). For the moment both processes read them, a query may reach the one that isn't running
+  the order; the order then fails and is retried after `failure_backoff_secs`.
 
 **Bounds:** 32 saved providers, 500 entries per list, and the request limits of the management
 listener. Adding a provider asks it about itself first: at most two requests of 4 s and 256 KiB,

@@ -158,6 +158,48 @@ domain = "exhub.internal"          # the domain and every name under it, at leas
   needs nothing from outside: `tls.mode = "acme"` then needs no `public.http_listen`, and names
   outside the authorities' domains can't be registered.
 
+**Wildcard certificates from Let's Encrypt (DNS-01)**: one certificate for a domain and every name one
+label under it, so a new tunnel needs no certificate of its own and its name never appears in the
+public certificate logs. The server proves the domain through DNS with a small DNS responder of its
+own, so no DNS host's API key is involved, whoever hosts your DNS:
+
+```toml
+[tls.dns01]
+domains = ["t.example.com", "example.org"]   # each gets "t.example.com" and "*.t.example.com"
+# listen = "0.0.0.0:53"                       # UDP and TCP; port 53 must reach it from the internet
+# zone = "acme.example.com"                   # for DNS hosts that can't delegate an _acme-challenge name
+# nameserver = "example.com"                  # this server's name in those records (default: management.hostname)
+```
+
+At the domains' DNS host, once, either delegate each `_acme-challenge` name to the server:
+
+```text
+_acme-challenge.t.example.com.   NS     example.com.
+_acme-challenge.example.org.     NS     example.com.
+```
+
+or, where the DNS host won't take an NS record with an underscore, delegate one zone and point each
+`_acme-challenge` name into it with a CNAME (set `zone`):
+
+```text
+acme.example.com.                NS     example.com.
+_acme-challenge.t.example.com.   CNAME  t.example.com.acme.example.com.
+_acme-challenge.example.org.     CNAME  example.org.acme.example.com.
+```
+
+* Covered: each domain itself and the names one label under it, including the management hostname
+  and every tunnel when the base domain is one of them, and names under a registered wildcard
+  (`*.example.org`) when its domain is. Deeper names keep a certificate each, from HTTP-01.
+* The responder answers only those challenge names, with values only while an order is waiting
+  (TTL 1); anything else gets `REFUSED`. It isn't a resolver. Answers are rate-limited and stay under
+  512 bytes.
+* **Settings → Wildcard certificates** lists the records each domain needs and how its certificate
+  is doing, with the reason when an order failed. Orders retry after `failure_backoff_secs`.
+* Needs `tls.mode = "acme"`. A domain can't be both here and under `[[tls.authorities]]`. When the
+  base domain and the management hostname are covered, `public.http_listen` isn't needed.
+* In Docker, publish port 53 for UDP and TCP (`"53:53/udp"`, `"53:53"`); the image may bind it
+  (`net.ipv4.ip_unprivileged_port_start = 0`).
+
 **TCP and UDP ports** are off until you give the server a port range:
 
 ```toml
@@ -761,9 +803,9 @@ agent. Its DNS must point at the server.
   (`tunnel.exhub.internal`, not `a.b.exhub.internal`), one tunnel per name, and each name gets its
   own certificate when a tunnel takes it: from Let's Encrypt (so each counts against
   `max_new_certificates_per_day`), or under a [certificate authority](#configure-and-start) of the
-  server's own, from that. A name registered on its own wins over the wildcard, but can't be
-  registered for someone else while a tunnel under the wildcard has it. Wildcard certificates from
-  Let's Encrypt (DNS-01) aren't supported yet.
+  server's own, from that. With its domain under [`[tls.dns01]`](#configure-and-start), all of them
+  share one wildcard certificate instead. A name registered on its own wins over the wildcard, but
+  can't be registered for someone else while a tunnel under the wildcard has it.
 
 ```bash
 magicpipes add 8000 --hostname shop.example.com             # only on a machine it was assigned to

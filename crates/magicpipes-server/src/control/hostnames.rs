@@ -84,13 +84,14 @@ pub fn validate_registration(cfg: &Config, raw: &str) -> Result<String, String> 
     if d == cfg.base_domain {
         return Err(format!("the names under {d} are tunnel names; use --name for them"));
     }
-    issuable(cfg, &d)?;
+    // As for any one of the names under it.
+    issuable(cfg, &format!("name.{d}"))?;
     Ok(format!("*.{d}"))
 }
 
-/// Whether this server can get certificates for `host`, or for the names under it.
+/// Whether this server can get a certificate for `host`.
 fn issuable(cfg: &Config, host: &str) -> Result<(), String> {
-    if cfg.tls.authority_for(host).is_some() {
+    if cfg.tls.authority_for(host).is_some() || cfg.tls.dns01_domain_for(host).is_some() {
         return Ok(());
     }
     let under = |d: &str| host == d || host.ends_with(&format!(".{d}"));
@@ -154,7 +155,9 @@ impl ControlPlane {
                 let names: Vec<String> = on_it.iter().map(|t| t.row.name.clone()).collect();
                 let wildcard = wildcard_domain(&h.hostname);
                 let tls = match wildcard {
+                    // One certificate for them all, through DNS-01.
                     None => self.certs.status(&h.hostname),
+                    Some(_) if self.cfg.tls.dns01_domain_for(&h.hostname).is_some() => self.certs.status(&h.hostname),
                     Some(_) => {
                         let all: Vec<CertStatus> = on_it.iter().map(|t| self.certs.status(&t.row.hostname)).collect();
                         let worst = all.iter().find(|s| matches!(s, CertStatus::Failed(_))).or_else(|| all.iter().find(|s| **s == CertStatus::Pending));
@@ -222,8 +225,8 @@ impl ControlPlane {
         }
         self.audit(who, "hostname.create", &hostname, owner_user_id.or(agent_id).unwrap_or(""));
         self.refresh();
-        // A wildcard's names get theirs as tunnels take them.
-        if wildcard_domain(&hostname).is_none() {
+        // A wildcard's names get theirs as tunnels take them, unless DNS-01 gets one for them all.
+        if wildcard_domain(&hostname).is_none() || self.cfg.tls.dns01_domain_for(&hostname).is_some() {
             self.certs.ensure(&hostname);
         }
         self.hostnames(who).into_iter().find(|h| h.hostname == hostname).ok_or_else(|| err(ErrorCode::Internal, "hostname not found after creating it"))

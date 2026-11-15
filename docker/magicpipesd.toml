@@ -28,6 +28,9 @@ acme_directory = "letsencrypt-staging"   # switch to "letsencrypt" once it works
 # server makes one in /data/authorities/<domain> unless you mount your own (cert_file, key_file).
 # [[tls.authorities]]
 # domain = "exhub.internal"
+# Wildcard certificates through DNS-01 (see magicpipesd.example.toml); publish 53/udp and 53/tcp.
+# [tls.dns01]
+# domains = ["t.example.com"]
 
 # [users]
 # session_max_age_secs = 43200

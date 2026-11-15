@@ -9,10 +9,10 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::extract::{AdminPosted, AdminUser, NoFields, UiUser};
-use super::html::{Actions, Number, Text, back, count, esc, form_alert, invalid, table, title_of, when};
+use super::html::{Actions, Number, Text, back, badge, count, esc, form_alert, invalid, table, title_of, when};
 use super::icons::DOWNLOAD;
 use super::ui::{Done, done, not_there, outcome, page};
-use crate::certs::{AuthorityView, ProvidedCert};
+use crate::certs::{AuthorityView, CertStatus, Dns01View, ProvidedCert};
 use crate::config::TlsMode;
 use crate::control::CertificateView;
 
@@ -108,6 +108,47 @@ pub(super) fn section(user: &UiUser, app: &AppState) -> String {
         list = table(&[Text("Names"), Text("Expires"), Text("Status"), Number("Tunnels"), Actions], &rows, &esc(&empty)),
         host = esc(&app.control.config().management.hostname),
     ) + &authorities_section(app, source)
+        + &app.control.dns01().map(|d| dns01_section(&d)).unwrap_or_default()
+}
+
+/// `[tls.dns01]`: each domain's certificate, and the records that lead its challenges here.
+fn dns01_section(d: &Dns01View) -> String {
+    let certs: String = d
+        .domains
+        .iter()
+        .map(|x| {
+            let status = match &x.status {
+                None => r#"<span class="sub">ordered when a name under it is used</span>"#.to_string(),
+                Some(CertStatus::Failed(m)) => format!(r#"{}<p class="note">{}</p>"#, badge("failed"), esc(m)),
+                Some(s) => badge(s.label()),
+            };
+            format!(
+                r#"<tr><td class="wrap"><span class="name">{domain}</span><span class="sub">and *.{domain}</span></td><td class="wrap">{status}</td><td>{expires}</td></tr>"#,
+                domain = esc(&x.domain),
+                expires = x.not_after.as_deref().map(when).unwrap_or_else(|| "—".into()),
+            )
+        })
+        .collect();
+    let record = |name: &str, kind: &str, to: &str| format!(r#"<tr><td class="wrap"><code>{}</code></td><td>{kind}</td><td class="wrap"><code>{}</code></td></tr>"#, esc(name), esc(to));
+    let mut records = String::new();
+    if let Some(zone) = &d.zone {
+        records.push_str(&record(zone, "NS", &d.nameserver));
+    }
+    for x in &d.domains {
+        match &x.cname {
+            Some(target) => records.push_str(&record(&x.challenge_name, "CNAME", target)),
+            None => records.push_str(&record(&x.challenge_name, "NS", &d.nameserver)),
+        }
+    }
+    format!(
+        r#"<div class="section" id="dns01"><h2>Wildcard certificates</h2></div>
+{certs}
+<p class="note">Ordered from Let's Encrypt through DNS-01, which this server answers itself on <code>{listen}</code> (UDP and TCP): port 53 must reach it from the internet. They need these records at the domains' DNS host, once:</p>
+{records}"#,
+        certs = table(&[Text("Domain"), Text("Certificate"), Text("Expires")], &certs, ""),
+        listen = esc(&d.listen),
+        records = table(&[Text("Name"), Text("Type"), Text("Points to")], &records, ""),
+    )
 }
 
 /// Where anyone signed in downloads an authority's certificate.

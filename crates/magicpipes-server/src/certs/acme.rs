@@ -1,4 +1,5 @@
-//! ACME (RFC 8555) issuance with HTTP-01 challenges, via `instant-acme`.
+//! ACME (RFC 8555) issuance via `instant-acme`: HTTP-01 for one name, DNS-01 (answered by
+//! [`super::dns`]) for a domain and every name one label under it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use instant_acme::{
 };
 use tokio::sync::OnceCell;
 
+use super::dns::DnsChallenges;
 use crate::config::TlsConfig;
 
 /// Pending HTTP-01 challenge responses (`token -> key authorization`), served on port 80.
@@ -55,6 +57,20 @@ impl Drop for PublishedTokens<'_> {
     }
 }
 
+/// The DNS-01 values one order published, `(domain, value)`; withdrawn however it ends.
+struct PublishedValues<'a> {
+    dns: &'a DnsChallenges,
+    values: Vec<(String, String)>,
+}
+
+impl Drop for PublishedValues<'_> {
+    fn drop(&mut self) {
+        for (domain, value) in &self.values {
+            self.dns.withdraw(domain, value);
+        }
+    }
+}
+
 pub struct AcmeClient {
     directory: String,
     email: Option<String>,
@@ -62,11 +78,12 @@ pub struct AcmeClient {
     account_path: PathBuf,
     account: OnceCell<Account>,
     challenges: Arc<Http01Challenges>,
+    dns: Option<Arc<DnsChallenges>>,
     timeout: Duration,
 }
 
 impl AcmeClient {
-    pub fn new(cfg: &TlsConfig, data_dir: &Path, challenges: Arc<Http01Challenges>) -> Self {
+    pub fn new(cfg: &TlsConfig, data_dir: &Path, challenges: Arc<Http01Challenges>, dns: Option<Arc<DnsChallenges>>) -> Self {
         Self {
             directory: cfg.acme_directory_url(),
             email: cfg.acme_email.clone(),
@@ -74,6 +91,7 @@ impl AcmeClient {
             account_path: data_dir.join("acme-account.json"),
             account: OnceCell::new(),
             challenges,
+            dns,
             timeout: Duration::from_secs(cfg.issuance_timeout_secs),
         }
     }
@@ -92,7 +110,8 @@ impl AcmeClient {
                 if let Ok(text) = std::fs::read_to_string(&self.account_path) {
                     let stored: StoredAccount = serde_json::from_str(&text).context("parsing ACME account file")?;
                     if stored.directory == self.directory {
-                        return Ok(self.builder()?.from_credentials(stored.credentials).await?);
+                        let account = self.builder()?.from_credentials(stored.credentials).await;
+                        return account.with_context(|| format!("reaching the ACME server at {}", self.directory));
                     }
                 }
                 let contact = self.email.as_ref().map(|e| format!("mailto:{e}"));
@@ -150,6 +169,47 @@ impl AcmeClient {
         }
         .await
     }
+
+    /// Runs one DNS-01 order for `domain` and `*.domain`, its challenge values answered by this
+    /// server's DNS responder; returns `(certificate chain PEM, private key PEM)`.
+    pub async fn order_wildcard(&self, domain: &str) -> anyhow::Result<(String, String)> {
+        let dns = self.dns.as_deref().ok_or_else(|| anyhow!("this server has no [tls.dns01]"))?;
+        let account = self.account().await?;
+        let ids = [Identifier::Dns(domain.to_string()), Identifier::Dns(format!("*.{domain}"))];
+        let mut order = account.new_order(&NewOrder::new(&ids)).await.context("creating ACME order")?;
+        let mut published = PublishedValues { dns, values: Vec::new() };
+        let hint = || format!("check that _acme-challenge.{domain} leads to this server's DNS responder, and that port 53 reaches it");
+        async {
+            let mut authzs = order.authorizations();
+            while let Some(authz) = authzs.next().await {
+                let mut authz = authz.context("fetching ACME authorization")?;
+                match authz.status {
+                    AuthorizationStatus::Pending => {}
+                    AuthorizationStatus::Valid => continue,
+                    other => bail!("ACME authorization is {other:?}"),
+                }
+                let mut challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| anyhow!("ACME server offered no DNS-01 challenge"))?;
+                // `*.example.com` is proven at `_acme-challenge.example.com`, as `example.com` is.
+                let Identifier::Dns(name) = challenge.identifier().identifier else { bail!("ACME authorization isn't for a DNS name") };
+                let name = name.clone();
+                let value = challenge.key_authorization().dns_value();
+                if !dns.publish(&name, &value) {
+                    bail!("can't answer the challenge for {name}: it isn't in [tls.dns01] domains, or too many are pending");
+                }
+                published.values.push((name, value));
+                challenge.set_ready().await.context("submitting ACME challenge")?;
+            }
+            let retry = RetryPolicy::new().initial_delay(Duration::from_millis(500)).timeout(self.timeout);
+            let status = order.poll_ready(&retry).await.with_context(|| format!("ACME DNS-01 challenge could not be completed; {}", hint()))?;
+            if status != OrderStatus::Ready {
+                bail!("ACME DNS-01 challenge could not be completed (order {status:?}); {}", hint());
+            }
+            let key_pem = order.finalize().await.context("finalizing ACME order")?;
+            let chain_pem = order.poll_certificate(&retry).await.context("downloading certificate")?;
+            Ok((chain_pem, key_pem))
+        }
+        .await
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -161,6 +221,19 @@ struct StoredAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_values_are_withdrawn_however_the_order_ends() {
+        let dns = DnsChallenges::new(&["example.com".into()], None, "ns.example.com");
+        {
+            let mut published = PublishedValues { dns: &dns, values: Vec::new() };
+            assert!(dns.publish("example.com", "v"));
+            published.values.push(("example.com".into(), "v".into()));
+        }
+        for i in 0..4 {
+            assert!(dns.publish("example.com", &format!("v{i}")), "the withdrawn one's place is free");
+        }
+    }
 
     #[test]
     fn tokens_are_removed_however_the_order_ends() {

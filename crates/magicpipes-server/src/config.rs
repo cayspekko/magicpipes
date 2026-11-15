@@ -542,6 +542,38 @@ pub struct TlsConfig {
     /// of `mode`: internal names, closed networks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub authorities: Vec<AuthorityConfig>,
+    /// ACME DNS-01 through this server's own DNS responder (`tls.mode = "acme"` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns01: Option<Dns01Config>,
+}
+
+/// ACME DNS-01, answered by this server: each domain gets one certificate for itself and every name
+/// one label under it (`example.com` and `*.example.com`). Its `_acme-challenge` name must lead here:
+/// delegated to this server by an NS record, or a CNAME to `<domain>.<zone>` with `zone` delegated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dns01Config {
+    pub domains: Vec<String>,
+    /// Where the DNS responder listens, UDP and TCP: port 53 for the internet to reach it.
+    #[serde(default = "default_dns01_listen")]
+    pub listen: SocketAddr,
+    /// A zone delegated to this server, for DNS hosts that can't delegate an `_acme-challenge` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// This server's name in the NS records that delegate to it (default: `management.hostname`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nameserver: Option<String>,
+}
+
+fn default_dns01_listen() -> SocketAddr {
+    "0.0.0.0:53".parse().unwrap()
+}
+
+/// A domain of two labels or more, lowercased: one CA or DNS host can't own a whole top-level domain.
+fn clean_domain(raw: &str) -> Option<String> {
+    let d = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    (d.len() <= 253 && d.split('.').count() >= 2 && d.split('.').all(label_ok)).then_some(d)
 }
 
 /// A certificate authority for `domain` and every name under it. Without `cert_file` and
@@ -579,6 +611,7 @@ impl Default for TlsConfig {
             failure_backoff_secs: 300,
             certificates: Vec::new(),
             authorities: Vec::new(),
+            dns01: None,
         }
     }
 }
@@ -594,14 +627,51 @@ impl TlsConfig {
             .max_by_key(|d| d.len())
     }
 
+    /// The DNS-01 domain whose certificate (`D` and `*.D`) covers `host`: `host` is `D`, one label
+    /// under it, or `*.D` itself.
+    pub fn dns01_domain_for(&self, host: &str) -> Option<&str> {
+        let parent = host.split_once('.').map(|(_, p)| p);
+        self.dns01.as_ref()?.domains.iter().map(String::as_str).find(|d| host == *d || parent == Some(*d))
+    }
+
+    fn check_dns01(&mut self, management: &str) -> anyhow::Result<()> {
+        let Some(d) = self.dns01.as_mut() else { return Ok(()) };
+        if self.mode != TlsMode::Acme {
+            bail!("tls.dns01 needs tls.mode = \"acme\"");
+        }
+        if d.domains.is_empty() {
+            bail!("tls.dns01.domains: name at least one domain");
+        }
+        let mut seen = Vec::new();
+        for raw in &d.domains {
+            let domain = clean_domain(raw).ok_or_else(|| anyhow::anyhow!("tls.dns01.domains: '{}' is not a domain such as example.com", raw.trim()))?;
+            if seen.contains(&domain) {
+                bail!("tls.dns01.domains: '{domain}' is listed twice");
+            }
+            seen.push(domain);
+        }
+        d.domains = seen;
+        if let Some(z) = &d.zone {
+            let zone = clean_domain(z).ok_or_else(|| anyhow::anyhow!("tls.dns01.zone: '{}' is not a domain such as acme.example.com", z.trim()))?;
+            if let Some(long) = d.domains.iter().find(|dom| dom.len() + 1 + zone.len() > 253) {
+                bail!("tls.dns01: {long}.{zone} is longer than a name can be");
+            }
+            d.zone = Some(zone);
+        }
+        // Any hostname: `localhost` too, for a server only tried locally.
+        let ns = d.nameserver.as_deref().unwrap_or(management);
+        let named = clean_domain(ns).or_else(|| clean_domain(&format!("{ns}.x")).map(|n| n.trim_end_matches(".x").to_string()));
+        d.nameserver = Some(named.ok_or_else(|| anyhow::anyhow!("tls.dns01.nameserver: '{}' is not a hostname", ns.trim()))?);
+        Ok(())
+    }
+
     fn check_authorities(&mut self) -> anyhow::Result<()> {
         for i in 0..self.authorities.len() {
             let a = &mut self.authorities[i];
             a.domain = a.domain.trim().trim_end_matches('.').to_ascii_lowercase();
             let d = a.domain.clone();
-            let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
             // Two labels at least: a CA for a whole top-level domain could vouch for other people's sites.
-            if d.len() > 253 || d.split('.').count() < 2 || !d.split('.').all(label_ok) {
+            if clean_domain(&d).is_none() {
                 bail!("tls.authorities: '{d}' is not a domain such as exhub.internal");
             }
             if a.cert_file.is_some() != a.key_file.is_some() {
@@ -936,9 +1006,15 @@ impl Config {
             bail!("tls.mode = \"files\" requires tls.cert_file and tls.key_file");
         }
         self.tls.check_authorities()?;
-        // Unless authorities issue the server's own names' certificates (a closed network).
-        let own_from_authorities = self.tls.authority_for(&self.management.hostname).is_some() && self.tls.authority_for(&self.base_domain).is_some();
-        if self.tls.mode == TlsMode::Acme && self.public.http_listen.is_none() && !own_from_authorities {
+        let management = self.management.hostname.clone();
+        self.tls.check_dns01(&management)?;
+        if let Some(d) = self.tls.dns01.as_ref().and_then(|d| d.domains.iter().find(|d| self.tls.authority_for(d).is_some())) {
+            bail!("tls.dns01.domains: {d} is under a [[tls.authorities]] domain, which issues its certificates already");
+        }
+        // Unless authorities or DNS-01 issue the server's own names' certificates.
+        let covered = |h: &str| self.tls.authority_for(h).is_some() || self.tls.dns01_domain_for(h).is_some();
+        let own_covered = covered(&self.management.hostname) && covered(&format!("name.{}", self.base_domain));
+        if self.tls.mode == TlsMode::Acme && self.public.http_listen.is_none() && !own_covered {
             bail!("tls.mode = \"acme\" requires public.http_listen for HTTP-01 challenges");
         }
         if let Some(r) = &self.ports.range {
@@ -1044,6 +1120,30 @@ pub const EXAMPLE: &str = include_str!("../../../magicpipesd.example.toml");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns01_covers_a_domain_and_one_label_under_it() {
+        let load = |text: &str| {
+            let mut c: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\n[management]\nhostname = \"example.com\"\n{text}"))?;
+            c.validate().map(|()| c)
+        };
+        let c = load("[tls.dns01]\ndomains = [\"T.Example.com.\", \"sonasora.com\"]\nzone = \"acme.example.com\"").unwrap();
+        let d = c.tls.dns01.as_ref().unwrap();
+        assert_eq!((d.domains[0].as_str(), d.nameserver.as_deref(), d.listen.port()), ("t.example.com", Some("example.com"), 53), "the management host answers by default");
+        for (host, want) in [("t.example.com", Some("t.example.com")), ("app.t.example.com", Some("t.example.com")), ("*.t.example.com", Some("t.example.com")), ("a.b.t.example.com", None), ("sonasora.com", Some("sonasora.com")), ("example.com", None)] {
+            assert_eq!(c.tls.dns01_domain_for(host), want, "{host}");
+        }
+        for bad in ["domains = []", "domains = [\"com\"]", "domains = [\"a.com\", \"A.com\"]", "domains = [\"*.a.com\"]", "domains = [\"a.com\"]\nzone = \"x\"", "domains = [\"a.com\"]\nnameserver = \"no thing\""] {
+            assert!(load(&format!("[tls.dns01]\n{bad}")).is_err(), "{bad}");
+        }
+        assert!(load("[tls]\nmode = \"dev-ca\"\n[tls.dns01]\ndomains = [\"a.com\"]").is_err(), "DNS-01 is for ACME");
+        assert_eq!(load("[tls.dns01]\ndomains = [\"a.com\"]\nnameserver = \"LocalHost\"").unwrap().tls.dns01.unwrap().nameserver.as_deref(), Some("localhost"));
+        assert!(load("[[tls.authorities]]\ndomain = \"example.com\"\n[tls.dns01]\ndomains = [\"t.example.com\"]").is_err(), "an authority issues those already");
+        // The server's own names by DNS-01: no HTTP-01, so no port 80 needed.
+        let mut c: Config = toml::from_str("base_domain = \"mp.example.com\"\n[management]\nhostname = \"mp.example.com\"\n[tls.dns01]\ndomains = [\"mp.example.com\"]").unwrap();
+        c.public.http_listen = None;
+        assert!(c.validate().is_ok());
+    }
 
     #[test]
     fn authorities_are_for_a_domain_each_and_the_longest_wins() {

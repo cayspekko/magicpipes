@@ -1100,8 +1100,8 @@ End-to-end tests, at minimum:
 ## Known limitations
 
 - **Certificate transparency.** In ACME mode every tunnel hostname, private ones included,
-  appears in public certificate logs. Use `tls.mode = "files"` with a wildcard certificate, or
-  unguessable names, when the names themselves are sensitive.
+  appears in public certificate logs. Use a wildcard certificate (`[tls.dns01]`, or
+  `tls.mode = "files"`), or unguessable names, when the names themselves are sensitive.
 - **A private tunnel's existence is visible.** An anonymous request gets a login redirect where
   an unknown name gets 404. Hiding that would break the login flow.
 - **IdP-driven revocation lags** by up to `sso_recheck_secs` (plus a quarter of it) for a session

@@ -4427,6 +4427,34 @@ async fn acme_with_pebble() {
     env.cli_ok(&["agent", "stop"]).await;
 }
 
+/// Real DNS-01 issuance against Pebble: one certificate for the base domain and `*.<base>` covers
+/// every tunnel, its challenges answered by magicpipesd's own DNS responder. Not run by default.
+/// Pebble asks that responder directly, so start it with `-dnsserver 127.0.0.1:<port>` and give
+/// the same port as `MAGICPIPES_PEBBLE_DNS_PORT`, with the variables of [`acme_with_pebble`]
+/// (`MAGICPIPES_PEBBLE_HTTP_PORT` isn't needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a running Pebble ACME server"]
+async fn acme_dns01_with_pebble() {
+    let dns_port = std::env::var("MAGICPIPES_PEBBLE_DNS_PORT").expect("MAGICPIPES_PEBBLE_DNS_PORT");
+    let env = Env::with_config(Tls::Pebble, &format!("[tls.dns01]\ndomains = [\"{BASE}\"]\nlisten = \"127.0.0.1:{dns_port}\"\n")).await;
+    env.login().await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let port = app.port.to_string();
+    for name in ["first", "second"] {
+        let t = add_json(&env, &[&port, "--name", name, "--timeout", "90"]).await;
+        assert_eq!(t["status"], "ready", "{t}");
+        let (status, err, body) = env.get_public(&format!("{name}.{BASE}"), "/").await;
+        assert_eq!((status, err, body.as_str()), (StatusCode::OK, None, "hello from app"));
+    }
+    // One order, for both names and every one to come.
+    assert_eq!(env.server_log().matches("obtaining certificate host=*.").count(), 1, "{}", env.server_log());
+    assert!(!env.server_log().contains(&format!("obtaining certificate host=first.{BASE}")));
+    assert!(env.root.join(format!("server/certs/_.{BASE}.crt")).exists(), "certificate cached");
+    // It covers the domain itself too: a handshake for that name verifies.
+    assert!(env.try_connect(BASE, env.https_port).await.is_ok());
+    env.cli_ok(&["agent", "stop"]).await;
+}
+
 // ---- email ------------------------------------------------------------------------------------
 
 /// A new account, through a real invitation. Returns its password and session.
