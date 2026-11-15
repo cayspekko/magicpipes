@@ -140,6 +140,7 @@ impl Session {
     }
 
     /// Which run of the agent this is, as its connections say.
+    #[cfg(unix)]
     pub fn instance(&self) -> &str {
         &self.instance
     }

@@ -583,6 +583,7 @@ impl Agent {
 
     /// For a take-over: connected, and every tunnel either registered on this session or turned
     /// down by the server (as the agent before it may have had it too). What it still waits for.
+    #[cfg(unix)]
     pub fn settled(&self) -> Result<(), Value> {
         let (conn, _) = self.connection();
         let pending: Vec<Value> = self.tunnels.snapshots().iter().filter(|s| s.registration == Registration::Pending).map(|s| json!(s.tunnel.name)).collect();

@@ -18,8 +18,9 @@ pub const MANIFEST: &str = "release.json";
 pub const SIGNATURE: &str = "release.json.sig";
 /// A manifest bigger than this isn't one.
 pub const MAX_MANIFEST: u64 = 256 * 1024;
-/// Nor is a binary bigger than this.
-pub const MAX_BINARY: u64 = 256 * 1024 * 1024;
+/// Nor is a binary bigger than this. Debug builds, which the tests release to themselves, carry
+/// their debug info: on Linux a debug `magicpipesd` is over 256 MiB.
+pub const MAX_BINARY: u64 = if cfg!(debug_assertions) { 1024 * 1024 * 1024 } else { 256 * 1024 * 1024 };
 
 /// The public halves of the keys releases are signed with: Ed25519, 32 bytes, base64.
 /// `scripts/release-key.sh` makes the key and prints the line to add here. Empty, a build would

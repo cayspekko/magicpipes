@@ -44,9 +44,11 @@ const KEEP_BACKUPS: usize = 5;
 /// How long the old process waits for the new one to connect, and then to be ready (its
 /// migrations, certificates and listeners).
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const REHEARSE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A request file older than this is left over, not a request.
+#[cfg(unix)]
 const REQUEST_FRESH_SECS: i64 = 600;
 /// After asking an agent to reconnect, how long before its idle connections here are closed
 /// anyway: by then it has connected to the new process, or it reconnects when they close.
@@ -204,6 +206,7 @@ pub fn write_request(data_dir: &Path, req: &RequestFile) -> std::io::Result<()> 
     Ok(())
 }
 
+#[cfg(unix)]
 fn take_request(data_dir: &Path) -> Option<RequestFile> {
     let path = data_dir.join(REQUEST_FILE);
     let req: Option<RequestFile> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
@@ -225,6 +228,7 @@ impl Ask {
     }
 
     /// For `SIGUSR2`: what `magicpipesd --upgrade` wrote, if it did.
+    #[cfg(unix)]
     pub fn from_signal(data_dir: &Path) -> Self {
         match take_request(data_dir) {
             Some(r) => Self { id: r.id, to: r.to },
@@ -322,13 +326,32 @@ enum Message {
     Bye,
 }
 
+/// The handover socket. Windows has no handover (`blocker`): there, nothing makes one, and
+/// connecting fails.
+#[cfg(unix)]
+type Stream = tokio::net::UnixStream;
+#[cfg(not(unix))]
+type Stream = tokio::io::DuplexStream;
+
+async fn connect(path: &Path) -> std::io::Result<Stream> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(path).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::other("a handover needs Linux or macOS"))
+    }
+}
+
 struct Line {
-    reader: BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
-    writer: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    reader: BufReader<tokio::io::ReadHalf<Stream>>,
+    writer: tokio::io::WriteHalf<Stream>,
 }
 
 impl Line {
-    fn new(stream: tokio::net::UnixStream) -> Self {
+    fn new(stream: Stream) -> Self {
         let (r, w) = tokio::io::split(stream);
         Self { reader: BufReader::new(r), writer: w }
     }
@@ -363,7 +386,7 @@ pub struct Joining {
 /// agents are coming. Call before binding anything.
 pub async fn join(socket: Option<PathBuf>) -> anyhow::Result<Option<Joining>> {
     let Some(path) = socket else { return Ok(None) };
-    let stream = tokio::time::timeout(HELLO_TIMEOUT, tokio::net::UnixStream::connect(&path))
+    let stream = tokio::time::timeout(HELLO_TIMEOUT, connect(&path))
         .await
         .map_err(|_| anyhow::anyhow!("the older process didn't answer at {}", path.display()))??;
     let mut line = Line::new(stream);
@@ -417,8 +440,10 @@ pub struct Old {
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub control: Arc<ControlPlane>,
+    /// Its open ports and the listeners `main` serves, by name: other descriptors for their
+    /// sockets, which a new process takes over.
+    #[cfg(unix)]
     pub data: Arc<crate::data::DataPlane>,
-    /// The listeners `main` serves, by name: other descriptors for their sockets.
     #[cfg(unix)]
     pub listeners: Vec<(String, std::os::fd::OwnedFd)>,
     pub busy: AtomicBool,
@@ -613,6 +638,7 @@ impl Old {
         }
     }
 
+    #[cfg(unix)]
     async fn await_ready(&self, listener: &tokio::net::UnixListener, child: &mut tokio::process::Child) -> Result<Line, String> {
         let gone = |status: std::io::Result<std::process::ExitStatus>| match status {
             Ok(s) => format!("the new version stopped ({s}) before it was ready; its log says why"),
@@ -733,6 +759,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Message::Go).unwrap(), r#"{"type":"go"}"#);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_request_file_is_taken_once_and_only_while_fresh() {
         let dir = std::env::temp_dir().join(format!("mp-handover-{}", secret::random_string(8)));

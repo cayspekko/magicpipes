@@ -414,6 +414,7 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
         data_dir: cfg.data_dir.clone(),
         config_path,
         control: control.clone(),
+        #[cfg(unix)]
         data: data.clone(),
         #[cfg(unix)]
         listeners: handed,

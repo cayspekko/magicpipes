@@ -209,7 +209,7 @@ async fn serve(
         tracing::info!("took over from the agent before");
     }
     #[cfg(not(unix))]
-    drop(joining);
+    let _ = joining;
     #[cfg(unix)]
     let handed_over = agent.handing.get().map(|h| h.stop_commands.clone()).unwrap_or_default();
     #[cfg(not(unix))]

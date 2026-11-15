@@ -73,6 +73,7 @@ pub(super) struct Listening {
 }
 
 /// What a port's socket is called when it's handed to a new version of the server.
+#[cfg(unix)]
 pub fn fd_name(kind: Kind, port: u16) -> String {
     format!("{kind}:{port}")
 }

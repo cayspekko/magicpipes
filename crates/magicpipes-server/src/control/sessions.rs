@@ -253,6 +253,7 @@ impl ControlPlane {
     }
 
     /// The agents connected now: those a new version of the server takes over should expect.
+    #[cfg(unix)]
     pub fn connected_agents(&self) -> HashSet<String> {
         self.state.lock().unwrap().sessions.keys().cloned().collect()
     }
