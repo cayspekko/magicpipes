@@ -17,7 +17,7 @@ use tokio_util::task::TaskTracker;
 use super::DataPlane;
 use crate::certs::Http01Challenges;
 use crate::forwarded::TrustedProxies;
-use crate::listen::{ListenOpts, serve};
+use crate::listen::{ConnInfo, ListenOpts, Site, serve, serve_with_site};
 
 pub async fn serve_https(
     listener: TcpListener,
@@ -33,6 +33,32 @@ pub async fn serve_https(
         service_fn(move |req| super::proxy::handle(dp.clone(), conn.clone(), req))
     })
     .await
+}
+
+/// [`serve_https`] with the management host on the same listener: connections asking for its
+/// name go to `management`, which is served on the control side as on a listener of its own.
+pub async fn serve_https_with<G, T, C>(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    dp: Arc<DataPlane>,
+    opts: ListenOpts,
+    management: Site<G>,
+    shutdown: CancellationToken,
+    tracker: TaskTracker,
+) where
+    G: Fn(ConnInfo) -> T + Send + Sync + 'static,
+    T: hyper::service::Service<Request<Incoming>, Response = Response<C>, Error = Infallible> + Send + 'static,
+    T::Future: Send + 'static,
+    C: hyper::body::Body + Send + 'static,
+    C::Data: Send,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let tunnels = move |conn: ConnInfo| {
+        let dp = dp.clone();
+        let conn = Arc::new(conn);
+        service_fn(move |req| super::proxy::handle(dp.clone(), conn.clone(), req))
+    };
+    serve_with_site(listener, acceptor, opts, shutdown, tracker, tunnels, management).await
 }
 
 const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";

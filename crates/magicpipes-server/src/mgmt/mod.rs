@@ -37,7 +37,9 @@ mod upgrades;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,7 +50,6 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper::body::Incoming;
-use hyper::service::service_fn;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -56,8 +57,8 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tower::ServiceExt;
 
 use crate::control::ControlPlane;
-use crate::forwarded::client_key;
-use crate::listen::{ListenOpts, serve};
+use crate::forwarded::{TrustedProxies, client_key};
+use crate::listen::{ConnInfo, ListenOpts, Site, serve};
 
 /// Remote address of the management connection, inserted into request extensions.
 #[derive(Clone, Copy, Debug)]
@@ -295,6 +296,13 @@ pub async fn serve_mgmt(
     shutdown: CancellationToken,
     tracker: TaskTracker,
 ) {
+    let site = site(control, control_rt);
+    serve(listener, Some(acceptor), site.opts, shutdown, tracker, site.make_service).await
+}
+
+/// The management host as a listener serves it: on one of its own ([`serve_mgmt`]), or as the
+/// public listener's second site, chosen by TLS SNI (`management.listen` = `public.https_listen`).
+pub fn site(control: Arc<ControlPlane>, control_rt: tokio::runtime::Handle) -> Site<impl Fn(ConnInfo) -> Requests + Send + Sync + 'static> {
     let cfg = control.config();
     let trusted = cfg.trusted_proxies();
     let opts = ListenOpts {
@@ -307,31 +315,42 @@ pub async fn serve_mgmt(
         // Requests here have their own deadline, and an agent's session stops being HTTP.
         idle_timeout: None,
     };
+    let host = cfg.management.hostname.clone();
     let app = router(control);
-    serve(listener, Some(acceptor), opts, shutdown, tracker, move |conn| {
-        let app = app.clone();
-        let peer = conn.peer;
-        let trusted = trusted.clone();
-        let control_rt = control_rt.clone();
-        service_fn(move |mut req: http::Request<Incoming>| {
-            let client = trusted.client_ip(peer.ip(), req.headers());
-            req.extensions_mut().insert(PeerAddr(peer));
-            req.extensions_mut().insert(ClientIp(client));
-            // The connection stays on the traffic threads, with every agent's session. Handlers
-            // block on the database, so they run on the control plane's threads.
-            let handler = AbortOnDropHandle::new(control_rt.spawn(app.clone().oneshot(req)));
-            async move {
-                Ok::<_, Infallible>(match handler.await {
-                    Ok(resp) => resp.unwrap_or_else(|e| match e {}),
-                    Err(e) => {
-                        tracing::error!(error = %e, "a management request failed");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    }
-                })
-            }
+    let make_service = move |conn: ConnInfo| Requests { app: app.clone(), peer: conn.peer, trusted: trusted.clone(), control_rt: control_rt.clone() };
+    Site { host, opts, make_service }
+}
+
+/// One management connection's requests.
+pub struct Requests {
+    app: Router,
+    peer: SocketAddr,
+    trusted: TrustedProxies,
+    control_rt: tokio::runtime::Handle,
+}
+
+impl hyper::service::Service<http::Request<Incoming>> for Requests {
+    type Response = axum::response::Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<axum::response::Response, Infallible>> + Send>>;
+
+    fn call(&self, mut req: http::Request<Incoming>) -> Self::Future {
+        let client = self.trusted.client_ip(self.peer.ip(), req.headers());
+        req.extensions_mut().insert(PeerAddr(self.peer));
+        req.extensions_mut().insert(ClientIp(client));
+        // The connection stays on the traffic threads, with every agent's session. Handlers
+        // block on the database, so they run on the control plane's threads.
+        let handler = AbortOnDropHandle::new(self.control_rt.spawn(self.app.clone().oneshot(req)));
+        Box::pin(async move {
+            Ok(match handler.await {
+                Ok(resp) => resp.unwrap_or_else(|e| match e {}),
+                Err(e) => {
+                    tracing::error!(error = %e, "a management request failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            })
         })
-    })
-    .await
+    }
 }
 
 // ---- UI sessions -------------------------------------------------------------------------

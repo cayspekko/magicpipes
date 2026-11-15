@@ -44,7 +44,8 @@ public port. See
 
 ### Requirements
 
-* A Linux (or macOS) host with a public IP and ports **80**, **443** and **8443** reachable.
+* A Linux (or macOS) host with a public IP and ports **80**, **443** and **8443** reachable (or
+  only 80 and 443, with [one port for everything](#configure-and-start)).
 * DNS (no per-tunnel records are ever needed):
   * `*.t.example.com  A  <server IP>` (wildcard for tunnels)
   * `example.com      A  <server IP>` (management hostname; any name works)
@@ -169,6 +170,24 @@ Every port in the range must reach `magicpipesd` from the internet, for both TCP
 firewall, router forwarding). Ports are bound when a tunnel claims them, so the range may
 overlap ports other programs use; those are skipped. Each agent may hold up to
 `agents.max_ports_per_agent` ports (default 10).
+
+**One port for everything.** Give `management.listen` the same address as `public.https_listen`,
+and the management UI, API and agent endpoint share port 443 with the tunnels: a connection that
+asks for `management.hostname` goes to them, and every other name to the tunnels. Nothing needs to
+split the port in front of `magicpipesd`, and the management address has no port in it.
+
+```toml
+[public]
+https_listen = "0.0.0.0:443"
+[management]
+listen = "0.0.0.0:443"        # the same address: one listener
+hostname = "example.com"
+```
+
+Each side keeps its own certificate (the management hostname never uses a tunnel's or one you
+brought) and its own connection limits. Behind a proxy that sends PROXY headers, `proxy_protocol`
+must then be the same in `[public]` and `[management]`. Switching an existing server to it needs
+a restart, since the ports change.
 
 **Behind a reverse proxy or load balancer**, list its addresses in `trusted_proxies` so the server
 sees real client addresses (for login rate limits, per-client connection caps, `--allow-cidr`

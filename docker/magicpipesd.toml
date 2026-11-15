@@ -12,7 +12,7 @@ https_listen = "0.0.0.0:443"
 http_listen = "0.0.0.0:80"    # ACME HTTP-01 challenges + redirects
 
 [management]
-listen = "0.0.0.0:8443"
+listen = "0.0.0.0:8443"       # "0.0.0.0:443" shares the tunnels' port (and needs no 8443 published)
 hostname = "example.com"
 
 [tls]

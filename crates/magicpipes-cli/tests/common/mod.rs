@@ -136,9 +136,19 @@ impl Env {
 
     /// `top` goes before the first section of the server's configuration, `extra` after the last.
     pub async fn with_settings(tls: Tls, top: &str, extra: &str) -> Env {
+        Self::build(tls, top, extra, false).await
+    }
+
+    /// The management host on the tunnels' port (`mgmt_port` is `https_port`), told apart by SNI.
+    pub async fn sharing_one_port(tls: Tls) -> Env {
+        Self::build(tls, "", "", true).await
+    }
+
+    async fn build(tls: Tls, top: &str, extra: &str, one_port: bool) -> Env {
         let root = std::env::temp_dir().join(format!("mpe2e-{}", magicpipes_core_rand()));
         std::fs::create_dir_all(root.join("home")).unwrap();
-        let (https_port, mut http_port, mgmt_port) = (free_port(), free_port(), free_port());
+        let (https_port, mut http_port) = (free_port(), free_port());
+        let mgmt_port = if one_port { https_port } else { free_port() };
         let ports = free_port_range(8);
         // With real HTTP-01 validation, Pebble connects to a fixed port (its `httpPort`).
         if tls == Tls::Pebble

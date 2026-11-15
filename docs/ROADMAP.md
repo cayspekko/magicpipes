@@ -652,3 +652,4 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 12b | Upgrades, server: `magicpipesd --upgrade` with the database rehearsed and backed up, a handover to the new process on inherited sockets, requests held while machines move, rollback | yes | done (Linux and macOS) |
 | 12c | Upgrades, machines: `magicpipes --upgrade`, a new run taking over from the old without cutting its streams | yes | done (background agents on Linux and macOS) |
 | 12d | Upgrades from the UI: the server itself, by administrators; and asking a machine to upgrade itself, where its own user turned that on (`--allow-remote`) | yes | done |
+| 12e | One port: the management host as a second site on the tunnels' 443, chosen by SNI (`management.listen` = `public.https_listen`), so nothing has to split the port in front | yes | done |

@@ -37,6 +37,11 @@ Choose one with `compare.sh --suite <name>`, or run one build alone with `bench.
 | `ssh` | What does the SSH gateway cost, beside sshd directly and a raw port? Needs a build with `--ssh`, and OpenSSH's server and client |
 | `connect` | What does `magicpipes connect` cost, beside a raw port, to the same application? Needs a build with `connect` |
 
+To measure the management host on the tunnels' port (one listener, chosen by SNI), copy a build
+and put a file named `one-port` in the copy: `cp -R target/bench/new target/bench/new-1p && touch
+target/bench/new-1p/one-port`, then `compare.sh new new-1p`. Not for the `wan` suite, which would
+then shape the tunnels' traffic too.
+
 `BENCH_SECS` sets the seconds per measurement (default 3). `bench.sh` lists its other settings. The
 scripts need Python 3, and they use their own home folder and ports, so an agent you're running
 yourself is left alone.

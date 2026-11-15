@@ -10,6 +10,8 @@
 #   BENCH_TRAFFIC_THREADS  the server's traffic threads in the control suite (default: 2)
 #   BENCH_WAN_MB           MiB per download in the wan suite (default: 64; take less on a slow link)
 #   BENCH_KEEP             set to keep the run's folder, with the server's log
+# A file named one-port in the build dir puts the management host on the tunnels' port
+# (management.listen = public.https_listen), to measure that beside the same build on two ports.
 set -uo pipefail
 
 USAGE="usage: bench.sh <traffic|control|memory|wan|unix|ssh|connect> <build dir>"
@@ -26,6 +28,7 @@ done
 
 # MGMT carries the agent's session, which is what wan.sh shapes.
 HTTPS=21443 HTTP=21080 MGMT=21844 APP=21900 IPERF=21901 IPERF_PUBLIC=21951 SSHD=21902 GATEWAY=21960 CONNECT=21961
+[ -e "$BIN/one-port" ] && MGMT=$HTTPS
 for port in $HTTPS $HTTP $MGMT $APP $IPERF $IPERF_PUBLIC $SSHD $GATEWAY $CONNECT; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     echo "port $port is in use; is another benchmark running?" >&2

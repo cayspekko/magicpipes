@@ -228,10 +228,12 @@ async fn bind(addr: std::net::SocketAddr, what: &str) -> anyhow::Result<TcpListe
     TcpListener::bind(addr).await.with_context(|| format!("binding {what} listener on {addr}"))
 }
 
-/// The listener an older version handed over as `name`, if it's for `addr`; else a new one.
-async fn take_or_bind(name: &str, addr: std::net::SocketAddr, what: &str) -> anyhow::Result<TcpListener> {
+/// The listener an older version handed over under one of `names` (the first that's for `addr`);
+/// else a new one. Those it doesn't use are closed.
+async fn take_or_bind(names: &[&str], addr: std::net::SocketAddr, what: &str) -> anyhow::Result<TcpListener> {
     #[cfg(unix)]
-    if let Some(fd) = magicpipes_core::fds::take(name) {
+    for name in names {
+        let Some(fd) = magicpipes_core::fds::take(name) else { continue };
         let std = std::net::TcpListener::from(fd);
         if std.local_addr().ok() == Some(addr) || std.local_addr().is_ok_and(|a| addr.ip().is_unspecified() && a.port() == addr.port()) {
             std.set_nonblocking(true)?;
@@ -240,7 +242,7 @@ async fn take_or_bind(name: &str, addr: std::net::SocketAddr, what: &str) -> any
         tracing::info!(listener = what, %addr, "the configuration moved this listener; binding the new address");
     }
     #[cfg(not(unix))]
-    let _ = name;
+    let _ = names;
     bind(addr, what).await
 }
 
@@ -323,21 +325,27 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
         drop(magicpipes_core::fds::take_prefixed(prefix));
     }
 
-    let public_https = take_or_bind("https", cfg.public.https_listen, "public HTTPS").await?;
+    // The management host shares the public listener, or has one of its own. Sharing, the older
+    // version's management listener may be the one on the right address (it had the port before).
+    let shared = cfg.management_shares_public();
+    let public_https = take_or_bind(if shared { &["https", "mgmt"] } else { &["https"] }, cfg.public.https_listen, "public HTTPS").await?;
     let public_http = match cfg.public.http_listen {
-        Some(a) => Some(take_or_bind("http", a, "public HTTP").await?),
+        Some(a) => Some(take_or_bind(&["http"], a, "public HTTP").await?),
         None => None,
     };
-    let mgmt = take_or_bind("mgmt", cfg.management.listen, "management").await?;
+    let mgmt = if shared { None } else { Some(take_or_bind(&["mgmt"], cfg.management.listen, "management").await?) };
     let ssh = match &cfg.ssh {
         Some(s) => {
             data.set_ssh_ca(data::ssh::load_key(&cfg.data_dir, "ssh-user-ca", "magicpipes user CA")?);
-            Some((take_or_bind("ssh", s.listen, "SSH gateway").await?, data::ssh::load_key(&cfg.data_dir, "ssh-host-key", "magicpipes gateway")?, s.clone()))
+            Some((take_or_bind(&["ssh"], s.listen, "SSH gateway").await?, data::ssh::load_key(&cfg.data_dir, "ssh-host-key", "magicpipes gateway")?, s.clone()))
         }
         None => None,
     };
+    // A listener the older version had that nothing here uses.
     #[cfg(unix)]
-    let handed: Vec<(String, std::os::fd::OwnedFd)> = [dup("https", &public_https), dup("mgmt", &mgmt)]
+    drop(magicpipes_core::fds::take("mgmt"));
+    #[cfg(unix)]
+    let handed: Vec<(String, std::os::fd::OwnedFd)> = [dup("https", &public_https), mgmt.as_ref().and_then(|l| dup("mgmt", l))]
         .into_iter()
         .chain([public_http.as_ref().and_then(|l| dup("http", l)), ssh.as_ref().and_then(|(l, ..)| dup("ssh", l))])
         .flatten()
@@ -352,8 +360,12 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
         certs.spawn_renewal(background.clone());
     }
 
-    let public_acceptor = TlsAcceptor::from(certs::server_config(certs.resolver()));
-    let mgmt_acceptor = TlsAcceptor::from(certs::server_config(mgmt_resolver));
+    // Sharing, one handshake serves both: the management hostname still gets only its own certificate.
+    let public_acceptor = if shared {
+        TlsAcceptor::from(certs::server_config(Arc::new(certs::WithManagement { management: mgmt_resolver.clone(), tunnels: certs.resolver() })))
+    } else {
+        TlsAcceptor::from(certs::server_config(certs.resolver()))
+    };
 
     tracing::info!(
         base_domain = %cfg.base_domain,
@@ -367,29 +379,32 @@ async fn serve(cfg: Config, config_path: PathBuf, joining: &mut Option<handover:
     );
 
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(data::ingress::serve_https(
-        public_https,
-        public_acceptor,
-        data.clone(),
-        listen::ListenOpts {
-            name: "public-https",
-            max_connections: cfg.public.max_connections,
-            max_per_client: cfg.public.max_connections_per_client.max(1),
-            header_read_timeout: Duration::from_secs(cfg.public.header_read_timeout_secs),
-            trusted_proxies: cfg.trusted_proxies(),
-            proxy_protocol: cfg.public.proxy_protocol,
-            idle_timeout: config::optional_secs(cfg.public.body_idle_timeout_secs),
-        },
-        shutdown.clone(),
-        tracker.clone(),
-    ));
+    let public_opts = listen::ListenOpts {
+        name: "public-https",
+        max_connections: cfg.public.max_connections,
+        max_per_client: cfg.public.max_connections_per_client.max(1),
+        header_read_timeout: Duration::from_secs(cfg.public.header_read_timeout_secs),
+        trusted_proxies: cfg.trusted_proxies(),
+        proxy_protocol: cfg.public.proxy_protocol,
+        idle_timeout: config::optional_secs(cfg.public.body_idle_timeout_secs),
+    };
+    match mgmt {
+        Some(mgmt) => {
+            tasks.spawn(data::ingress::serve_https(public_https, public_acceptor, data.clone(), public_opts, shutdown.clone(), tracker.clone()));
+            let mgmt_acceptor = TlsAcceptor::from(certs::server_config(mgmt_resolver));
+            tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), control_rt.clone(), shutdown.clone(), tracker.clone()));
+        }
+        None => {
+            let site = mgmt::site(control.clone(), control_rt.clone());
+            tasks.spawn(data::ingress::serve_https_with(public_https, public_acceptor, data.clone(), public_opts, site, shutdown.clone(), tracker.clone()));
+        }
+    }
     if let Some(l) = public_http {
         tasks.spawn(data::ingress::serve_http(l, certs.challenges(), cfg.url_port(), shutdown.clone(), tracker.clone()));
     }
     if let Some((listener, key, settings)) = ssh {
         tasks.spawn(data::ssh::serve(listener, key, data.clone(), settings, shutdown.clone()));
     }
-    tasks.spawn(mgmt::serve_mgmt(mgmt, mgmt_acceptor, control.clone(), control_rt.clone(), shutdown.clone(), tracker.clone()));
 
     if let Some(mut j) = joining.take() {
         let hosts = {

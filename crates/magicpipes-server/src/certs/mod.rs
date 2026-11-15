@@ -9,7 +9,7 @@
 //! that [`authority`], whatever the mode.
 
 mod acme;
-mod devca;
+pub(crate) mod devca;
 mod provided;
 
 mod authority;
@@ -115,6 +115,21 @@ impl ResolvesServerCert for SingleHost {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let name = hello.server_name()?;
         if name.eq_ignore_ascii_case(&self.host) { self.inner.lookup_issued(&self.host) } else { None }
+    }
+}
+
+/// The public listener when the management host shares it: the management hostname gets what
+/// [`SingleHost`] gives it (never a certificate people brought), and every other name the tunnels'.
+/// Which of the two serves the connection afterwards follows the same name.
+#[derive(Debug)]
+pub struct WithManagement {
+    pub management: Arc<SingleHost>,
+    pub tunnels: Arc<CertResolver>,
+}
+
+impl ResolvesServerCert for WithManagement {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if hello.server_name()?.eq_ignore_ascii_case(&self.management.host) { self.management.resolve(hello) } else { self.tunnels.resolve(hello) }
     }
 }
 

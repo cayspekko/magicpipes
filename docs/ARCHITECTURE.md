@@ -21,7 +21,7 @@ streams *inside* the session the agent established.
 |---|---|---|
 | Reverse proxy | **hyper 1.x** (+ hyper-util) | See below. |
 | Multiplexing | **yamux 0.14** (libp2p) | Mature, very widely deployed, per-stream flow control (256 KiB window, auto-tuned) gives real backpressure; optimistic stream open (no extra round trip). |
-| Agent transport | HTTPS + `Upgrade: magicpipes-mux/1` | Shares port 8443 with the API, goes through ordinary TLS terminators and firewalls, authenticated with a bearer token before the upgrade. WebSocket framing would only add overhead under yamux. |
+| Agent transport | HTTPS + `Upgrade: magicpipes-mux/1` | Shares the management port (8443, or 443 with the tunnels) with the API, goes through ordinary TLS terminators and firewalls, authenticated with a bearer token before the upgrade. WebSocket framing would only add overhead under yamux. |
 | TLS | rustls 0.23 (ring provider) | Memory-safe, dynamic `ResolvesServerCert` for per-hostname certificates; ring avoids a C/CMake toolchain dependency. |
 | ACME | instant-acme 0.8 | Low-level async ACME client: lets us control which hostnames get ordered, report per-hostname readiness and back off on failure. `rustls-acme` manages a fixed domain list, which does not fit tunnels being created at runtime. |
 | Management API/UI | axum 0.8 | Same hyper stack; server-rendered HTML, no frontend build. |
@@ -1222,6 +1222,22 @@ compromised server can do is have an opted-in machine install a genuine newer re
   listener has no certificate for other names and returns 421 for another `Host`. Tunnels share
   the parent domain, so serving the UI under a tunnel's name would hand its cookie to that
   tunnel's application.
+* One port for both (`management.listen` = `public.https_listen`): the management host is a
+  second site on the public listener, the way a tunnel is a route on it, without a load balancer
+  in front to split the port by name. The handshake's SNI decides, once, which side serves the
+  connection (`listen::serve_with_site`), and the certificate follows the same name
+  (`certs::WithManagement`): the management hostname gets only what `SingleHost` gives it, never a
+  tunnel's or one people brought, and a tunnel's name never reaches the management side. Each
+  side then checks `Host` against that name as before (421). Until the handshake names its side,
+  a connection counts as one being set up, bounded like the public listener; then it takes a place
+  on that side only, the tunnels' counts or the management ones, and is dropped if that side is
+  full. The two never share a count, so a client with every place it may have on tunnels (an
+  office behind one address, or everyone on the LAN behind hairpin NAT) still reaches the
+  management host, and the reverse (`the_site_and_the_tunnels_count_apart`). A PROXY header comes
+  before TLS, so `management.proxy_protocol` must equal `public.proxy_protocol`. Agents' sessions run on the same
+  connection code either way, so this costs tunnels one comparison per handshake and nothing per
+  request. Sign-in, its cookies and its addresses are unchanged: they follow the management
+  hostname, not the socket.
 * Client addresses come from the TCP peer unless it is in `trusted_proxies`; then from its
   PROXY header (listeners with `proxy_protocol = true`) or the right-most untrusted
   X-Forwarded-For entry. Tunnels receive `X-Forwarded-For` rewritten accordingly; `Forwarded`

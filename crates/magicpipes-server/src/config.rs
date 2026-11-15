@@ -487,6 +487,8 @@ impl Default for PublicConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementConfig {
+    /// The same address as `public.https_listen` shares that listener: connections asking for
+    /// `hostname` (TLS SNI) come here, every other one goes to the tunnels.
     #[serde(default = "default_mgmt_listen")]
     pub listen: SocketAddr,
     /// Hostname of the management UI/API and agent endpoint, e.g. `example.com`.
@@ -947,6 +949,10 @@ impl Config {
         if proxied && trusted.is_empty() {
             bail!("proxy_protocol requires trusted_proxies (the load balancer's addresses)");
         }
+        // A PROXY header comes before TLS, so before anyone knows which of the two a connection is for.
+        if self.management_shares_public() && self.management.proxy_protocol != self.public.proxy_protocol {
+            bail!("management.listen is public.https_listen, so management.proxy_protocol must be the same as public.proxy_protocol");
+        }
         if let Some(s) = &self.smtp {
             s.check().map_err(|m| anyhow::anyhow!("smtp: {m}"))?;
         }
@@ -971,6 +977,12 @@ impl Config {
 
     /// This server's own address, for links in email and for `magicpipes login`. Always from here,
     /// never a request's `Host`.
+    /// Whether the management host is served on the public HTTPS listener, chosen by TLS SNI,
+    /// rather than on a listener of its own.
+    pub fn management_shares_public(&self) -> bool {
+        self.management.listen == self.public.https_listen
+    }
+
     pub fn management_url(&self) -> String {
         match self.management.listen.port() {
             443 => format!("https://{}", self.management.hostname),
@@ -1063,6 +1075,31 @@ mod tests {
         for bad in ["", "0-10", "10-5", "a-b", "1-70000"] {
             assert!(PortRange::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn management_can_share_the_public_listener() {
+        let load = |text: &str| {
+            let mut c: Config = toml::from_str(&format!("base_domain = \"t.example.com\"\n{text}")).unwrap();
+            c.validate().map(|_| c)
+        };
+        let own = load("[management]\nhostname = \"example.com\"\n").unwrap();
+        assert!(!own.management_shares_public(), "by default it has a port of its own");
+        assert_eq!(own.management_url(), "https://example.com:8443");
+
+        let shared = "[public]\nhttps_listen = \"0.0.0.0:443\"\n[management]\nhostname = \"example.com\"\nlisten = \"0.0.0.0:443\"\n";
+        let c = load(shared).unwrap();
+        assert!(c.management_shares_public());
+        assert_eq!(c.management_url(), "https://example.com");
+
+        // A PROXY header comes before anyone knows which of the two a connection is for.
+        let proxied = |public: bool, mgmt: bool| {
+            load(&format!(
+                "trusted_proxies = [\"10.0.0.1/32\"]\n[public]\nhttps_listen = \"0.0.0.0:443\"\nproxy_protocol = {public}\n[management]\nhostname = \"example.com\"\nlisten = \"0.0.0.0:443\"\nproxy_protocol = {mgmt}\n"
+            ))
+        };
+        assert!(proxied(true, true).is_ok() && proxied(false, false).is_ok());
+        assert!(proxied(true, false).is_err() && proxied(false, true).is_err());
     }
 
     #[test]

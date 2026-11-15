@@ -14,7 +14,7 @@ use hyper::body::{Body, Incoming};
 use hyper::service::Service;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -202,16 +202,129 @@ pub async fn serve<F, S, B>(
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let permits = Arc::new(Semaphore::new(opts.max_connections));
-    let per_client = Arc::new(PerClient::default());
+    let counts = Counts::new(&opts);
     let make_service = Arc::new(make_service);
+    while let Some((tcp, peer, permit)) = accept(&listener, &counts, &opts, &shutdown).await {
+        let make_service = make_service.clone();
+        let tls = tls.clone();
+        let shutdown = shutdown.clone();
+        let opts = opts.clone();
+        let counts = counts.clone();
+        tracker.spawn(async move {
+            let Some((tcp, peer, limits)) = admit(tcp, peer, permit, &opts, &counts).await else { return };
+            let (header_timeout, idle_timeout) = (opts.header_read_timeout, opts.idle_timeout);
+            match tls {
+                Some(acceptor) => {
+                    let Some(stream) = handshake(&acceptor, tcp, peer).await else { return };
+                    let sni = stream.get_ref().1.server_name().map(str::to_ascii_lowercase);
+                    let svc = make_service(ConnInfo { peer, sni, limits: limits.clone() });
+                    serve_conn(stream, svc, header_timeout, idle_timeout, shutdown).await
+                }
+                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, idle_timeout, shutdown).await,
+            }
+        });
+    }
+}
+
+/// A second site on a TLS listener, chosen by the name a connection asks for (SNI): the
+/// management host on the public listener.
+pub struct Site<F> {
+    /// Lowercase.
+    pub host: String,
+    pub opts: ListenOpts,
+    pub make_service: F,
+}
+
+/// Like [`serve`] with TLS, sending connections that ask for `site.host` to `site`. Until the
+/// handshake says which side a connection is for, it counts as one being set up, under `opts`
+/// (PROXY header and handshake included); then it takes a place on its side, `opts`' counts for
+/// the tunnels or the site's own, and is dropped if that side is full. So the two sides never share
+/// a count: a client with every place it may have on tunnels (a whole office behind one address)
+/// still reaches the management host, and the reverse.
+pub async fn serve_with_site<F, S, B, G, T, C>(
+    listener: TcpListener,
+    tls: TlsAcceptor,
+    opts: ListenOpts,
+    shutdown: CancellationToken,
+    tracker: TaskTracker,
+    make_service: F,
+    site: Site<G>,
+) where
+    F: Fn(ConnInfo) -> S + Send + Sync + 'static,
+    S: Service<Request<Incoming>, Response = Response<B>, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    G: Fn(ConnInfo) -> T + Send + Sync + 'static,
+    T: Service<Request<Incoming>, Response = Response<C>, Error = Infallible> + Send + 'static,
+    T::Future: Send + 'static,
+    C: Body + Send + 'static,
+    C::Data: Send,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let setting_up = Counts::new(&opts);
+    let tunnels = Counts::new(&opts);
+    let site_counts = Counts::new(&site.opts);
+    let make_service = Arc::new(make_service);
+    let site = Arc::new(site);
+    while let Some((tcp, peer, permit)) = accept(&listener, &setting_up, &opts, &shutdown).await {
+        let make_service = make_service.clone();
+        let site = site.clone();
+        let tls = tls.clone();
+        let shutdown = shutdown.clone();
+        let opts = opts.clone();
+        let (setting_up, tunnels, site_counts) = (setting_up.clone(), tunnels.clone(), site_counts.clone());
+        tracker.spawn(async move {
+            let Some((tcp, peer, pending)) = admit(tcp, peer, permit, &opts, &setting_up).await else { return };
+            let Some(stream) = handshake(&tls, tcp, peer).await else { return };
+            let sni = stream.get_ref().1.server_name().map(str::to_ascii_lowercase);
+            let to_site = sni.as_deref() == Some(site.host.as_str());
+            let Some(limits) = (if to_site { place(peer, &site.opts, &site_counts) } else { place(peer, &opts, &tunnels) }) else { return };
+            drop(pending);
+            let info = ConnInfo { peer, sni, limits: limits.clone() };
+            if to_site {
+                serve_conn(stream, (site.make_service)(info), site.opts.header_read_timeout, site.opts.idle_timeout, shutdown).await
+            } else {
+                serve_conn(stream, make_service(info), opts.header_read_timeout, opts.idle_timeout, shutdown).await
+            }
+        });
+    }
+}
+
+/// A place among `counts` for an established connection, without waiting: a listener of the
+/// side's own would have left it in the kernel's queue instead. `None` drops it.
+fn place(peer: SocketAddr, opts: &ListenOpts, counts: &Counts) -> Option<Arc<ConnLimits>> {
+    let Ok(permit) = counts.permits.clone().try_acquire_owned() else {
+        tracing::debug!(listener = opts.name, %peer, "too many connections");
+        return None;
+    };
+    let slot = client_slot(peer, opts, counts)?;
+    Some(Arc::new(ConnLimits { _permit: permit, _slot: slot }))
+}
+
+/// A listener's (or a site's) open connections, in all and per client.
+#[derive(Clone)]
+struct Counts {
+    permits: Arc<Semaphore>,
+    per_client: Arc<PerClient>,
+}
+
+impl Counts {
+    fn new(opts: &ListenOpts) -> Self {
+        Self { permits: Arc::new(Semaphore::new(opts.max_connections)), per_client: Arc::default() }
+    }
+}
+
+/// The next connection, once there's room for it; `None` at shutdown.
+async fn accept(listener: &TcpListener, counts: &Counts, opts: &ListenOpts, shutdown: &CancellationToken) -> Option<(TcpStream, SocketAddr, OwnedSemaphorePermit)> {
     loop {
         let permit = tokio::select! {
-            _ = shutdown.cancelled() => return,
-            p = permits.clone().acquire_owned() => p.expect("semaphore never closed"),
+            _ = shutdown.cancelled() => return None,
+            p = counts.permits.clone().acquire_owned() => p.expect("semaphore never closed"),
         };
         let (tcp, peer) = tokio::select! {
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => return None,
             r = listener.accept() => match r {
                 Ok(v) => v,
                 Err(e) => {
@@ -226,43 +339,50 @@ pub async fn serve<F, S, B>(
         // time, but it has no use for megabytes of kernel memory for a slow reader either.
         #[cfg(target_os = "linux")]
         let _ = socket2::SockRef::from(&tcp).set_tcp_notsent_lowat(magicpipes_core::mux::SEND_QUEUE);
-        let make_service = make_service.clone();
-        let tls = tls.clone();
-        let shutdown = shutdown.clone();
-        let (header_timeout, idle_timeout) = (opts.header_read_timeout, opts.idle_timeout);
-        let opts = opts.clone();
-        let per_client = per_client.clone();
-        tracker.spawn(async move {
-            let mut tcp = tcp;
-            let mut peer = peer;
-            if opts.proxy_protocol {
-                match proxy_header::client_addr(&mut tcp, peer, &opts.trusted_proxies).await {
-                    Ok(client) => peer = client,
-                    Err(e) => return tracing::debug!(%peer, error = %e, "bad PROXY header"),
-                }
+        return Some((tcp, peer, permit));
+    }
+}
+
+/// Learns who the client is (from a PROXY header, if the listener expects one) and counts the
+/// connection against it; `None` drops the connection.
+async fn admit(mut tcp: TcpStream, mut peer: SocketAddr, permit: OwnedSemaphorePermit, opts: &ListenOpts, counts: &Counts) -> Option<(TcpStream, SocketAddr, Arc<ConnLimits>)> {
+    if opts.proxy_protocol {
+        match proxy_header::client_addr(&mut tcp, peer, &opts.trusted_proxies).await {
+            Ok(client) => peer = client,
+            Err(e) => {
+                tracing::debug!(%peer, error = %e, "bad PROXY header");
+                return None;
             }
-            let slot = if opts.trusted_proxies.trusts(peer.ip()) {
-                None
-            } else {
-                match per_client.acquire(peer.ip(), opts.max_per_client) {
-                    Some(slot) => Some(slot),
-                    None => return tracing::debug!(listener = opts.name, %peer, "too many connections from this client"),
-                }
-            };
-            let limits = Arc::new(ConnLimits { _permit: permit, _slot: slot });
-            match tls {
-                Some(acceptor) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
-                    Ok(Ok(stream)) => {
-                        let sni = stream.get_ref().1.server_name().map(str::to_ascii_lowercase);
-                        let svc = make_service(ConnInfo { peer, sni, limits: limits.clone() });
-                        serve_conn(stream, svc, header_timeout, idle_timeout, shutdown).await
-                    }
-                    Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
-                    Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
-                },
-                None => serve_conn(tcp, make_service(ConnInfo { peer, sni: None, limits: limits.clone() }), header_timeout, idle_timeout, shutdown).await,
-            }
-        });
+        }
+    }
+    let slot = client_slot(peer, opts, counts)?;
+    Some((tcp, peer, Arc::new(ConnLimits { _permit: permit, _slot: slot })))
+}
+
+/// The client's place among its connections: `Some(None)` for a trusted proxy, which carries many
+/// clients, and `None` when the client has no room left.
+fn client_slot(peer: SocketAddr, opts: &ListenOpts, counts: &Counts) -> Option<Option<ClientSlot>> {
+    if opts.trusted_proxies.trusts(peer.ip()) {
+        return Some(None);
+    }
+    let slot = counts.per_client.acquire(peer.ip(), opts.max_per_client);
+    if slot.is_none() {
+        tracing::debug!(listener = opts.name, %peer, "too many connections from this client");
+    }
+    slot.map(Some)
+}
+
+async fn handshake(acceptor: &TlsAcceptor, tcp: TcpStream, peer: SocketAddr) -> Option<tokio_rustls::server::TlsStream<TcpStream>> {
+    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            tracing::debug!(%peer, error = %e, "TLS handshake failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(%peer, "TLS handshake timed out");
+            None
+        }
     }
 }
 
@@ -417,6 +537,70 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(upgrade(addr).await.is_some(), "the upgraded connection gave its slot back");
         drop(first);
+    }
+
+    /// One listener, two sides: once the handshake names its side, a connection counts only there,
+    /// so a client with every place it may have on one still gets onto the other.
+    #[tokio::test]
+    async fn the_site_and_the_tunnels_count_apart() {
+        use http_body_util::{BodyExt, Full};
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, ServerName};
+
+        let dir = std::env::temp_dir().join(format!("mp-listen-{}", magicpipes_core::secret::random_string(8)));
+        let ca = crate::certs::devca::DevCa::load_or_create(&dir, &["t.test"]).unwrap();
+        let resolver = Arc::new(crate::certs::CertResolver::default());
+        for name in ["app.t.test", "m.t.test"] {
+            let (chain, key) = ca.issue(name).unwrap();
+            resolver.insert(name, crate::certs::load_pem(chain.as_bytes(), key.as_bytes()).unwrap().key);
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(ca.ca_path()).unwrap() {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(client));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answer = |body: &'static str| {
+            move |_: ConnInfo| {
+                hyper::service::service_fn(move |_: Request<Incoming>| async move { Ok::<_, Infallible>(Response::new(Full::new(bytes::Bytes::from_static(body.as_bytes())))) })
+            }
+        };
+        let site = Site { host: "m.t.test".into(), opts: opts(1), make_service: answer("site") };
+        let acceptor = TlsAcceptor::from(crate::certs::server_config(resolver));
+        tokio::spawn(serve_with_site(listener, acceptor, opts(1), CancellationToken::new(), TaskTracker::new(), answer("tunnels"), site));
+
+        // A connection that has had one answer and stays open, with that answer; `None` if refused.
+        let open = |name: &'static str| {
+            let client = client.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await.ok()?;
+                let tls = client.connect(ServerName::try_from(name).unwrap(), tcp).await.ok()?;
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.ok()?;
+                tokio::spawn(conn);
+                let req = Request::get("/").header("host", name).body(Empty::<bytes::Bytes>::new()).unwrap();
+                let resp = tokio::time::timeout(Duration::from_secs(2), sender.send_request(req)).await.ok()?.ok()?;
+                let body = resp.into_body().collect().await.ok()?.to_bytes();
+                Some((sender, String::from_utf8_lossy(&body).into_owned()))
+            }
+        };
+        let (tunnel, said) = open("app.t.test").await.expect("a connection to a tunnel");
+        assert_eq!(said, "tunnels");
+        let (site_conn, said) = open("m.t.test").await.expect("the client's place on the tunnels doesn't count on the site");
+        assert_eq!(said, "site");
+        assert!(open("app.t.test").await.is_none(), "its one place on the tunnels is taken");
+        assert!(open("m.t.test").await.is_none(), "and its one on the site");
+        drop(tunnel);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(open("app.t.test").await.map(|o| o.1).as_deref(), Some("tunnels"), "its place on the tunnels is free again");
+        drop(site_conn);
     }
 
     #[tokio::test]

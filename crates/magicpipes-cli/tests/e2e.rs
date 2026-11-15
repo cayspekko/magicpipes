@@ -2291,6 +2291,55 @@ async fn open_private(env: &Env, host: &str, path: &str, ui_cookie: &str) -> Res
     Ok(done.cookie("__Host-mp_tunnel").expect("tunnel cookie"))
 }
 
+/// The management host on the tunnels' port, told apart by the name each connection asks for
+/// (`management.listen` = `public.https_listen`): agents, the API and private tunnels' sign-in
+/// work as they do on two ports, and neither side answers for the other's names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn management_shares_the_tunnels_port() {
+    let env = Env::sharing_one_port(Tls::DevCa).await;
+    assert_eq!(env.mgmt_port, env.https_port);
+    let admin = env.admin_token();
+    let body = serde_json::json!({ "email": "ann@example.com", "password": "correct horse battery" });
+    let (status, v) = env.api_json("POST", "/api/v1/users", Some(&admin), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let ann_id = v["user"]["id"].as_str().unwrap().to_string();
+    let ann = sign_in(&env, "ann@example.com", "correct horse battery").await;
+
+    // Her machine signs in and holds its session through the shared port.
+    let body = serde_json::json!({ "owner_user_id": ann_id, "allow_public": true });
+    let (_, v) = env.api_json("POST", "/api/v1/enrollments", Some(&admin), body).await;
+    let (url, ca) = (env.server_url(), env.ca_path.to_string_lossy().to_string());
+    assert_eq!(url, format!("https://localhost:{}", env.https_port));
+    env.cli_ok(&["login", "--server", &url, "--token", v["enrollment_token"].as_str().unwrap(), "--ca-cert", &ca, "--name", "anns-laptop"]).await;
+    let app = common::http_app(Arc::new(tokio::sync::Notify::new())).await;
+    let port = app.port.to_string();
+
+    let site = add_json(&env, &[&port, "--name", "site", "--public"]).await;
+    assert_eq!(site["status"], "ready", "{site}");
+    let site_host = hostname(site["public_url"].as_str().unwrap());
+    let (status, _, _) = env.get_public(&site_host, "/").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A private tunnel sends the browser to sign in on the management host, at the same port.
+    let wiki = add_json(&env, &[&port, "--name", "wiki"]).await;
+    assert_eq!((wiki["status"].as_str(), wiki["visibility"].as_str()), (Some("ready"), Some("private")), "{wiki}");
+    let wiki_host = hostname(wiki["public_url"].as_str().unwrap());
+    let cookie = open_private(&env, &wiki_host, "/whoami", &ann).await.unwrap();
+    let r = env.tunnel_get(&wiki_host, "/whoami", &cookie, false).await;
+    assert!(r.status == 200 && r.body.starts_with("user=ann@example.com"), "{} {}", r.status, r.body);
+
+    // The management UI under a tunnel's name, and a tunnel under the management host's: neither.
+    let req = |path: &str, host: &str| Request::get(path).header(header::HOST, format!("{host}:{}", env.https_port)).body(Full::new(Bytes::new())).unwrap();
+    let resp = env.send(&site_host, env.https_port, req("/login", "localhost")).await;
+    assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert!(resp.headers().contains_key("x-magicpipes-error"), "the tunnels' side answered");
+    let resp = env.send("localhost", env.https_port, req("/", &site_host)).await;
+    assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert!(!resp.headers().contains_key("x-magicpipes-error"), "the management side answered");
+    let (status, v) = env.api("GET", "/api/v1/agents", Some(&admin)).await;
+    assert_eq!((status, v["agents"][0]["connected"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn private_tunnels() {
     let env = Env::new(Tls::DevCa).await;
@@ -2443,7 +2492,15 @@ async fn private_tunnels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Chrome and Node"]
 async fn browser_signs_in_to_private_tunnels() {
-    browser_sign_in(false).await;
+    browser_sign_in(false, false).await;
+}
+
+/// The same with the management host on the tunnels' port: its cookies, redirects and CSP hold
+/// when the two share a listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Chrome and Node"]
+async fn browser_signs_in_through_one_port() {
+    browser_sign_in(false, true).await;
 }
 
 /// The same with sign-in codes on: the note between the password and the code is a
@@ -2451,14 +2508,14 @@ async fn browser_signs_in_to_private_tunnels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Chrome and Node"]
 async fn browser_signs_in_with_a_code() {
-    browser_sign_in(true).await;
+    browser_sign_in(true, false).await;
 }
 
-async fn browser_sign_in(with_code: bool) {
+async fn browser_sign_in(with_code: bool, one_port: bool) {
     let chrome = std::env::var("MAGICPIPES_CHROME").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") { "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() } else { "google-chrome".into() }
     });
-    let env = Env::new(Tls::DevCa).await;
+    let env = if one_port { Env::sharing_one_port(Tls::DevCa).await } else { Env::new(Tls::DevCa).await };
     let admin = env.admin_token();
     let first_password = "correct horse battery";
     let body = serde_json::json!({ "email": "ann@example.com", "password": first_password });
@@ -2489,7 +2546,7 @@ async fn browser_sign_in(with_code: bool) {
 
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/browser-sign-in.mjs");
     // One profile per test: Chrome won't start a second time on one that's in use.
-    let profile = std::env::temp_dir().join(format!("mp-chrome-{}-{}", std::process::id(), if with_code { "code" } else { "password" }));
+    let profile = std::env::temp_dir().join(format!("mp-chrome-{}-{}-{one_port}", std::process::id(), if with_code { "code" } else { "password" }));
     let opts = serde_json::json!({
         "chrome": chrome,
         "first": format!("{}/", first["public_url"].as_str().unwrap()),
