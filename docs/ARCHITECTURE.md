@@ -258,6 +258,22 @@ macOS's allocator measured the same, and it isn't for the agent, whose memory af
 heaps behind. On the server it costs memory too: about 30 MB idle instead of 10, and up to about
 100 MB kept after heavy load instead of 10.
 
+Fast uploads show it most (measured 2026-11-15 with production's x86-64 image, mimalloc 3.3 through
+`libmimalloc-sys` 0.1.49, on one host with an internal Docker network). One 300 MB upload at about
+500 MB/s left the server at 69 MB, and six 50 MB parts at once at 97–112 MB, with a high-water mark
+of 102–140 MB over four runs; mp.applegate.us went from 62 to about 207 MB after uploads to an S3
+store behind a tunnel. It isn't data held up on its way: the agent stayed at 1–2 MB, and on macOS
+the server's high-water mark through a 300 MB upload at 1.5 GB/s was 22 MB. It's memory a worker
+thread freed for another (a chunk read on one, dropped on the other), which mimalloc keeps until
+that thread allocates again, and an idle one doesn't. Repeated rounds don't keep adding to it.
+Smaller yamux windows wouldn't change it, and can't go below 256 KiB per stream anyway (64 MiB per
+connection at 256 streams). `MIMALLOC_PURGE_DELAY=0`, which returns freed memory at once, gave
+about 16% lower high-water marks and 24% less afterwards, in four alternating runs each, with no
+difference in the server's CPU over 20,000 small requests, though at a low rate. A shorter arena
+purge on top was about the same in one run; collecting more often (`MIMALLOC_GENERIC_COLLECT=1000`)
+or keeping no full pages was worse. mp.applegate.us sets it in its environment; it isn't the
+built-in default until the traffic suite has measured it on static Linux.
+
 Measured on a 4-core Linux VM holding the client, server, agent and application, with static musl
 binaries, so these numbers are only relative. [`scripts/bench`](../scripts/bench/README.md) repeats
 these measurements. The last two rows shape the agent's connection with
