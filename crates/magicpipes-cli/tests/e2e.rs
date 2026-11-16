@@ -3220,6 +3220,82 @@ allowed_email_domains = ["team.example.com"]"#;
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// An account for single sign-on only has no password for anyone to pass on: it opens at the
+/// first sign-in through a provider that links accounts by address, which never asks for a new
+/// password. An administrator can also take a password away, where a single sign-on still
+/// reaches its owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accounts_for_single_sign_on_only() {
+    let idp = common::FakeOidc::start().await;
+    let dir = std::env::temp_dir().join(format!("mp-sso-only-{}", std::process::id()));
+    let env = Env::with_config(Tls::DevCa, &idp.config(&dir, "", true)).await;
+    let token = env.admin_token();
+    let admin = admin_session(&env).await;
+    let user = async |email: &str| {
+        let (_, v) = env.api("GET", "/api/v1/users", Some(&token)).await;
+        v["users"].as_array().unwrap().iter().find(|u| u["email"] == email).cloned().unwrap_or_else(|| panic!("no {email}: {v}"))
+    };
+    let password_sign_in = async |email: &str, password: &str| env.ui("/login", None, Some(&[("email", email), ("password", password)])).await.cookie;
+
+    // The Users page offers it first, naming the provider, and shows no password after.
+    let users = env.ui("/users", Some(&admin), None).await;
+    assert!(users.html.contains(r#"value="sso" checked> Single sign-on only, with Fake ID"#), "{}", users.html);
+    let csrf = users.csrf();
+    let added = env.ui("/users", Some(&admin), Some(&[("csrf", &csrf), ("email", "ann@example.com"), ("role", "member"), ("how", "sso")])).await;
+    assert_eq!(added.location.as_deref(), Some("/users?done=user-added-sso"), "{}", added.html);
+    let list = env.ui("/users", Some(&admin), None).await;
+    assert!(list.html.contains(r#"waiting for first sign-in</span><span class="sub flow">through Fake ID"#), "{}", list.html);
+    let a = user("ann@example.com").await;
+    assert_eq!((&a["has_password"], &a["has_single_sign_on"], &a["must_change_password"]), (&Value::Bool(false), &Value::Bool(false), &Value::Bool(false)));
+    // A password typed with that choice is refused, not dropped.
+    let both = [("csrf", csrf.as_str()), ("email", "bob@example.com"), ("role", "member"), ("how", "sso"), ("password", "correct horse battery")];
+    let refused = env.ui("/users", Some(&admin), Some(&both)).await;
+    assert!(refused.status == StatusCode::BAD_REQUEST && refused.html.contains("You typed a password"), "{}", refused.html);
+
+    // The API's way; leaving sign_in out still generates a password, as scripts expect.
+    let (s, v) = env.api_json("POST", "/api/v1/users", Some(&token), serde_json::json!({ "email": "bob@example.com", "sign_in": "sso" })).await;
+    assert!(s == StatusCode::CREATED && v.get("password").is_none() && v["user"]["has_password"] == false, "{v}");
+    for bad in [serde_json::json!({ "email": "c@example.com", "sign_in": "sso", "password": "correct horse battery" }), serde_json::json!({ "email": "c@example.com", "sign_in": "magic" })] {
+        let (s, v) = env.api_json("POST", "/api/v1/users", Some(&token), bad).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")), "{v}");
+    }
+    let (s, v) = env.api_json("POST", "/api/v1/users", Some(&token), serde_json::json!({ "email": "pat@example.com" })).await;
+    assert!(s == StatusCode::CREATED && v["password"].is_string(), "{v}");
+    let (pat_id, pat_password) = (v["user"]["id"].as_str().unwrap().to_string(), v["password"].as_str().unwrap().to_string());
+
+    // Nothing signs in to Ann's account but the provider, whose first sign-in opens it and goes
+    // straight in.
+    assert!(password_sign_in("ann@example.com", "correct horse battery").await.is_none());
+    *idp.person.lock().unwrap() = common::OidcPerson::new("ann-1", "ann@example.com");
+    let ann = session_of(&oidc_sign_in(&env, None).await);
+    let home = env.ui("/", Some(&ann), None).await;
+    assert_eq!(home.status, StatusCode::OK, "never sent to change a password: {:?}", home.location);
+    assert_eq!(user("ann@example.com").await["has_single_sign_on"], true);
+    assert_eq!(env.ui("/users", Some(&admin), None).await.html.matches("waiting for first sign-in").count(), 1, "only Bob still waits");
+
+    // Pat chose a password; the menu names who would still reach them without it.
+    let pat = sign_in(&env, "pat@example.com", &pat_password).await;
+    let list = env.ui("/users", Some(&admin), None).await;
+    assert!(list.html.contains("Remove the password of pat@example.com? They are signed out, and can then sign in only with Fake ID."), "{}", list.html);
+    let removed = env.ui(&format!("/users/{pat_id}"), Some(&admin), Some(&[("csrf", &list.csrf()), ("action", "remove-password")])).await;
+    assert_eq!(removed.location.as_deref(), Some("/users?done=password-removed"), "{}", removed.html);
+    assert_eq!(env.ui("/account", Some(&pat), None).await.location.as_deref(), Some("/login?next=%2Faccount"), "the session it opened ended");
+    assert!(password_sign_in("pat@example.com", &format!("{pat_password} again")).await.is_none());
+    let (s, v) = env.api("DELETE", &format!("/api/v1/users/{pat_id}/password"), Some(&token)).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("not_found")), "nothing left to remove: {v}");
+    *idp.person.lock().unwrap() = common::OidcPerson::new("pat-1", "pat@example.com");
+    let pat = session_of(&oidc_sign_in(&env, None).await);
+    assert_eq!(env.ui("/", Some(&pat), None).await.status, StatusCode::OK);
+
+    // Through the API, a password goes the same way.
+    let (_, v) = env.api_json("POST", "/api/v1/users", Some(&token), serde_json::json!({ "email": "dee@example.com", "password": "correct horse battery" })).await;
+    let dee = v["user"]["id"].as_str().unwrap().to_string();
+    let (s, v) = env.api("DELETE", &format!("/api/v1/users/{dee}/password"), Some(&token)).await;
+    assert!(s == StatusCode::OK && v["user"]["has_password"] == false, "{v}");
+    assert!(password_sign_in("dee@example.com", "correct horse battery").await.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Waits for a WebSocket to be closed by the other side.
 async fn closes_soon<S>(sock: &mut tokio_tungstenite::WebSocketStream<S>) -> bool
 where

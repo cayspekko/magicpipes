@@ -114,6 +114,7 @@ input[aria-invalid=true],select[aria-invalid=true],textarea[aria-invalid=true]{b
 input[type=checkbox],input[type=radio]{accent-color:var(--accent);width:16px;height:16px;margin:0 8px 0 0;vertical-align:-3px}
 label:has(input[type=checkbox]),label:has(input[type=radio]){font-weight:400;color:var(--ink);margin:14px 0 0}
 fieldset.choice{border:0;padding:0;margin:0;min-width:0}fieldset.choice legend{padding:0;font-size:13.5px;font-weight:500;color:var(--ink-2)}
+fieldset.choice:has(input.reveals:not(:checked))+.revealed{display:none}
 td input:not([type]),td input[type=text]{padding:7px 10px;font-size:13.5px}
 .alert{margin:0 0 20px;padding:11px 14px;border-radius:10px;font-size:13.5px;color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--bad) 25%,var(--line))}
 .done{margin:0 0 24px;padding:11px 14px;border-radius:10px;font-size:13.5px;color:var(--ok);background:color-mix(in srgb,var(--ok) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--ok) 25%,var(--line))}
@@ -124,7 +125,7 @@ td input:not([type]),td input[type=text]{padding:7px 10px;font-size:13.5px}
 .steps p{margin:0}.steps .codebox,.steps pre.term{margin-top:12px}
 details.more{margin-top:14px}details.more>summary{padding:2px 0;cursor:pointer;font-size:13.5px;color:var(--ink-2)}details.more>div{margin-top:10px;max-width:62ch;color:var(--ink-2);font-size:13.5px}details.more p{margin:8px 0 0}
 .spaced{margin-top:22px}.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}.note+.row{margin-top:8px}.inline{display:inline}
-.sub.you{display:inline;margin:0 8px 0 0}.sub.wrap{min-width:14em;white-space:normal;overflow-wrap:anywhere}td.wrap{min-width:14em;max-width:28em;white-space:normal;overflow-wrap:anywhere}
+.sub.you{display:inline;margin:0 8px 0 0}.sub.wrap{min-width:14em;white-space:normal;overflow-wrap:anywhere}.sub.flow{white-space:normal;overflow-wrap:anywhere}td.wrap{min-width:14em;max-width:28em;white-space:normal;overflow-wrap:anywhere}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 @media (max-width:1100px){th,td{padding-left:10px;padding-right:10px}}
 @media (max-width:640px){.top-in,main,.foot{padding-left:16px;padding-right:16px}main{padding-top:32px}dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:2px}dd{padding-top:0}}

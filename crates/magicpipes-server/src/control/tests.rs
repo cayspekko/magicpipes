@@ -978,3 +978,42 @@ async fn registering_again_with_one_run_publishes_nothing() {
     f.cp.register(&a, Some(conn), &RegisterTunnel { id: Some(t.id.clone()), ..http("app") }).unwrap();
     assert!(Arc::ptr_eq(&before, &f.data.lookup(&t.hostname).unwrap()), "the same table");
 }
+
+/// Accounts for single sign-on only: none where nothing would open one, and a password is taken
+/// away only where a single sign-on still reaches its owner.
+#[tokio::test]
+async fn accounts_for_single_sign_on_only() {
+    use crate::authz::Role;
+    let f = fixture();
+    let admin = Principal::AdminToken;
+    assert!(f.cp.sign_ons_that_link().is_empty());
+    assert!(f.cp.create_sso_only_user(&admin, "ann@example.com", "", Role::Member).unwrap_err().is(ErrorCode::InvalidRequest), "nobody could sign in to it");
+    let (pat, _) = f.cp.create_user(&admin, "pat@example.com", "", Role::Member, Some("correct horse battery")).await.unwrap();
+    assert!(f.cp.remove_password(&admin, &pat.id).unwrap_err().is(ErrorCode::InvalidRequest), "it would lock them out");
+
+    let dir = f.stop();
+    let secret = dir.join("google-secret");
+    std::fs::write(&secret, "s\n").unwrap();
+    let provider = |link: bool, id: &str, label: &str| {
+        format!("[[oidc]]\nid = \"{id}\"\nlabel = \"{label}\"\nissuer = \"https://{id}.example.test\"\nclient_id = \"c\"\nclient_secret_file = \"{}\"\nlink_by_email = {link}\n", secret.display())
+    };
+    let f = fixture_in(dir, &format!("{}{}", provider(true, "google", "Google"), provider(false, "gh", "GitHub")));
+    assert_eq!(f.cp.sign_ons_that_link(), vec!["Google".to_string()], "only providers that link accounts by address");
+    let ann = f.cp.create_sso_only_user(&admin, "Ann@Example.com", "Ann", Role::Member).unwrap();
+    assert_eq!((ann.email.as_str(), ann.has_password, ann.has_single_sign_on, ann.must_change_password), ("ann@example.com", false, false, false));
+    assert!(ann.personal_tag.is_some());
+    assert!(f.cp.create_sso_only_user(&admin, "ann@example.com", "", Role::Member).unwrap_err().is(ErrorCode::EmailTaken));
+    let member = Principal::User { id: pat.id.clone(), role: Role::Member, tags: vec![] };
+    assert!(f.cp.create_sso_only_user(&member, "bob@example.com", "", Role::Member).is_err(), "administrators only");
+    assert!(f.cp.remove_password(&member, &pat.id).is_err(), "administrators only");
+
+    // Now Google would reach Pat, so the password can go.
+    assert_eq!(f.cp.sign_ons_of(&f.cp.user(&admin, &pat.id).unwrap()), vec!["Google".to_string()]);
+    let pat = f.cp.remove_password(&admin, &pat.id).unwrap();
+    assert!(!pat.has_password && !pat.must_change_password);
+    assert!(f.cp.remove_password(&admin, &pat.id).unwrap_err().is(ErrorCode::NotFound), "nothing left to remove");
+    assert!(f.cp.remove_password(&admin, "us_nobody").unwrap_err().is(ErrorCode::NotFound));
+    let audit = f.cp.audit_entries(&admin, 50).unwrap();
+    assert!(audit.iter().any(|a| a.action == "user.password_remove" && a.resource == pat.id));
+    assert!(audit.iter().any(|a| a.action == "user.create" && a.detail.ends_with("single sign-on")));
+}

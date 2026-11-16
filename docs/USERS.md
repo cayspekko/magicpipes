@@ -430,6 +430,16 @@ gets in; `docs/ARCHITECTURE.md` lists its limits.
   role. Without it, the first user is created with the admin token.
 - **Temporary passwords.** A password an administrator set stops working when its owner signs
   in with SSO, instead of forcing a change they have no use for.
+- **Accounts for single sign-on only.** An administrator can add someone with no password at all
+  (Users page, **Single sign-on only**; API `"sign_in": "sso"`): the account has no identity until
+  their first sign-in through a provider with `link_by_email` (or the proxy, which always links by
+  address) links it, so there's no password for anyone to pass on. It's refused where no provider
+  would link it, since nobody could sign in. **Remove password** takes the password away from an
+  existing account where a provider still reaches it (one they have signed in through, or one that
+  links by address): their sessions and emailed links end, their API tokens stay, and it counts as
+  an administrator vouching for the account, so `disable_idle_after_days` doesn't disable it the
+  next hour for single sign-ons long ago. Sign-in codes and emailed sign-in links need a password,
+  so neither reaches such an account.
 - **Providers that don't verify addresses.** `trust_email` accepts a provider's addresses without
   `email_verified`, for Microsoft Entra (never sends it) and authentik (`false` by default since
   2025.10). Off by default. Anyone who can choose their address at that provider could use an

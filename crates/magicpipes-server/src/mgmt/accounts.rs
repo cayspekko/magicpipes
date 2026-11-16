@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::extract::{AdminPosted, AdminUser, Fields, NoFields, Posted, UiUser};
-use super::html::{Actions, Number, Text, alert, back, badge, chips, count, esc, form_alert, invalid, menu_post, row_menu, table, title_of, when};
+use super::html::{Actions, Number, Text, alert, back, badge, chips, count, esc, form_alert, invalid, menu_post, one_of, row_menu, table, title_of, when};
 use super::picker::{self, Holder, Submitted};
 use super::ui::{Done, done, done_url, failed, logged_in_to, not_there, outcome, page, server_url};
 use crate::authz::{Principal, Role};
@@ -262,6 +262,8 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
     // Behind an authenticating proxy, nobody signs in with a password.
     let passwords = app.control.proxy_auth().is_none();
     let mail = app.control.mail_on();
+    // What opens an account nobody has signed in to yet.
+    let linkers = app.control.sign_ons_that_link();
     // Said of an account disabled for going without a single sign-on, which the next one enables.
     let idle = match app.control.config().users.disable_idle_after_days {
         0 => "no recent sign-in".to_string(),
@@ -273,6 +275,14 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
             (true, _) if u.disabled_reason.is_some() => format!(r#"<span class="status bad">disabled</span><span class="sub">{idle}</span>"#),
             (true, _) => r#"<span class="status bad">disabled</span>"#.to_string(),
             (false, true) => r#"<span class="status warn">must change password</span>"#.to_string(),
+            // Made for single sign-on only, or its password taken away, and no single sign-on yet.
+            (false, false) if !u.has_password && !u.has_single_sign_on => {
+                if linkers.is_empty() {
+                    r#"<span class="status warn">can't sign in</span><span class="sub">no provider links it by address</span>"#.to_string()
+                } else {
+                    format!(r#"<span class="status">waiting for first sign-in</span><span class="sub flow">through {}</span>"#, esc(&one_of(&linkers)))
+                }
+            }
             (false, false) => r#"<span class="status ok">active</span>"#.to_string(),
         };
         let me = matches!(&user.who, Principal::User { id, .. } if *id == u.id);
@@ -301,6 +311,12 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
                 let codes = if u.has_totp { " their sign-in codes are turned off," } else { "" };
                 let reset = format!("Reset the password of {}? Their sessions end, their API tokens are revoked,{codes} and they must replace the new password when they next sign in.", u.email);
                 items.push(post("reset", "Reset password", false, Some(reset)));
+                // Only where a single sign-on would still reach them.
+                let sign_ons = if u.has_password { app.control.sign_ons_of(u) } else { Vec::new() };
+                if !sign_ons.is_empty() {
+                    let remove = format!("Remove the password of {}? They are signed out, and can then sign in only with {}.", u.email, one_of(&sign_ons));
+                    items.push(post("remove-password", "Remove password", false, Some(remove)));
+                }
             }
             let revoke = format!("Revoke every API token of {}? Anything using them stops working.", u.email);
             items.push(post("revoke-tokens", "Revoke API tokens", false, Some(revoke)));
@@ -342,8 +358,27 @@ fn users_page(user: &UiUser, app: &AppState, error: Option<&str>, attempt: Optio
             invalid(bad_password)
         )
     };
-    // With email, an invitation is the usual way, and a password is for someone without an inbox here.
-    let (submit, how_they_sign_in) = if mail {
+    // With a provider that links accounts by address, the choice is how they sign in. Otherwise
+    // with email, an invitation is the usual way, and a password is for someone without an inbox here.
+    let (submit, how_they_sign_in) = if passwords && !linkers.is_empty() {
+        let names = esc(&one_of(&linkers));
+        let how = attempt.and_then(|(f, _)| f.get("how")).unwrap_or("sso");
+        let option = |value: &str, label: &str, class: &str| {
+            let checked = if how == value { " checked" } else { "" };
+            format!(r#"<label><input type="radio" name="how" value="{value}"{class}{checked}> {label}</label>"#)
+        };
+        (
+            format!(
+                r#"<div class="spaced"><fieldset class="choice"><legend>How they sign in</legend>{sso}{invite}{password}</fieldset>
+<div class="revealed">{field}</div></div><button class="btn primary spaced">Add user</button>"#,
+                sso = option("sso", &format!("Single sign-on only, with {names}"), ""),
+                invite = if mail { option("invite", "An emailed invitation, to choose for themselves", "") } else { String::new() },
+                password = option("password", "A password", r#" class="reveals""#),
+                field = password_field("Password (empty = generate one)"),
+            ),
+            format!("With single sign-on only there's no password: the account opens at their first sign-in with {names}. A password you give them is replaced when they first sign in."),
+        )
+    } else if mail {
         (
             format!(
                 r#"<button class="btn primary spaced" name="how" value="invite">Send invitation</button>
@@ -405,26 +440,51 @@ pub async fn create_user(State(app): State<AppState>, Posted(user, fields): Post
     };
     let (email, name, password) = (form.get("email").unwrap_or(""), form.get("display_name").unwrap_or(""), form.get("password").unwrap_or(""));
     let role = form.get("role").and_then(Role::parse).unwrap_or(Role::Member);
-    if app.control.mail_on() && password.is_empty() && form.get("how") != Some("password") {
-        return match app.control.invite(&user.who, email, name, role, &tags).await {
-            Ok(_) => done("/users", Done::InvitationSent),
-            Err(e) => refused(&e.message),
-        };
+    let proxied = app.control.proxy_auth().is_some();
+    // The choice, or the button pressed; a form with neither is the one without email.
+    let how = match form.get("how") {
+        // Nobody signs in with a password behind the proxy.
+        _ if proxied => "sso",
+        Some(how) => how,
+        None if app.control.mail_on() && password.is_empty() => "invite",
+        None => "password",
+    };
+    if !password.is_empty() && how != "password" {
+        return refused("You typed a password but chose another way for them to sign in. Clear the password, or add them with a password.");
+    }
+    // The tags were checked above, and the account exists (with a password to show) whatever happens.
+    let give_tags = |id: &str| {
+        if !tags.is_empty()
+            && let Err(e) = app.control.set_user_tags(&user.who, id, &tags)
+        {
+            tracing::error!(user = %id, error = %e.message, "could not give a new user their tags");
+        }
+    };
+    match how {
+        "invite" => {
+            return match app.control.invite(&user.who, email, name, role, &tags).await {
+                Ok(_) => done("/users", Done::InvitationSent),
+                Err(e) => refused(&e.message),
+            };
+        }
+        "sso" => {
+            return match app.control.create_sso_only_user(&user.who, email, name, role) {
+                Ok(u) => {
+                    give_tags(&u.id);
+                    done("/users", if proxied { Done::UserAddedForProxy } else { Done::UserAddedForSignOn })
+                }
+                Err(e) => refused(&e.message),
+            };
+        }
+        _ => {}
     }
     let created = app.control.create_user(&user.who, email, name, role, (!password.is_empty()).then_some(password)).await;
     let (u, generated) = match created {
         Ok(created) => created,
         Err(e) => return refused(&e.message),
     };
-    // The tags were checked above, and a generated password must reach the page whatever happens.
-    if !tags.is_empty()
-        && let Err(e) = app.control.set_user_tags(&user.who, &u.id, &tags)
-    {
-        tracing::error!(user = %u.id, error = %e.message, "could not give a new user their tags");
-    }
+    give_tags(&u.id);
     match generated {
-        // It can't be used here, and its first sign-in through the proxy removes it.
-        _ if app.control.proxy_auth().is_some() => done("/users", Done::UserAddedForProxy),
         Some(generated) => shown_once(
             &user,
             &format!("Password for {}", u.email),
@@ -473,6 +533,7 @@ pub async fn update_user(State(app): State<AppState>, Path(id): Path<String>, Po
             }
             Err(e) => return (StatusCode::BAD_REQUEST, users_page(&user, &app, Some(&e.message), None)).into_response(),
         },
+        "remove-password" => (app.control.remove_password(&user.who, &id).map(drop), Done::PasswordRemoved),
         "revoke-tokens" => (app.control.revoke_tokens(&user.who, &id).map(drop), Done::TokensRevoked),
         "tags" => (app.control.set_user_tags(&user.who, &id, &[f.tags]).map(drop), Done::TagsSaved),
         "admin" => (app.control.update_user(&user.who, &id, Some(Role::Admin), None).map(drop), Done::RoleChanged),

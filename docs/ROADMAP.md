@@ -397,26 +397,25 @@ management hostname, never the base domain that tunnels share. Signing in with o
 Chrome's virtual authenticator through the headless Chrome script. Worth building when people run
 MagicPipes without an identity provider and ask for it.
 
-**Accounts for single sign-on only** (phase 4c). Without a mail server, an administrator who adds a
-person (Users page or `POST /api/v1/users`) always gets a generated password, shown once with "they
-must replace it when they first sign in", and the Users list says **must change password** until
-then. For someone who will only ever sign in with Google, that's a password nobody needs, to pass on
-over a channel you trust. Their first sign-in through a provider does delete it and asks for no
-change, but the administrator has already had to handle it. Found while moving a team's devbox
-onto mp.applegate.us with Google sign-in. To build:
+**Accounts for single sign-on only** (phase 4c, done). Without a mail server, an administrator who
+added a person always got a generated password, shown once with "they must replace it when they
+first sign in": for someone who will only ever sign in with Google, a password nobody needs, to pass
+on over a channel you trust. Found while moving a team's devbox onto mp.applegate.us with Google
+sign-in. Built:
 
-- On the Users page, a "How they sign in" choice: **Single sign-on only** (no password at all; the
-  default when a provider links first sign-ins by email, since that's how such an account is
-  reached) or **Password**, beside the email invitation when there's a mail server. The page then
-  says the account waits for their first sign-in, naming the providers that can link it.
-- In the API, an optional `"sign_in": "sso"` on `POST /api/v1/users`; leaving it out keeps
-  today's generated password, so scripts are unaffected.
-- In the Users list, **single sign-on** in place of **must change password** for such an account.
-- **Remove password** for an existing account (administrators), making it single sign-on only, with
-  the confirmation naming the effect, such as "They can then only sign in with Google". The store
-  already has accounts without a password: the ones single sign-on creates.
-- An e2e test that an account created this way can't sign in with a password, links on its first
-  sign-in through the fake provider, and is never sent to change a password.
+- On the Users page, where a provider links first sign-ins by address (`link_by_email`), a "How
+  they sign in" choice: **Single sign-on only, with Google** (first, and chosen), an emailed
+  invitation when there's a mail server, or **A password**, whose field shows only when chosen (CSS,
+  no script). Behind the authenticating proxy everyone added there is single sign-on only. Without
+  such a provider the form is as before: nothing would open the account.
+- In the API, an optional `"sign_in": "sso"` on `POST /api/v1/users`; leaving it out keeps the
+  generated password, so scripts are unaffected. Users carry `has_single_sign_on`.
+- In the Users list, **waiting for first sign-in**, through which providers, until then.
+- **Remove password** in a person's row menu and `DELETE /api/v1/users/{id}/password`, offered and
+  allowed only where a provider still reaches them, with the question naming the effect ("They are
+  signed out, and can then sign in only with Google.").
+- The e2e test `accounts_for_single_sign_on_only`: such an account can't sign in with a password,
+  opens at its first sign-in through the fake provider, and is never sent to change a password.
 
 ## Monitoring: health, history, alerts and synthetic checks
 
@@ -650,7 +649,7 @@ Each phase ships on its own with end-to-end tests and a case in the cross-platfo
 | 3 | TCP ports (allocator, listener manager, `--allow-cidr`) | yes | done |
 | 4 | Users, SSO login, tag-based access, audit log ([design](USERS.md)) | yes | done (password accounts, tags, private tunnels, OIDC and GitHub sign-in, the Settings page, the authenticating proxy, email, `magicpipes connect`, tag rules from groups, claims, GitHub teams and address domains, disabling accounts single sign-on went quiet about, and sign-in codes from an authenticator app); the rest of "Left for later" in USERS.md to come |
 | 4b | Passkeys for password accounts (WebAuthn; [why only these](#prerequisite-for-browser-access-and-the-ssh-gateway-users)) | yes | later, when asked for |
-| 4c | Accounts for single sign-on only: add a person without a password, and Remove password ([plan](#prerequisite-for-browser-access-and-the-ssh-gateway-users)) | yes | planned |
+| 4c | Accounts for single sign-on only: add a person without a password, and Remove password ([plan](#prerequisite-for-browser-access-and-the-ssh-gateway-users)) | yes | done (Users page and API) |
 | 5 | SSH gateway + SSH web terminal | yes | done (certificates from the server's own authority) |
 | 5b | SSH files in the browser: an SFTP browser beside the terminal (`russh-sftp`) | yes | planned |
 | 6 | Web RDP (IronRDP) + VNC (noVNC) | yes | done (RDP used against Windows 11 with NLA; VNC built, not yet tried against a real VNC server) |

@@ -44,12 +44,15 @@ pub struct UserRow {
     pub email_verified: bool,
     /// Signing in with a password or an emailed link also takes a code from an authenticator app.
     pub has_totp: bool,
+    /// The issuers of the single sign-ons that reach it: providers and the authenticating proxy.
+    pub sso_issuers: Vec<String>,
 }
 
 pub(super) const USER_SELECT: &str = "SELECT u.id, u.email, u.display_name, m.role, u.disabled_at, COALESCE(p.must_change, 0),
     u.sessions_valid_after, u.created_at, (SELECT MAX(i.last_login_at) FROM identities i WHERE i.user_id = u.id),
     p.user_id IS NOT NULL, u.email_verified_at IS NOT NULL, u.disabled_reason IS 'idle',
-    EXISTS (SELECT 1 FROM totp t WHERE t.user_id = u.id)
+    EXISTS (SELECT 1 FROM totp t WHERE t.user_id = u.id),
+    (SELECT group_concat(i.issuer, char(10)) FROM identities i WHERE i.user_id = u.id AND i.issuer != 'local')
     FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = 'org_default'
     LEFT JOIN passwords p ON p.user_id = u.id";
 
@@ -72,6 +75,7 @@ pub(super) fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         has_password: r.get(9)?,
         email_verified: r.get(10)?,
         has_totp: r.get(12)?,
+        sso_issuers: r.get::<_, Option<String>>(13)?.map(|s| s.lines().map(str::to_string).collect()).unwrap_or_default(),
     })
 }
 
@@ -147,6 +151,17 @@ impl Store {
 
     /// Creates a password account. Returns `None` if the email already has an account.
     pub fn create_user(&self, email: &str, display_name: &str, role: Role, password_hash: &str) -> anyhow::Result<Option<String>> {
+        self.add_user(email, display_name, role, Some(password_hash))
+    }
+
+    /// Creates an account with no password and no identity yet, for someone who will only sign in
+    /// through single sign-on: their first one links it by its address, where the provider allows
+    /// that. Returns `None` if the email already has an account.
+    pub fn create_user_without_password(&self, email: &str, display_name: &str, role: Role) -> anyhow::Result<Option<String>> {
+        self.add_user(email, display_name, role, None)
+    }
+
+    fn add_user(&self, email: &str, display_name: &str, role: Role, password_hash: Option<&str>) -> anyhow::Result<Option<String>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE email = ?1)", [email], |r| r.get(0))?;
@@ -154,8 +169,10 @@ impl Store {
             return Ok(None);
         }
         let id = insert_user(&tx, email, display_name, role)?;
-        tx.execute("INSERT INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![LOCAL_ISSUER, email, id])?;
-        tx.execute("INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, ?2, 1, ?3)", params![id, password_hash, unix_now()])?;
+        if let Some(hash) = password_hash {
+            tx.execute("INSERT INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![LOCAL_ISSUER, email, id])?;
+            tx.execute("INSERT INTO passwords (user_id, hash, must_change, updated_at) VALUES (?1, ?2, 1, ?3)", params![id, hash, unix_now()])?;
+        }
         tx.commit()?;
         Ok(Some(id))
     }
@@ -269,6 +286,24 @@ impl Store {
             params![user_id, hash, must_change as i64, unix_now()],
         )?;
         tx.execute("INSERT OR IGNORE INTO identities (issuer, subject, user_id) VALUES (?1, ?2, ?3)", params![LOCAL_ISSUER, email, user_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Takes an account's password away, so that it signs in only through single sign-on, and ends
+    /// its sessions and emailed links as a password change does. An administrator doing this
+    /// vouches for the account, as enabling one does, so it isn't disabled at once for having gone
+    /// without a single sign-on. `false` if it had no password.
+    pub fn remove_password(&self, user_id: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        if tx.execute("DELETE FROM passwords WHERE user_id = ?1", [user_id])? == 0 {
+            return Ok(false);
+        }
+        let now = unix_now();
+        tx.execute("UPDATE users SET sessions_valid_after = ?1, vouched_at = ?1 WHERE id = ?2", params![now, user_id])?;
+        tx.execute("DELETE FROM email_tokens WHERE user_id = ?1", [user_id])?;
+        tx.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
         tx.commit()?;
         Ok(true)
     }
@@ -605,6 +640,42 @@ mod tests {
         assert!(s.set_password(&ann, "temporary", true).unwrap());
         assert_eq!(s.password_login("ann@example.com").unwrap().unwrap().1, "temporary");
         assert!(!s.set_password("us_nobody", "x", true).unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn accounts_without_a_password() {
+        let (s, dir) = store();
+        let iss = "https://idp.example.com";
+        let ann = s.create_user_without_password("ann@example.com", "Ann", Role::Member).unwrap().unwrap();
+        let row = s.user(&ann).unwrap().unwrap();
+        assert!(!row.has_password && !row.must_change_password && row.sso_issuers.is_empty() && row.last_login_at.is_none());
+        assert!(s.password_login("ann@example.com").unwrap().is_none(), "no way in until a single sign-on links it");
+        assert!(s.create_user_without_password("ann@example.com", "", Role::Member).unwrap().is_none());
+        assert!(s.create_user("ann@example.com", "", Role::Member, "hash").unwrap().is_none());
+        assert_eq!(s.tags().unwrap().iter().filter(|t| t.user_id.as_deref() == Some(ann.as_str())).count(), 1, "it has its personal tag");
+        assert!(s.link_identity(&ann, iss, "sub-ann").unwrap());
+        s.finish_sso_login(&ann, iss).unwrap();
+        let row = s.user(&ann).unwrap().unwrap();
+        assert_eq!((row.sso_issuers, row.has_password, row.last_login_at.is_some()), (vec![iss.to_string()], false, true));
+
+        // Taking a password away: it stops working, and so do the sessions it may have opened.
+        let pat = s.create_user("pat@example.com", "Pat", Role::Member, "hash").unwrap().unwrap();
+        assert!(s.link_identity(&pat, iss, "sub-pat").unwrap());
+        s.with(|c| c.execute("UPDATE users SET created_at = 0 WHERE id = ?1", [&pat])).unwrap();
+        let (cookie, _) = s.create_session(Some(&pat), 60).unwrap();
+        assert!(s.remove_password(&pat).unwrap());
+        assert!(s.password_login("pat@example.com").unwrap().is_none());
+        assert!(s.session(&cookie).unwrap().is_none());
+        let row = s.user(&pat).unwrap().unwrap();
+        assert_eq!((row.has_password, row.must_change_password, row.sso_issuers), (false, false, vec![iss.to_string()]));
+        assert!(!s.remove_password(&pat).unwrap(), "nothing left to remove");
+        assert!(!s.remove_password("us_nobody").unwrap());
+        // An old account whose single sign-on went quiet isn't disabled the moment its password goes.
+        assert!(s.disable_idle(unix_now() - 60, "idle").unwrap().is_empty());
+        // And an administrator can give it one again.
+        assert!(s.set_password(&pat, "new", true).unwrap());
+        assert_eq!(s.password_login("pat@example.com").unwrap().unwrap().1, "new");
         std::fs::remove_dir_all(dir).ok();
     }
 

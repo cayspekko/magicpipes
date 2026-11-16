@@ -64,6 +64,15 @@ pub(super) fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// `A`, `A or B`, `A, B or C`.
+pub(super) fn one_of(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 /// The color of a state.
 pub(super) fn tone(state: &str) -> &'static str {
     match state {

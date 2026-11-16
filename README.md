@@ -277,6 +277,16 @@ let the server generate one, shown once). Everyone must replace a password set b
 administrator when they first sign in. With a mail server, they're invited by email instead: see
 [Email](#email).
 
+Someone who will only ever sign in with Google (or another provider) needs no password at all.
+Where a provider has `link_by_email = true`, or behind the [authenticating proxy](#authenticating-proxy),
+**How they sign in** offers **Single sign-on only**, already chosen: the account has no password,
+the Users list says it's **waiting for first sign-in** and through which provider, and their first
+sign-in there opens it, with nothing to change. Without such a provider nothing would open it, so the
+choice isn't offered. **Remove password** in a person's row menu does the same for an existing
+account: they're signed out, their API tokens keep working, and from then on they sign in only
+through single sign-on. It's offered only where a provider still reaches them. **Reset password**
+gives them one again.
+
 * **Roles**: *administrators* manage tunnels, agents, users, tags, enrollment tokens and the
   audit log; *members* manage their own account (password, API tokens, sessions) and their own
   machines and tunnels. Design: [docs/USERS.md](docs/USERS.md).
@@ -597,7 +607,8 @@ the account is created then. Having the link is the proof, so a provider's own i
 doesn't matter and the account gets the invited address, verified. Pending invitations are listed on
 the same page, where you can send one again (the old link stops working) or revoke it. One from an
 administrator who is disabled or made a member ends with that. Adding someone with a password is
-still there under **Set a password yourself instead**.
+still there under **Set a password yourself instead**, or, with a provider that links accounts by
+address, as one of the choices under **How they sign in**.
 
 **Sign-in links.** **Forgot your password?** on the sign-in page emails a link that works once, for
 15 minutes. Whoever uses it can also choose a new password, which ends their other sessions. A link
@@ -1496,10 +1507,11 @@ answer `403 forbidden` to members.
 | POST | `/api/v1/probes` | `{"kept": n}`; body `{"results": [{"tunnel", "ok", "said"?}]}`, at most 200: what `magicpipes probe` found from outside. Results for tunnels you don't manage are left out |
 | GET | `/api/v1/connect/{name}` | With a connect pass: `{"name", "kind", "online"}` for a private TCP or UDP tunnel or a remote desktop you can reach, else 404; with `Upgrade: magicpipes-connect/1`, a connection to it (used by `connect`) |
 | GET | `/api/v1/users` | `{"users": [...]}`: every account for administrators, your own for members |
-| POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?}`. Without `password` one is generated and returned once. `409 email_taken` if the email has an account |
+| POST | `/api/v1/users` | 201 `{"user", "password"?}`; body `{"email", "display_name"?, "role"?, "password"?, "sign_in"?}`. Without `password` one is generated and returned once. `"sign_in": "sso"` makes an account with no password, which the first single sign-on through a provider with `link_by_email` (or the proxy) opens; `400 invalid_request` with a `password`, or where no provider would open it. `409 email_taken` if the email has an account |
 | GET | `/api/v1/users/{id}` | One user |
 | PATCH | `/api/v1/users/{id}` | `{"role"?: "admin" \| "member", "disabled"?: bool, "tags"?: [...]}`; role and status not for your own account |
 | POST | `/api/v1/users/{id}/password` | `{"password"}`: a new generated password the user must change; ends their sessions and revokes their API tokens |
+| DELETE | `/api/v1/users/{id}/password` | `{"user"}`: removes the password, so they sign in only through single sign-on; ends their sessions, keeps their API tokens. `404 not_found` if they have none; `400 invalid_request` where no single sign-on would reach them |
 | DELETE | `/api/v1/users/{id}/tokens` | `{"revoked": n}`: revokes all of a user's API tokens (your own, or anyone's for an administrator) |
 | GET | `/api/v1/invitations` | `{"invitations": [...]}`, newest first (administrators) |
 | POST | `/api/v1/invitations` | 201 `{"invitation"}`, once the mail server has taken the message; body `{"email", "display_name"?, "role"?, "tags"?}`. Replaces any invitation for that address. `409 email_taken`, `409 mail_not_configured`, `502 mail_failed` |
@@ -1519,7 +1531,9 @@ User object: `id`, `email`, `display_name`, `role`, `has_totp` (signing in with 
 takes a code), `disabled`, `disabled_reason` (only `idle`, when
 `disable_idle_after_days` did it rather than an administrator: their next single sign-on enables it
 again), `must_change_password`,
-`has_password` (false for someone who only signs in with single sign-on), `email_verified` (they
+`has_password` (false for someone who only signs in with single sign-on), `has_single_sign_on`
+(they have signed in through a provider or the proxy; false with no password either means the
+account waits for its first single sign-on), `email_verified` (they
 proved the address is theirs), `tags` (assigned), `rule_tags` (given by tag rules now), `personal_tag`,
 `created_at`, `last_login_at`.
 

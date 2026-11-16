@@ -24,6 +24,8 @@ pub const MIN_PASSWORD_CHARS: usize = 12;
 const MAX_PASSWORD_BYTES: usize = 256;
 /// Length of passwords the server generates (base62, ~119 bits).
 const GENERATED_PASSWORD_CHARS: usize = 20;
+/// Why an account without a password couldn't be reached.
+const NO_SIGN_ON_LINKS: &str = "no single sign-on provider links a first sign-in to an existing account by its address (link_by_email)";
 
 /// After this many failures within [`ACCOUNT_WINDOW`], an account accepts one attempt per
 /// [`ACCOUNT_SPACING`], right password or not. That slows guessing down without letting anyone
@@ -143,6 +145,12 @@ pub struct UserView {
     pub email_verified: bool,
     /// Signing in with their password also takes a code from an authenticator app.
     pub has_totp: bool,
+    /// They have signed in through single sign-on (a provider or the authenticating proxy). False
+    /// with no password either: the account waits for the first one.
+    pub has_single_sign_on: bool,
+    /// The issuers of those sign-ons.
+    #[serde(skip)]
+    pub sso_issuers: Vec<String>,
     /// Tags assigned by administrators.
     pub tags: Vec<String>,
     /// Tags that tag rules give them now.
@@ -168,6 +176,8 @@ impl From<UserRow> for UserView {
             has_password: u.has_password,
             email_verified: u.email_verified,
             has_totp: u.has_totp,
+            has_single_sign_on: !u.sso_issuers.is_empty(),
+            sso_issuers: u.sso_issuers,
             tags: Vec::new(),
             rule_tags: Vec::new(),
             personal_tag: None,
@@ -503,6 +513,80 @@ impl ControlPlane {
         self.refresh();
         let user = self.store.user(&id).map_err(internal)?.ok_or_else(|| err(ErrorCode::Internal, "the new user disappeared"))?;
         Ok((self.user_view(user), generated))
+    }
+
+    /// Creates an account with no password, for someone who will only sign in through single
+    /// sign-on: their first one, through a provider that links accounts by address, opens it.
+    /// Refused where nothing would.
+    pub fn create_sso_only_user(&self, who: &Principal, email: &str, display_name: &str, role: Role) -> Result<UserView, ErrorBody> {
+        if !authz::authorize(who, Action::Manage, Resource::Org) {
+            return Err(denied(who));
+        }
+        let email = normalize_email(email).ok_or_else(|| err(ErrorCode::InvalidRequest, "that is not an email address"))?;
+        let display_name = clean_name(display_name, 100);
+        if self.sign_ons_that_link().is_empty() {
+            return Err(err(ErrorCode::InvalidRequest, format!("nobody could sign in to it: {NO_SIGN_ON_LINKS}. Give them a password instead")));
+        }
+        let id = self
+            .store
+            .create_user_without_password(&email, &display_name, role)
+            .map_err(internal)?
+            .ok_or_else(|| err(ErrorCode::EmailTaken, format!("an account for {email} already exists")))?;
+        self.audit(who, "user.create", &id, &format!("{email} {} single sign-on", role.as_str()));
+        self.refresh();
+        let user = self.store.user(&id).map_err(internal)?.ok_or_else(|| err(ErrorCode::Internal, "the new user disappeared"))?;
+        Ok(self.user_view(user))
+    }
+
+    /// The single sign-ons that open an account someone hasn't signed in to yet, by its address,
+    /// as people know them: the providers that link accounts by email, or the authenticating proxy.
+    pub fn sign_ons_that_link(&self) -> Vec<String> {
+        self.sign_ons(|_| false)
+    }
+
+    /// The single sign-ons that reach `user`: the ones they have signed in through, and the ones
+    /// that would link their account.
+    pub fn sign_ons_of(&self, user: &UserView) -> Vec<String> {
+        self.sign_ons(|issuer| user.sso_issuers.iter().any(|i| i == issuer))
+    }
+
+    fn sign_ons(&self, linked: impl Fn(&str) -> bool) -> Vec<String> {
+        // Behind the proxy it's the only way in, and it links by address.
+        if self.proxy_auth().is_some() {
+            return vec!["the authenticating proxy".to_string()];
+        }
+        let mut labels: Vec<String> = Vec::new();
+        for p in self.oidc_providers().iter().filter(|p| p.link_by_email || linked(&p.issuer)) {
+            if !labels.contains(&p.label) {
+                labels.push(p.label.clone());
+            }
+        }
+        labels
+    }
+
+    /// Takes the password away from an account, which then signs in only through single sign-on.
+    /// Its sessions end, as with a new password; its API tokens keep working. Refused where no
+    /// single sign-on reaches it, so nobody is locked out.
+    pub fn remove_password(&self, who: &Principal, id: &str) -> Result<UserView, ErrorBody> {
+        if !authz::authorize(who, Action::Manage, Resource::Org) {
+            return Err(denied(who));
+        }
+        let user = self.store.user(id).map_err(internal)?.ok_or_else(|| err(ErrorCode::NotFound, "no such user"))?;
+        let view = self.user_view(user);
+        if !view.has_password {
+            return Err(err(ErrorCode::NotFound, format!("{} has no password", view.email)));
+        }
+        if self.sign_ons_of(&view).is_empty() {
+            return Err(err(ErrorCode::InvalidRequest, format!("{} would have no way to sign in: they haven't signed in through single sign-on, and {NO_SIGN_ON_LINKS}", view.email)));
+        }
+        if !self.store.remove_password(id).map_err(internal)? {
+            return Err(err(ErrorCode::NotFound, format!("{} has no password", view.email)));
+        }
+        self.audit(who, "user.password_remove", id, "");
+        // Tunnel cookies from before now stop working too.
+        self.refresh();
+        let user = self.store.user(id).map_err(internal)?.ok_or_else(|| err(ErrorCode::NotFound, "no such user"))?;
+        Ok(self.user_view(user))
     }
 
     /// Changes another account's role or disables or enables it.

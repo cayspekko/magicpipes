@@ -61,6 +61,8 @@ done_messages! {
     PasswordChanged "password-changed" "Password changed. Other devices were signed out.",
     UserAdded "user-added" "User added. They replace that password when they first sign in.",
     UserAddedForProxy "user-added-proxy" "User added.",
+    UserAddedForSignOn "user-added-sso" "User added, with no password. The account opens at their first single sign-on.",
+    PasswordRemoved "password-removed" "Password removed. They were signed out, and from now on sign in only through single sign-on.",
     RoleChanged "role-changed" "Role changed.",
     UserDisabled "user-disabled" "User disabled. They were signed out, and their machines stopped serving tunnels.",
     UserEnabled "user-enabled" "User enabled.",

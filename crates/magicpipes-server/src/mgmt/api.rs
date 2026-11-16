@@ -234,11 +234,24 @@ pub struct NewUser {
     role: Option<String>,
     /// Omitted: the server generates one and returns it once.
     password: Option<String>,
+    /// `"password"` (the default) or `"sso"`: no password at all, for someone who will only sign in
+    /// through single sign-on.
+    sign_in: Option<String>,
 }
 
-/// Creates a password account. The user must change the password at first login.
+/// Creates a password account, which the user must change at first sign-in, or one for single
+/// sign-on only.
 pub async fn create_user(Caller(who): Caller, State(app): State<AppState>, Json(req): Json<NewUser>) -> Result<impl IntoResponse, ApiError> {
     let role = parse_role(req.role.as_deref())?.unwrap_or(Role::Member);
+    match req.sign_in.as_deref() {
+        None | Some("password") => {}
+        Some("sso") if req.password.is_some() => return Err(api_err(ErrorCode::InvalidRequest, "an account for single sign-on only has no password")),
+        Some("sso") => {
+            let user = app.control.create_sso_only_user(&who, &req.email, &req.display_name, role).map_err(ApiError)?;
+            return Ok((StatusCode::CREATED, Json(json!({ "user": user }))));
+        }
+        Some(_) => return Err(api_err(ErrorCode::InvalidRequest, "sign_in must be \"password\" or \"sso\"")),
+    }
     let (user, generated) =
         app.control.create_user(&who, &req.email, &req.display_name, role, req.password.as_deref()).await.map_err(ApiError)?;
     let mut body = json!({ "user": user });
@@ -314,6 +327,12 @@ pub async fn update_user(
 pub async fn reset_password(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
     let password = app.control.reset_password(&who, &id).await.map_err(ApiError)?;
     Ok(Json(json!({ "password": password })))
+}
+
+/// Takes a user's password away, so they sign in only through single sign-on.
+pub async fn remove_password(Caller(who): Caller, State(app): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
+    let user = app.control.remove_password(&who, &id).map_err(ApiError)?;
+    Ok(Json(json!({ "user": user })))
 }
 
 /// Revokes all of a user's API tokens.
