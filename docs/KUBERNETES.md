@@ -25,6 +25,12 @@ It's `FROM scratch` with only the static `magicpipes` binary, running as user 65
 certificate authorities it was built with, so it needs no CA bundle. `docker build` without
 `--target` still builds the server image.
 
+A release can push both images, for `linux/amd64` and `linux/arm64`, to a registry of your choice
+as `<repository>/magicpipes-agent:<version>` and `<repository>/magicpipes:<version>`, made from the
+release's own binaries (README, [CI and releases](../README.md#ci-and-releases)). If that registry
+is private, give the pods an `imagePullSecrets` entry with a token that can only read it, such as a
+GitLab deploy token with `read_registry`.
+
 ## Settings
 
 | Variable | |
@@ -148,7 +154,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: agent
-          image: registry.example.com/magicpipes-agent:0.1.1
+          image: registry.example.com/magicpipes-agent:0.2.0
           env:
             - {name: MAGICPIPES_CONFIG, value: /etc/magicpipes/identity/config.json}
             - {name: MAGICPIPES_TUNNELS_FILE, value: /etc/magicpipes/tunnels/tunnels}
@@ -194,7 +200,7 @@ The same container, next to the app, with the app at `127.0.0.1`:
           image: registry.example.com/shop:1.4
           ports: [{containerPort: 8080}]
         - name: magicpipes
-          image: registry.example.com/magicpipes-agent:0.1.1
+          image: registry.example.com/magicpipes-agent:0.2.0
           env:
             - {name: MAGICPIPES_CONFIG, value: /etc/magicpipes/identity/config.json}
             - {name: MAGICPIPES_TUNNELS, value: "8080 --name shop --public"}

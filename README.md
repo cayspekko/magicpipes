@@ -58,10 +58,10 @@ Prebuilt archives are attached to each
 
 | Platform | Archive |
 |---|---|
-| macOS, Apple silicon | `magicpipes-<version>-aarch64-apple-darwin.tar.gz` |
-| Windows x86-64 | `magicpipes-<version>-x86_64-pc-windows-msvc.zip` |
-| Linux x86-64 (static) | `magicpipes-<version>-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 (static) | `magicpipes-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| macOS, Apple silicon | `magicpipes-v<version>-aarch64-apple-darwin.tar.gz` |
+| Windows x86-64 | `magicpipes-v<version>-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 (static) | `magicpipes-v<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 (static) | `magicpipes-v<version>-aarch64-unknown-linux-musl.tar.gz` |
 
 Or build from source:
 
@@ -1381,8 +1381,9 @@ agents can't both run, because only one agent per `MAGICPIPES_HOME` can exist.
 
 ### In a container or Kubernetes
 
-`docker build --target agent -t magicpipes-agent .` builds an image of the agent alone, which runs
-`magicpipes agent run` set up by its environment:
+`docker build --target agent -t magicpipes-agent .` builds an image of the agent alone (releases can
+also push it to a registry: [CI and releases](#ci-and-releases)). It runs `magicpipes agent run`
+set up by its environment:
 
 ```bash
 docker run -d -v magicpipes-agent:/data -e MAGICPIPES_SERVER=https://mp.example.com \
@@ -1739,22 +1740,37 @@ pull request: clippy and the test suite on Linux and macOS, clippy on Windows, `
 check`, and a build of both images from the `Dockerfile` (the server, and `--target agent`),
 each of which then runs its binary's `--version`. Images are built, never pushed.
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) runs only when a GitHub
-release is published:
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs when a GitHub release is
+published:
 
 1. clippy and the test suite on Linux and macOS;
 2. a release build for each of the four targets above, each on its own OS (native ARM64
    runners for Linux ARM64);
 3. `scripts/smoke-test.sh` against each build on that OS: real server with a dev CA, login,
    `add`, a public HTTPS request through the tunnel, `agent stop`;
-4. if every platform passed, the four archives, the bare binaries, `SHA256SUMS` and the manifest
+4. the server and agent images for `linux/amd64` and `linux/arm64`, made from those same Linux
+   binaries (`docker/Dockerfile.release`, `scripts/release-images.sh`), the amd64 ones run once;
+5. if all of that passed, the four archives, the bare binaries, `SHA256SUMS` and the manifest
    `--upgrade` reads are attached to the release: `release.json`, listing each binary's address
-   and SHA-256, and `release.json.sig`, its Ed25519 signature.
+   and SHA-256, and `release.json.sig`, its Ed25519 signature;
+6. then, if a registry is set up (below), the images are pushed as `<repository>/magicpipes` and
+   `<repository>/magicpipes-agent`, tagged with the version and, unless it's a pre-release,
+   `latest`.
 
-To publish, create a GitHub release with a tag such as `0.2.0` on a commit from `main`. The
-workflow refuses tags that aren't on `main` or don't match the `version` in `Cargo.toml` (bump that
-first: binaries compare it with the release's to decide whether to upgrade). Release notes that
-contain `[security]` mark it as a security fix. The toolchain is pinned to Rust 1.99.
+To publish, bump the `version` in `Cargo.toml` on `main` (binaries compare it with the release's
+to decide whether to upgrade), then create a GitHub release with the tag `v` and that version, such
+as `v0.2.0`, on a commit from `main`. The workflow refuses tags without the `v`, tags that aren't on
+`main`, and tags that don't match `Cargo.toml`. Release notes that contain `[security]` mark it as a
+security fix. The toolchain is pinned to Rust 1.99.
+
+To try all of it first, choose **Run workflow** on the workflow's page under Actions: a dry run
+runs the same tests, builds, smoke tests and images, and publishes and pushes nothing.
+
+The images go to the registry named by the `release` environment's variable `IMAGE_REPOSITORY`
+(such as `registry.gitlab.com/your-group/magicpipes`), signed in with its secrets
+`IMAGE_REGISTRY_USERNAME` and `IMAGE_REGISTRY_PASSWORD`. Use a token that can only push to that
+one place, such as a GitLab project deploy token with `read_registry` and `write_registry`.
+Without `IMAGE_REPOSITORY`, a release pushes no images and says so.
 
 The manifest is signed in the `publish` job, which runs in a GitHub environment named `release`
 holding the secret `MAGICPIPES_RELEASE_KEY`. To set it up once, run `scripts/release-key.sh`, which
@@ -1762,8 +1778,8 @@ makes the key with OpenSSL, add the public key it prints to `RELEASE_KEYS` in
 `crates/magicpipes-core/src/release.rs`, and store the private key as that secret. Binaries
 install only releases signed by a key they were built with, so the workflow also refuses a key
 that isn't in that list. Whoever controls the repository can therefore ship an upgrade.
-To check builds without releasing, run `cargo test --workspace` and `scripts/smoke-test.sh`
-locally.
+On your own machine, `cargo test --workspace` and `scripts/smoke-test.sh <bin dir>` check a build
+for that platform.
 
 The end-to-end tests in `crates/magicpipes-cli/tests/e2e.rs` start real `magicpipesd` and
 `magicpipes` processes and cover HTTP, streaming, WebSockets, the UI, the API, agent and server

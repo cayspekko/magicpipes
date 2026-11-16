@@ -228,9 +228,9 @@ def send(op, data):
     mask, n = os.urandom(4), len(data)
     size = bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n)
     sock.sendall(bytes([0x80 | op]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
-screen = ""
+screen, answered = "", 0
 def until(text):
-    global screen
+    global screen, answered
     deadline = time.time() + 20
     while text not in screen:
         if time.time() > deadline: sys.exit(f"timed out waiting for {text!r}; screen: {screen!r}")
@@ -238,7 +238,13 @@ def until(text):
         n = b1 & 127
         n = struct.unpack(">H", read(2))[0] if n == 126 else struct.unpack(">Q", read(8))[0] if n == 127 else n
         op, data = b0 & 15, read(n)
-        if op == 2: screen += data.decode(errors="replace")
+        if op == 2:
+            screen += data.decode(errors="replace")
+            # Windows' pseudo-console asks where the cursor is and shows nothing until it's told, as
+            # xterm.js does in the browser.
+            while screen.count("\x1b[6n") > answered:
+                answered += 1
+                send(2, b"\x1b[1;1R")
         elif op == 1:
             print("control:", data.decode())
             if json.loads(data)["type"] != "ready": sys.exit("session refused")

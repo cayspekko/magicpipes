@@ -1,14 +1,19 @@
-# Runs only when a GitHub release is published: tests, builds magicpipes + magicpipesd for four
-# platforms, smoke-tests each build on its own OS, and attaches the archives, the bare binaries,
-# SHA256SUMS and the signed manifest `--upgrade` reads (release.json and release.json.sig) to the
-# release. Nothing is published unless every platform passes. A release whose notes contain
+# Runs when a GitHub release is published: tests, builds magicpipes + magicpipesd for four
+# platforms, smoke-tests each build on its own OS, builds the server and agent images from the Linux
+# builds, then attaches the archives, the bare binaries, SHA256SUMS and the signed manifest
+# `--upgrade` reads (release.json and release.json.sig) to the release and pushes the images.
+# Nothing is published unless every platform and both images pass. A release whose notes contain
 # "[security]" is marked as a security fix, which servers raise an alert about until they have it.
+#
+# "Run workflow" (workflow_dispatch) is a dry run: the same tests, builds, smoke tests and images,
+# with nothing published or pushed.
 
 name: Build and release
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,6 +28,43 @@ env:
 # Dockerfile, so new compiler or clippy releases never break a release build.
 
 jobs:
+  name:
+    name: Name the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.name.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the tag
+        id: name
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_EVENT_NAME" != release ]]; then
+            echo "Dry run of ${version} from ${GITHUB_REF_NAME}: nothing will be published."
+            echo "tag=dry-run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Only the release environment can sign, and it admits only tags matching v*.
+          if [[ "$GITHUB_REF_NAME" != v* ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} should be v${version}: the release environment admits only tags matching v*."
+            exit 1
+          fi
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main."
+            exit 1
+          fi
+          # Binaries report the workspace version, and compare it with the release's to decide
+          # whether to upgrade, so the two must be the same.
+          if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the workspace version ${version} in Cargo.toml."
+            exit 1
+          fi
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
   test:
     name: Test (${{ matrix.os }})
     timeout-minutes: 30
@@ -42,7 +84,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs: [name, test]
     strategy:
       fail-fast: false
       matrix:
@@ -62,23 +104,6 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check that the release commit is on main
-        run: |
-          git fetch --quiet origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Release tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main."
-            exit 1
-          fi
-          # Binaries report the workspace version, and compare it with the release's to decide
-          # whether to upgrade, so the two must be the same.
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match the workspace version ${version} in Cargo.toml."
-            exit 1
-          fi
 
       - uses: dtolnay/rust-toolchain@1.99
         with:
@@ -117,8 +142,9 @@ jobs:
         id: package
         env:
           TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.name.outputs.tag }}
         run: |
-          name="magicpipes-${GITHUB_REF_NAME}-${TARGET}"
+          name="magicpipes-${TAG}-${TARGET}"
           ext=""
           [[ "$TARGET" == *windows* ]] && ext=".exe"
           mkdir -p "dist/$name"
@@ -141,8 +167,8 @@ jobs:
           cp "$novnc/vendor/pako/LICENSE" "dist/$name/LICENSE-pako"
           # The bare binaries, for `--upgrade` (scripts/release-manifest.py lists them).
           mkdir -p dist/upload
-          cp "target/$TARGET/release/magicpipes$ext" "dist/upload/magicpipes-${GITHUB_REF_NAME}-${TARGET}$ext"
-          cp "target/$TARGET/release/magicpipesd$ext" "dist/upload/magicpipesd-${GITHUB_REF_NAME}-${TARGET}$ext"
+          cp "target/$TARGET/release/magicpipes$ext" "dist/upload/magicpipes-${TAG}-${TARGET}$ext"
+          cp "target/$TARGET/release/magicpipesd$ext" "dist/upload/magicpipesd-${TAG}-${TARGET}$ext"
           cd dist
           if [[ "$TARGET" == *windows* ]]; then
             7z a -tzip -bso0 "upload/$name.zip" "$name"
@@ -156,9 +182,26 @@ jobs:
           path: dist/upload/*
           if-no-files-found: error
 
+  images:
+    name: Images
+    needs: [name, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-linux-musl'
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the images
+        run: scripts/release-images.sh dist "${{ needs.name.outputs.tag }}"
+
   publish:
     name: Publish release assets
-    needs: build
+    needs: [build, images]
+    if: github.event_name == 'release'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # The signing key is a secret of this environment, so only this job can read it.
@@ -208,3 +251,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+
+  push-images:
+    name: Push images
+    # After the release's files, so images never exist for a release whose files didn't publish.
+    needs: [name, images, publish]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The registry's address and credentials are this environment's, like the signing key.
+    environment: release
+    steps:
+      - name: Check the registry settings
+        id: registry
+        env:
+          REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+          USERNAME: ${{ secrets.IMAGE_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.IMAGE_REGISTRY_PASSWORD }}
+        run: |
+          if [[ -z "$REPOSITORY" ]]; then
+            echo "::notice::No images pushed: the release environment has no IMAGE_REPOSITORY variable."
+            echo "push=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
+            echo "::error::IMAGE_REPOSITORY is set, but the release environment lacks the IMAGE_REGISTRY_USERNAME or IMAGE_REGISTRY_PASSWORD secret."
+            exit 1
+          fi
+          echo "push=1" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.registry.outputs.push
+      - uses: actions/download-artifact@v4
+        if: steps.registry.outputs.push
+        with:
+          pattern: '*-linux-musl'
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+        if: steps.registry.outputs.push
+      - name: Sign in to the registry
+        if: steps.registry.outputs.push
+        env:
+          REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+          USERNAME: ${{ secrets.IMAGE_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.IMAGE_REGISTRY_PASSWORD }}
+        run: printf '%s' "$PASSWORD" | docker login "${REPOSITORY%%/*}" -u "$USERNAME" --password-stdin
+      - name: Push the images
+        if: steps.registry.outputs.push
+        env:
+          REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+        run: scripts/release-images.sh dist "${{ needs.name.outputs.tag }}" --push "$REPOSITORY"

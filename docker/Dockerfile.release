@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+#
+# A release's container images: the same images as the Dockerfile at the top of the repository, but
+# made from the static Linux binaries the release has already built and smoke-tested, so the images
+# run exactly the binaries the release ships. scripts/release-images.sh builds them; the build
+# context is a directory holding amd64/ and arm64/, each with magicpipes and magicpipesd.
+#
+#   --target agent   the agent alone, for containers and Kubernetes (docs/KUBERNETES.md)
+#   (no --target)    the server
+
+ARG BASE=alpine:3
+
+# Runs on the machine doing the build, whatever the target platform: it only provides the CA bundle
+# and the directories.
+FROM --platform=$BUILDPLATFORM ${BASE} AS rootfs
+RUN mkdir -p /rootfs/data /rootfs/tmp && chmod 1777 /rootfs/tmp
+
+# The agent, configured by its environment (docs/KUBERNETES.md). It trusts the public CAs it was
+# built with, so it needs no CA bundle.
+FROM scratch AS agent
+ARG TARGETARCH
+COPY --from=rootfs --chown=65532:65532 /rootfs/ /
+COPY --chmod=755 ${TARGETARCH}/magicpipes /usr/local/bin/
+ENV MAGICPIPES_HOME=/data
+USER 65532:65532
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/local/bin/magicpipes", "agent", "run"]
+
+FROM scratch
+ARG TARGETARCH
+COPY --from=rootfs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=rootfs --chown=65532:65532 /rootfs/ /
+COPY --chmod=755 ${TARGETARCH}/magicpipesd ${TARGETARCH}/magicpipes /usr/local/bin/
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    MAGICPIPESD_CONFIG=/etc/magicpipes/magicpipesd.toml
+USER 65532:65532
+VOLUME ["/data"]
+EXPOSE 80 443 8443
+ENTRYPOINT ["/usr/local/bin/magicpipesd"]
